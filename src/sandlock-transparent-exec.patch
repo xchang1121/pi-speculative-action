@@ -4982,9 +4982,25 @@ index 3673d84..d7fbba7 100644
                  virtual_hostname: None,
                  has_http_acl: false,
 diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/src/seccomp/notif.rs
-index abcd92c..55849aa 100644
+index abcd92c..74f861d 100644
 --- a/crates/sandlock-core/src/seccomp/notif.rs
 +++ b/crates/sandlock-core/src/seccomp/notif.rs
+@@ -360,13 +360,13 @@ pub(crate) fn is_path_denied_for_notif(
+     notif: &SeccompNotif,
+     notif_fd: RawFd,
+ ) -> bool {
+-    if let Some(path) = resolve_path_for_notif(notif, notif_fd) {
++    if let Some(path) = resolve_path_for_notif(notif, notif_fd, false) {
+         if is_denied_with_symlink_resolve(policy_fn_state, &path) {
+             return true;
+         }
+     }
+     // For two-path syscalls, also check the second (destination) path.
+-    if let Some(path) = resolve_second_path_for_notif(notif, notif_fd) {
++    if let Some(path) = resolve_path_for_notif(notif, notif_fd, true) {
+         if is_denied_with_symlink_resolve(policy_fn_state, &path) {
+             return true;
+         }
 @@ -514,6 +514,13 @@ pub(crate) struct OpenArgs {
      pub(crate) resolve: u64,
  }
@@ -5411,132 +5427,162 @@ index abcd92c..55849aa 100644
  }
 
  fn normalize_path(path: &std::path::Path) -> String {
-@@ -1658,80 +1853,80 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
-         n if n == libc::SYS_openat || n == arch::SYS_OPENAT2 => {
-             // openat(dirfd, pathname, flags, mode) and
-             // openat2(dirfd, pathname, how, size) share (dirfd, pathname).
+@@ -1645,129 +1840,35 @@ fn resolve_at_path_for_event(notif: &SeccompNotif, dirfd: i64, path: &str) -> Op
+     Some(normalize_path(&base.join(path)))
+ }
+
+-/// Resolve the primary path argument of a path-bearing syscall.
+-///
+-/// Serves two callers with different scopes: `emit_policy_event` uses it for
+-/// every syscall matched here (observation, e.g. `sandlock learn`), while
+-/// deny enforcement via `is_path_denied_for_notif` only ever sees syscalls in
+-/// `fs_denied_path_syscalls` — adding a match arm here does NOT widen deny
+-/// gating.
+-fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<String> {
++/// Select the pathname and its directory from the same canonical ABI used by
++/// filesystem mediation. A symlink's target is data; only its new name is gated.
++fn path_argument(notif: &SeccompNotif, second: bool) -> Option<(i64, u64)> {
++    let notif = canonical_path_call(*notif);
+     let nr = notif.data.nr as i64;
+-    match nr {
+-        n if n == libc::SYS_openat || n == arch::SYS_OPENAT2 => {
+-            // openat(dirfd, pathname, flags, mode) and
+-            // openat2(dirfd, pathname, how, size) share (dirfd, pathname).
 -            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[1], notif_fd)?;
-             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
-         }
-         n if Some(n) == arch::sys_open() || n == libc::SYS_execve => {
+-            resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+-        }
+-        n if Some(n) == arch::sys_open() || n == libc::SYS_execve => {
 -            let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[0], notif_fd)?;
-             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
-         }
-         n if n == libc::SYS_execveat => {
+-            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+-        }
+-        n if n == libc::SYS_execveat => {
 -            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[1], notif_fd)?;
-             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
-         }
-         // linkat(olddirfd, oldpath, newdirfd, newpath, flags)
-         // Check the source (old) path — deny if it's a denied file being linked away.
-         n if n == libc::SYS_linkat => {
+-            resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+-        }
+-        // linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+-        // Check the source (old) path — deny if it's a denied file being linked away.
+-        n if n == libc::SYS_linkat => {
 -            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[1], notif_fd)?;
-             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
-         }
-         // renameat2/renameat(olddirfd, oldpath, newdirfd, newpath[, flags])
-         // Check the source (old) path — deny if a denied file is being renamed away.
-         n if n == libc::SYS_renameat2 || Some(n) == arch::sys_renameat() => {
+-            resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+-        }
+-        // renameat2/renameat(olddirfd, oldpath, newdirfd, newpath[, flags])
+-        // Check the source (old) path — deny if a denied file is being renamed away.
+-        n if n == libc::SYS_renameat2 || Some(n) == arch::sys_renameat() => {
 -            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[1], notif_fd)?;
-             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
-         }
-         // mkdirat(dirfd, pathname, mode)
-         n if n == libc::SYS_mkdirat => {
+-            resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+-        }
+-        // mkdirat(dirfd, pathname, mode)
+-        n if n == libc::SYS_mkdirat => {
 -            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[1], notif_fd)?;
-             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
-         }
-         // mknodat(dirfd, pathname, mode, dev)
-         n if n == libc::SYS_mknodat => {
+-            resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+-        }
+-        // mknodat(dirfd, pathname, mode, dev)
+-        n if n == libc::SYS_mknodat => {
 -            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[1], notif_fd)?;
-             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
-         }
-         // mknod(pathname, mode, dev), legacy, AT_FDCWD implied.
-         n if Some(n) == arch::sys_mknod() => {
+-            resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+-        }
+-        // mknod(pathname, mode, dev), legacy, AT_FDCWD implied.
+-        n if Some(n) == arch::sys_mknod() => {
 -            let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[0], notif_fd)?;
-             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
-         }
-         // unlinkat(dirfd, pathname, flags)
-         n if n == libc::SYS_unlinkat => {
+-            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+-        }
+-        // unlinkat(dirfd, pathname, flags)
+-        n if n == libc::SYS_unlinkat => {
 -            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[1], notif_fd)?;
-             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
-         }
-         // symlinkat(target, newdirfd, linkpath): args[2] is the created symlink path.
-         // args[0] is the target string (not a filesystem path to grant rights on).
-         n if n == libc::SYS_symlinkat => {
+-            resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+-        }
+-        // symlinkat(target, newdirfd, linkpath): args[2] is the created symlink path.
+-        // args[0] is the target string (not a filesystem path to grant rights on).
+-        n if n == libc::SYS_symlinkat => {
 -            let path = read_path_for_event(notif, notif.data.args[2], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[2], notif_fd)?;
-             resolve_at_path_for_event(notif, notif.data.args[1] as i64, &path)
-         }
-         // truncate(path, length): absolute path, no dirfd.
-         n if n == libc::SYS_truncate => {
+-            resolve_at_path_for_event(notif, notif.data.args[1] as i64, &path)
+-        }
+-        // truncate(path, length): absolute path, no dirfd.
+-        n if n == libc::SYS_truncate => {
 -            let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[0], notif_fd)?;
-             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
-         }
-         // Legacy single-path variants: mkdir, rmdir, unlink share args[0]=path.
-         n if Some(n) == arch::sys_mkdir() || Some(n) == arch::sys_rmdir()
-             || Some(n) == arch::sys_unlink() =>
-         {
+-            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+-        }
+-        // Legacy single-path variants: mkdir, rmdir, unlink share args[0]=path.
+-        n if Some(n) == arch::sys_mkdir() || Some(n) == arch::sys_rmdir()
+-            || Some(n) == arch::sys_unlink() =>
+-        {
 -            let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[0], notif_fd)?;
-             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
-         }
-         // symlink(target, linkpath): args[1] is the created symlink path.
-         n if Some(n) == arch::sys_symlink() => {
+-            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+-        }
+-        // symlink(target, linkpath): args[1] is the created symlink path.
+-        n if Some(n) == arch::sys_symlink() => {
 -            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[1], notif_fd)?;
-             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
-         }
-         // link(oldpath, newpath) — legacy, AT_FDCWD implied for both
-         n if Some(n) == arch::sys_link() => {
+-            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+-        }
+-        // link(oldpath, newpath) — legacy, AT_FDCWD implied for both
+-        n if Some(n) == arch::sys_link() => {
 -            let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[0], notif_fd)?;
-             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
-         }
-         // rename(oldpath, newpath) — legacy, AT_FDCWD implied for both
-         n if Some(n) == arch::sys_rename() => {
+-            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+-        }
+-        // rename(oldpath, newpath) — legacy, AT_FDCWD implied for both
+-        n if Some(n) == arch::sys_rename() => {
 -            let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[0], notif_fd)?;
-             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+-            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
++    let args = notif.data.args;
++    let pair = nr == libc::SYS_linkat || nr == libc::SYS_renameat2 || Some(nr) == arch::sys_renameat();
++    if second && !pair { return None; }
++    let (dirfd, pathname) = if pair {
++        let offset = if second { 2 } else { 0 };
++        (args[offset] as i64, args[offset + 1])
++    } else {
++        match nr {
++            libc::SYS_openat | arch::SYS_OPENAT2 | libc::SYS_execveat |
++            libc::SYS_mkdirat | libc::SYS_mknodat | libc::SYS_unlinkat => (args[0] as i64, args[1]),
++            libc::SYS_symlinkat => (args[1] as i64, args[2]),
++            libc::SYS_execve | libc::SYS_truncate => (libc::AT_FDCWD as i64, args[0]),
++            n if Some(n) == arch::sys_open() => (libc::AT_FDCWD as i64, args[0]),
++            _ => return None,
          }
-         _ => None,
-@@ -1746,24 +1941,24 @@ fn resolve_second_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Optio
-     match nr {
-         // renameat2/renameat(olddirfd, oldpath, newdirfd, newpath[, flags])
-         n if n == libc::SYS_renameat2 || Some(n) == arch::sys_renameat() => {
+-        _ => None,
+-    }
++    };
++    Some((dirfd, pathname))
+ }
+
+-/// Resolve the second (destination) path for two-path syscalls.
+-///
+-/// Returns `None` for syscalls that only have a single path argument.
+-fn resolve_second_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<String> {
+-    let nr = notif.data.nr as i64;
+-    match nr {
+-        // renameat2/renameat(olddirfd, oldpath, newdirfd, newpath[, flags])
+-        n if n == libc::SYS_renameat2 || Some(n) == arch::sys_renameat() => {
 -            let path = read_path_for_event(notif, notif.data.args[3], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[3], notif_fd)?;
-             resolve_at_path_for_event(notif, notif.data.args[2] as i64, &path)
-         }
-         // linkat(olddirfd, oldpath, newdirfd, newpath, flags)
-         // Destination of a hardlink to a denied file should also be denied
-         // (prevents overwriting a denied file via linkat).
-         n if n == libc::SYS_linkat => {
+-            resolve_at_path_for_event(notif, notif.data.args[2] as i64, &path)
+-        }
+-        // linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+-        // Destination of a hardlink to a denied file should also be denied
+-        // (prevents overwriting a denied file via linkat).
+-        n if n == libc::SYS_linkat => {
 -            let path = read_path_for_event(notif, notif.data.args[3], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[3], notif_fd)?;
-             resolve_at_path_for_event(notif, notif.data.args[2] as i64, &path)
-         }
-         // rename(oldpath, newpath) — legacy
-         n if Some(n) == arch::sys_rename() => {
+-            resolve_at_path_for_event(notif, notif.data.args[2] as i64, &path)
+-        }
+-        // rename(oldpath, newpath) — legacy
+-        n if Some(n) == arch::sys_rename() => {
 -            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[1], notif_fd)?;
-             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
-         }
-         // link(oldpath, newpath) — legacy
-         n if Some(n) == arch::sys_link() => {
+-            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+-        }
+-        // link(oldpath, newpath) — legacy
+-        n if Some(n) == arch::sys_link() => {
 -            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
-+            let path = read_path(notif, notif.data.args[1], notif_fd)?;
-             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
-         }
-         _ => None,
-@@ -1810,7 +2005,7 @@ fn read_argv_for_event(notif: &SeccompNotif, argv_ptr: u64, notif_fd: RawFd) ->
+-            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+-        }
+-        _ => None,
+-    }
++/// Policy observation uses every path recognized above; deny enforcement still
++/// admits only fs_denied_path_syscalls, independently of this argument decoder.
++fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd, second: bool) -> Option<String> {
++    let (dirfd, address) = path_argument(notif, second)?;
++    resolve_at_path_for_event(notif, dirfd, &read_path(notif, address, notif_fd)?)
+ }
+
+ /// Extract the `sun_path` from an `AF_UNIX` sockaddr in child memory.
+@@ -1810,7 +1911,7 @@ fn read_argv_for_event(notif: &SeccompNotif, argv_ptr: u64, notif_fd: RawFd) ->
          let str_ptr = u64::from_ne_bytes(ptr_bytes[..8].try_into().ok()?);
          if str_ptr == 0 { break; } // NULL terminator
 
@@ -5545,7 +5591,35 @@ index abcd92c..55849aa 100644
              args.push(s);
          } else {
              break;
-@@ -2546,6 +2741,12 @@ pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::sta
+@@ -1934,7 +2035,7 @@ async fn emit_policy_event(
+             notif.data.args[1]
+         };
+         argv = read_argv_for_event(notif, argv_ptr, notif_fd);
+-        path = resolve_path_for_notif(notif, notif_fd)
++        path = resolve_path_for_notif(notif, notif_fd, false)
+             .map(std::path::PathBuf::from);
+     }
+
+@@ -1998,7 +2099,7 @@ async fn emit_policy_event(
+     // openat/openat2/open: resolved path + flags.
+     if nr == libc::SYS_openat || nr == arch::SYS_OPENAT2 || Some(nr) == arch::sys_open() {
+         if let Some(open_args) = decode_open_args(notif, notif_fd) {
+-            path = resolve_path_for_notif(notif, notif_fd)
++            path = resolve_path_for_notif(notif, notif_fd, false)
+                 .map(std::path::PathBuf::from);
+             flags = Some(open_args.flags);
+         }
+@@ -2016,7 +2117,7 @@ async fn emit_policy_event(
+         || Some(nr) == arch::sys_link() || Some(nr) == arch::sys_rename()
+         || Some(nr) == arch::sys_renameat();
+     if is_fs_mutating {
+-        path = resolve_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from);
+-        path2 = resolve_second_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from);
++        path = resolve_path_for_notif(notif, notif_fd, false).map(std::path::PathBuf::from);
++        path2 = resolve_path_for_notif(notif, notif_fd, true).map(std::path::PathBuf::from);
+     }
+
+@@ -2546,6 +2647,12 @@ pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::sta
          }
      }
      ctx.processes.unregister(key);
@@ -5558,7 +5632,52 @@ index abcd92c..55849aa 100644
  }
 
  // ============================================================
-@@ -2585,6 +2786,16 @@ mod tests {
+@@ -2557,6 +2664,44 @@ mod tests {
+     use super::*;
+     use std::os::unix::io::FromRawFd;
+
++    #[test]
++    fn policy_paths_preserve_each_syscall_abi_and_symlink_destination() {
++        let cwd = libc::AT_FDCWD as i64;
++        let mut cases = vec![
++            (libc::SYS_openat, (11, 22), None),
++            (arch::SYS_OPENAT2, (11, 22), None),
++            (libc::SYS_execve, (cwd, 11), None),
++            (libc::SYS_execveat, (11, 22), None),
++            (libc::SYS_mkdirat, (11, 22), None),
++            (libc::SYS_mknodat, (11, 22), None),
++            (libc::SYS_unlinkat, (11, 22), None),
++            (libc::SYS_truncate, (cwd, 11), None),
++            (libc::SYS_symlinkat, (22, 33), None),
++            (libc::SYS_linkat, (11, 22), Some((33, 44))),
++            (libc::SYS_renameat2, (11, 22), Some((33, 44))),
++        ];
++        for nr in [arch::sys_open(), arch::sys_mkdir(), arch::sys_mknod(), arch::sys_rmdir(), arch::sys_unlink()].into_iter().flatten() {
++            cases.push((nr, (cwd, 11), None));
++        }
++        if let Some(nr) = arch::sys_symlink() { cases.push((nr, (cwd, 22), None)); }
++        for nr in [arch::sys_link(), arch::sys_rename()].into_iter().flatten() {
++            cases.push((nr, (cwd, 11), Some((cwd, 22))));
++        }
++        if let Some(nr) = arch::sys_renameat() { cases.push((nr, (11, 22), Some((33, 44)))); }
++        let mut notif: SeccompNotif = unsafe { std::mem::zeroed() };
++        notif.data.args = [11, 22, 33, 44, 55, 66];
++        for (nr, first, second) in cases {
++            notif.data.nr = nr as i32;
++            assert_eq!(path_argument(&notif, false), Some(first), "syscall {nr}");
++            assert_eq!(path_argument(&notif, true), second, "syscall {nr}");
++        }
++        for nr in [libc::SYS_read, libc::SYS_newfstatat, libc::SYS_fchmodat, libc::SYS_readlinkat] {
++            notif.data.nr = nr as i32;
++            assert_eq!(path_argument(&notif, false), None);
++            assert_eq!(path_argument(&notif, true), None);
++        }
++    }
++
+     fn gettid() -> u32 {
+         (unsafe { libc::syscall(libc::SYS_gettid) }) as u32
+     }
+@@ -2585,6 +2730,16 @@ mod tests {
          path_ptr: u64,
          argv_ptr: u64,
          envp_ptr: u64,
@@ -5575,7 +5694,7 @@ index abcd92c..55849aa 100644
      ) -> Result<ExecRewritePlan, NotifError> {
          let mut read = |addr: u64, len: usize| {
              let off = addr
-@@ -2595,101 +2806,48 @@ mod tests {
+@@ -2595,101 +2750,48 @@ mod tests {
                  .map(|s| s.to_vec())
                  .ok_or_else(|| NotifError::Supervisor("read past fake memory".into()))
          };
@@ -5602,13 +5721,16 @@ index abcd92c..55849aa 100644
 -        let p = plan(&mem, FAKE_BASE, FAKE_BASE + 0x800, 0).unwrap();
 -        assert_eq!(p.buf, [FD, b"./m\0".as_slice()].concat());
 -        assert_eq!(p.patches, vec![(FAKE_BASE + 0x800, FAKE_BASE + 16)]);
--    }
--
--    #[test]
++        plan_exec_rewrite(&mut read, path_ptr, FD, argv_ptr, envp_ptr, below)
+     }
+
+     #[test]
 -    fn exec_rewrite_relocates_packed_argv1() {
 -        // argv[1] sits right after the path string, inside the fd-path
 -        // window; both strings must survive.
--        let mut mem = vec![0u8; 4096];
++    fn exec_rewrite_below_the_stack_writes_only_the_fd_path_over_the_strings() {
++        // flock execs getenv("SHELL") as path and argv[0]: the tail of an environment string high on the stack.
+         let mut mem = vec![0u8; 4096];
 -        put(&mut mem, FAKE_BASE, b"./echo\0EXEC_OK\0");
 -        put_ptrs(&mut mem, FAKE_BASE + 0x800, &[FAKE_BASE, FAKE_BASE + 7]);
 -        let p = plan(&mem, FAKE_BASE, FAKE_BASE + 0x800, 0).unwrap();
@@ -5620,16 +5742,13 @@ index abcd92c..55849aa 100644
 -                (FAKE_BASE + 0x808, FAKE_BASE + 23),
 -            ]
 -        );
-+        plan_exec_rewrite(&mut read, path_ptr, FD, argv_ptr, envp_ptr, below)
-     }
-
-     #[test]
+-    }
+-
+-    #[test]
 -    fn exec_rewrite_relocates_string_reaching_window_from_below() {
 -        // The path pointer aims into the tail of argv[0] ("echo" inside
 -        // "/bin/echo"): the whole string must be relocated.
-+    fn exec_rewrite_below_the_stack_writes_only_the_fd_path_over_the_strings() {
-+        // flock execs getenv("SHELL") as path and argv[0]: the tail of an environment string high on the stack.
-         let mut mem = vec![0u8; 4096];
+-        let mut mem = vec![0u8; 4096];
 -        put(&mut mem, FAKE_BASE, b"/bin/echo\0");
 -        put_ptrs(&mut mem, FAKE_BASE + 0x800, &[FAKE_BASE]);
 -        let p = plan(&mem, FAKE_BASE + 5, FAKE_BASE + 0x800, 0).unwrap();
@@ -5711,7 +5830,7 @@ index abcd92c..55849aa 100644
      }
 
      #[test]
-@@ -2712,6 +2870,19 @@ mod tests {
+@@ -2712,6 +2814,19 @@ mod tests {
          assert!(p.patches.is_empty());
      }
 
