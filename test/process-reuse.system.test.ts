@@ -124,6 +124,19 @@ test.each(['3</tools>, "worker", ["worker"], [], 0', '3</tools/worker>, "", ["wo
 	expect(observed.paths).toContainEqual({ path: "/tools/worker", role: "executable" });
 });
 
+test.each([false, true])("attributes private external writes only to an owned brokered child (%s)", async owned => {
+	const target = "/tmp/compiler.s", query = (size: number) => `statx(AT_FDCWD, "${target}", 0, STATX_SIZE, {stx_mask=STATX_SIZE, stx_size=${size}}) = 0`;
+	const { prefix } = await processTrace([
+		'execve("/tools/worker", ["worker"], []) = 0', query(1), query(2), "+++ exited with 0 +++\n",
+	].join("\n"));
+	const observed = await observeStrace(prefix, "/tools/worker", "/work", {
+		brokeredWrites: pid => pid === (owned ? 101 : 102) ? [target] : undefined,
+	});
+	expect(observed.complete).toBe(owned);
+	expect(observed.external).toEqual(owned ? [target] : []);
+	expect(observed.incompleteReasons).toEqual(owned ? [] : [`metadata_changed:${target}`]);
+});
+
 test("tracks shared cwd and resumed writes across growing ordered trace chunks", async () => {
 	const { tail, append } = await processTrace('101 1.000000 clone(flags=CLONE_FS|SIGCHLD) = 102\n102 1.000001 chdir("/new") = 0\n101 1.000002 openat(AT_FDCWD, "output", O_WRONLY|O_CREAT, 0600) = 3</new/output>\n', "stream");
 	await tail.read();

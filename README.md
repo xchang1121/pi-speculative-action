@@ -58,6 +58,8 @@ Drafter 参照 [TomasuLLM](https://arxiv.org/html/2609.38201v2) 将动作预测�
 
 底层进程 API 仍包含 `spawn/execFile/exec/fork` 及同步交接机制，供独立后端开发与资格测试；它们不属于公开 Host 的自动优化闭包。直接构建底层 router 或替换整个 Host 的调用方自行承担执行协议，不能把其测试通过解释为默认扩展已支持原生复用。文件绑定的第三方工具仍可通过资源协议共享输入和纯计算。
 
+Bash 后端的新增资格对照覆盖真实 `cc -c`：本次执行及其子进程创建、结束前已删除的私有临时文件，按调用前的缺失证明验新，不再误作现存输入。已有文件及仍保留输出的元数据证明继续验证；未证明对象关系的重命名、硬链接和未知写入不获得此放宽。其他调用占用临时路径或源代码改变会拒绝采用。测试验证隔离期间源字段不变、对象文件字节一致、正式调用省去编译且一次成果不能重复消费；完整链接与 Python 的元数据拒绝仍保留。此结果仅推进底层后端，公开 Host 和默认扩展的 Bash 路由仍由 Actor 执行。
+
 结果、输入和句柄各自保留所有权，跨轮消费仍验新。缓存发布与回收由跨进程事务协调，活跃借用受预算保护；关闭先停止接纳，再排空已接纳工作和句柄。直接使用 process-reuse API 时，以 `withPublication` 包住产物写入至证书封存，在回调外调用 `gc`、`drain` 或 `dispose`。
 
 Linux 输入版本可显式配置 `ResourceVersionManager(root, { persistentInputs: { store, limits } })`，其中 `store` 是现有 `ProvenanceCertificateStore`，直接 API 默认要求缓存目录位于源树之外。`capture(dependencies, retainBytes)` 保留分块输入，`persist(token)` 返回记录摘要；重启后用新 manager 调用 `restore(id, retainBytes)`，完整核对内容和当前路径观察后才返回新的输入令牌。记录缺失或源已变化时返回 `undefined`，损坏记录拒绝恢复。`view.readFile(path, maxBytes)` 读取有界前缀，`view.readFileRange(path, offset, length)` 支持逐块消费；使用结束后等待 `token.release()`。扩展的专用内部缓存边界见下文。

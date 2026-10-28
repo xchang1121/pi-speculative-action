@@ -59,7 +59,7 @@ export interface StraceObservation {
 export interface StraceObservationOptions {
 	/** Exact root launch alias; the prototype separately binds the installed executable bytes. */
 	readonly launchPath?: string;
-	/** The workspace names a run brokered from a traced launcher pid wrote, its own brokered runs included. */
+	/** Writes owned by a brokered launcher and its descendants: relative workspace names or absolute external paths. */
 	readonly brokeredWrites?: (pid: number) => readonly string[] | undefined;
 	/** The session's private branch, where a descriptor on a copy shows the copy: it stands for the host path it shadows. */
 	readonly privateUpper?: string;
@@ -768,7 +768,9 @@ export async function observeStrace(
 	}
 	// A workspace file the traced processes wrote changes under their own hands; its later state is their effect, not an input.
 	// A run brokered from its tree, whose launcher the trace holds, wrote on its behalf.
-	for (const pid of selected.keys()) for (const name of options.brokeredWrites?.(pid) ?? []) written.add(`//${name}`);
+	for (const pid of selected.keys()) for (const name of options.brokeredWrites?.(pid) ?? []) {
+		if (path.posix.isAbsolute(name)) external.add(name); else written.add(`//${name}`);
+	}
 	// What it wrote outside the workspace, and the directories holding those names, change by its own hand.
 	const touched = new Set([...external, ...[...written].flatMap(name => semanticRoots.map(root => path.posix.join(root, name.slice(2))))]
 		.flatMap(target => [target, path.posix.dirname(target)]));

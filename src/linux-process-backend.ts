@@ -2009,9 +2009,23 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 	};
 	// Rebase owned inputs; metadata survives unless its private object vanished within this transaction.
 	const changed = new Set(effects.effects.map(effect => effect.logicalPath));
+	const retainedExternal = new Set(external.changes.filter(change => change.after).map(change => change.target));
+	let unmovedPrivateObjects: Promise<boolean> | undefined;
+	const privateObjectsUnmoved = () => unmovedPrivateObjects ??= (async () => {
+		// A deleted name can still identify a retained output through rename/link. Without a full
+		// object mapping, multi-path writes and unresolved writes cannot prove the object vanished.
+		for (const writer of sessionWriters(session)) {
+			const trace = writer.tail ? await writer.tail.read() : writer;
+			if (trace.unsafe || !trace.writes || trace.writes.some(write => !write.paths || write.paths.length > 1)) return false;
+		}
+		return true;
+	})();
 	const atStart = async (dependency: DynamicDependency) => {
-		if (dependency.kind !== "fd" && dependency.kind !== "lock" && dependency.kind !== "metadata" && external.before.has(dependency.path)) {
-			return external.before.get(dependency.path);
+		if (dependency.kind !== "fd" && dependency.kind !== "lock" && external.before.has(dependency.path)) {
+			const initial = external.before.get(dependency.path);
+			// Only a private object created AND removed by this run can discard its metadata.
+			// A retained output's identity must still agree with the object the Actor will see.
+			if (dependency.kind !== "metadata" || initial?.kind === "absence" && !retainedExternal.has(dependency.path) && await privateObjectsUnmoved()) return initial;
 		}
 		const physical = dependency.kind === "fd" ? undefined : session.projection.toPhysical(dependency.path);
 		const relative = physical && relativeFilesystemPath(snapshot.root, physical);
@@ -2295,7 +2309,8 @@ function sandboxPolicyArguments(
 /** What the brokered run a traced launcher `pid` started wrote, with its own descendants; a run never answers for itself. */
 function brokeredWrites(session: ActiveSession, pid: number, self?: SessionWriter) {
 	const writers = sessionWriters(session).filter(writer => writer !== self && writer.pid === pid);
-	return writers.length && writers.every(writer => writer.written) ? [...new Set(writers.flatMap(writer => writer.written!))] : undefined;
+	return writers.length && writers.every(writer => writer.written) ? [...new Set(writers.flatMap(writer =>
+		[writer, ...writer.descendants ?? []].flatMap(child => [...child.written ?? [], ...child.external ?? []])))] : undefined;
 }
 
 const sessionWriters = (session: ActiveSession) => [...session.writers].filter(writer => writer.owner === session.token);
