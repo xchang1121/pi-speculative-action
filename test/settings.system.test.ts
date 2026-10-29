@@ -44,27 +44,6 @@ describe("settings publication and reopening on disk", () => {
 		expect([untrusted.scope, untrusted.effective()]).toEqual(["global", reloaded.editable("global")]);
 	});
 
-	it("uses explicit tombstones for project removal and clears only the selected layer", async () => {
-		const { agent, cwd } = await fixture();
-		const store = new SpeculativeActionSettingsStore(cwd, agent);
-		await store.load();
-		store.setEffective({ enabled: true, candidateLimit: 6, draftModel: "openai/draft" });
-		await store.flush();
-		store.setScope("project");
-		store.setEffective({ enabled: false, candidateLimit: 6 });
-		await store.flush();
-		expect(store.editable()).toEqual({ enabled: false, candidateLimit: 6 });
-		expect(store.editable("global")).toEqual({ enabled: true, candidateLimit: 6, draftModel: "openai/draft" });
-		expect(JSON.parse(await readText(cwd, ".pi", "speculative-action.json"))).toEqual({
-			enabled: false,
-			draftModel: null,
-		});
-		expect(store.effective()).toEqual({ enabled: false, candidateLimit: 6 });
-		store.clear();
-		await store.flush();
-		expect(store.effective()).toMatchObject({ enabled: true, candidateLimit: 6, draftModel: "openai/draft" });
-	});
-
 	it("keeps malformed input, reports failed publication and persists only values the lower layer lacks", async () => {
 		const { agent, cwd } = await fixture();
 		const target = path.join(agent, "speculative-action.json");

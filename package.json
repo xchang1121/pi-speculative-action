@@ -54,7 +54,7 @@
 		"bench:ablation": "tsx ./bench/run.ts",
 		"bench:suite": "tsx ./bench/suite.ts",
 		"bench:check": "tsc --noEmit -p ./bench/tsconfig.json",
-		"bench:exec-boundary": "vitest --run test/linux-exec-boundary.test.ts test/linux-process-world.test.ts --maxWorkers=1 --no-file-parallelism",
+		"bench:exec-boundary": "vitest --run test/bash-closure.test.ts test/extension.system.test.ts --maxWorkers=1 --no-file-parallelism",
 		"bench:overlay-probe": "vitest --run test/linux-overlayfs.test.ts --maxWorkers=1 --no-file-parallelism",
 		"setup:linux": "node ./src/setup-linux-process-backend.mjs",
 		"build:windows": "node ./src/setup-windows-filesystem.mjs",

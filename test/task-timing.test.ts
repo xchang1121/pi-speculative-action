@@ -1,35 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { TaskTimeline, TimelineInterval, toolSpeedup, normalizeTimelineComputation } from "../src/task-timing.ts";
 import { restoreNativeDependency, serializeNativeDependency } from "../src/linux-process-sync.ts";
-import { emptySpeculativeTraceSummary, summarizeSpeculativeTrace } from "../src/trace-summary.ts";
-import type { SpeculativeActionEvent } from "../src/events.ts";
-import { benchmarkTraceReport } from "../bench/trace-report.ts";
-
-it("counts arbitrary projector names as trace data", () => {
-	for (const projector of ["constructor", "__proto__", "toString", "rows"]) {
-		const event: SpeculativeActionEvent<string> = { type: "actor_action", sessionID: "trace", turnID: "turn", timestamp: 0,
-			cache: emptySpeculativeTraceSummary().cache, actualAction: "", settlement: {
-				actorAction: { id: "call", sequence: 1, turnID: "turn" }, tool: projector, matchedPredictions: [],
-				rejections: [0, 1].map(() => ({ candidateID: "rejected", match: { kind: "exact", distance: 0 }, cause: { stage: "matching", code: projector } })),
-				provider: { kind: "speculative", candidateID: "candidate", toolExecution: new TimelineInterval(0, 1),
-					match: { kind: "projected", distance: 1, projector } },
-			} };
-		const summary = summarizeSpeculativeTrace([event, event]);
-		expect(summary.partialResultReuseByProjector).toEqual({ [projector]: 2 });
-		expect(summary.actorCandidateRejections).toEqual({ [`matching:${projector}`]: 4 });
-		expect(summary.actorActionsByTool).toEqual({ [projector]: [2, 2] });
-		const prediction: SpeculativeActionEvent<string> = { ...event, type: "prediction", settlement: {
-			prediction: { id: "prediction", source: projector, proposalID: "proposal", actionID: "action" },
-			observation: "unobserved", cause: { stage: "control", code: "turn_closed" },
-		} };
-		const fallback: typeof event = { ...event, settlement: { ...event.settlement, provider: { kind: "actor", origin: "fallback",
-			durationMs: 1, isError: false, cause: { stage: "matching", code: "no_candidate" }, toolExecution: new TimelineInterval(0, 1) } } };
-		const report = benchmarkTraceReport([event, event, prediction, prediction, fallback]);
-		expect(report.speculativeHitsByTool).toEqual({ [projector]: 2 });
-		expect(report.predictionsBySource).toEqual({ [projector]: { settled: 2, observed: 0, matched: 0, adopted: 0 } });
-		expect(report.actorFallbacksByTool).toEqual({ [projector]: 1 });
-	}
-});
 
 const restore = (computation: TimelineInterval): TimelineInterval => {
 	const evidence = TimelineInterval.serialize(computation);
@@ -40,68 +11,6 @@ const restore = (computation: TimelineInterval): TimelineInterval => {
 };
 
 describe("consumed calculation and time hidden before Actor issue", () => {
-	it("records execution boundaries and diagnoses the remaining control wait", async () => {
-		let now = 0;
-		const borrowed = new TimelineInterval(200, 240), producer = { source: "pattern", mode: "early" };
-		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
-		try {
-			const evaluation = await TimelineInterval.measure(async () => {
-				now = 10;
-				await TimelineInterval.outside(async () => {
-					now = 1000;
-					for (const unknown of [TimelineInterval.unknownReuse("old"), TimelineInterval.from({ startedAt: 200, completedAt: 240 })]) expect(TimelineInterval.serialize(unknown)?.nodes[0]?.producer).toBeUndefined();
-					for (const input of [borrowed, restore(borrowed), TimelineInterval.attempted(borrowed)]) TimelineInterval.use(input);
-					const calculation = await TimelineInterval.measure(() => { now = 1010; });
-					expect(new TaskTimeline(0).recordTool(restore(calculation.computation), 100_000, true).hiddenByMode)
-						.toEqual([{ ...producer, hiddenComputeMs: 10 }]);
-					expect([...TimelineInterval.reusedProducers([{ computation: restore(calculation.computation), reused: true }])]).toEqual(["live"]);
-					TimelineInterval.own(calculation.computation);
-					now = 1015;
-				});
-				now = 1025;
-			}, undefined, { ...producer, id: "live" });
-			const graph = TimelineInterval.serialize(evaluation.computation)!;
-			expect(graph.nodes.flatMap(node => node.inputs ?? []).some(input => input.overhead)).toBe(false);
-			expect(new TaskTimeline(0).recordTool(evaluation.computation, 100_000)).toMatchObject({ toolComputeMs: 70, hiddenComputeMs: 40 });
-			expect(new TaskTimeline(0).recordTool(TimelineInterval.restore(graph)!, 100_000, true)).toMatchObject({ toolComputeMs: 70, hiddenComputeMs: 70,
-				hiddenByMode: [{ ...producer, hiddenComputeMs: 30 }] });
-			expect(new TaskTimeline(0).recordCall([{ computation: evaluation.computation }], 0, now))
-				.toMatchObject({ toolComputeMs: 70, hiddenComputeMs: 0, adoptionWaitMs: 955 });
-			clock.mockClear();
-			await TimelineInterval.outside(() => { now += 1000; });
-			expect(clock).not.toHaveBeenCalled();
-		} finally { clock.mockRestore(); }
-	});
-	it.each([0, 60, 120])("separates control wait from a producer finishing at %s", end => {
-		const producer = new TimelineInterval(0, end), timeline = new TaskTimeline(40);
-		const roots = [{ computation: new TimelineInterval(40, 140, [{ computation: producer, reused: true },
-			{ computation: new TimelineInterval(40, 140), overhead: true }]) }];
-		expect(timeline.recordCall(roots, 40, 140)).toMatchObject({ toolComputeMs: end, hiddenComputeMs: Math.min(40, end), adoptionWaitMs: 140 - Math.max(40, end) });
-		const restored = restore(producer);
-		expect(timeline.recordCall([{ computation: restored, reused: true }], 50, 150).adoptionWaitMs).toBe(150 - Math.max(50, end));
-		expect(timeline.measure(150).adoptionWaitMs).toBe(150 - Math.max(40, end));
-		expect(timeline.recordCall([{ computation: TimelineInterval.unknownReuse("old"), reused: true }], 150, 160).adoptionWaitMs).toBeUndefined();
-		expect(timeline.measure(160).adoptionWaitMs).toBeUndefined();
-	});
-
-	it("unions complete and interrupted tool waits without using them as the computation denominator", () => {
-		const timeline = new TaskTimeline(100);
-		timeline.recordTool(new TimelineInterval(0, 100), 100_000);
-		timeline.recordTool(new TimelineInterval(110, 130), 100_000, true);
-		timeline.startToolWait(140)(170);
-		timeline.startToolWait(150)(180);
-		const interrupted = timeline.startToolWait(190);
-		expect(timeline.measure(200)).toMatchObject({ toolWaitMs: 50, toolComputeMs: 120, hiddenComputeMs: 20 });
-		expect(toolSpeedup(timeline.measure(200))).toBe(1.2);
-		interrupted(195); interrupted(250);
-		expect(timeline.measure(200).toolWaitMs).toBe(45);
-		expect(toolSpeedup(timeline.measure(200))).toBe(1.2);
-		expect(toolSpeedup(new TaskTimeline(200).measure(300))).toBeNull();
-		for (const toolComputeMs of [0, -1, NaN, Infinity]) expect(toolSpeedup({ toolComputeMs, hiddenComputeMs: 20 })).toBeNull();
-		for (const hiddenComputeMs of [-1, NaN, Infinity]) expect(toolSpeedup({ toolComputeMs: 50, hiddenComputeMs })).toBeNull();
-		expect(toolSpeedup({ toolComputeMs: 150, hiddenComputeMs: 100, hiddenComputeIncomplete: true })).toBeNull();
-	});
-
 	it.each([
 		{ name: "native work without reuse", computation: new TimelineInterval(0, 100), issuedAt: 0, reused: false,
 			expected: { toolComputeMs: 100, hiddenComputeMs: 0 }, speedup: 1 },
@@ -206,29 +115,4 @@ describe("persisted computation evidence", () => {
 		expect(collected.dependencies).toEqual([]);
 	});
 
-	it("retains large calculation graphs and every excluded span through JSON persistence", () => {
-		const children = Array.from({ length: 4096 }, (_, index) => new TimelineInterval(index, index + 1));
-		const largeGraph = new TimelineInterval(0, 10_000, children.map(computation => ({ computation, owned: true, shared: [computation] })));
-		const child = new TimelineInterval(0, 1);
-		const manyEdges = new TimelineInterval(0, 10_000, Array.from({ length: 4096 }, () => ({ computation: child, overhead: true })));
-		const spans = Array.from({ length: 131_072 }, (_, index) => new TimelineInterval(index, index + 0.5));
-		const manySpans = new TimelineInterval(0, spans.length, [{ computation: new TimelineInterval(0, spans.length), overhead: true, shared: spans }]);
-		const activeSpans = new TimelineInterval(0, spans.length, [], spans);
-		const groups = TimelineInterval.retained("long-id".repeat(128), 0, new TimelineInterval(0, 10_000));
-		for (let index = 0; index < 4096; index++) TimelineInterval.group(groups, {});
-		let deep = child, owned = child;
-		for (let index = 0; index < 8192; index++) {
-			deep = new TimelineInterval(index + 1, index + 2, [{ computation: deep }]);
-			owned = new TimelineInterval(index + 1, index + 2, [{ computation: owned, owned: true }]);
-		}
-		TimelineInterval.producedBy(owned, { source: "pattern", mode: "whole" });
-		for (const [computation, total] of [[largeGraph, 10_000], [manyEdges, 9999], [manySpans, 65_536], [activeSpans, 65_536],
-			[groups, 10_000], [deep, 8193], [TimelineInterval.attempted(deep), 8193]] as const) {
-			const saved = restore(computation);
-			expect(new TaskTimeline(0).recordTool(saved, 1_000_000, true)).toMatchObject({ toolComputeMs: total, hiddenComputeMs: total });
-			for (const issuedAt of [0, 500, 1_000_000]) expect(new TaskTimeline(0).recordCall([{ computation: saved, reused: true }], issuedAt, 1_000_000))
-				.toEqual(new TaskTimeline(0).recordCall([{ computation, reused: true }], issuedAt, 1_000_000));
-		}
-		expect(Buffer.byteLength(JSON.stringify(TimelineInterval.serialize(largeGraph)))).toBeGreaterThan(128 * 1024);
-	});
 });

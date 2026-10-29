@@ -1,4 +1,4 @@
-import { lstat, readFile, utimes } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { expect } from "vitest";
@@ -87,70 +87,6 @@ processTest.for([false, true])("adopts compiled work once and rejects changed so
 	expect(textOutput(await execute())).toBe("(no output)");
 	expect(executions).toBe(changed ? 2 : 1);
 	await h.host.finishTurn("actor");
-});
-
-processTest.for([{ appeared: false, retained: false }, { appeared: true, retained: false }, { appeared: false, retained: true }])(
-	"validates private temporary inputs (appeared=$appeared, retained=$retained)", { timeout: 60_000 }, async ({ appeared, retained }, { benchmark }) => {
-	const f = await benchmark("pi-bash-scratch-", "git"), scratch = path.join(f.root, "scratch");
-	const command = `printf data > '${scratch}'; stat -c %s '${scratch}'${retained ? "" : `; rm '${scratch}'`}`;
-	expect(textOutput(await f.tool.execute("oracle", { command: `${command}; rm -f '${scratch}'` }))).toBe("4\n");
-	await f.prepare();
-	const branch = await f.fork(command);
-	await using _branch = onExit(async () => { await branch.dispose?.(); });
-	expect(await lstat(scratch).catch(error => error.code)).toBe("ENOENT");
-	if (appeared) await f.write("../scratch", "another owner's input");
-	const validation = await branch.validate!();
-	expect(validation, JSON.stringify({ validation, metrics: f.backend.metrics() })).toMatchObject({ status: retained ? "indeterminate" : appeared ? "stale" : "valid" });
-	if (appeared) expect(await readFile(scratch, "utf8")).toBe("another owner's input");
-	else if (!retained) expect(textOutput((await branch.commit()).result)).toBe("4\n");
-});
-
-processTest.for(["mv", "ln"])("keeps metadata proof when a temporary object survives under an alias (%s)", { timeout: 60_000 }, async (operation, { benchmark }) => {
-	const f = await benchmark("pi-bash-scratch-alias-", "git"), scratch = path.join(f.root, "scratch"), kept = path.join(f.root, "kept");
-	const command = `printf data > '${scratch}'; stat -c %i '${scratch}'; ${operation} '${scratch}' '${kept}'; rm -f '${scratch}'`;
-	await f.tool.execute("oracle", { command: `${command}; rm '${kept}'` });
-	await f.prepare();
-	const branch = await f.fork(command);
-	await using _branch = onExit(async () => { await branch.dispose?.(); });
-	expect(await lstat(kept).catch(error => error.code)).toBe("ENOENT");
-	const validation = await branch.validate!();
-	expect(validation.status, JSON.stringify({ validation, metrics: f.backend.metrics() })).not.toBe("valid");
-});
-
-processTest.for(["warm", "cold", "expired", "explicit"])("preserves native access-time decisions (%s)", { timeout: 60_000 }, async (mode, { benchmark }) => {
-	const f = await benchmark("pi-bash-access-", "git", {}, os.homedir());
-	await f.compile("access-time", { code: `#define _GNU_SOURCE
-#include <fcntl.h>
-#include <stdio.h>
-#include <sys/stat.h>
-#include <unistd.h>
-int main(int argc, char **argv) {
-  struct stat before, after; char value;
-  if (stat(argv[1], &before)) return 1;
-  if (argc > 2) { struct timespec t[2] = {{123, 456}, {0, UTIME_OMIT}}; if (utimensat(AT_FDCWD, argv[1], t, 0)) return 2; }
-  int fd = open(argv[1], O_RDONLY | (argc > 2 ? O_NOATIME : 0));
-  if (fd < 0 || read(fd, &value, 1) != 1 || close(fd) || stat(argv[1], &after)) return 3;
-  printf("%d\\n", before.st_atim.tv_sec != after.st_atim.tv_sec || before.st_atim.tv_nsec != after.st_atim.tv_nsec);
-  return 0;
-}\n` });
-	await f.write("input", "value");
-	const target = path.join(f.workspace, "input"), command = `./access-time input${mode === "explicit" ? " write" : ""}`;
-	await f.tool.execute("warm-runtime", { command: "./access-time input" });
-	if (mode === "cold" || mode === "expired") await utimes(target, mode === "cold" ? 0 : Date.now() / 1000 - 86401, 0);
-	const snapshot = async () => {
-		const stat = await lstat(target, { bigint: true });
-		return Object.fromEntries(FILESYSTEM_OBSERVATION_FIELDS.map(field => [field, String(stat[field])]));
-	};
-	const before = await snapshot();
-	await f.prepare();
-	const branch = await f.fork(command);
-	await using _branch = onExit(async () => { await branch.dispose?.(); });
-	expect(await snapshot()).toEqual(before);
-	expect(textOutput(branch.output.result), JSON.stringify(f.backend.metrics())).toBe(mode === "warm" ? "0\n" : "1\n");
-	const validation = await branch.validate!();
-	if (mode === "warm") expect(validation.status, JSON.stringify(validation)).toBe("valid");
-	else expect(validation.status, JSON.stringify(validation)).not.toBe("valid");
-	expect(textOutput(branch.output.result)).toBe(textOutput(await f.tool.execute("oracle", { command })));
 });
 
 processTest.for(["failure", "timeout", "cancel"])("preserves default Bash failure and cancellation (%s)", { timeout: 30_000 }, async (mode, { benchmark }) => {

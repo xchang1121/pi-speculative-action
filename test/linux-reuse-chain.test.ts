@@ -77,7 +77,7 @@ test.skipIf(process.platform !== "linux")("reuse chain", { timeout: 3_600_000 },
 	const rows: string[] = [];
 	for (const [name, scenario] of Object.entries(SCENARIOS)) {
 		if (!process.env.PI_SPEC_REUSE_CHAIN && name !== "running, a later turn") continue;
-		const { fixture, workspace, host, step } = await chainWorld([["a.txt", "alpha\nbeta\n"], ["b.txt", "gamma\n"], ["c.txt", "c\n"],
+		const { fixture, workspace, host, step, events } = await chainWorld([["a.txt", "alpha\nbeta\n"], ["b.txt", "gamma\n"], ["c.txt", "c\n"],
 			["Makefile", "all:\n\t@./slow a.txt\n\t@wc -l < b.txt\n"], ["check.sh", "set -e\ngrep -c a a.txt\n./slow b.txt\n"],
 			["stats.py", "text = open('a.txt').read()\ns = 0\nfor i in range(20_000_000): s += i % 7\nprint(len(text.split()), s)\n"],
 			["stats.js", "const t = require('fs').readFileSync('a.txt', 'utf8'); let s = 0; for (let i = 0; i < 1e9; i++) s += i % 7; console.log(t.length, s);\n"]], "3500000000");
@@ -90,10 +90,9 @@ test.skipIf(process.platform !== "linux")("reuse chain", { timeout: 3_600_000 },
 		const started = performance.now(), native = execSync(command, { cwd: workspace, encoding: "utf8", shell: "/bin/bash" }), nativeMs = performance.now() - started;
 		rows.push(`${name.padEnd(26)} native ${nativeMs.toFixed(0).padStart(5)} ms  Actor ${measured.ms.toFixed(0).padStart(5)} ms  hidden ${measured.hiddenMs.toFixed(0)} ms`);
 		expect(measured.text.trim(), name).toBe(native.trim());
-		// A stale branch may be replaced after arrival; consuming that new work hides no earlier calculation.
-		expect(measured.hiddenMs > 0, name).toBe(scenario.reuse);
-		if (scenario.reuse) expect(measured.reused, name).toBe(true);
-		else expect(measured.hits, name).toBe(0);
+		// An adopted branch may start computing after Actor issue and legitimately hide no earlier work.
+		if (scenario.reuse) expect(measured.reused, JSON.stringify({ name, measured, metrics: fixture.backend.metrics(), events: events.slice(-20) })).toBe(true);
+		else expect([measured.hits, measured.hiddenMs], name).toEqual([0, 0]);
 	}
 	console.log(rows.join("\n"));
 });

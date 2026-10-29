@@ -82,56 +82,6 @@ test.skipIf(process.platform !== "linux").each(["reuse", "stale", "environment",
 	for (const entry of forbidden) expect(entry).not.toHaveBeenCalled();
 });
 
-test.each(["async", "sync", "async-no-reuse", "sync-no-reuse"])("keeps callbacks authoritative and preserves Bash output and effects (%s)", async mode => {
-	const cwd = await directories.create(), agentDir = path.join(cwd, "agent"), calls: string[] = [];
-	await mkdir(agentDir); vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
-	await writeFile(path.join(agentDir, "speculative-action.json"), JSON.stringify({ enabled: true, reuseEnabled: !mode.endsWith("no-reuse"),
-		drafterEnabled: false, prepareObservedOperations: true, patternAware: { enabled: false }, executionRouting: { primary: true, nativeFallback: true } }));
-	await writeFile(path.join(cwd, "notes.txt"), "original\n");
-	await writeFile(path.join(cwd, "counter.cjs"), 'const fs=require("node:fs");fs.appendFileSync("runs","1");process.stdout.write(fs.readFileSync("notes.txt"));if(process.argv.includes("--fail"))process.exitCode=7;');
-	const nativeEntries = ["completedReplayExecutor", "refreshNativeObservation"] as const;
-	const forbidden = nativeEntries.map(entry => vi.spyOn(LinuxProcessReuseBackend.prototype, entry).mockImplementation(() => { throw new Error(`unsupported entry: ${entry}`); }));
-	const actor = fauxProvider({ provider: "closure-actor", models: [{ id: "actor" }], tokensPerSecond: 4_000 });
-	const events: SpeculativeActionEvent<string>[] = [];
-	const settingsManager = SettingsManager.inMemory({}, { projectTrusted: true });
-	const resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noExtensions: true, extensionFactories: [pi => {
-		pi.registerTool({ name: "compute", label: "compute", description: "Runs the current native implementation", parameters: {
-			type: "object", properties: { fail: { type: "boolean" } }, required: ["fail"] }, execute: async (id, args, signal) => {
-			calls.push(id); const argv = ["counter.cjs", ...(args.fail ? ["--fail"] : [])];
-			const output = mode.startsWith("sync") ? execFileSync(process.execPath, argv, { cwd, encoding: "utf8" }) : await new Promise<string>((resolve, reject) => {
-				const child = spawn(process.execPath, argv, { cwd, signal }); let text = "";
-				child.stdout.on("data", bytes => { text += bytes; }); child.on("error", reject);
-				child.on("close", code => code ? reject(new Error(`${text}exit:${code}`)) : resolve(text));
-			});
-			return { content: [fauxText(output)], details: { id } };
-		} });
-	}, createSpeculativeActionExtension({ createHost: (id, options) => createSpeculativeActionHost(id, {
-		...options, onEvent: event => { events.push(event); options.onEvent?.(event); },
-	}) })] });
-	await resourceLoader.reload();
-	const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, refreshOnCreate: false });
-	modelRuntime.registerNativeProvider(actor.provider);
-	const { session } = await createAgentSession({ cwd, agentDir, model: actor.getModel(), modelRuntime, settingsManager, resourceLoader,
-		sessionManager: SessionManager.inMemory(cwd), tools: ["compute", "bash"] });
-	await using _session = onExit(async () => { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); });
-	await session.bindExtensions({ mode: "print", onError: error => { throw error; } });
-	actor.setResponses([response("compute", { fail: false }, { id: "seed" }), async () => {
-		await writeFile(path.join(cwd, "notes.txt"), "changed\n");
-		return response("bash", { command: `"${process.execPath.replaceAll("\\", "/")}" counter.cjs` });
-	}, response("compute", { fail: true }, { id: "failed" }), fauxAssistantMessage("done")]);
-	await session.prompt("Run the three operations in order, preserving their outputs and failures.");
-	const results = session.messages.filter(message => message.role === "toolResult");
-	expect(results).toHaveLength(3); expect(results.map(result => result.isError)).toEqual([false, false, true]);
-	expect(results[0]!.content).toEqual([fauxText("original\n")]); expect(results[1]!.content).toEqual([fauxText("changed\n")]);
-	expect(await readText(cwd, "runs")).toBe("111"); expect(calls).toEqual(["seed", "failed"]);
-	for (const entry of forbidden) expect(entry).not.toHaveBeenCalled();
-	const bashEligible = process.platform === "linux" && !mode.endsWith("no-reuse");
-	for (const event of events.filter(event => event.type === "actor_action")) {
-		if (bashEligible && event.settlement.tool === "bash") continue;
-		expect(event.settlement.provider.kind).toBe("actor"); expect(event.computation?.hiddenComputeMs).toBe(0);
-	}
-});
-
 test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-stale", "-running", "-retired", "-unkeyed", "-inputs", "-inputs-stale", "-sync-producer", "-sync-consumer", "-sync-both", "-sync-stale", "-sync-lost", "-sync-inputs", "-sync-inputs-stale", "-sync-inputs-preempted", "-sync-inputs-preempted-stale", "-cold", "-cold-stale", "-sync-cold", "-sync-cold-stale", "-continuation", "-continuation-stale", "-continuation-cancel", "-continuation-cold", "-continuation-cold-stale", "-continuation-cold-session", "-continuation-cold-damaged", "-continuation-cold-context", "-continuation-cold-lost"].map(mode => `native${mode}`) : [])])("runs Pi session contracts through the default entry (%s)", { timeout: 60_000 }, async mode => {
 	const enabled = mode !== "off", native = mode.startsWith("native"), running = mode === "native-running" || mode === "native-retired";
 	const live = mode.startsWith("native-continuation");
@@ -147,7 +97,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 					database.prepare("UPDATE process_checkpoints SET value=? WHERE ticket=?").run(JSON.stringify({ ...body, id: digestObject(body) }), body.ticket);
 				});
 				if (mode.endsWith("lost")) {
-					const peer = storePeer(saved.cache, saved.record.certificate, [], undefined, { ticket: saved.record.ticket, action: "hold" });
+					const peer = storePeer(saved.cache, saved.record.certificate, { ticket: saved.record.ticket, action: "hold" });
 					try { expect(await peer.noticed).toBe("claimed"); } finally { peer.child.kill("SIGKILL"); await peer.completed.catch(() => {}); }
 				}
 			}

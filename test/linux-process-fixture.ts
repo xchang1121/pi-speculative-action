@@ -1,5 +1,5 @@
 import { execHostText } from "../src/executable-path.ts";
-import { access, copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { MessageChannel, type Worker } from "node:worker_threads";
@@ -9,17 +9,15 @@ import { readText } from "./filesystem.ts";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import { LinuxProcessReuseBackend, type LinuxProcessReuseMetrics } from "../src/linux-process-backend.ts";
-import { resolveLinuxExecHelper } from "../src/linux-held-exec.ts";
+import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
-import { adaptProcessToolOperations, definedProcessEnvironment, ProcessExecutionCoordinator, type ProcessExecutionRequest, type ProcessExecutor } from "../src/process-execution.ts";
+import { adaptProcessToolOperations, definedProcessEnvironment, ProcessExecutionCoordinator, type ProcessExecutionRequest } from "../src/process-execution.ts";
 import { WorkspaceSandboxService, type WorkspaceSandboxDriver } from "../src/workspace-sandbox.ts";
 import { createAgentExecutionHost, type CreateSpeculativeActionHostOptions, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
 import type { SpeculativeActionEvent } from "../src/events.ts";
 import { testModel } from "./model.ts";
-import type { ProcessProvenanceCertificate } from "../src/provenance-certificate.ts";
 import type { ExecutionScope } from "../src/execution-world.ts";
 
 export type LinuxProcessBenchmark = Readonly<Awaited<ReturnType<typeof createLinuxProcessBenchmark>>>;
@@ -40,13 +38,6 @@ export function patternProcessHost(fixture: LinuxProcessBenchmark, sessionID: st
 		start: (turnID: string, signal?: AbortSignal, systemPrompt = "unchanged") => host.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined, context: { systemPrompt, messages: [], tools } }, signal),
 		call: (turnID: string, command: string) => ({ turnID, id: turnID, tool: "bash", args: { command }, tools }),
 	};
-}
-
-export async function recordProcessPublications(fixture: LinuxProcessBenchmark) {
-	await fixture.inOwner(async state => {
-		state.publishing = state.method((await state.load("../src/reuse-planner.ts")).ProcessReusePlanner.prototype, "publishCompleted");
-	});
-	return () => fixture.inOwner(state => state.publishing.mock.calls.map(({ arguments: [certificate] }: any) => certificate) as ProcessProvenanceCertificate[]);
 }
 
 /** Tests release their backends after assertions, failures and early skips. */
@@ -110,7 +101,7 @@ export function inspectProcessOwner(create: () => object) {
 export async function createLinuxProcessBenchmark(
 	rootPrefix: string,
 	workspaceDriver?: WorkspaceSandboxDriver,
-	{ processImages, ...backendOptions }: Omit<ConstructorParameters<typeof LinuxProcessReuseBackend>[0], "storeRoot"> & { readonly processImages?: false } = {},
+	backendOptions: Omit<ConstructorParameters<typeof LinuxProcessReuseBackend>[0], "storeRoot"> = {},
 	parent = os.tmpdir(),
 ) {
 	if (process.platform !== "linux") throw new Error("Run this benchmark inside Linux or WSL 2");
@@ -126,11 +117,6 @@ export async function createLinuxProcessBenchmark(
 		LANG: "C.UTF-8",
 	});
 	const executor = (shellPath: string) => adaptProcessToolOperations(createLocalBashOperations({ shellPath })), host = executor(shellPath);
-	if (processImages === false) {
-		const binary = await resolveLinuxExecHelper(backendOptions.heldExecBinary ?? process.env.PI_SPEC_HELD_EXEC);
-		backendOptions.heldExecBinary = path.join(root, "held-exec");
-		for (const suffix of ["", ".node", ".sqlite"]) await copyFile(binary + suffix, backendOptions.heldExecBinary + suffix);
-	}
 	const backend = new LinuxProcessReuseBackend({ storeRoot, ...backendOptions });
 	const { inOwner, dispose: closeInspection } = inspectProcessOwner(() => Reflect.get(backend, "processOwner").call(backend));
 	const coordinator = new ProcessExecutionCoordinator(backend.completedReplayExecutor(host, {
@@ -173,16 +159,12 @@ export async function createLinuxProcessBenchmark(
 		commit: commitBenchmarkFixture.bind(undefined, workspace),
 		write: (file: string, data: Parameters<typeof writeFile>[1], options?: Parameters<typeof writeFile>[2]) => writeFile(path.join(workspace, file), data, options),
 		read: readText.bind(undefined, workspace),
-		prepare: async ({ workspaceDriver: driver, includeWorkspaceFingerprint, skip }: {
-			readonly workspaceDriver?: WorkspaceSandboxDriver; readonly includeWorkspaceFingerprint?: boolean; readonly skip?: (reason: string) => void;
-		} = {}) => {
+		prepare: async () => {
 			const status = await backend.check(true);
-			if (status.state !== "ready") { skip?.(status.detail); throw new Error(status.detail); }
+			if (status.state !== "ready") throw new Error(status.detail);
 			if (!status.sandlockBinary || !status.straceBinary) throw new Error("Linux process backend omitted ready binaries");
-			const workspaceFingerprint = includeWorkspaceFingerprint ? await workspaceSandbox.fingerprint({ driver: driver ?? "auto" }, workspace) : undefined;
 			await world.speculation.prepare?.({ cwd: workspace });
-			const backendFingerprint = await backend.fingerprint();
-			return { executionFingerprint: executionFingerprint = workspaceFingerprint ? `${backendFingerprint}:${workspaceFingerprint}` : backendFingerprint };
+			return { executionFingerprint: executionFingerprint = await backend.fingerprint() };
 		},
 		fork: async (command: string, options: { readonly namespace?: string; readonly executionScope?: ExecutionScope; readonly signal?: AbortSignal } = {}) => {
 			if (!executionFingerprint) throw new Error("Prepare the process fixture before forking");
@@ -214,17 +196,7 @@ export async function compileBenchmarkHelper(
 	await access(path.join(workspace, output));
 }
 
-/** Render shared C boilerplate without changing include order or the helper's source bytes. */
-export function cHeaders(headers: string): string {
-	return headers.split(" ").map(header => `#include <${header}>`).join("\n");
-}
-
-export async function executeProcess(fixture: Pick<LinuxProcessBenchmark, "workspace" | "environment">, executor: ProcessExecutor,
-	command: string, request: Pick<ProcessExecutionRequest, "scope" | "signal" | "timeout"> = {}) {
-	let output = "";
-	return { ...await executor.execute({ command, cwd: fixture.workspace, environment: fixture.environment, ...request, onData: data => { output += data.toString(); } }), output };
-}
-
+/** Commit the benchmark workspace before speculative execution. */
 export async function commitBenchmarkFixture(workspace: string, name: string, paths: readonly string[] = ["."]): Promise<void> {
 	await execHostText("git", ["init", "--quiet"], { cwd: workspace });
 	await execHostText("git", ["config", "user.name", name], { cwd: workspace });
@@ -235,11 +207,4 @@ export async function commitBenchmarkFixture(workspace: string, name: string, pa
 
 export function textOutput(result: { readonly content: readonly { readonly type: string; readonly text?: string }[] }): string {
 	return result.content.flatMap(item => item.type === "text" && typeof item.text === "string" ? [item.text] : []).join("\n");
-}
-
-export function metricDelta(before: LinuxProcessReuseMetrics, after: LinuxProcessReuseMetrics): LinuxProcessReuseMetrics {
-	return {
-		...Object.fromEntries(Object.entries(after).flatMap(([name, value]) => typeof value === "number" ? [[name, value - (Reflect.get(before, name) ?? 0)]] : [])),
-		...(after.lastError !== before.lastError && after.lastError ? { lastError: after.lastError } : {}),
-	} as LinuxProcessReuseMetrics;
 }
