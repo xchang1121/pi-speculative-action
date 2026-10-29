@@ -12,6 +12,18 @@ export function validateArtifact(reference: ArtifactReference, sizes?: Map<Sha25
 }
 
 export const CONTENT_CHUNK_BYTES = 1024 * 1024;
+
+/** Read a validated range from fixed-size content blocks, including a short final block. */
+export async function readChunkRange(offset: number, length: number, block: (index: number) => Promise<Buffer>): Promise<Buffer> {
+	const result = Buffer.allocUnsafe(length);
+	for (let copied = 0; copied < length;) {
+		const position = offset + copied, index = Math.floor(position / CONTENT_CHUNK_BYTES), start = position % CONTENT_CHUNK_BYTES;
+		const bytes = await block(index), count = Math.min(length - copied, bytes.length - start);
+		bytes.copy(result, copied, start, start + count); copied += count;
+	}
+	return result;
+}
+
 export interface ChunkedContentManifest {
 	readonly size: number; readonly digest: Sha256Digest; readonly chunks: readonly (ArtifactReference | null)[];
 }

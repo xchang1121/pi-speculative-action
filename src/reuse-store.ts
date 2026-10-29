@@ -9,7 +9,7 @@ import {
 	certificateReplayable, parseProcessCertificate, type ProcessProvenanceCertificate, type ProvenanceTaint,
 	referencedArtifacts,
 } from "./provenance-certificate.ts";
-import { type ArtifactReference, validateArtifact } from "./artifact-reference.ts";
+import { CONTENT_CHUNK_BYTES as ARTIFACT_BLOCK_BYTES, readChunkRange, type ArtifactReference, validateArtifact } from "./artifact-reference.ts";
 import { digestObject, isSha256Digest, sha256Digest, sha256DigestAsync, type Sha256Digest } from "./stable-value-hash.ts";
 import { stableStringify } from "./stable-json.ts";
 import { nonNegativeNumber, positiveInteger } from "./setting-input.ts";
@@ -111,7 +111,6 @@ export interface VerifiedArtifactClosure {
 }
 
 export type ArtifactTransfer = { readonly reference: ArtifactReference } & ({ readonly object: FilesystemObjectTransfer } | { readonly bytes: Uint8Array });
-const ARTIFACT_BLOCK_BYTES = 1024 * 1024;
 interface ArtifactReadLimits { readonly maxReadBytes: number; readonly maxStoredBytes: number; readonly maxOpenChunks: number; }
 
 /** One verified content lease, shared by effect closures and input chunks. Linux owns objects; other adapters retain their existing byte images. */
@@ -211,13 +210,8 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 	}
 	readRange(reference: ArtifactReference, offset: number, length: number): Promise<Buffer> {
 		return this.lifetime.serialize(async () => {
-			const value = this.value(reference); this.range(reference, offset, length); const result = Buffer.allocUnsafe(length);
-			for (let copied = 0; copied < length;) {
-				const position = offset + copied, index = Math.floor(position / ARTIFACT_BLOCK_BYTES), start = position % ARTIFACT_BLOCK_BYTES;
-				const block = await this.block(value, index), count = Math.min(length - copied, block.length - start);
-				block.copy(result, copied, start, start + count); copied += count;
-			}
-			return result;
+			const value = this.value(reference); this.range(reference, offset, length);
+			return readChunkRange(offset, length, index => this.block(value, index));
 		});
 	}
 	lend() {

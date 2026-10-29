@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { FileHandle } from "node:fs/promises";
-import { CONTENT_CHUNK_BYTES, parseContentManifest, type ChunkedContentManifest, type ArtifactReference } from "./artifact-reference.ts";
+import { CONTENT_CHUNK_BYTES, parseContentManifest, readChunkRange, type ChunkedContentManifest, type ArtifactReference } from "./artifact-reference.ts";
 export { CONTENT_CHUNK_BYTES, parseContentManifest, type ChunkedContentManifest } from "./artifact-reference.ts";
 import { ArtifactReadView, type ArtifactTransfer, type ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
@@ -101,13 +101,7 @@ export class ContentChunkPool {
 			if (!isSafeCount(offset) || maxBytes !== undefined && !isSafeCount(maxBytes)) throw new Error("invalid content read budget");
 			const size = Math.min(Math.max(0, manifest.size - offset), maxBytes ?? manifest.size);
 			if (size > this.limits.maxReadBytes) throw new Error("content read budget exceeded; request a bounded prefix");
-			const result = Buffer.allocUnsafe(size);
-			for (let copied = 0; copied < size;) {
-				const position = offset + copied, index = Math.floor(position / CONTENT_CHUNK_BYTES), start = position % CONTENT_CHUNK_BYTES;
-				const block = await this.block(manifest, index), count = Math.min(block.length - start, size - copied);
-				block.copy(result, copied, start, start + count); copied += count;
-			}
-			return result;
+			return readChunkRange(offset, size, index => this.block(manifest, index));
 		});
 	}
 	dispose(): Promise<void> {

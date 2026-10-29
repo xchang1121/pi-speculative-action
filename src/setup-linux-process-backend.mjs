@@ -14,6 +14,7 @@ import { qualifyNativeStartup } from "./process-startup.mjs";
 const SANDLOCK_REVISION = "f6a3e39b31afa80f66609c8af8ae5b2582f628e8";
 const SANDLOCK_REPOSITORY = "https://github.com/multikernel/sandlock.git";
 const SANDLOCK_PATCH = fileURLToPath(new URL("./sandlock-transparent-exec.patch", import.meta.url));
+const SANDLOCK_DIRECTORY = fileURLToPath(new URL("./sandlock-directory.rs", import.meta.url));
 const SQLITE_HEADERS = {
 	"sqlite3.h": "919e7f2e8ed1d8f56ac17b412b8971c76aa5d1a879752cc6058f75e7d5910e1d",
 	"sqlite3ext.h": "ac9645e5c9ff0cf176efdd6e75cb5e98f46295d38e02db5c4d208826a39ab4be",
@@ -59,7 +60,7 @@ async function setup() {
 }
 
 async function installSandlock() {
-	return installNative(sandlock, sha256(SANDLOCK_REVISION, await readFile(SANDLOCK_PATCH)), qualifySandlock, async (buildRoot, temporary) => {
+	return installNative(sandlock, sha256(SANDLOCK_REVISION, await readFile(SANDLOCK_PATCH), await readFile(SANDLOCK_DIRECTORY)), qualifySandlock, async (buildRoot, temporary) => {
 		const cargo = await executable([path.join(os.homedir(), ".cargo", "bin", "cargo"), "cargo"]).catch(() => {
 			throw new Error("Rust stable is required to build Sandlock. Install it from https://rustup.rs and retry.");
 		});
@@ -68,6 +69,7 @@ async function installSandlock() {
 		await run(git, ["clone", "--quiet", "--no-checkout", SANDLOCK_REPOSITORY, source]);
 		await run(git, ["-C", source, "checkout", "--quiet", "--detach", SANDLOCK_REVISION]);
 		await run(git, ["-C", source, "apply", "--whitespace=error-all", SANDLOCK_PATCH]);
+		await copyFile(SANDLOCK_DIRECTORY, path.join(source, "crates/sandlock-core/src/cow/dispatch.rs"));
 		await run(cargo, [
 			"build", "--locked", "--release", "-p", "sandlock-cli",
 			"--manifest-path", path.join(source, "Cargo.toml"), "--target-dir", targetRoot,

@@ -90,6 +90,8 @@ Linux 扩展启用复用后，普通文件绑定自动发现、验证和发布�
 
 ## 开发与验证
 
+Linux 原生构建使用固定上游版本、局部补丁和[共用目录模块](./src/sandlock-directory.rs)。手动构建 Sandlock 时，应用补丁后还须将此模块复制到 `crates/sandlock-core/src/cow/dispatch.rs`；[安装器](./src/setup-linux-process-backend.mjs)自动完成两步，并将补丁、替换源码和产物都纳入安装摘要。COW 路径操作共用 chroot 处理器，没有显式根目录时使用 `/` 映射，保留调用者的起始 cwd。
+
 ```sh
 npm ci
 npm run check

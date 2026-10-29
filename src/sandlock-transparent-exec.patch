@@ -73,7 +73,7 @@ index 96309ec..f30b2a3 100644
          if policy.workdir.is_none() {
              return Err(anyhow!("--dry-run requires --workdir"));
 diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/src/chroot/dispatch.rs
-index 6e4ab93..601ee0a 100644
+index 6e4ab93..0508506 100644
 --- a/crates/sandlock-core/src/chroot/dispatch.rs
 +++ b/crates/sandlock-core/src/chroot/dispatch.rs
 @@ -47,9 +47,10 @@
@@ -110,8 +110,8 @@ index 6e4ab93..601ee0a 100644
      pub processes: &'a Arc<ProcessIndex>,
 +    /// A COW branch over the whole host root takes every write the host user could make that the policy does not grant.
 +    pub private_writes: bool,
-+    /// That branch's upper directory, when it does.
-+    pub private_upper: Option<&'a Path>,
++    /// The private upper and the host workdir it overlays.
++    pub cow_roots: Option<(&'a Path, &'a Path)>,
 +}
 +
 +/// What a write asks of the host, as the kernel would check it for this user.
@@ -135,7 +135,7 @@ index 6e4ab93..601ee0a 100644
 +            metadata_image: &policy.chroot_metadata_image,
              processes,
 +            private_writes: policy.cow_enabled && policy.chroot_root.as_deref() == Some(Path::new("/")),
-+            private_upper: policy.chroot_private_upper.as_deref().filter(|_| policy.cow_enabled && policy.chroot_root.as_deref() == Some(Path::new("/"))),
++            cow_roots: policy.chroot_cow_roots.as_ref().map(|(upper, lower)| (upper.as_path(), lower.as_path())),
          }
      }
  }
@@ -156,8 +156,8 @@ index 6e4ab93..601ee0a 100644
 +            Ok(real) => NotifAction::Errno(std::fs::metadata(real).err().and_then(|e| e.raw_os_error()).unwrap_or(libc::EACCES)),
 +            Err(action) => {
 +                // A private lookup failure must not become a false absence proof.
-+                if let Some(upper) = self.private_upper {
-+                    if let Err(error) = std::fs::metadata(upper.join(virtual_path.strip_prefix("/").unwrap_or(&virtual_path))) {
++                if let Some((upper, relative)) = self.cow_roots.and_then(|(upper, lower)| host.strip_prefix(lower).ok().map(|rel| (upper, rel))) {
++                    if let Err(error) = std::fs::metadata(upper.join(relative)) {
 +                        if error.raw_os_error() != Some(libc::ENOENT) { return NotifAction::Errno(error.raw_os_error().unwrap_or(libc::EACCES)); }
 +                    }
 +                }
@@ -188,7 +188,7 @@ index 6e4ab93..601ee0a 100644
      /// Check if a virtual path falls under any mount point.
      fn is_mounted(&self, virtual_path: &Path) -> bool {
          self.mounts.iter().any(|(vp, _)| virtual_path.starts_with(vp))
-@@ -169,68 +231,44 @@ impl ChrootCtx<'_> {
+@@ -169,68 +231,41 @@ impl ChrootCtx<'_> {
          Some((mount_hp, sub_str))
      }
 
@@ -206,21 +206,6 @@ index 6e4ab93..601ee0a 100644
 -        let confined = confine(virtual_path);
 -        let (mount_target, sub_path) = self.mount_target(&confined)?;
 -        resolver(mount_target, &sub_path).map(|(host, _)| (host, confined))
--    }
--
--    /// Resolve against mounts for paths that may not exist yet (O_CREAT).
--    fn resolve_mount(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
--        self.resolve_mount_with(virtual_path, resolve_in_root)
--    }
--
--    /// Resolve against mounts for paths that must exist.
--    fn resolve_mount_existing(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
--        self.resolve_mount_with(virtual_path, resolve_existing_in_root)
--    }
--
--    /// Resolve against mounts without following a final symlink.
--    fn resolve_mount_nofollow(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
--        self.resolve_mount_with(virtual_path, resolve_in_root_nofollow)
 +        resolver: fn(&Path, &str) -> Result<(PathBuf, PathBuf), i32>,
 +    ) -> Result<(PathBuf, PathBuf), i32> {
 +        let requested = Path::new(virtual_path);
@@ -231,23 +216,35 @@ index 6e4ab93..601ee0a 100644
 +        Ok((host, virtual_root.join(resolved.strip_prefix("/").map_err(|_| libc::EACCES)?)))
      }
 
-     /// Inverse: given a host path, return the virtual path.
-     /// Checks mount targets first, then falls back to chroot root.
-     fn host_to_virtual(&self, host_path: &Path) -> Option<PathBuf> {
-+        // The branch holds a path at its place under the root: a descriptor on its copy names that place.
-+        if let Some(rel) = self.private_upper.and_then(|upper| host_path.strip_prefix(upper).ok()) {
-+            return Some(Path::new("/").join(rel));
-+        }
-         crate::chroot::resolve::host_to_virtual(self.root, self.mounts, host_path)
+-    /// Resolve against mounts for paths that may not exist yet (O_CREAT).
+-    fn resolve_mount(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
+-        self.resolve_mount_with(virtual_path, resolve_in_root)
++    /// Inverse: given a host path, return the virtual path.
++    /// Checks mount targets first, then falls back to chroot root.
++    fn host_to_virtual(&self, host_path: &Path) -> Option<PathBuf> {
++        let original = self.cow_roots.and_then(|(upper, lower)| host_path.strip_prefix(upper).ok().map(|rel| lower.join(rel)));
++        crate::chroot::resolve::host_to_virtual(self.root, self.mounts, original.as_deref().unwrap_or(host_path))
      }
-+
+
+-    /// Resolve against mounts for paths that must exist.
+-    fn resolve_mount_existing(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
+-        self.resolve_mount_with(virtual_path, resolve_existing_in_root)
 +    fn exec_target(&self, virtual_path: &Path) -> Option<&Path> {
 +        self.exec_mounts.iter().find_map(|(virtual_exec, host_exec)| {
 +            (virtual_exec == virtual_path).then_some(host_exec.as_path())
 +        })
-+    }
-+
-+
+     }
+
+-    /// Resolve against mounts without following a final symlink.
+-    fn resolve_mount_nofollow(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
+-        self.resolve_mount_with(virtual_path, resolve_in_root_nofollow)
+-    }
+
+-    /// Inverse: given a host path, return the virtual path.
+-    /// Checks mount targets first, then falls back to chroot root.
+-    fn host_to_virtual(&self, host_path: &Path) -> Option<PathBuf> {
+-        crate::chroot::resolve::host_to_virtual(self.root, self.mounts, host_path)
+-    }
  }
 
  // ============================================================
@@ -279,7 +276,7 @@ index 6e4ab93..601ee0a 100644
  /// Rewrite the magic `/proc/self` and `/proc/thread-self` symlinks to the
  /// caller's real PID.  Under chroot, `/proc` is serviced by an on-behalf
  /// `openat2` in the *supervisor*, so the kernel would otherwise resolve `self`
-@@ -272,6 +310,8 @@ fn virtual_cwd_of(notif: &SeccompNotif, ctx: &ChrootCtx<'_>) -> Option<PathBuf>
+@@ -272,6 +307,8 @@ fn virtual_cwd_of(notif: &SeccompNotif, ctx: &ChrootCtx<'_>) -> Option<PathBuf>
  /// Record the calling task's new virtual cwd.
  fn set_virtual_cwd(notif: &SeccompNotif, ctx: &ChrootCtx<'_>, cwd: PathBuf) {
      if let Ok(pid) = i32::try_from(notif.pid) {
@@ -288,7 +285,7 @@ index 6e4ab93..601ee0a 100644
          ctx.processes.set_virtual_cwd(pid, cwd);
      }
  }
-@@ -407,60 +447,39 @@ fn build_virtual_path(
+@@ -407,60 +444,39 @@ fn build_virtual_path(
      Some(canon_proc_cwd(&canon_proc_self(&vpath, notif.pid), ctx))
  }
 
@@ -374,7 +371,7 @@ index 6e4ab93..601ee0a 100644
  }
 
  /// Convert a Path to CString, returning Errno on failure.
-@@ -475,6 +494,23 @@ fn last_errno(fallback: i32) -> i32 {
+@@ -475,6 +491,23 @@ fn last_errno(fallback: i32) -> i32 {
          .unwrap_or(fallback)
  }
 
@@ -398,7 +395,7 @@ index 6e4ab93..601ee0a 100644
  /// Resolve host_path through COW (handle_stat), returning the real path.
  /// Falls back to host_path if COW is inactive or doesn't match.
  async fn cow_resolve(
-@@ -493,60 +529,6 @@ async fn cow_resolve(
+@@ -493,60 +526,6 @@ async fn cow_resolve(
      Ok(host_path.to_path_buf())
  }
 
@@ -459,7 +456,7 @@ index 6e4ab93..601ee0a 100644
  fn exec_on_host(f: impl FnOnce(*const libc::c_char) -> libc::c_int, host: &Path) -> NotifAction {
      let c = match path_cstr(host, libc::EINVAL) {
          Ok(c) => c,
-@@ -563,6 +545,102 @@ fn exec_on_host(f: impl FnOnce(*const libc::c_char) -> libc::c_int, host: &Path)
+@@ -563,6 +542,102 @@ fn exec_on_host(f: impl FnOnce(*const libc::c_char) -> libc::c_int, host: &Path)
  // openat handler
  // ============================================================
 
@@ -562,7 +559,7 @@ index 6e4ab93..601ee0a 100644
  pub(crate) async fn handle_chroot_open(
      notif: &SeccompNotif,
      _chroot_state: &Arc<Mutex<ChrootState>>,
-@@ -573,8 +651,8 @@ pub(crate) async fn handle_chroot_open(
+@@ -573,8 +648,8 @@ pub(crate) async fn handle_chroot_open(
      // Every open spelling lands here, and they do not share an argument
      // layout: openat2 keeps flags, mode and resolve in a struct open_how in
      // child memory, where args[2] is the pointer to it rather than the flags.
@@ -573,7 +570,7 @@ index 6e4ab93..601ee0a 100644
          None => return NotifAction::Continue,
      };
 
-@@ -583,24 +661,43 @@ pub(crate) async fn handle_chroot_open(
+@@ -583,24 +658,43 @@ pub(crate) async fn handle_chroot_open(
          None => return NotifAction::Continue,
      };
 
@@ -627,7 +624,7 @@ index 6e4ab93..601ee0a 100644
          return NotifAction::Errno(libc::EACCES);
      }
 
-@@ -610,6 +707,12 @@ pub(crate) async fn handle_chroot_open(
+@@ -610,6 +704,12 @@ pub(crate) async fn handle_chroot_open(
          if let Some(cow) = cs.branch.as_mut() {
              let host_str = host_path.to_string_lossy();
              if cow.matches(&host_str) {
@@ -640,7 +637,7 @@ index 6e4ab93..601ee0a 100644
                  match cow.handle_open(&host_str, flags) {
                      Ok(Some(real_path)) => {
                          drop(cs);
-@@ -617,25 +720,22 @@ pub(crate) async fn handle_chroot_open(
+@@ -617,25 +717,22 @@ pub(crate) async fn handle_chroot_open(
                              Ok(c) => c,
                              Err(a) => return a,
                          };
@@ -676,7 +673,7 @@ index 6e4ab93..601ee0a 100644
                      Err(crate::error::BranchError::QuotaExceeded) => {
                          return NotifAction::Errno(libc::ENOSPC);
                      }
-@@ -657,25 +757,8 @@ pub(crate) async fn handle_chroot_open(
+@@ -657,25 +754,8 @@ pub(crate) async fn handle_chroot_open(
      }
 
      // Resolve the path to an fd to hand the child: either a freshly opened tree
@@ -704,7 +701,7 @@ index 6e4ab93..601ee0a 100644
  }
 
  /// Open `virtual_path` within the child's virtual namespace, returning an fd to
-@@ -714,22 +797,20 @@ fn open_in_namespace(
+@@ -714,22 +794,20 @@ fn open_in_namespace(
 
      // Category 2, named directly: skip the open and dup straight away.
      if let Some(child_fd) = magic_self_fd(&vp_str, child_pid) {
@@ -731,7 +728,7 @@ index 6e4ab93..601ee0a 100644
                  None => Err(errno),
              }
          }
-@@ -737,11 +818,50 @@ fn open_in_namespace(
+@@ -737,11 +815,50 @@ fn open_in_namespace(
      }
  }
 
@@ -783,7 +780,7 @@ index 6e4ab93..601ee0a 100644
      let is_self =
          who == "self" || who == "thread-self" || who.parse::<u32>().ok() == Some(child_pid);
      if !is_self || fd_part.contains('/') {
-@@ -867,6 +987,62 @@ fn read_pt_interp(fd: RawFd) -> Option<(String, u64, usize)> {
+@@ -867,6 +984,62 @@ fn read_pt_interp(fd: RawFd) -> Option<(String, u64, usize)> {
      None
  }
 
@@ -846,7 +843,7 @@ index 6e4ab93..601ee0a 100644
  /// Create a memfd copy of `src_fd` with PT_INTERP patched to `new_interp`.
  /// Uses sendfile for efficient kernel-to-kernel copy, then patches the
  /// interpreter path in place.
-@@ -934,12 +1110,61 @@ fn memfd_with_patched_interp(
+@@ -934,12 +1107,61 @@ fn memfd_with_patched_interp(
  // execve/execveat handler
  // ============================================================
 
@@ -909,7 +906,7 @@ index 6e4ab93..601ee0a 100644
  ) -> NotifAction {
      let nr = notif.data.nr as i64;
      let (dirfd, path_ptr, argv_ptr, envp_ptr) = if nr == libc::SYS_execveat {
-@@ -952,7 +1177,23 @@ pub(crate) async fn handle_chroot_exec(
+@@ -952,7 +1174,23 @@ pub(crate) async fn handle_chroot_exec(
          Some(p) => p,
          None => return NotifAction::Continue,
      };
@@ -934,7 +931,7 @@ index 6e4ab93..601ee0a 100644
      // Build the full virtual path from dirfd + relative path.
      let full_path = if Path::new(&rel_path).is_absolute() {
          rel_path
-@@ -974,29 +1215,119 @@ pub(crate) async fn handle_chroot_exec(
+@@ -974,29 +1212,119 @@ pub(crate) async fn handle_chroot_exec(
          return NotifAction::Errno(libc::EACCES);
      }
 
@@ -1068,7 +1065,7 @@ index 6e4ab93..601ee0a 100644
          // Open the image's interpreter from the chroot root (intentionally
          // NOT mount-aware ��� the dynamic linker should come from the base
          // image, not from workspace mounts).
-@@ -1019,7 +1350,7 @@ pub(crate) async fn handle_chroot_exec(
+@@ -1019,7 +1347,7 @@ pub(crate) async fn handle_chroot_exec(
              flags: 0,
              srcfd: interp_src as u32,
              newfd: 0,
@@ -1077,7 +1074,7 @@ index 6e4ab93..601ee0a 100644
          };
          let child_interp_fd = unsafe {
              libc::ioctl(
-@@ -1058,7 +1389,7 @@ pub(crate) async fn handle_chroot_exec(
+@@ -1058,7 +1386,7 @@ pub(crate) async fn handle_chroot_exec(
      // correct path (memfd-backed binaries would otherwise show the memfd path).
      {
          let mut cs = chroot_state.lock().await;
@@ -1086,7 +1083,7 @@ index 6e4ab93..601ee0a 100644
      }
 
      // Inject the (possibly patched) binary fd into the child and rewrite
-@@ -1068,7 +1399,7 @@ pub(crate) async fn handle_chroot_exec(
+@@ -1068,7 +1396,7 @@ pub(crate) async fn handle_chroot_exec(
          flags: 0,
          srcfd: exec_fd.as_raw_fd() as u32,
          newfd: 0,
@@ -1095,7 +1092,7 @@ index 6e4ab93..601ee0a 100644
      };
      let child_fd = unsafe {
          libc::ioctl(
-@@ -1083,14 +1414,17 @@ pub(crate) async fn handle_chroot_exec(
+@@ -1083,14 +1411,17 @@ pub(crate) async fn handle_chroot_exec(
          return NotifAction::Errno(libc::EIO);
      }
 
@@ -1118,7 +1115,7 @@ index 6e4ab93..601ee0a 100644
      )
      .is_err()
      {
-@@ -1111,348 +1445,419 @@ pub(crate) async fn handle_chroot_write(
+@@ -1111,348 +1442,421 @@ pub(crate) async fn handle_chroot_write(
      notif_fd: RawFd,
      ctx: &ChrootCtx<'_>,
  ) -> NotifAction {
@@ -1141,7 +1138,7 @@ index 6e4ab93..601ee0a 100644
 +    let rename = nr == libc::SYS_renameat2 || Some(nr) == crate::arch::sys_renameat();
 +    let link = nr == libc::SYS_linkat;
 +    let (dirfd, pathname, kind) = match nr {
-+        libc::SYS_unlinkat | libc::SYS_mkdirat => (args[0] as i64, args[1], WriteKind::Entry),
++        libc::SYS_unlinkat | libc::SYS_mkdirat | libc::SYS_mknodat => (args[0] as i64, args[1], WriteKind::Entry),
 +        libc::SYS_fchmodat | libc::SYS_fchownat | libc::SYS_utimensat => (args[0] as i64, args[1], WriteKind::Owner),
 +        libc::SYS_symlinkat => (args[1] as i64, args[2], WriteKind::Entry),
 +        libc::SYS_truncate => (libc::AT_FDCWD as i64, args[0], WriteKind::Content),
@@ -1223,6 +1220,7 @@ index 6e4ab93..601ee0a 100644
 +                let done = match nr {
 +                    libc::SYS_unlinkat => cow.handle_unlink(&source, directory),
 +                    libc::SYS_mkdirat => branch_result(cow.handle_mkdir(&source, mode)),
++                    libc::SYS_mknodat => branch_result(cow.handle_mknod(&source, args[2] as u32, args[3])),
 +                    libc::SYS_symlinkat => branch_result(cow.handle_symlink(target.as_ref().unwrap(), &source)),
 +                    libc::SYS_fchmodat => branch_result(cow.handle_chmod(&source, mode)),
 +                    libc::SYS_fchownat => branch_result(cow.handle_chown(&source, args[2] as u32, args[3] as u32)),
@@ -1237,6 +1235,27 @@ index 6e4ab93..601ee0a 100644
 -            &host_path,
 -        );
      }
+-
+-    if nr == libc::SYS_mkdirat {
+-        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx, 0, 1) {
+-            Ok(r) => r,
+-            Err(a) => return a,
+-        };
+-        if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
+-        let mode = notif.data.args[2] as u32;
+-
+-        {
+-            let mut cs = cow_state.lock().await;
+-            if let Some(cow) = cs.branch.as_mut() {
+-                let s = host_path.to_string_lossy();
+-                if cow.matches(&s) {
+-                    match cow.handle_mkdir(&s) {
+-                        Ok(true) => return NotifAction::ReturnValue(0),
+-                        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+-                        _ => {}
+-                    }
+-                }
+-            }
 +    // Declined private work cannot reach the host through any mutation opcode.
 +    if !ctx.can_write(&virtual_path) || destination.as_ref().is_some_and(|(_, vp)| !ctx.can_write(vp)) {
 +        return Err(NotifAction::Errno(libc::EACCES));
@@ -1257,7 +1276,35 @@ index 6e4ab93..601ee0a 100644
 +            if fd >= 0 && setgid { libc::fchown(fd, libc::uid_t::MAX, above.st_gid); }
 +            if fd >= 0 { libc::fchmod(fd, mode | if setgid { libc::S_ISGID } else { 0 }); libc::close(fd); }
 +            0
-+        }
+         }
+-        return exec_on_host(|p| unsafe { libc::mkdir(p, mode) }, &host_path);
+-    }
+-
+-    // renameat carries the same (olddirfd, oldpath, newdirfd, newpath) slots
+-    // as renameat2 and differs only by the flags argument, which this handler
+-    // does not read.
+-    if nr == libc::SYS_renameat2 || Some(nr) == crate::arch::sys_renameat() {
+-        let old_path = match read_path(notif, notif.data.args[1], notif_fd) {
+-            Some(p) => p,
+-            None => return NotifAction::Continue,
+-        };
+-        let new_path = match read_path(notif, notif.data.args[3], notif_fd) {
+-            Some(p) => p,
+-            None => return NotifAction::Continue,
+-        };
+-        // rename(2) moves the names themselves: a symlink on either side is
+-        // renamed, not chased.
+-        let (old_host, old_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[0] as i64, &old_path, ctx) {
+-            Some(r) => r,
+-            None => return NotifAction::Errno(libc::EACCES),
+-        };
+-        let (new_host, new_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[2] as i64, &new_path, ctx) {
+-            Some(r) => r,
+-            None => return NotifAction::Errno(libc::EACCES),
+-        };
+-        if !ctx.can_write(&old_vp) || !ctx.can_write(&new_vp) {
+-            return NotifAction::Errno(libc::EACCES);
++        libc::SYS_mknodat => libc::mknod(source.as_ptr(), args[2] as u32, args[3]),
 +        libc::SYS_symlinkat => libc::symlink(target.as_ref().unwrap().as_ptr(), source.as_ptr()),
 +        libc::SYS_fchmodat => libc::chmod(source.as_ptr(), mode),
 +        libc::SYS_fchownat => if nofollow { libc::lchown(source.as_ptr(), args[2] as u32, args[3] as u32) }
@@ -1268,35 +1315,35 @@ index 6e4ab93..601ee0a 100644
 +            // native EINVAL, without letting the host follow the target again.
 +            let flags = args[4] as i32 & !(libc::AT_EMPTY_PATH | libc::AT_SYMLINK_FOLLOW);
 +            libc::linkat(libc::AT_FDCWD, source.as_ptr(), libc::AT_FDCWD, destination.as_ref().unwrap().as_ptr(), flags)
-+        }
+         }
 +        _ => libc::renameat2(libc::AT_FDCWD, source.as_ptr(), libc::AT_FDCWD, destination.as_ref().unwrap().as_ptr(), rename_flags),
 +    } };
 +    if result < 0 { Err(NotifAction::Errno(last_errno(libc::EIO))) } else { Ok(0) }
 +}
 
--    if nr == libc::SYS_mkdirat {
--        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx, 0, 1) {
--            Ok(r) => r,
--            Err(a) => return a,
--        };
--        if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
--        let mode = notif.data.args[2] as u32;
--
 -        {
 -            let mut cs = cow_state.lock().await;
 -            if let Some(cow) = cs.branch.as_mut() {
--                let s = host_path.to_string_lossy();
--                if cow.matches(&s) {
--                    match cow.handle_mkdir(&s) {
+-                let old_str = old_host.to_string_lossy();
+-                if cow.matches(&old_str) {
+-                    match cow.handle_rename(&old_str, &new_host.to_string_lossy()) {
 -                        Ok(true) => return NotifAction::ReturnValue(0),
--                        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
--                        _ => {}
+-                        Err(errno) => return NotifAction::Errno(errno),
+-                        Ok(false) => {}
 -                    }
 -                }
+-            }
+-        }
 +// ============================================================
 +// stat/access handler
 +// ============================================================
-+
+
+-        let c_old = match path_cstr(&old_host, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
+-        let c_new = match path_cstr(&new_host, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
+-        return if unsafe { libc::rename(c_old.as_ptr(), c_new.as_ptr()) } < 0 {
+-            NotifAction::Errno(last_errno(libc::EIO))
+-        } else {
+-            NotifAction::ReturnValue(0)
 +
 +/// A read image owns the original bytes independently of the working COW object. The latter keeps an internal
 +/// hard link, so its metadata identity survives unlink/replacement until the enclosing private workspace is gone.
@@ -1369,9 +1416,7 @@ index 6e4ab93..601ee0a 100644
 +                if previous == row { continue; }
 +                if previous["path"] == name && previous["image"] == key && previous["links"] == row["links"] && previous["ambiguous"] != true { row }
 +                else { serde_json::json!({ "path": name, "ambiguous": true }) }
-             }
--        }
--        return exec_on_host(|p| unsafe { libc::mkdir(p, mode) }, &host_path);
++            }
 +            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
 +                let counter = root.join("indexes");
 +                let count: usize = match fs::read_to_string(&counter) {
@@ -1384,34 +1429,22 @@ index 6e4ab93..601ee0a 100644
 +                row
 +            }
 +            Err(error) => return Err(error),
-+        };
+         };
 +        let temporary = root.join("publishing");
 +        fs::write(&temporary, serde_json::to_vec(&row)?)?; fs::rename(temporary, index)?;
      }
 +    Ok(())
 +}
 
--    // renameat carries the same (olddirfd, oldpath, newdirfd, newpath) slots
--    // as renameat2 and differs only by the flags argument, which this handler
--    // does not read.
--    if nr == libc::SYS_renameat2 || Some(nr) == crate::arch::sys_renameat() {
--        let old_path = match read_path(notif, notif.data.args[1], notif_fd) {
+-    if nr == libc::SYS_symlinkat {
+-        // symlinkat(target, newdirfd, linkpath)
+-        let target = match read_path(notif, notif.data.args[0], notif_fd) {
 -            Some(p) => p,
 -            None => return NotifAction::Continue,
 -        };
--        let new_path = match read_path(notif, notif.data.args[3], notif_fd) {
+-        let linkpath = match read_path(notif, notif.data.args[2], notif_fd) {
 -            Some(p) => p,
 -            None => return NotifAction::Continue,
--        };
--        // rename(2) moves the names themselves: a symlink on either side is
--        // renamed, not chased.
--        let (old_host, old_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[0] as i64, &old_path, ctx) {
--            Some(r) => r,
--            None => return NotifAction::Errno(libc::EACCES),
--        };
--        let (new_host, new_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[2] as i64, &new_path, ctx) {
--            Some(r) => r,
--            None => return NotifAction::Errno(libc::EACCES),
 +fn capture_input_image(cow: &mut crate::cow::seccomp::SeccompCowBranch, path: &Path, requested: &str,
 +    metadata: &MetadataImage) -> std::io::Result<()> {
 +    use std::fs::{self, OpenOptions};
@@ -1473,19 +1506,21 @@ index 6e4ab93..601ee0a 100644
 +            fs::write(&proof, serde_json::to_vec(&image)?)?;
 +            image
          };
--        if !ctx.can_write(&old_vp) || !ctx.can_write(&new_vp) {
--            return NotifAction::Errno(libc::EACCES);
--        }
+-        let (host_link, link_vp) = match resolve_chroot_path(notif, notif.data.args[1] as i64, &linkpath, ctx) {
+-            Some(r) => r,
+-            None => return NotifAction::Errno(libc::EACCES),
+-        };
+-        if !ctx.can_write(&link_vp) { return NotifAction::Errno(libc::EACCES); }
 -
 -        {
 -            let mut cs = cow_state.lock().await;
 -            if let Some(cow) = cs.branch.as_mut() {
--                let old_str = old_host.to_string_lossy();
--                if cow.matches(&old_str) {
--                    match cow.handle_rename(&old_str, &new_host.to_string_lossy()) {
+-                let s = host_link.to_string_lossy();
+-                if cow.matches(&s) {
+-                    match cow.handle_symlink(&target, &s) {
 -                        Ok(true) => return NotifAction::ReturnValue(0),
--                        Err(errno) => return NotifAction::Errno(errno),
--                        Ok(false) => {}
+-                        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+-                        _ => {}
 -                    }
 +        if image.path != original_path { return Err(invalid()); }
 +        let parse = |row: &[String; 14]| row.iter().map(|value| value.parse::<i128>()).collect::<Result<Vec<_>, _>>()
@@ -1512,76 +1547,7 @@ index 6e4ab93..601ee0a 100644
 +                Err(error) => return Err(error),
              }
          }
-+    }
-+    result
-+}
-
--        let c_old = match path_cstr(&old_host, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
--        let c_new = match path_cstr(&new_host, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
--        return if unsafe { libc::rename(c_old.as_ptr(), c_new.as_ptr()) } < 0 {
--            NotifAction::Errno(last_errno(libc::EIO))
--        } else {
--            NotifAction::ReturnValue(0)
-+/// The owner pins each private object while this mapping exists. Inodes cannot be
-+/// recycled under a retained identity, including after rename, unlink, or replacement.
-+#[derive(Debug, Default)]
-+pub struct MetadataImage {
-+    objects: std::sync::RwLock<std::collections::HashMap<(u64, u64), ([i128; 14], [i128; 14], u8)>>,
-+}
-+
-+impl MetadataImage {
-+    pub fn decode(bytes: &[u8]) -> std::io::Result<Self> {
-+        let rows: Vec<([String; 14], [String; 14], u8)> = serde_json::from_slice(bytes)?;
-+        let parse = |row: [String; 14]| -> std::io::Result<[i128; 14]> {
-+            Ok(row.into_iter().map(|value| value.parse()).collect::<Result<Vec<i128>, _>>()
-+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?.try_into().unwrap())
-         };
-+        Self::from_rows(rows.into_iter().map(|(a, b, policy)| Ok((parse(a)?, parse(b)?, policy))).collect::<std::io::Result<Vec<_>>>()?)
-     }
-
--    if nr == libc::SYS_symlinkat {
--        // symlinkat(target, newdirfd, linkpath)
--        let target = match read_path(notif, notif.data.args[0], notif_fd) {
--            Some(p) => p,
--            None => return NotifAction::Continue,
--        };
--        let linkpath = match read_path(notif, notif.data.args[2], notif_fd) {
--            Some(p) => p,
--            None => return NotifAction::Continue,
--        };
--        let (host_link, link_vp) = match resolve_chroot_path(notif, notif.data.args[1] as i64, &linkpath, ctx) {
--            Some(r) => r,
--            None => return NotifAction::Errno(libc::EACCES),
--        };
--        if !ctx.can_write(&link_vp) { return NotifAction::Errno(libc::EACCES); }
 -
--        {
--            let mut cs = cow_state.lock().await;
--            if let Some(cow) = cs.branch.as_mut() {
--                let s = host_link.to_string_lossy();
--                if cow.matches(&s) {
--                    match cow.handle_symlink(&target, &s) {
--                        Ok(true) => return NotifAction::ReturnValue(0),
--                        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
--                        _ => {}
--                    }
--                }
-+    fn from_rows(rows: Vec<([i128; 14], [i128; 14], u8)>) -> std::io::Result<Self> {
-+        let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
-+        if rows.len() > 100_002 { return Err(invalid("metadata object bound exceeded")); }
-+        let mut image = Self::default();
-+        for (physical, original, policy) in rows {
-+            if policy > 2 { return Err(invalid("invalid access-time policy")); }
-+            if !physical[..10].iter().chain(&original[..10]).all(|value| *value >= 0 && *value <= u64::MAX as i128) {
-+                return Err(invalid("invalid metadata value"));
-+            }
-+            if image.objects.get_mut().unwrap().insert((physical[0] as u64, physical[1] as u64), (physical, original, policy)).is_some() {
-+                return Err(invalid("duplicate snapshot object"));
-             }
-         }
-+        Ok(image)
-+    }
-
 -        let c_target = match CString::new(target.as_str()) { Ok(c) => c, Err(_) => return NotifAction::Errno(libc::EINVAL) };
 -        let c_link = match path_cstr(&host_link, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
 -        return if unsafe { libc::symlink(c_target.as_ptr(), c_link.as_ptr()) } < 0 {
@@ -1589,9 +1555,9 @@ index 6e4ab93..601ee0a 100644
 -        } else {
 -            NotifAction::ReturnValue(0)
 -        };
-+    pub fn serialize<S: serde::Serializer>(image: &Arc<Self>, serializer: S) -> Result<S::Ok, S::Error> {
-+        serde::Serialize::serialize(&image.objects.read().unwrap().values().collect::<Vec<_>>(), serializer)
      }
++    result
++}
 
 -    if nr == libc::SYS_linkat {
 -        // linkat(olddirfd, oldpath, newdirfd, newpath, flags)
@@ -1640,7 +1606,20 @@ index 6e4ab93..601ee0a 100644
 -        let (new_host, new_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[2] as i64, &new_path, ctx) {
 -            Some(r) => r,
 -            None => return NotifAction::Errno(libc::EACCES),
--        };
++/// The owner pins each private object while this mapping exists. Inodes cannot be
++/// recycled under a retained identity, including after rename, unlink, or replacement.
++#[derive(Debug, Default)]
++pub struct MetadataImage {
++    objects: std::sync::RwLock<std::collections::HashMap<(u64, u64), ([i128; 14], [i128; 14], u8)>>,
++}
++
++impl MetadataImage {
++    pub fn decode(bytes: &[u8]) -> std::io::Result<Self> {
++        let rows: Vec<([String; 14], [String; 14], u8)> = serde_json::from_slice(bytes)?;
++        let parse = |row: [String; 14]| -> std::io::Result<[i128; 14]> {
++            Ok(row.into_iter().map(|value| value.parse()).collect::<Result<Vec<i128>, _>>()
++                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?.try_into().unwrap())
+         };
 -        // A hard link is a second name for one inode, so afterwards the
 -        // authority over that inode is the union of the policy on both names.
 -        // Gating the destination alone lets a guest re-file a readable but
@@ -1652,7 +1631,9 @@ index 6e4ab93..601ee0a 100644
 -        if !ctx.can_write(&old_vp) || !ctx.can_write(&new_vp) {
 -            return NotifAction::Errno(libc::EACCES);
 -        }
--
++        Self::from_rows(rows.into_iter().map(|(a, b, policy)| Ok((parse(a)?, parse(b)?, policy))).collect::<std::io::Result<Vec<_>>>()?)
++    }
+
 -        {
 -            let mut cs = cow_state.lock().await;
 -            if let Some(cow) = cs.branch.as_mut() {
@@ -1671,9 +1652,22 @@ index 6e4ab93..601ee0a 100644
 -                if cow.matches(&new_s) {
 -                    return crate::cow::result::link_result(cow.handle_link(&old_s, &new_s));
 -                }
--            }
--        }
--
++    fn from_rows(rows: Vec<([i128; 14], [i128; 14], u8)>) -> std::io::Result<Self> {
++        let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
++        if rows.len() > 100_002 { return Err(invalid("metadata object bound exceeded")); }
++        let mut image = Self::default();
++        for (physical, original, policy) in rows {
++            if policy > 2 { return Err(invalid("invalid access-time policy")); }
++            if !physical[..10].iter().chain(&original[..10]).all(|value| *value >= 0 && *value <= u64::MAX as i128) {
++                return Err(invalid("invalid metadata value"));
++            }
++            if image.objects.get_mut().unwrap().insert((physical[0] as u64, physical[1] as u64), (physical, original, policy)).is_some() {
++                return Err(invalid("duplicate snapshot object"));
+             }
+         }
++        Ok(image)
++    }
+
 -        let c_old = match path_cstr(&old_host, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
 -        let c_new = match path_cstr(&new_host, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
 -        // Both defined flags describe a source this code has already resolved,
@@ -1691,8 +1685,8 @@ index 6e4ab93..601ee0a 100644
 -        } else {
 -            NotifAction::ReturnValue(0)
 -        };
-+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Arc<Self>, D::Error> {
-+        Self::from_rows(serde::Deserialize::deserialize(deserializer)?).map(Arc::new).map_err(serde::de::Error::custom)
++    pub fn serialize<S: serde::Serializer>(image: &Arc<Self>, serializer: S) -> Result<S::Ok, S::Error> {
++        serde::Serialize::serialize(&image.objects.read().unwrap().values().collect::<Vec<_>>(), serializer)
      }
 
 -    if nr == libc::SYS_fchmodat {
@@ -1717,8 +1711,9 @@ index 6e4ab93..601ee0a 100644
 -            }
 -        }
 -        return exec_on_host(|p| unsafe { libc::chmod(p, mode) }, &host_path);
--    }
-+    pub fn is_empty(&self) -> bool { self.objects.read().unwrap().is_empty() }
++    pub fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Arc<Self>, D::Error> {
++        Self::from_rows(serde::Deserialize::deserialize(deserializer)?).map(Arc::new).map_err(serde::de::Error::custom)
+     }
 
 -    if nr == libc::SYS_fchownat {
 -        let nofollow = (notif.data.args[4] & libc::AT_SYMLINK_NOFOLLOW as u64) != 0;
@@ -1754,6 +1749,8 @@ index 6e4ab93..601ee0a 100644
 -            },
 -            &host_path,
 -        );
++    pub fn is_empty(&self) -> bool { self.objects.read().unwrap().is_empty() }
++
 +    fn inode(&self, device: u64, inode: u64) -> u64 {
 +        self.objects.read().unwrap().get(&(device, inode)).map_or(inode, |(_, source, _)| source[1] as u64)
      }
@@ -1847,7 +1844,7 @@ index 6e4ab93..601ee0a 100644
 
      // Let libc lay the struct out. Hand-packing it in field order is an
      // x86_64 assumption: aarch64 and riscv64 put st_mode and st_nlink before
-@@ -1476,6 +1881,11 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
+@@ -1476,6 +1880,11 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
          return NotifAction::Errno(last_errno(libc::ENOENT));
      }
 
@@ -1859,7 +1856,7 @@ index 6e4ab93..601ee0a 100644
      let bytes = unsafe {
          std::slice::from_raw_parts(
              &st as *const libc::stat as *const u8,
-@@ -1488,6 +1898,8 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
+@@ -1488,6 +1897,8 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
      NotifAction::ReturnValue(0)
  }
 
@@ -1868,7 +1865,7 @@ index 6e4ab93..601ee0a 100644
  pub(crate) async fn handle_chroot_stat(
      notif: &SeccompNotif,
      _chroot_state: &Arc<Mutex<ChrootState>>,
-@@ -1496,98 +1908,101 @@ pub(crate) async fn handle_chroot_stat(
+@@ -1496,98 +1907,101 @@ pub(crate) async fn handle_chroot_stat(
      ctx: &ChrootCtx<'_>,
  ) -> NotifAction {
      let nr = notif.data.nr as i64;
@@ -1916,7 +1913,13 @@ index 6e4ab93..601ee0a 100644
 +        (held_path, device)
      } else {
 -        read_and_resolve_existing(notif, notif_fd, ctx, 0, 1)
--    };
++        let path = match path { Some(path) if !extended || !path.is_empty() => path, _ => return NotifAction::Continue };
++        let resolve = if flags & libc::AT_SYMLINK_NOFOLLOW != 0 { resolve_chroot_path_nofollow } else { resolve_chroot_path_existing };
++        let (host_path, vp) = match resolve(notif, dirfd, &path, ctx) { Ok(paths) => paths, Err(errno) => return NotifAction::Errno(errno) };
++        if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
++        let real_path = match cow_resolve(cow_state, &host_path).await { Ok(path) => path, Err(action) => return action };
++        (real_path, mounted_device(ctx, &host_path, &vp, flags & libc::AT_SYMLINK_NOFOLLOW == 0))
+     };
 -    let (_, host_path, vp) = match resolved {
 -        Ok(r) => r,
 -        Err(a) => return a,
@@ -1926,13 +1929,7 @@ index 6e4ab93..601ee0a 100644
 -    let real_path = match cow_resolve(cow_state, &host_path).await {
 -        Ok(p) => p,
 -        Err(a) => return a,
-+        let path = match path { Some(path) if !extended || !path.is_empty() => path, _ => return NotifAction::Continue };
-+        let resolve = if flags & libc::AT_SYMLINK_NOFOLLOW != 0 { resolve_chroot_path_nofollow } else { resolve_chroot_path_existing };
-+        let (host_path, vp) = match resolve(notif, dirfd, &path, ctx) { Ok(paths) => paths, Err(errno) => return NotifAction::Errno(errno) };
-+        if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
-+        let real_path = match cow_resolve(cow_state, &host_path).await { Ok(path) => path, Err(action) => return action };
-+        (real_path, mounted_device(ctx, &host_path, &vp, flags & libc::AT_SYMLINK_NOFOLLOW == 0))
-     };
+-    };
 -
 -    if nr == libc::SYS_faccessat || nr == crate::arch::SYS_FACCESSAT2 {
 -        return if real_path.exists() || real_path.is_symlink() {
@@ -2046,7 +2043,7 @@ index 6e4ab93..601ee0a 100644
          return NotifAction::Continue;
      }
      NotifAction::ReturnValue(0)
-@@ -1687,7 +2102,7 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1687,7 +2101,7 @@ pub(crate) async fn handle_chroot_readlink(
      // (needed because memfd-backed binaries would show "/memfd:sandlock-exec" otherwise).
      if path == format!("{}/exe", own_proc) {
          let cs = chroot_state.lock().await;
@@ -2055,7 +2052,7 @@ index 6e4ab93..601ee0a 100644
              let s = exe.to_string_lossy();
              return write_target(s.as_bytes());
          }
-@@ -1704,8 +2119,8 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1704,8 +2118,8 @@ pub(crate) async fn handle_chroot_readlink(
      // readlink must read the link itself, never what it points at, which is
      // exactly what the no-follow resolver gives.
      let (host_path, _) = match resolve_chroot_path_nofollow(notif, dirfd, &path, ctx) {
@@ -2066,7 +2063,7 @@ index 6e4ab93..601ee0a 100644
      };
 
      // COW
-@@ -1716,7 +2131,12 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1716,7 +2130,12 @@ pub(crate) async fn handle_chroot_readlink(
              if cow.matches(&host_str) {
                  let target = match cow.handle_readlink(&host_str) {
                      Some(t) => t,
@@ -2080,7 +2077,7 @@ index 6e4ab93..601ee0a 100644
                  };
                  drop(cs);
                  return write_target(target.as_bytes());
-@@ -1726,7 +2146,7 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1726,7 +2145,7 @@ pub(crate) async fn handle_chroot_readlink(
 
      let target = match std::fs::read_link(&host_path) {
          Ok(t) => t,
@@ -2089,7 +2086,7 @@ index 6e4ab93..601ee0a 100644
      };
 
      // Strip chroot/mount prefix from absolute targets
-@@ -1742,96 +2162,8 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1742,96 +2161,8 @@ pub(crate) async fn handle_chroot_readlink(
  // xattr handler
  // ============================================================
 
@@ -2188,7 +2185,7 @@ index 6e4ab93..601ee0a 100644
  pub(crate) async fn handle_chroot_xattr(
      notif: &SeccompNotif,
      _chroot_state: &Arc<Mutex<ChrootState>>,
-@@ -1839,100 +2171,60 @@ pub(crate) async fn handle_chroot_xattr(
+@@ -1839,100 +2170,60 @@ pub(crate) async fn handle_chroot_xattr(
      notif_fd: RawFd,
      ctx: &ChrootCtx<'_>,
  ) -> NotifAction {
@@ -2277,10 +2274,7 @@ index 6e4ab93..601ee0a 100644
 -                Err(a) => return a,
 -            };
 -            xattr_read(notif, notif_fd, &c_path, Some(&name), follow, 2, 3)
-+        if buffer_index != 0 {
-+            args[buffer_index] = if !writing && buffer.is_empty() { 0 } else { buffer.as_mut_ptr() as u64 };
-+            args[buffer_index + 1] = buffer.len() as u64;
-         }
+-        }
 -        XattrOp::List => xattr_read(notif, notif_fd, &c_path, None, follow, 1, 2),
 -        XattrOp::Set => {
 -            let name = match read_name() {
@@ -2309,11 +2303,9 @@ index 6e4ab93..601ee0a 100644
 -            } else {
 -                NotifAction::ReturnValue(0)
 -            }
-+        let ret = unsafe { libc::syscall(nr, args[0], args[1], args[2], args[3], args[4]) };
-+        if ret < 0 { return Err(NotifAction::Errno(last_errno(if writing { libc::EIO } else { libc::ENODATA }))); }
-+        if !writing && !buffer.is_empty() && ret > 0 {
-+            write_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[buffer_index], &buffer[..ret as usize])
-+                .map_err(|_| NotifAction::Errno(libc::EFAULT))?;
++        if buffer_index != 0 {
++            args[buffer_index] = if !writing && buffer.is_empty() { 0 } else { buffer.as_mut_ptr() as u64 };
++            args[buffer_index + 1] = buffer.len() as u64;
          }
 -        XattrOp::Remove => {
 -            let name = match read_name() {
@@ -2327,7 +2319,12 @@ index 6e4ab93..601ee0a 100644
 -            } else {
 -                NotifAction::ReturnValue(0)
 -            }
--        }
++        let ret = unsafe { libc::syscall(nr, args[0], args[1], args[2], args[3], args[4]) };
++        if ret < 0 { return Err(NotifAction::Errno(last_errno(if writing { libc::EIO } else { libc::ENODATA }))); }
++        if !writing && !buffer.is_empty() && ret > 0 {
++            write_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[buffer_index], &buffer[..ret as usize])
++                .map_err(|_| NotifAction::Errno(libc::EFAULT))?;
+         }
 -    }
 +        Ok(ret)
 +    }.await;
@@ -2335,7 +2332,7 @@ index 6e4ab93..601ee0a 100644
  }
 
  // ============================================================
-@@ -1940,18 +2232,15 @@ pub(crate) async fn handle_chroot_xattr(
+@@ -1940,18 +2231,15 @@ pub(crate) async fn handle_chroot_xattr(
  // ============================================================
 
  pub(crate) async fn handle_chroot_getdents(
@@ -2361,7 +2358,78 @@ index 6e4ab93..601ee0a 100644
  }
 
  // ============================================================
-@@ -2043,6 +2332,20 @@ pub(crate) async fn handle_chroot_fchdir(
+@@ -1961,57 +2249,24 @@ pub(crate) async fn handle_chroot_getdents(
+ pub(crate) async fn handle_chroot_chdir(
+     notif: &SeccompNotif,
+     _chroot_state: &Arc<Mutex<ChrootState>>,
+-    _cow_state: &Arc<Mutex<CowState>>,
++    cow_state: &Arc<Mutex<CowState>>,
+     notif_fd: RawFd,
+     ctx: &ChrootCtx<'_>,
+ ) -> NotifAction {
+-    let path = match read_path(notif, notif.data.args[0], notif_fd) {
+-        Some(p) => p,
+-        None => return NotifAction::Errno(libc::EFAULT),
++    let Some(path) = read_path(notif, notif.data.args[0], notif_fd) else { return NotifAction::Errno(libc::EFAULT); };
++    let (host, virtual_path) = match resolve_chroot_path_existing(notif, libc::AT_FDCWD as i64, &path, ctx) {
++        Ok(paths) => paths, Err(errno) => return NotifAction::Errno(errno),
+     };
+-
+-    let full_path = match build_virtual_path(notif, libc::AT_FDCWD as i64, &path, ctx) {
+-        Some(p) => p,
+-        None => return NotifAction::Errno(libc::EACCES),
+-    };
+-
+-    // Resolve on-behalf: this is what decides whether the directory exists,
+-    // is reachable inside the root, and is a directory at all, and it gives
+-    // the errno the child gets when it is not.
+-    let confined = confine(&full_path);
+-    let (chdir_root, chdir_path) = if let Some((mt, sub)) = ctx.mount_target(&confined) {
+-        (mt.to_path_buf(), sub)
+-    } else {
+-        (ctx.root.to_path_buf(), full_path.clone())
++    let host = match cow_resolve(cow_state, &host).await { Ok(path) => path, Err(action) => return action };
++    let fd = match openat2_in_root(Path::new("/"), &host.to_string_lossy(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC, 0) {
++        Ok(fd) => unsafe { OwnedFd::from_raw_fd(fd) }, Err(errno) => return NotifAction::Errno(errno),
+     };
+-    let src_fd = match openat2_in_root(
+-        &chdir_root,
+-        &chdir_path,
+-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+-        0,
+-    ) {
+-        Ok(fd) => fd,
+-        Err(errno) => return NotifAction::Errno(errno),
+-    };
+-    // Record where the kernel actually landed, not what the child asked for:
+-    // symlinks and .. are already collapsed in the resolved fd.
+-    let resolved = std::fs::read_link(format!("/proc/self/fd/{}", src_fd)).ok();
+-    unsafe { libc::close(src_fd) };
+-    let virtual_cwd = resolved
+-        .as_deref()
+-        .and_then(|host| ctx.host_to_virtual(host))
+-        .unwrap_or(confined);
+-
+-    // The child's own cwd never moves. chdir cannot be run on-behalf (only
+-    // the kernel can update the calling task's fs_struct) and the argument
+-    // registers are not writable from seccomp-notify, so the handler used to
+-    // rewrite the child's path buffer in place to /proc/self/fd/N and let the
+-    // kernel run that. It could not: 16 bytes do not fit the buffer behind a
+-    // path as short as "/tmp" or "/", which is issue #178. Tracking the cwd
+-    // here instead serves every spelling, and it drops both a TOCTOU window
+-    // (the kernel re-read the path we wrote) and a force-write through
+-    // /proc/<pid>/mem that permanently corrupted a .rodata path literal.
+-    set_virtual_cwd(notif, ctx, virtual_cwd);
++    // Kernel resolution checks existence and directory type; the logical cwd
++    // names the merged path even when that object only exists in the upper.
++    let resolved = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).ok();
++    let cwd = resolved.as_deref().and_then(|host| ctx.host_to_virtual(host)).unwrap_or(virtual_path);
++    // Do not rewrite the child's pathname buffer or move the supervisor cwd.
++    set_virtual_cwd(notif, ctx, cwd);
+     NotifAction::ReturnValue(0)
+ }
+
+@@ -2043,6 +2298,20 @@ pub(crate) async fn handle_chroot_fchdir(
      NotifAction::Continue
  }
 
@@ -2382,7 +2450,7 @@ index 6e4ab93..601ee0a 100644
  // ============================================================
  // getcwd handler
  // ============================================================
-@@ -2092,12 +2395,38 @@ pub(crate) async fn handle_chroot_statfs(
+@@ -2092,12 +2361,38 @@ pub(crate) async fn handle_chroot_statfs(
          None => return NotifAction::Continue,
      };
 
@@ -2425,7 +2493,7 @@ index 6e4ab93..601ee0a 100644
          Ok(c) => c,
          Err(a) => return a,
      };
-@@ -2118,327 +2447,6 @@ pub(crate) async fn handle_chroot_statfs(
+@@ -2118,327 +2413,6 @@ pub(crate) async fn handle_chroot_statfs(
      NotifAction::ReturnValue(0)
  }
 
@@ -2753,14 +2821,14 @@ index 6e4ab93..601ee0a 100644
  #[cfg(test)]
  mod self_rewrite_tests {
      use super::canon_proc_self;
-@@ -2475,13 +2483,19 @@ mod mount_ro_tests {
+@@ -2475,13 +2449,19 @@ mod mount_ro_tests {
          writable: &'a [PathBuf],
          processes: &'a Arc<ProcessIndex>,
      ) -> ChrootCtx<'a> {
 +        static METADATA: std::sync::LazyLock<super::MetadataImage> = std::sync::LazyLock::new(super::MetadataImage::default);
          ChrootCtx {
 +            private_writes: false,
-+            private_upper: None,
++            cow_roots: None,
              root: Path::new("/rootfs"),
              readable: &[],
              writable,
@@ -2773,7 +2841,7 @@ index 6e4ab93..601ee0a 100644
              processes,
          }
      }
-@@ -2511,3 +2525,79 @@ mod mount_ro_tests {
+@@ -2511,3 +2491,79 @@ mod mount_ro_tests {
          assert!(c.can_write(Path::new("/data/file")));
      }
  }
@@ -3265,630 +3333,6 @@ index f96622d..6e8c060 100644
      }
 
      pub fn iter(&self) -> impl Iterator<Item = &str> {
-diff --git a/crates/sandlock-core/src/cow/dispatch.rs b/crates/sandlock-core/src/cow/dispatch.rs
-index 9453906..a5c0097 100644
---- a/crates/sandlock-core/src/cow/dispatch.rs
-+++ b/crates/sandlock-core/src/cow/dispatch.rs
-@@ -24,7 +24,8 @@
- //! provided by Landlock (or by the chroot dispatcher, when chroot mode
- //! is active and runs before COW).
-
--use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
-+use crate::seccomp::notif::read_path;
-+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
- use std::path::{Component, Path, PathBuf};
- use std::sync::Arc;
-
-@@ -34,7 +35,6 @@ use tokio::sync::Mutex as AsyncMutex;
- use crate::arch;
- use crate::cow::result::link_result;
- use crate::cow::seccomp::SeccompCowBranch;
--use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
- use crate::seccomp::notif::{read_child_mem, write_child_mem, write_child_mem_force, NotifAction};
- use crate::seccomp::state::{CowState, PerProcessState, ProcessIndex};
- use crate::sys::structs::SeccompNotif;
-@@ -63,31 +63,6 @@ async fn current_virtual_cwd(
-     cwd
- }
-
--/// Read a NUL-terminated path from child memory (up to 4096 bytes for filesystem paths).
--///
--/// Reads page-by-page to avoid crossing into unmapped memory (e.g. when the path
--/// pointer is near a page boundary on the stack).
--fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String> {
--    if addr == 0 {
--        return None;
--    }
--    const PAGE_SIZE: u64 = 4096;
--    let mut result = Vec::with_capacity(256);
--    let mut cur = addr;
--    while result.len() < 4096 {
--        let page_remaining = PAGE_SIZE - (cur % PAGE_SIZE);
--        let to_read = page_remaining.min((4096 - result.len()) as u64) as usize;
--        let bytes = read_child_mem(notif_fd, notif.id, notif.pid, cur, to_read).ok()?;
--        if let Some(nul) = bytes.iter().position(|&b| b == 0) {
--            result.extend_from_slice(&bytes[..nul]);
--            return String::from_utf8(result).ok();
--        }
--        result.extend_from_slice(&bytes);
--        cur += to_read as u64;
--    }
--    String::from_utf8(result).ok()
--}
--
- /// Resolve a path that may be relative to a dirfd.
- /// For AT_FDCWD (-100), returns the path as-is (assumed absolute or cwd-relative).
- /// For other dirfds, reads /proc/{pid}/fd/{dirfd} to get the base path.
-@@ -316,7 +291,7 @@ pub(crate) async fn handle_cow_open(
- /// Parsed COW write operation with resolved paths and extracted arguments.
- enum CowWriteOp {
-     Unlink { path: String, is_dir: bool },
--    Mkdir { path: String },
-+    Mkdir { path: String, mode: u32 },
-     Mknod { path: String, mode: u32, dev: u64 },
-     Rename { old_path: String, new_path: String },
-     Symlink { target: String, linkpath: String },
-@@ -330,7 +305,7 @@ impl CowWriteOp {
-     fn remap_upper_paths(&mut self, cow: &SeccompCowBranch) {
-         match self {
-             CowWriteOp::Unlink { path, .. }
--            | CowWriteOp::Mkdir { path }
-+            | CowWriteOp::Mkdir { path, .. }
-             | CowWriteOp::Mknod { path, .. }
-             | CowWriteOp::Chmod { path, .. }
-             | CowWriteOp::Chown { path, .. }
-@@ -349,141 +324,42 @@ impl CowWriteOp {
-     }
- }
-
--/// Read and resolve a path argument. For *at syscalls, pass the dirfd arg index;
--/// for legacy syscalls, pass None to use the raw path.
--fn read_resolved(
--    notif: &SeccompNotif,
--    path_arg: usize,
--    dirfd_arg: Option<usize>,
--    notif_fd: RawFd,
--    virtual_cwd: Option<&str>,
--) -> Option<String> {
--    let raw = read_path(notif, notif.data.args[path_arg], notif_fd)?;
--    match dirfd_arg {
--        Some(i) => Some(resolve_at_path_with_virtual(
--            notif,
--            notif.data.args[i] as i64,
--            &raw,
--            virtual_cwd,
--        )),
--        None => Some(resolve_at_path_with_virtual(
--            notif,
--            libc::AT_FDCWD as i64,
--            &raw,
--            virtual_cwd,
--        )),
--    }
--}
--
--/// Parse the syscall into a CowWriteOp, reading and resolving paths from child memory.
--fn parse_cow_write(
--    notif: &SeccompNotif,
--    notif_fd: RawFd,
--    virtual_cwd: Option<&str>,
--) -> Option<CowWriteOp> {
--    let nr = notif.data.nr as i64;
--
--    // *at variants (dirfd in args[0], path in args[1])
--    if nr == libc::SYS_unlinkat {
--        let path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
--        let is_dir = (notif.data.args[2] & libc::AT_REMOVEDIR as u64) != 0;
--        return Some(CowWriteOp::Unlink { path, is_dir });
--    }
--    if nr == libc::SYS_mkdirat {
--        return Some(CowWriteOp::Mkdir {
--            path: read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?,
--        });
--    }
--    if nr == libc::SYS_mknodat {
--        // mknodat(dirfd, pathname, mode, dev)
--        return Some(CowWriteOp::Mknod {
--            path: read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?,
--            mode: notif.data.args[2] as u32,
--            dev:  notif.data.args[3],
--        });
--    }
--    if nr == libc::SYS_renameat2 {
--        let old_path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
--        let new_path = read_resolved(notif, 3, Some(2), notif_fd, virtual_cwd)?;
--        return Some(CowWriteOp::Rename { old_path, new_path });
--    }
--    if nr == libc::SYS_symlinkat {
--        // symlinkat(target, newdirfd, linkpath): target is raw, linkpath is resolved
--        let target = read_path(notif, notif.data.args[0], notif_fd)?;
--        let linkpath = read_resolved(notif, 2, Some(1), notif_fd, virtual_cwd)?;
--        return Some(CowWriteOp::Symlink { target, linkpath });
--    }
--    if nr == libc::SYS_linkat {
--        let old_path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
--        let new_path = read_resolved(notif, 3, Some(2), notif_fd, virtual_cwd)?;
--        return Some(CowWriteOp::Link { old_path, new_path });
--    }
--    if nr == libc::SYS_fchmodat {
--        let path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
--        return Some(CowWriteOp::Chmod { path, mode: (notif.data.args[2] & 0o7777) as u32 });
--    }
--    if nr == libc::SYS_fchownat {
--        let path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
--        return Some(CowWriteOp::Chown { path, uid: notif.data.args[2] as u32, gid: notif.data.args[3] as u32 });
--    }
--
--    // Legacy variants (path in args[0], no dirfd)
--    if Some(nr) == arch::sys_unlink() {
--        return Some(CowWriteOp::Unlink {
--            path: read_resolved(notif, 0, None, notif_fd, virtual_cwd)?,
--            is_dir: false,
--        });
--    }
--    if Some(nr) == arch::sys_rmdir() {
--        return Some(CowWriteOp::Unlink {
--            path: read_resolved(notif, 0, None, notif_fd, virtual_cwd)?,
--            is_dir: true,
--        });
--    }
--    if Some(nr) == arch::sys_mkdir() {
--        return Some(CowWriteOp::Mkdir {
--            path: read_resolved(notif, 0, None, notif_fd, virtual_cwd)?,
--        });
--    }
--    if Some(nr) == arch::sys_mknod() {
--        // mknod(pathname, mode, dev)
--        return Some(CowWriteOp::Mknod {
--            path: read_resolved(notif, 0, None, notif_fd, virtual_cwd)?,
--            mode: notif.data.args[1] as u32,
--            dev:  notif.data.args[2],
--        });
--    }
--    if Some(nr) == arch::sys_rename() {
--        let old_path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
--        let new_path = read_resolved(notif, 1, None, notif_fd, virtual_cwd)?;
--        return Some(CowWriteOp::Rename { old_path, new_path });
--    }
--    if Some(nr) == arch::sys_symlink() {
--        let target = read_path(notif, notif.data.args[0], notif_fd)?;
--        let linkpath = read_resolved(notif, 1, None, notif_fd, virtual_cwd)?;
--        return Some(CowWriteOp::Symlink { target, linkpath });
--    }
--    if Some(nr) == arch::sys_link() {
--        let old_path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
--        let new_path = read_resolved(notif, 1, None, notif_fd, virtual_cwd)?;
--        return Some(CowWriteOp::Link { old_path, new_path });
--    }
--    if Some(nr) == arch::sys_chmod() {
--        let path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
--        return Some(CowWriteOp::Chmod { path, mode: (notif.data.args[1] & 0o7777) as u32 });
--    }
--    if Some(nr) == arch::sys_chown() || Some(nr) == arch::sys_lchown() {
--        let path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
--        return Some(CowWriteOp::Chown { path, uid: notif.data.args[1] as u32, gid: notif.data.args[2] as u32 });
--    }
--
--    // truncate (legacy only, path in args[0])
--    if nr == libc::SYS_truncate {
--        let path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
--        return Some(CowWriteOp::Truncate { path, length: notif.data.args[1] as i64 });
--    }
--
--    None
-+/// Read canonical arguments; both filesystem views use the same legacy ABI conversion.
-+fn parse_cow_write(notif: &SeccompNotif, notif_fd: RawFd, virtual_cwd: Option<&str>) -> Option<CowWriteOp> {
-+    let a = notif.data.args;
-+    let path = |dirfd, pointer| read_path(notif, pointer, notif_fd)
-+        .map(|raw| resolve_at_path_with_virtual(notif, dirfd, &raw, virtual_cwd));
-+    Some(match notif.data.nr as i64 {
-+        libc::SYS_unlinkat => CowWriteOp::Unlink {
-+            path: path(a[0] as i64, a[1])?, is_dir: a[2] & libc::AT_REMOVEDIR as u64 != 0,
-+        },
-+        libc::SYS_mkdirat => CowWriteOp::Mkdir {
-+            path: path(a[0] as i64, a[1])?, mode: crate::seccomp::notif::creation_mode(notif.pid, a[2]) & 0o1777,
-+        },
-+        libc::SYS_mknodat => CowWriteOp::Mknod {
-+            path: path(a[0] as i64, a[1])?, mode: a[2] as u32, dev: a[3],
-+        },
-+        libc::SYS_renameat2 => CowWriteOp::Rename {
-+            old_path: path(a[0] as i64, a[1])?, new_path: path(a[2] as i64, a[3])?,
-+        },
-+        // The symlink target is literal text; only the new entry resolves against a directory.
-+        libc::SYS_symlinkat => CowWriteOp::Symlink {
-+            target: read_path(notif, a[0], notif_fd)?, linkpath: path(a[1] as i64, a[2])?,
-+        },
-+        libc::SYS_linkat => CowWriteOp::Link {
-+            old_path: path(a[0] as i64, a[1])?, new_path: path(a[2] as i64, a[3])?,
-+        },
-+        libc::SYS_fchmodat => CowWriteOp::Chmod {
-+            path: path(a[0] as i64, a[1])?, mode: (a[2] & 0o7777) as u32,
-+        },
-+        libc::SYS_fchownat => CowWriteOp::Chown {
-+            path: path(a[0] as i64, a[1])?, uid: a[2] as u32, gid: a[3] as u32,
-+        },
-+        libc::SYS_truncate => CowWriteOp::Truncate {
-+            path: path(libc::AT_FDCWD as i64, a[0])?, length: a[1] as i64,
-+        },
-+        _ => return None,
-+    })
- }
-
- /// Map a BranchError result to a NotifAction.
-@@ -622,9 +498,9 @@ pub(crate) async fn handle_cow_write(
-             if !cow.matches(path) { return NotifAction::Continue; }
-             unlink_result(cow.handle_unlink(path, is_dir))
-         }
--        CowWriteOp::Mkdir { ref path } => {
-+        CowWriteOp::Mkdir { ref path, mode } => {
-             if !cow.matches(path) { return NotifAction::Continue; }
--            cow_result(cow.handle_mkdir(path))
-+            cow_result(cow.handle_mkdir(path, mode))
-         }
-         CowWriteOp::Mknod { ref path, mode, dev } => {
-             if !cow.matches(path) { return NotifAction::Continue; }
-@@ -679,30 +555,12 @@ pub(crate) async fn handle_cow_access(
-     processes: &Arc<ProcessIndex>,
-     notif_fd: RawFd,
- ) -> NotifAction {
--    let nr = notif.data.nr as i64;
-     let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
--
--    // access(pathname, mode): args[0]=path, args[1]=mode
--    // faccessat(dirfd, pathname, mode, flags): args[0]=dirfd, args[1]=path, args[2]=mode
--    let (path, mode) = if Some(nr) == arch::sys_access() {
--        let p = match read_path(notif, notif.data.args[0], notif_fd) {
--            Some(p) => resolve_at_path_with_virtual(
--                notif,
--                libc::AT_FDCWD as i64,
--                &p,
--                virtual_cwd.as_deref(),
--            ),
--            None => return NotifAction::Continue,
--        };
--        (p, notif.data.args[1] as i32)
--    } else {
--        let dirfd = notif.data.args[0] as i64;
--        let p = match read_path(notif, notif.data.args[1], notif_fd) {
--            Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
--            None => return NotifAction::Continue,
--        };
--        (p, notif.data.args[2] as i32)
-+    let path = match read_path(notif, notif.data.args[1], notif_fd) {
-+        Some(path) => resolve_at_path_with_virtual(notif, notif.data.args[0] as i64, &path, virtual_cwd.as_deref()),
-+        None => return NotifAction::Continue,
-     };
-+    let mode = notif.data.args[2] as i32;
-
-     // Only intercept W_OK checks
-     if mode & libc::W_OK == 0 {
-@@ -821,25 +679,8 @@ pub(crate) async fn handle_cow_stat(
- ) -> NotifAction {
-     let nr = notif.data.nr as i64;
-
--    // newfstatat(dirfd, pathname, statbuf, flags)
--    // faccessat(dirfd, pathname, mode, flags)
--    // stat/lstat(pathname, statbuf), access(pathname, mode)
--    //
--    // The legacy x86_64 variants carry the path in args[0] and have no
--    // dirfd or flags. Parsing them with the at-variant layout reads the
--    // statbuf pointer as the path, never matches the workdir, and falls
--    // through to the kernel, which leaks whiteouted lower entries to any
--    // static-libc child that emits legacy stat (same register-layout bug
--    // handle_cow_open fixed for legacy open).
--    let legacy = [arch::sys_stat(), arch::sys_lstat(), arch::sys_access()]
--        .into_iter()
--        .flatten()
--        .any(|l| l == nr);
--    let (dirfd, path_ptr) = if legacy {
--        (libc::AT_FDCWD as i64, notif.data.args[0])
--    } else {
--        (notif.data.args[0] as i64, notif.data.args[1])
--    };
-+    let dirfd = notif.data.args[0] as i64;
-+    let path_ptr = notif.data.args[1];
-     let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
-     let path = match read_path(notif, path_ptr, notif_fd) {
-         Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
-@@ -865,10 +706,7 @@ pub(crate) async fn handle_cow_stat(
-         (real, upper_root, workdir_root)
-     };
-
--    if nr == libc::SYS_faccessat
--        || nr == crate::arch::SYS_FACCESSAT2
--        || arch::sys_access() == Some(nr)
--    {
-+    if nr == libc::SYS_faccessat || nr == crate::arch::SYS_FACCESSAT2 {
-         // Existence check, confined: lstat succeeds for any present entry
-         // (including a dangling symlink), matching the prior semantics.
-         let (root, rel) = match pick_root_rel(&upper_root, &workdir_root, &real_path) {
-@@ -884,13 +722,8 @@ pub(crate) async fn handle_cow_stat(
-     // newfstatat/stat/lstat — stat the resolved path (confined to its layer
-     // root) and write the native libc layout back to the child. Do not
-     // hand-pack struct stat; its layout is architecture-specific.
--    let statbuf_addr = if legacy { notif.data.args[1] } else { notif.data.args[2] };
--    let follow = if legacy {
--        arch::sys_lstat() != Some(nr)
--    } else {
--        let flags = (notif.data.args[3] & 0xFFFF_FFFF) as i32;
--        (flags & libc::AT_SYMLINK_NOFOLLOW) == 0
--    };
-+    let statbuf_addr = notif.data.args[2];
-+    let follow = notif.data.args[3] as i32 & libc::AT_SYMLINK_NOFOLLOW == 0;
-     let (root, rel) = match pick_root_rel(&upper_root, &workdir_root, &real_path) {
-         Ok(v) => v,
-         Err(e) => return NotifAction::Errno(e),
-@@ -1076,12 +909,12 @@ pub(crate) async fn handle_cow_exec(
-
-     // Rewrite the path argument to /proc/self/fd/N so the kernel execs the
-     // injected fd, relocating argv[0] when it aliases the path buffer (see
--    // rewrite_exec_path_to_fd). Force-writes past read-only protections (a
-+    // rewrite_exec_path). Force-writes past read-only protections (a
-     // .rodata exec path literal). No length guard: execve replaces the
-     // address space on success, so a write past the original buffer is
-     // harmless.
--    if crate::seccomp::notif::rewrite_exec_path_to_fd(
--        notif_fd, notif.id, notif.pid, path_ptr, argv_ptr, envp_ptr, child_fd,
-+    if crate::seccomp::notif::rewrite_exec_path(
-+        notif_fd, notif.id, notif.pid, path_ptr, argv_ptr, envp_ptr, format!("/proc/self/fd/{child_fd}\0").as_bytes(),
-     )
-     .is_err()
-     {
-@@ -1136,139 +969,133 @@ pub(crate) async fn handle_cow_readlink(
-     NotifAction::ReturnValue(write_len as i64)
- }
-
--/// Handle getdents64 for COW directories — merge upper + lower entries.
-+/// Both COW and chroot use the opened directory's merged view and the kernel OFD cursor.
- pub(crate) async fn handle_cow_getdents(
-     notif: &SeccompNotif,
-     cow_state: &Arc<Mutex<CowState>>,
--    processes: &Arc<ProcessIndex>,
-+    _processes: &Arc<ProcessIndex>,
-     notif_fd: RawFd,
- ) -> NotifAction {
--    let pid = notif.pid;
--    let child_fd = (notif.data.args[0] & 0xFFFFFFFF) as u32;
--    let buf_addr = notif.data.args[1];
--    let buf_size = (notif.data.args[2] & 0xFFFFFFFF) as usize;
--
--    // Check if fd points to a COW-managed directory.
--    let link_path = format!("/proc/{}/fd/{}", pid, child_fd);
--    let target = match std::fs::read_link(&link_path) {
--        Ok(t) => t.to_string_lossy().into_owned(),
--        Err(_) => return NotifAction::Continue,
--    };
-+    read_directory(notif, cow_state, notif_fd, &[], None).await
-+}
-
--    // Compute rel_path under the global COW lock, but do not hold it
--    // across the per-process lock acquired below.
--    let rel_path = {
--        let st = cow_state.lock().await;
--        let cow = match st.branch.as_ref() {
--            Some(c) => c,
--            None => return NotifAction::Continue,
--        };
--        if !cow.has_changes() {
--            return NotifAction::Continue;
--        }
--        let target_path = Path::new(&target);
--        if cow.matches(&target) {
--            cow.safe_rel(&target).unwrap_or_else(|| ".".to_string())
--        } else if let Ok(rel) = target_path.strip_prefix(cow.upper_dir()) {
--            let rel = rel.to_string_lossy();
--            if rel.is_empty() {
--                ".".to_string()
--            } else {
--                rel.into_owned()
--            }
--        } else {
--            return NotifAction::Continue;
--        }
-+pub(crate) async fn read_directory(
-+    notif: &SeccompNotif,
-+    cow_state: &Arc<Mutex<CowState>>,
-+    notif_fd: RawFd,
-+    directory_images: &[(PathBuf, Vec<u8>)],
-+    inode_projection: Option<&(dyn Fn(u64, u64) -> u64 + Sync)>,
-+) -> NotifAction {
-+    use std::os::unix::fs::MetadataExt;
-+    // getdents and seek share the OFD cursor, including dup and fork aliases.
-+    let cs = cow_state.lock().await;
-+    if directory_images.is_empty() && inode_projection.is_none() && cs.branch.is_none() { return NotifAction::Continue; }
-+    let pin = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, notif.data.args[0] as i32) {
-+        Ok(pin) => pin, Err(_) => return NotifAction::Errno(libc::EBADF),
-     };
--
--    // Per-process dir cache lookup.
--    let pp = match pp_handle(processes, pid) {
--        Some(h) => h,
--        None => return NotifAction::Continue,
-+    let mut state: libc::stat = unsafe { std::mem::zeroed() };
-+    if unsafe { libc::fstat(pin.as_raw_fd(), &mut state) } != 0 { return NotifAction::Errno(libc::EBADF); }
-+    let image = directory_images.iter().find_map(|(directory, bytes)| {
-+        let named = std::fs::metadata(directory).ok()?;
-+        (named.dev() == state.st_dev && named.ino() == state.st_ino).then_some(bytes)
-+    });
-+    let merged = if image.is_some() { None } else { merged_listing(cs.branch.as_ref(), pin.as_raw_fd(), &state, inode_projection) };
-+    let image = image.map(Vec::as_slice).or(merged.as_deref());
-+    let native = image.is_none();
-+    if native && (inode_projection.is_none() || notif.data.nr as i64 == libc::SYS_lseek) { return NotifAction::Continue; }
-+    if unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH != 0 { return NotifAction::Errno(libc::EBADF); }
-+    if notif.data.nr as i64 == libc::SYS_lseek {
-+        let position = unsafe { libc::lseek(pin.as_raw_fd(), notif.data.args[1] as i64, notif.data.args[2] as i32) };
-+        return if position < 0 { NotifAction::Errno(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL)) } else { NotifAction::ReturnValue(position) };
-+    }
-+    let capacity = notif.data.args[2] as u32 as usize;
-+    if capacity > i32::MAX as usize { return NotifAction::Errno(libc::EINVAL); }
-+    let cursor = unsafe { libc::lseek(pin.as_raw_fd(), 0, libc::SEEK_CUR) };
-+    let restore = || { if native && cursor >= 0 { unsafe { libc::lseek(pin.as_raw_fd(), cursor, libc::SEEK_SET); } } };
-+    // All sources use getdents64 records. Only a native read advances the OFD now;
-+    // an image advances it after delivery, while a failed native delivery restores it.
-+    let mut observed = Vec::new();
-+    let image = if let Some(image) = image {
-+        if cursor < 0 { return NotifAction::Errno(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)); }
-+        image
-+    } else {
-+        observed.resize(capacity.min(2 * 1024 * 1024), 0);
-+        let used = unsafe { libc::syscall(libc::SYS_getdents64, pin.as_raw_fd(), observed.as_mut_ptr(), observed.len()) };
-+        if used < 0 { return NotifAction::Errno(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)); }
-+        observed.truncate(used as usize);
-+        &observed
-     };
--    let mut perproc = pp.lock().await;
--
--    // Invalidate stale cache (fd reused for a different directory),
--    // and short-circuit EOF on a previously fully-drained entry.
--    if let Some((cached_target, entries)) = perproc.cow_dir_cache.get(&child_fd) {
--        if *cached_target != target {
--            perproc.cow_dir_cache.remove(&child_fd);
--        } else if entries.is_empty() {
--            perproc.cow_dir_cache.remove(&child_fd);
--            return NotifAction::ReturnValue(0);
-+    if image.len() > 2 * 1024 * 1024 { return NotifAction::Errno(libc::EINVAL); }
-+    let mut entries = Vec::new();
-+    let (mut offset, mut previous, mut used, mut next) = (0usize, 0i64, 0usize, cursor);
-+    let mut reached = native || cursor == 0;
-+    while offset < image.len() {
-+        if image.len() - offset < 20 { return NotifAction::Errno(libc::EIO); }
-+        let size = u16::from_le_bytes(image[offset+16..offset+18].try_into().unwrap()) as usize;
-+        let cookie = i64::from_le_bytes(image[offset+8..offset+16].try_into().unwrap());
-+        if size < 24 || size % 8 != 0 || size > image.len() - offset || (!native && cookie <= previous) { return NotifAction::Errno(libc::EIO); }
-+        let Some(name) = image[offset+19..offset+size].iter().position(|&byte| byte == 0) else { return NotifAction::Errno(libc::EIO); };
-+        reached |= cursor == previous;
-+        if reached {
-+            if size > capacity - used { break; }
-+            entries.push((offset, size, name)); used += size; next = cookie;
-         }
--    }
--
--    // Build cache on first call.
--    if !perproc.cow_dir_cache.contains_key(&child_fd) {
--        let entries = {
--            let st = cow_state.lock().await;
--            let cow = match st.branch.as_ref() {
--                Some(c) => c,
--                None => return NotifAction::Continue,
--            };
--            let merged = cow.list_merged_dir(&rel_path);
--            let upper_dir = cow.upper_dir().join(&rel_path);
--            let lower_dir = cow.workdir().join(&rel_path);
--
--            let mut out = Vec::new();
--            let mut d_off: i64 = 0;
--            for name in &merged {
--                d_off += 1;
--                let upper_p = upper_dir.join(name);
--                let lower_p = lower_dir.join(name);
--                let check = if upper_p.exists() || upper_p.is_symlink() {
--                    &upper_p
--                } else {
--                    &lower_p
--                };
--                let d_type = if check.is_dir() {
--                    DT_DIR
--                } else if check.is_symlink() {
--                    DT_LNK
--                } else {
--                    DT_REG
--                };
--                use std::os::unix::fs::MetadataExt;
--                let d_ino = std::fs::symlink_metadata(check)
--                    .map(|m| m.ino())
--                    .unwrap_or(0);
--                if let Some(rec) = build_dirent64(d_ino, d_off, d_type, name) {
--                    out.push(rec);
--                }
--            }
--            out
--        };
--        perproc.cow_dir_cache.insert(child_fd, (target.clone(), entries));
--    }
--
--    let entries = match perproc.cow_dir_cache.get_mut(&child_fd) {
--        Some((_, e)) => e,
--        None => return NotifAction::Continue,
-+        previous = cookie; offset += size;
-+    }
-+    if !reached && cursor != previous { return NotifAction::Errno(libc::EINVAL); }
-+    if used == 0 { return if offset == image.len() { NotifAction::ReturnValue(0) } else { NotifAction::Errno(libc::EINVAL) }; }
-+    // Preserve padding and touch only returned records, including a buffer that
-+    // ends at a protected page before the caller's requested capacity.
-+    let mut output = match read_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[1], used) {
-+        Ok(bytes) => bytes, Err(_) => { restore(); return NotifAction::Errno(libc::EFAULT); }
-     };
--
--    let mut result = Vec::new();
--    let mut consumed = 0;
--    for entry in entries.iter() {
--        if result.len() + entry.len() > buf_size {
--            break;
--        }
--        result.extend_from_slice(entry);
--        consumed += 1;
--    }
--
--    if consumed > 0 {
--        entries.drain(..consumed);
--    }
--    drop(perproc);
--
--    if !result.is_empty() {
--        if write_child_mem(notif_fd, notif.id, pid, buf_addr, &result).is_err() {
--            return NotifAction::Continue;
-+    let legacy = Some(notif.data.nr as i64) == crate::arch::sys_getdents();
-+    let mut destination = 0;
-+    for (source, size, name) in entries {
-+        output[destination..destination+18].copy_from_slice(&image[source..source+18]);
-+        if let Some(project) = inode_projection.filter(|_| native) {
-+            let inode = u64::from_le_bytes(image[source..source+8].try_into().unwrap());
-+            output[destination..destination+8].copy_from_slice(&project(state.st_dev, inode).to_ne_bytes());
-         }
--    }
-+        let name_start = if legacy { 18 } else { 19 };
-+        output[destination+name_start..destination+name_start+name+1].copy_from_slice(&image[source+19..source+20+name]);
-+        output[destination+if legacy { size-1 } else { 18 }] = image[source+18];
-+        destination += size;
-+    }
-+    if write_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[1], &output).is_err() { restore(); return NotifAction::Errno(libc::EFAULT); }
-+    if !native && unsafe { libc::lseek(pin.as_raw_fd(), next, libc::SEEK_SET) } != next { return NotifAction::Errno(libc::EIO); }
-+    NotifAction::ReturnValue(used as i64)
-+}
-
--    NotifAction::ReturnValue(result.len() as i64)
-+/// The listing of the directory `fd` names when the COW branch holds entries in it: its own entry, its parent's,
-+/// then each merged name, as getdents64 records keyed by their position.
-+fn merged_listing(cow: Option<&SeccompCowBranch>, fd: RawFd, state: &libc::stat,
-+    inode_projection: Option<&(dyn Fn(u64, u64) -> u64 + Sync)>) -> Option<Vec<u8>> {
-+    use std::os::unix::fs::MetadataExt;
-+    let cow = cow?;
-+    let target = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok()?;
-+    let rel = match target.strip_prefix(cow.upper_dir()) {
-+        Ok(rest) => rest.to_str()?.to_string(),
-+        Err(_) if cow.matches(target.to_str()?) => cow.safe_rel(target.to_str()?)?,
-+        Err(_) => return None,
-+    };
-+    let entries = cow.merged_entries(&rel)?;
-+    let parent = Path::new(&rel).parent().map(|parent| cow.resolve_read(parent.to_str().unwrap_or("")))
-+        .unwrap_or_else(|| cow.workdir().parent().unwrap_or(Path::new("/")).to_path_buf());
-+    let parent = std::fs::symlink_metadata(parent).map_or((state.st_dev, state.st_ino), |m| (m.dev(), m.ino()));
-+    let mut image = Vec::new();
-+    let own = [(".".to_string(), state.st_dev, state.st_ino, libc::DT_DIR), ("..".to_string(), parent.0, parent.1, libc::DT_DIR)];
-+    for (position, (name, device, ino, kind)) in own.into_iter().chain(entries).enumerate() {
-+        let ino = inode_projection.map_or(ino, |project| project(device, ino));
-+        let (start, size) = (image.len(), (19 + name.len() + 1 + 7) & !7);
-+        image.resize(start + size, 0);
-+        image[start..start + 8].copy_from_slice(&ino.to_le_bytes());
-+        image[start + 8..start + 16].copy_from_slice(&(position as i64 + 1).to_le_bytes());
-+        image[start + 16..start + 18].copy_from_slice(&(size as u16).to_le_bytes());
-+        image[start + 18] = kind;
-+        image[start + 19..start + 19 + name.len()].copy_from_slice(name.as_bytes());
-+    }
-+    Some(image)
- }
-
- /// Handle chdir — redirect to COW upper directory if the target was created
 diff --git a/crates/sandlock-core/src/cow/seccomp.rs b/crates/sandlock-core/src/cow/seccomp.rs
 index 9bab5df..0998745 100644
 --- a/crates/sandlock-core/src/cow/seccomp.rs
@@ -4443,14 +3887,14 @@ index 634755e..38fd708 100644
              policy_fn: sandbox.policy_fn.is_some(),
              port_remap: sandbox.port_remap,
 diff --git a/crates/sandlock-core/src/resource.rs b/crates/sandlock-core/src/resource.rs
-index 398d45a..50d2d24 100644
+index 398d45a..567d415 100644
 --- a/crates/sandlock-core/src/resource.rs
 +++ b/crates/sandlock-core/src/resource.rs
 @@ -955,12 +955,16 @@ mod tests {
              num_cpus: None,
              port_remap: false,
              cow_enabled: false,
-+            chroot_private_upper: None,
++            chroot_cow_roots: None,
              chroot_root: None,
              chroot_readable: Vec::new(),
              chroot_writable: Vec::new(),
@@ -4464,7 +3908,7 @@ index 398d45a..50d2d24 100644
              virtual_hostname: None,
              has_http_acl: false,
 diff --git a/crates/sandlock-core/src/sandbox.rs b/crates/sandlock-core/src/sandbox.rs
-index 8d06d60..31adbc1 100644
+index 8d06d60..a899102 100644
 --- a/crates/sandlock-core/src/sandbox.rs
 +++ b/crates/sandlock-core/src/sandbox.rs
 @@ -179,6 +179,7 @@ impl TryFrom<&Sandbox> for Confinement {
@@ -4591,20 +4035,25 @@ index 8d06d60..31adbc1 100644
                  extra_syscalls: &extra_syscalls,
                  parent_pid,
                  foreground,
-@@ -2115,7 +2144,6 @@ impl Sandbox {
+@@ -2115,7 +2144,10 @@ impl Sandbox {
                  .map(|t| crate::time::calculate_time_offset(t))
                  .unwrap_or(0);
 
 -            let rt_name = self.rt().name.clone();
++            let roots = |branch: &crate::cow::seccomp::SeccompCowBranch| (branch.upper_dir().to_path_buf(), branch.workdir().to_path_buf());
++            let cow_roots = if let Some(shared) = &shared_cow {
++                shared.state.lock().await.branch.as_ref().map(roots)
++            } else { seccomp_cow_branch.as_ref().map(roots) };
              let notif_policy = NotifPolicy {
                  max_memory_bytes: self.max_memory.map(|m| m.0).unwrap_or(0),
                  max_processes: self.max_processes,
-@@ -2130,14 +2158,18 @@ impl Sandbox {
+@@ -2130,14 +2162,18 @@ impl Sandbox {
                  num_cpus: self.num_cpus,
                  port_remap: resolved.features.port_remap,
                  cow_enabled: resolved.features.cow,
-+                chroot_private_upper: self.cow_upper.clone(),
-                 chroot_root: chroot_root.clone(),
+-                chroot_root: chroot_root.clone(),
++                chroot_cow_roots: cow_roots,
++                chroot_root: chroot_root.clone().or_else(|| self.workdir.as_ref().map(|_| PathBuf::from("/"))),
                  chroot_readable: self.fs_readable.clone(),
                  chroot_writable: self.fs_writable.clone(),
                  chroot_denied: self.fs_denied.clone(),
@@ -4734,20 +4183,24 @@ index 6eaa211..4286406 100644
              in_child_main: None,
              clean_env: self.clean_env,
 diff --git a/crates/sandlock-core/src/seccomp/dispatch.rs b/crates/sandlock-core/src/seccomp/dispatch.rs
-index 3673d84..d7fbba7 100644
+index 3673d84..a1d0b62 100644
 --- a/crates/sandlock-core/src/seccomp/dispatch.rs
 +++ b/crates/sandlock-core/src/seccomp/dispatch.rs
-@@ -546,7 +546,8 @@ pub(crate) fn build_dispatch_table(
-     // ------------------------------------------------------------------
-     // COW filesystem interception
-     // ------------------------------------------------------------------
--    if policy.cow_enabled {
-+    // Under a chroot its own handlers resolve every path through the branch; a second, host-path pass would re-resolve their results.
-+    if policy.cow_enabled && policy.chroot_root.is_none() {
-         register_cow_handlers(&mut table, ctx);
+@@ -543,13 +543,6 @@ pub(crate) fn build_dispatch_table(
+         register_chroot_handlers(&mut table, policy, ctx);
      }
 
-@@ -785,30 +786,7 @@ fn register_chroot_handlers(
+-    // ------------------------------------------------------------------
+-    // COW filesystem interception
+-    // ------------------------------------------------------------------
+-    if policy.cow_enabled {
+-        register_cow_handlers(&mut table, ctx);
+-    }
+-
+     // ------------------------------------------------------------------
+     // /proc directory-listing PID filter. Stays after chroot/COW: under chroot
+     // the /proc dir fd resolves to the empty rootfs procfs, so the listing is
+@@ -785,30 +778,7 @@ fn register_chroot_handlers(
              let cow_state = Arc::clone(&ctx.cow);
              let processes = Arc::clone(&ctx.processes);
              move |cx: &HandlerCtx| {
@@ -4779,7 +4232,7 @@ index 3673d84..d7fbba7 100644
                  let chroot_state = Arc::clone(&chroot_state);
                  let cow_state = Arc::clone(&cow_state);
                  let processes = Arc::clone(&processes);
-@@ -826,14 +804,14 @@ fn register_chroot_handlers(
+@@ -826,14 +796,14 @@ fn register_chroot_handlers(
      // openat, openat2 — fallthrough if Continue. Both carry (dirfd, path) in
      // the same slots; the handler decodes the rest per spelling.
      for &nr in &[libc::SYS_openat, arch::SYS_OPENAT2] {
@@ -4797,14 +4250,15 @@ index 3673d84..d7fbba7 100644
      }
 
      // execve, execveat — unconditional return
-@@ -842,120 +820,40 @@ fn register_chroot_handlers(
+@@ -842,120 +812,40 @@ fn register_chroot_handlers(
              crate::chroot::dispatch::handle_chroot_exec));
      }
 
 -    // Modern write syscalls
 +    // Modern and legacy writes share the canonical argument layout.
      let mut write_nrs = vec![
-         libc::SYS_unlinkat, libc::SYS_mkdirat, libc::SYS_renameat2,
+-        libc::SYS_unlinkat, libc::SYS_mkdirat, libc::SYS_renameat2,
++        libc::SYS_unlinkat, libc::SYS_mkdirat, libc::SYS_mknodat, libc::SYS_renameat2,
          libc::SYS_symlinkat, libc::SYS_linkat, libc::SYS_fchmodat,
 -        libc::SYS_fchownat, libc::SYS_truncate,
 +        libc::SYS_fchownat, libc::SYS_truncate, libc::SYS_utimensat,
@@ -4813,7 +4267,7 @@ index 3673d84..d7fbba7 100644
      // there on the arches without a plain rename(2).
 -    write_nrs.extend(arch::sys_renameat());
 +    write_nrs.extend([
-+        arch::sys_renameat(), arch::sys_unlink(), arch::sys_rmdir(), arch::sys_mkdir(),
++        arch::sys_renameat(), arch::sys_unlink(), arch::sys_rmdir(), arch::sys_mkdir(), arch::sys_mknod(),
 +        arch::sys_rename(), arch::sys_symlink(), arch::sys_link(), arch::sys_chmod(),
 +        arch::sys_chown(), arch::sys_lchown(),
 +    ].into_iter().flatten());
@@ -4900,8 +4354,7 @@ index 3673d84..d7fbba7 100644
 
 -    // Legacy stat
 -    if let Some(nr) = arch::sys_stat() {
-+    for nr in std::iter::once(libc::SYS_readlinkat).chain(arch::sys_readlink()) {
-         table.register(nr, chroot_handler!(policy,
+-        table.register(nr, chroot_handler!(policy,
 -            crate::chroot::dispatch::handle_chroot_legacy_stat));
 -    }
 -    if let Some(nr) = arch::sys_lstat() {
@@ -4921,7 +4374,8 @@ index 3673d84..d7fbba7 100644
 -    table.register(libc::SYS_readlinkat, chroot_handler!(policy,
 -        crate::chroot::dispatch::handle_chroot_readlink));
 -    if let Some(nr) = arch::sys_readlink() {
--        table.register(nr, chroot_handler!(policy,
++    for nr in std::iter::once(libc::SYS_readlinkat).chain(arch::sys_readlink()) {
+         table.register(nr, chroot_handler!(policy,
 -            crate::chroot::dispatch::handle_chroot_legacy_readlink));
 +            crate::chroot::dispatch::handle_chroot_readlink));
      }
@@ -4932,7 +4386,7 @@ index 3673d84..d7fbba7 100644
      if let Some(getdents) = arch::sys_getdents() {
          getdents_nrs.push(getdents);
      }
-@@ -964,17 +862,19 @@ fn register_chroot_handlers(
+@@ -964,17 +854,19 @@ fn register_chroot_handlers(
              crate::chroot::dispatch::handle_chroot_getdents));
      }
 
@@ -4955,20 +4409,98 @@ index 3673d84..d7fbba7 100644
 
      // xattr family (path-based) — get/set/list/remove and their l* variants
      for &nr in &[
-@@ -1000,7 +900,7 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
-             let cow_state = Arc::clone(&ctx.cow);
-             let processes_state = Arc::clone(&ctx.processes);
-             move |cx: &HandlerCtx| {
+@@ -988,86 +880,6 @@ fn register_chroot_handlers(
+     }
+ }
+
+-// ============================================================
+-// COW handler registration
+-// ============================================================
+-
+-fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
+-    // Helper that captures `ctx.cow` and `ctx.processes` once at table-build
+-    // time, then re-clones the per-handler `Arc`s on each invocation.
+-    macro_rules! cow_call {
+-        ($handler:expr) => {{
+-            let cow_state = Arc::clone(&ctx.cow);
+-            let processes_state = Arc::clone(&ctx.processes);
+-            move |cx: &HandlerCtx| {
 -                let notif = cx.notif;
-+                let notif = super::notif::canonical_path_call(cx.notif);
-                 let cow_state = Arc::clone(&cow_state);
-                 let processes_state = Arc::clone(&processes_state);
-                 let notif_fd = cx.notif_fd;
-@@ -1140,12 +1040,16 @@ mod handler_tests {
+-                let cow_state = Arc::clone(&cow_state);
+-                let processes_state = Arc::clone(&processes_state);
+-                let notif_fd = cx.notif_fd;
+-                async move {
+-                    $handler(&notif, &cow_state, &processes_state, notif_fd).await
+-                }
+-            }
+-        }};
+-    }
+-
+-    // Write syscalls (*at variants + legacy)
+-    let mut write_nrs = vec![
+-        libc::SYS_unlinkat, libc::SYS_mkdirat, libc::SYS_mknodat, libc::SYS_renameat2,
+-        libc::SYS_symlinkat, libc::SYS_linkat, libc::SYS_fchmodat,
+-        libc::SYS_fchownat, libc::SYS_truncate,
+-    ];
+-    write_nrs.extend([
+-        arch::sys_unlink(), arch::sys_rmdir(), arch::sys_mkdir(), arch::sys_mknod(),
+-        arch::sys_rename(), arch::sys_symlink(), arch::sys_link(), arch::sys_chmod(),
+-        arch::sys_chown(), arch::sys_lchown(),
+-    ].into_iter().flatten());
+-    for nr in write_nrs {
+-        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_write));
+-    }
+-
+-    table.register(libc::SYS_utimensat, cow_call!(crate::cow::dispatch::handle_cow_utimensat));
+-
+-    let mut access_nrs = vec![libc::SYS_faccessat, arch::SYS_FACCESSAT2];
+-    access_nrs.extend(arch::sys_access());
+-    for nr in access_nrs {
+-        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_access));
+-    }
+-
+-    let mut open_nrs = vec![libc::SYS_openat];
+-    open_nrs.extend(arch::sys_open());
+-    for nr in open_nrs {
+-        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_open));
+-    }
+-
+-    let mut stat_nrs = vec![libc::SYS_newfstatat, libc::SYS_faccessat];
+-    stat_nrs.extend([arch::sys_stat(), arch::sys_lstat(), arch::sys_access()].into_iter().flatten());
+-    for nr in stat_nrs {
+-        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_stat));
+-    }
+-
+-    table.register(libc::SYS_statx, cow_call!(crate::cow::dispatch::handle_cow_statx));
+-
+-    let mut readlink_nrs = vec![libc::SYS_readlinkat];
+-    readlink_nrs.extend(arch::sys_readlink());
+-    for nr in readlink_nrs {
+-        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_readlink));
+-    }
+-
+-    let mut getdents_nrs = vec![libc::SYS_getdents64];
+-    getdents_nrs.extend(arch::sys_getdents());
+-    for nr in getdents_nrs {
+-        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_getdents));
+-    }
+-
+-    table.register(libc::SYS_chdir, cow_call!(crate::cow::dispatch::handle_cow_chdir));
+-    table.register(libc::SYS_getcwd, cow_call!(crate::cow::dispatch::handle_cow_getcwd));
+-
+-    for &nr in &[libc::SYS_execve, libc::SYS_execveat] {
+-        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_exec));
+-    }
+-}
+-
+ // ============================================================
+ // Tests
+ // ============================================================
+@@ -1140,12 +952,16 @@ mod handler_tests {
                  argv_safety_required: false,
                  port_remap: false,
                  cow_enabled: false,
-+                chroot_private_upper: None,
++                chroot_cow_roots: None,
                  chroot_root: None,
                  chroot_readable: Vec::new(),
                  chroot_writable: Vec::new(),
@@ -4982,7 +4514,7 @@ index 3673d84..d7fbba7 100644
                  virtual_hostname: None,
                  has_http_acl: false,
 diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/src/seccomp/notif.rs
-index abcd92c..74f861d 100644
+index abcd92c..d100e72 100644
 --- a/crates/sandlock-core/src/seccomp/notif.rs
 +++ b/crates/sandlock-core/src/seccomp/notif.rs
 @@ -360,13 +360,13 @@ pub(crate) fn is_path_denied_for_notif(
@@ -5019,8 +4551,8 @@ index abcd92c..74f861d 100644
      pub num_cpus: Option<u32>,
      pub port_remap: bool,
      pub cow_enabled: bool,
-+    /// The COW branch's upper directory, whose paths the chroot names by their place in the merged view.
-+    pub chroot_private_upper: Option<std::path::PathBuf>,
++    /// The COW upper and its host workdir, used to name descriptors in the merged view.
++    pub chroot_cow_roots: Option<(std::path::PathBuf, std::path::PathBuf)>,
      pub chroot_root: Option<std::path::PathBuf>,
      /// Virtual paths allowed for reading under chroot (original user-specified paths).
      pub chroot_readable: Vec<std::path::PathBuf>,
@@ -5851,10 +5383,20 @@ index abcd92c..74f861d 100644
      fn inject_failure_response_denies_not_continues() {
          // When fd injection fails, the supervisor must fail closed: deny the
 diff --git a/crates/sandlock-core/src/seccomp/state.rs b/crates/sandlock-core/src/seccomp/state.rs
-index 0b4a2c4..e7f7cb7 100644
+index 0b4a2c4..c7b4f12 100644
 --- a/crates/sandlock-core/src/seccomp/state.rs
 +++ b/crates/sandlock-core/src/seccomp/state.rs
-@@ -144,13 +144,7 @@ pub struct PerProcessState {
+@@ -132,9 +132,6 @@ pub(crate) fn read_pid_start_time(pid: i32) -> Option<u64> {
+ /// supervisor's per-handler clones drop along with their tasks.
+ #[derive(Default)]
+ pub struct PerProcessState {
+-    /// Logical cwd while the process is chdir'd into a COW-only
+-    /// directory. None means "use kernel-reported cwd".
+-    pub virtual_cwd: Option<String>,
+     /// Recorded brk base for memory accounting. None until first brk.
+     pub brk_base: Option<u64>,
+     /// Anonymous memory (bytes) charged to this address space and not
+@@ -144,13 +141,7 @@ pub struct PerProcessState {
      /// Credited back to the global total when the address space goes away
      /// (exec replaces it, or the process exits).
      pub mem_charged: u64,
@@ -5869,7 +5411,7 @@ index 0b4a2c4..e7f7cb7 100644
      pub procfs_dir_cache: HashMap<(u32, String), Vec<Vec<u8>>>,
  }
 
-@@ -184,6 +178,9 @@ pub struct PerProcessState {
+@@ -184,6 +175,9 @@ pub struct PerProcessState {
  /// deregister a recycled fd from epoll.
  pub struct ProcessIndex {
      inner: std::sync::RwLock<HashMap<i32, ProcessEntry>>,
@@ -5879,7 +5421,7 @@ index 0b4a2c4..e7f7cb7 100644
  }
 
  /// A task's current directory as the sandbox believes it to be: the
-@@ -213,6 +210,7 @@ impl ProcessIndex {
+@@ -213,6 +207,7 @@ impl ProcessIndex {
      pub fn new() -> Self {
          Self {
              inner: std::sync::RwLock::new(HashMap::new()),
@@ -5887,7 +5429,7 @@ index 0b4a2c4..e7f7cb7 100644
          }
      }
 
-@@ -231,7 +229,7 @@ impl ProcessIndex {
+@@ -231,7 +226,7 @@ impl ProcessIndex {
              key,
              tgid,
              state: Arc::new(AsyncMutex::new(PerProcessState::default())),
@@ -5896,7 +5438,7 @@ index 0b4a2c4..e7f7cb7 100644
          };
          self.inner.write().ok()?.insert(pid, entry);
          Some(key)
-@@ -263,6 +261,39 @@ impl ProcessIndex {
+@@ -263,6 +258,39 @@ impl ProcessIndex {
          Arc::new(std::sync::Mutex::new(parent_cwd))
      }
 
@@ -5936,7 +5478,7 @@ index 0b4a2c4..e7f7cb7 100644
      /// The cwd cell to read or write for `pid`.
      ///
      /// A task without an entry of its own falls back to its
-@@ -808,6 +839,29 @@ mod tests {
+@@ -808,6 +836,29 @@ mod tests {
          thread.join().unwrap();
      }
 
@@ -5967,18 +5509,81 @@ index 0b4a2c4..e7f7cb7 100644
      fn a_child_copies_the_parent_cwd_instead_of_sharing_it() {
          // fork(2) copies fs_struct: the child starts where the parent stood,
 diff --git a/crates/sandlock-core/src/seccomp_plan.rs b/crates/sandlock-core/src/seccomp_plan.rs
-index 03fc456..b4dea0f 100644
+index 03fc456..e63bd9c 100644
 --- a/crates/sandlock-core/src/seccomp_plan.rs
 +++ b/crates/sandlock-core/src/seccomp_plan.rs
-@@ -146,6 +146,7 @@ fn cow_path_syscalls() -> Vec<i64> {
+@@ -130,55 +130,6 @@ const NETLINK_NOTIF_SYSCALLS: &[i64] = &[
+     libc::SYS_close,
+ ];
+
+-fn cow_path_syscalls() -> Vec<i64> {
+-    let mut v = vec![
+-        libc::SYS_openat,
+-        libc::SYS_execve,
+-        libc::SYS_execveat,
+-        libc::SYS_unlinkat,
+-        libc::SYS_mkdirat,
+-        libc::SYS_mknodat,
+-        libc::SYS_renameat2,
+-        libc::SYS_symlinkat,
+-        libc::SYS_linkat,
+-        libc::SYS_fchmodat,
+-        libc::SYS_fchownat,
+-        libc::SYS_truncate,
+-        libc::SYS_utimensat,
+-        libc::SYS_newfstatat,
+-        libc::SYS_statx,
+-        libc::SYS_faccessat,
+-        arch::SYS_FACCESSAT2,
+-        libc::SYS_readlinkat,
+-        libc::SYS_getdents64,
+-        libc::SYS_chdir,
+-        libc::SYS_getcwd,
+-    ];
+-    v.extend(
+-        [
+-            arch::sys_open(),
+-            arch::sys_unlink(),
+-            arch::sys_rmdir(),
+-            arch::sys_mkdir(),
+-            arch::sys_mknod(),
+-            arch::sys_rename(),
+-            arch::sys_symlink(),
+-            arch::sys_link(),
+-            arch::sys_chmod(),
+-            arch::sys_chown(),
+-            arch::sys_lchown(),
+-            arch::sys_stat(),
+-            arch::sys_lstat(),
+-            arch::sys_access(),
+-            arch::sys_readlink(),
+-            arch::sys_getdents(),
+-        ]
+-        .into_iter()
+-        .flatten(),
+-    );
+-    v
+-}
+-
+ fn chroot_path_syscalls() -> Vec<i64> {
+     let mut v = vec![
+         libc::SYS_openat,
+@@ -190,12 +141,14 @@ fn chroot_path_syscalls() -> Vec<i64> {
+         libc::SYS_execveat,
+         libc::SYS_unlinkat,
+         libc::SYS_mkdirat,
++        libc::SYS_mknodat,
+         libc::SYS_renameat2,
+         libc::SYS_symlinkat,
+         libc::SYS_linkat,
+         libc::SYS_fchmodat,
+         libc::SYS_fchownat,
          libc::SYS_truncate,
-         libc::SYS_utimensat,
-         libc::SYS_newfstatat,
 +        libc::SYS_fstat,
+         libc::SYS_newfstatat,
          libc::SYS_statx,
          libc::SYS_faccessat,
-         arch::SYS_FACCESSAT2,
-@@ -207,8 +208,12 @@ fn chroot_path_syscalls() -> Vec<i64> {
+@@ -207,8 +160,12 @@ fn chroot_path_syscalls() -> Vec<i64> {
          // later relative path resolves against, so the supervisor has to
          // see it to keep its own notion in step.
          libc::SYS_fchdir,
@@ -5991,14 +5596,152 @@ index 03fc456..b4dea0f 100644
          libc::SYS_utimensat,
          // xattr family (path-based): must be mediated so that paths under an
          // fs_mount/chroot resolve to the real backing file rather than the
-@@ -415,6 +420,7 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
-     // Chroot path interception
-     if features.chroot {
+@@ -234,6 +191,7 @@ fn chroot_path_syscalls() -> Vec<i64> {
+             arch::sys_unlink(),
+             arch::sys_rmdir(),
+             arch::sys_mkdir(),
++            arch::sys_mknod(),
+             arch::sys_rename(),
+             // Where the ABI has no plain rename(2), libc's rename() compiles
+             // to renameat, so leaving it out left rename unmediated on
+@@ -407,14 +365,10 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
+         nrs.extend(&[libc::SYS_uname, libc::SYS_openat]);
+     }
+
+-    // COW filesystem interception (seccomp-based, unprivileged)
+-    if features.cow {
+-        nrs.extend(&cow_path_syscalls());
+-    }
+-
+-    // Chroot path interception
+-    if features.chroot {
++    // One filesystem view handles explicit roots and identity-root COW.
++    if features.chroot || features.cow {
          nrs.extend(&chroot_path_syscalls());
 +        if features.directory_images { nrs.push(libc::SYS_lseek); }
      }
 
      // Explicit deny-paths need path-bearing syscalls intercepted.
+diff --git a/crates/sandlock-core/src/sys/fs.rs b/crates/sandlock-core/src/sys/fs.rs
+index dd61067..428b922 100644
+--- a/crates/sandlock-core/src/sys/fs.rs
++++ b/crates/sandlock-core/src/sys/fs.rs
+@@ -136,68 +136,6 @@ pub(crate) fn statat_in_root(root: &Path, path: &str, follow: bool) -> Result<li
+     }
+ }
+
+-/// `statx` a path confined within `root`, writing the raw `struct statx` into
+-/// `buf` (must be at least `sizeof(struct statx)`, 256 bytes). The child's
+-/// `AT_SYMLINK_NOFOLLOW` in `flags` selects follow vs nofollow; other `flags`
+-/// bits (sync hints) are preserved.
+-pub(crate) fn statx_in_root(
+-    root: &Path,
+-    path: &str,
+-    flags: i32,
+-    mask: u32,
+-    buf: &mut [u8],
+-) -> Result<(), i32> {
+-    // The kernel writes sizeof(struct statx) = 256 bytes; refuse a short buffer
+-    // rather than risk a heap overflow if a future caller passes a smaller one.
+-    if buf.len() < 256 {
+-        return Err(libc::EINVAL);
+-    }
+-    let follow = (flags & libc::AT_SYMLINK_NOFOLLOW) == 0;
+-    let fd = opath_in_root(root, path, follow)?;
+-    // statx the handle itself via AT_EMPTY_PATH; follow/nofollow is already
+-    // baked into how the fd was opened, so drop AT_SYMLINK_NOFOLLOW here.
+-    let stx_flags = (flags & !libc::AT_SYMLINK_NOFOLLOW) | libc::AT_EMPTY_PATH;
+-    let rc = unsafe {
+-        libc::syscall(libc::SYS_statx, fd, EMPTY, stx_flags, mask, buf.as_mut_ptr())
+-    };
+-    let err = last_errno(libc::EIO);
+-    unsafe { libc::close(fd) };
+-    if rc < 0 {
+-        Err(err)
+-    } else {
+-        Ok(())
+-    }
+-}
+-
+-/// Set timestamps on a path confined within `root`.
+-///
+-/// Resolves a confined `O_PATH` handle, then stamps it through its
+-/// `/proc/self/fd/N` magic link. The kernel cannot take an `O_PATH` fd
+-/// directly for `utimensat` (EBADF), but the magic link jumps straight to the
+-/// already-confined inode, so resolution cannot escape. `follow` selects
+-/// whether the final symlink is followed or stamped in place (baked into how
+-/// the handle is opened).
+-pub(crate) fn utimensat_in_root(
+-    root: &Path,
+-    path: &str,
+-    times: *const libc::timespec,
+-    follow: bool,
+-) -> Result<(), i32> {
+-    let fd = opath_in_root(root, path, follow)?;
+-    let proc = CString::new(format!("/proc/self/fd/{}", fd)).map_err(|_| {
+-        unsafe { libc::close(fd) };
+-        libc::EINVAL
+-    })?;
+-    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, proc.as_ptr(), times, 0) };
+-    let err = last_errno(libc::EIO);
+-    unsafe { libc::close(fd) };
+-    if rc < 0 {
+-        Err(err)
+-    } else {
+-        Ok(())
+-    }
+-}
+-
+ /// Read a symlink's target confined within `root`. Returns the raw target
+ /// bytes. `Err(EINVAL)` means the final component is not a symlink.
+ pub(crate) fn readlink_in_root(root: &Path, path: &str) -> Result<Vec<u8>, i32> {
+@@ -666,46 +604,6 @@ mod tests {
+         assert_eq!(readlink_in_root(root, "dirlink/group"), Err(libc::ENOENT));
+     }
+
+-    #[test]
+-    fn utimensat_confined_stamps_in_tree_and_refuses_escape() {
+-        let tmp = TempDir::new().unwrap();
+-        let root = tmp.path();
+-        std::fs::write(root.join("f"), "x").unwrap();
+-        symlink("/etc", root.join("dirlink")).unwrap();
+-
+-        let times = [
+-            libc::timespec { tv_sec: 1_000_000, tv_nsec: 0 },
+-            libc::timespec { tv_sec: 1_000_000, tv_nsec: 0 },
+-        ];
+-        // In-tree file: stamp succeeds and takes effect.
+-        skip_if_nosys!(utimensat_in_root(root, "f", times.as_ptr(), true)).unwrap();
+-        let meta = std::fs::metadata(root.join("f")).unwrap();
+-        use std::os::unix::fs::MetadataExt;
+-        assert_eq!(meta.mtime(), 1_000_000);
+-
+-        // Escaping parent: refused, so the host /etc/group is never stamped.
+-        assert_eq!(
+-            utimensat_in_root(root, "dirlink/group", times.as_ptr(), true),
+-            Err(libc::ENOENT)
+-        );
+-    }
+-
+-    #[test]
+-    fn statx_confines_symlinked_parent() {
+-        let tmp = TempDir::new().unwrap();
+-        let root = tmp.path();
+-        std::fs::write(root.join("f"), "data").unwrap();
+-        symlink("/etc", root.join("dirlink")).unwrap();
+-        let mut buf = vec![0u8; 256];
+-
+-        // In-tree file resolves; escaping parent does not.
+-        skip_if_nosys!(statx_in_root(root, "f", 0, libc::STATX_BASIC_STATS, &mut buf)).unwrap();
+-        assert_eq!(
+-            statx_in_root(root, "dirlink/group", 0, libc::STATX_BASIC_STATS, &mut buf),
+-            Err(libc::ENOENT)
+-        );
+-    }
+-
+     #[test]
+     fn mkdirp_creates_in_tree_and_refuses_escape() {
+         let tmp = TempDir::new().unwrap();
 diff --git a/crates/sandlock-core/tests/integration/test_chroot.rs b/crates/sandlock-core/tests/integration/test_chroot.rs
 index d7130ff..9c4391c 100644
 --- a/crates/sandlock-core/tests/integration/test_chroot.rs
@@ -6667,7 +6410,7 @@ index d7130ff..9c4391c 100644
 -    cleanup_rootfs(&rootfs);
  }
 diff --git a/crates/sandlock-core/tests/integration/test_cow.rs b/crates/sandlock-core/tests/integration/test_cow.rs
-index 3698cfe..4a02bf9 100644
+index 3698cfe..2a7783c 100644
 --- a/crates/sandlock-core/tests/integration/test_cow.rs
 +++ b/crates/sandlock-core/tests/integration/test_cow.rs
 @@ -27,10 +27,8 @@ async fn test_seccomp_cow_create_file() {
@@ -6822,9 +6565,15 @@ index 3698cfe..4a02bf9 100644
  /// Test that chdir works for directories created inside COW.
  ///
  /// When a directory is created via COW (only exists in the upper layer),
-@@ -214,13 +203,7 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
-     let workdir = temp_dir("seccomp-chdir");
-     let out_file = workdir.join("chdir_ok.txt");
+@@ -211,48 +200,46 @@ async fn test_seccomp_cow_open_directory() {
+ /// this, the kernel returns ENOENT because it doesn't see the COW directory.
+ #[tokio::test]
+ async fn test_seccomp_cow_chdir_to_created_dir() {
+-    let workdir = temp_dir("seccomp-chdir");
+-    let out_file = workdir.join("chdir_ok.txt");
++    for explicit_root in [false, true] {
++        let workdir = temp_dir(if explicit_root { "seccomp-chdir-root" } else { "seccomp-chdir" });
++        let out_file = workdir.join("chdir_ok.txt");
 
 -    let policy = Sandbox::builder()
 -        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
@@ -6833,11 +6582,75 @@ index 3698cfe..4a02bf9 100644
 -        .workdir(&workdir)
 -        .cwd(&workdir)
 -        .on_exit(BranchAction::Commit)
-+    let policy = cow_sandbox(&workdir, BranchAction::Commit)
-         .build()
-         .unwrap();
+-        .build()
+-        .unwrap();
++        let policy = cow_sandbox(&workdir, BranchAction::Commit);
++        let relative = pathdiff::diff_paths(&workdir, std::env::current_dir().unwrap()).unwrap();
++        let policy = if explicit_root { policy.chroot("/") } else { policy.workdir(relative) }
++            .build()
++            .unwrap();
 
-@@ -266,17 +249,8 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
+-    // Create a nested directory through a dirfd so the COW handler must map the
+-    // upper-layer fd target back to the logical workdir before mkdirat.
+-    // Use physical pwd so the assertion covers getcwd virtualization.
+-    let script = format!(
+-        concat!(
+-            "mkdir -p subdir && python3 -c \"",
+-            "import os; ",
+-            "fd = os.open('subdir', os.O_RDONLY | os.O_DIRECTORY); ",
+-            "os.mkdir('deep', dir_fd=fd); ",
+-            "os.close(fd)\" && ",
+-            "cd subdir/deep && pwd -P > {}"
+-        ),
+-        out_file.display()
+-    );
+-    let result = policy.clone().run(&["sh", "-c", &script]).await;
+-    match result {
+-        Ok(r) => {
+-            assert!(r.success(), "script should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+-            let content = fs::read_to_string(&out_file).unwrap();
+-            assert!(
+-                content.trim().ends_with("subdir/deep"),
+-                "pwd should end with subdir/deep, got: {}",
+-                content.trim()
+-            );
++        // Create a nested directory through a dirfd so the COW handler must map the
++        // upper-layer fd target back to the logical workdir before mkdirat.
++        // Use physical pwd so the assertion covers getcwd virtualization.
++        let script = format!(
++            concat!(
++                "mkdir -p subdir && python3 -c \"",
++                "import os; ",
++                "fd = os.open('subdir', os.O_RDONLY | os.O_DIRECTORY); ",
++                "os.mkdir('deep', dir_fd=fd); ",
++                "os.close(fd)\" && ",
++                "cd subdir/deep && pwd -P > {}"
++            ),
++            out_file.display()
++        );
++        let result = policy.clone().run(&["sh", "-c", &script]).await;
++        match result {
++            Ok(r) => {
++                assert!(r.success(), "script should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
++                let content = fs::read_to_string(&out_file).unwrap();
++                assert!(
++                    content.trim().ends_with("subdir/deep"),
++                    "pwd should end with subdir/deep, got: {}",
++                    content.trim()
++                );
++            }
++            Err(e) => panic!("Seccomp COW chdir failed: {}", e),
+         }
+-        Err(e) => eprintln!("Seccomp COW chdir test skipped: {}", e),
+-    }
+
+-    let _ = fs::remove_dir_all(&workdir);
++        let _ = fs::remove_dir_all(&workdir);
++    }
+ }
+
+ /// Test that the raw open syscall ABI works correctly with COW.
+@@ -266,17 +253,8 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
  #[tokio::test]
  async fn test_seccomp_cow_legacy_open_syscall() {
      let workdir = temp_dir("seccomp-legacy-open");
@@ -6856,7 +6669,7 @@ index 3698cfe..4a02bf9 100644
          .build()
          .unwrap();
 
-@@ -297,72 +271,41 @@ async fn test_seccomp_cow_legacy_open_syscall() {
+@@ -297,72 +275,41 @@ async fn test_seccomp_cow_legacy_open_syscall() {
          "    os.write(fd, b'created via raw open')\n",
          "    os.close(fd)\n",
          "    content = open('{wd}/newfile.txt').read()\n",
@@ -6950,7 +6763,7 @@ index 3698cfe..4a02bf9 100644
  }
 
  /// Test that O_CREAT|O_EXCL succeeds after unlink in COW mode.
-@@ -375,18 +318,9 @@ async fn test_seccomp_cow_legacy_stat_honors_whiteout() {
+@@ -375,18 +322,9 @@ async fn test_seccomp_cow_legacy_stat_honors_whiteout() {
  #[tokio::test]
  async fn test_seccomp_cow_excl_after_unlink() {
      let workdir = temp_dir("seccomp-excl-unlink");
@@ -6970,7 +6783,7 @@ index 3698cfe..4a02bf9 100644
          .build()
          .unwrap();
 
-@@ -397,7 +331,7 @@ async fn test_seccomp_cow_excl_after_unlink() {
+@@ -397,7 +335,7 @@ async fn test_seccomp_cow_excl_after_unlink() {
          "path = b'{wd}/target.txt'\n",
          "ret = libc.unlink(path)\n",
          "if ret != 0:\n",
@@ -6979,7 +6792,7 @@ index 3698cfe..4a02bf9 100644
          "    raise SystemExit(1)\n",
          "O_WRONLY = 1; O_CREAT = 64; O_EXCL = 128\n",
          "if platform.machine() in ('aarch64', 'riscv64'):\n",
-@@ -408,21 +342,20 @@ async fn test_seccomp_cow_excl_after_unlink() {
+@@ -408,21 +346,20 @@ async fn test_seccomp_cow_excl_after_unlink() {
          "if fd >= 0:\n",
          "    os.write(fd, b'recreated')\n",
          "    os.close(fd)\n",
@@ -7005,7 +6818,7 @@ index 3698cfe..4a02bf9 100644
  }
 
  /// Test that seccomp COW read isolation works (reads original before any writes).
-@@ -431,10 +364,8 @@ async fn test_seccomp_cow_read_existing() {
+@@ -431,10 +368,8 @@ async fn test_seccomp_cow_read_existing() {
      let workdir = temp_dir("seccomp-read");
      fs::write(workdir.join("data.txt"), "hello world").unwrap();
 
@@ -7018,7 +6831,7 @@ index 3698cfe..4a02bf9 100644
          .workdir(&workdir)
          .on_exit(BranchAction::Commit)
          .build()
-@@ -467,18 +398,9 @@ async fn test_seccomp_cow_read_existing() {
+@@ -467,18 +402,9 @@ async fn test_seccomp_cow_read_existing() {
  #[tokio::test]
  async fn test_seccomp_cow_read_deleted_file_is_enoent() {
      let workdir = temp_dir("seccomp-read-deleted");
@@ -7038,7 +6851,7 @@ index 3698cfe..4a02bf9 100644
          .build()
          .unwrap();
 
-@@ -487,35 +409,21 @@ async fn test_seccomp_cow_read_deleted_file_is_enoent() {
+@@ -487,35 +413,21 @@ async fn test_seccomp_cow_read_deleted_file_is_enoent() {
      // redirect, which stat first and would short-circuit on the (correct) stat
      // ENOENT without ever exercising the open path this fix targets. `dd`
      // succeeding means the open was honored and the untouched lower bytes leaked;
@@ -7080,7 +6893,7 @@ index 3698cfe..4a02bf9 100644
  }
 
  /// Regression test: statx on a COW-created file must succeed.
-@@ -527,17 +435,8 @@ async fn test_seccomp_cow_read_deleted_file_is_enoent() {
+@@ -527,17 +439,8 @@ async fn test_seccomp_cow_read_deleted_file_is_enoent() {
  #[tokio::test]
  async fn test_seccomp_cow_statx_created_file() {
      let workdir = temp_dir("seccomp-statx");
@@ -7099,7 +6912,7 @@ index 3698cfe..4a02bf9 100644
          .build()
          .unwrap();
 
-@@ -554,16 +453,16 @@ async fn test_seccomp_cow_statx_created_file() {
+@@ -554,16 +457,16 @@ async fn test_seccomp_cow_statx_created_file() {
          "nr = 291 if platform.machine() in ('aarch64', 'riscv64') else 332\n",
          "ret = libc.syscall(nr, AT_FDCWD, b'created.txt', 0, STATX_BASIC_STATS, buf)\n",
          "err = ctypes.get_errno()\n",
@@ -7120,7 +6933,7 @@ index 3698cfe..4a02bf9 100644
  }
 
  /// Regression test: a binary created inside the COW workdir must
-@@ -576,14 +475,8 @@ async fn test_seccomp_cow_exec_created_file() {
+@@ -576,14 +479,8 @@ async fn test_seccomp_cow_exec_created_file() {
      let helper = helper_binary();
      let helper_dir = helper.parent().unwrap().to_path_buf();
 
@@ -7136,7 +6949,7 @@ index 3698cfe..4a02bf9 100644
          .build()
          .unwrap();
 
-@@ -625,14 +518,8 @@ async fn test_seccomp_cow_exec_packed_argv_relocation() {
+@@ -625,14 +522,8 @@ async fn test_seccomp_cow_exec_packed_argv_relocation() {
      let helper = helper_binary();
      let helper_dir = helper.parent().unwrap().to_path_buf();
 
@@ -7152,7 +6965,7 @@ index 3698cfe..4a02bf9 100644
          .build()
          .unwrap();
 
-@@ -696,10 +583,8 @@ async fn test_abandoned_sandbox_honours_keep_and_still_reclaims_by_default() {
+@@ -696,10 +587,8 @@ async fn test_abandoned_sandbox_honours_keep_and_still_reclaims_by_default() {
          let _ = fs::create_dir_all(d);
      }
 
@@ -7165,7 +6978,7 @@ index 3698cfe..4a02bf9 100644
 
      {
          let mut sb = base.clone()
-@@ -761,16 +646,25 @@ async fn test_abandoned_sandbox_honours_keep_and_still_reclaims_by_default() {
+@@ -761,16 +650,25 @@ async fn test_abandoned_sandbox_honours_keep_and_still_reclaims_by_default() {
  // Branch disposition on a completed run
  // ============================================================
 
@@ -7195,7 +7008,7 @@ index 3698cfe..4a02bf9 100644
          .on_exit(on_exit)
          .on_error(on_error)
          .build()
-@@ -868,10 +762,8 @@ async fn test_kept_branch_marker_records_the_runs_deletion_not_only_its_upper()
+@@ -868,10 +766,8 @@ async fn test_kept_branch_marker_records_the_runs_deletion_not_only_its_upper()
      fs::write(workdir.join("victim.txt"), "ORIGINAL").unwrap();
 
      {
@@ -7208,7 +7021,7 @@ index 3698cfe..4a02bf9 100644
              .fs_storage(&storage)
              .on_exit(BranchAction::Keep)
              .build()
-@@ -920,10 +812,8 @@ async fn test_kept_branch_marker_records_the_runs_deletion_not_only_its_upper()
+@@ -920,10 +816,8 @@ async fn test_kept_branch_marker_records_the_runs_deletion_not_only_its_upper()
  /// Build a COW sandbox over `workdir` that reads enough of the host to run a
  /// shell or python, and writes only inside the workdir.
  fn cow_sandbox(workdir: &std::path::Path, on_exit: BranchAction) -> SandboxBuilder {
@@ -7221,7 +7034,7 @@ index 3698cfe..4a02bf9 100644
          .on_exit(on_exit)
  }
 
-@@ -1194,10 +1084,8 @@ async fn test_cow_child_rm_r_directory_stays_deleted() {
+@@ -1194,10 +1088,8 @@ async fn test_cow_child_rm_r_directory_stays_deleted() {
      fs::create_dir_all(workdir.join("d")).unwrap();
      fs::write(workdir.join("d/secret.txt"), "SECRET").unwrap();
 
@@ -7234,7 +7047,7 @@ index 3698cfe..4a02bf9 100644
          .workdir(&workdir)
          .on_exit(BranchAction::Commit)
          .build()
-@@ -1225,10 +1113,8 @@ async fn test_cow_child_mv_directory_preserves_contents() {
+@@ -1225,10 +1117,8 @@ async fn test_cow_child_mv_directory_preserves_contents() {
      fs::create_dir_all(workdir.join("d")).unwrap();
      fs::write(workdir.join("d/inner.txt"), "PRECIOUS").unwrap();
 
@@ -7247,7 +7060,7 @@ index 3698cfe..4a02bf9 100644
          .workdir(&workdir)
          .on_exit(BranchAction::Commit)
          .build()
-@@ -1260,10 +1146,8 @@ async fn test_cow_child_rmdir_nonempty_fails() {
+@@ -1260,10 +1150,8 @@ async fn test_cow_child_rmdir_nonempty_fails() {
      fs::create_dir_all(workdir.join("d")).unwrap();
      fs::write(workdir.join("d/inner.txt"), "DATA").unwrap();
 
@@ -7260,7 +7073,7 @@ index 3698cfe..4a02bf9 100644
          .workdir(&workdir)
          .on_exit(BranchAction::Commit)
          .build()
-@@ -1304,10 +1188,8 @@ async fn test_seccomp_cow_hardlink_cannot_cross_the_workdir_boundary() {
+@@ -1304,10 +1192,8 @@ async fn test_seccomp_cow_hardlink_cannot_cross_the_workdir_boundary() {
      fs::write(workdir.join("inside.txt"), "INSIDE").unwrap();
      fs::write(outside.join("outside.txt"), "OUTSIDE").unwrap();
 
@@ -7273,3 +7086,17 @@ index 3698cfe..4a02bf9 100644
          .fs_write(&outside)
          .workdir(&workdir)
          .on_exit(BranchAction::Abort)
+diff --git a/crates/sandlock-core/tests/integration/test_transaction.rs b/crates/sandlock-core/tests/integration/test_transaction.rs
+index 9b4b13e..e30de4b 100644
+--- a/crates/sandlock-core/tests/integration/test_transaction.rs
++++ b/crates/sandlock-core/tests/integration/test_transaction.rs
+@@ -1553,7 +1553,8 @@ async fn test_sandbox_dry_run_overrides_keep_so_an_abandoned_dry_run_leaves_no_u
+     let mut sb = Sandbox::builder()
+         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+         .fs_read("/proc")
+-        .fs_write(&workdir).workdir(&workdir).cwd(&workdir)
++        // An explicit host-write grant bypasses COW; this case needs a private write.
++        .fs_read(&workdir).workdir(&workdir).cwd(&workdir)
+         .fs_storage(&storage)
+         .on_exit(BranchAction::Keep)
+         .build()
