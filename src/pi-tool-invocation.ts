@@ -478,21 +478,27 @@ async function prepareCapturedGrep(view: ToolFilesystemOperations, cwd: string, 
 	const originalCwd = cwd, originalTarget = path.resolve(cwd, query.path), rootStat = await stat(originalTarget, "type");
 	const directory = rootStat.isDirectory(), volume = path.parse(cwd).root, privateVolume = path.join(destination, "volume");
 	const realCwd = (await stat(cwd, "type")).realPath;
-	assert.ok(realCwd && rootStat.realPath, "resolved input names require captured evidence"); cwd = realCwd;
-	// A changed cwd spelling can change caller-glob matching even when contents are equal.
-	if (directory && query.glob) assert.equal(cwd, originalCwd, "glob cwd alias namespace is not qualified");
+	assert.ok(realCwd && rootStat.realPath, "resolved input names require captured evidence");
+	// Windows retains the cwd spelling; POSIX reports its physical path. Recreate the alias for rg itself.
+	if (process.platform !== "win32") cwd = realCwd;
 	const sourceTarget = directory ? rootStat.realPath : originalTarget;
 	const map = (source: string) => {
 		const relative = relativeFilesystemPath(volume, source);
 		assert.ok(relative !== undefined, "input crossed its declared filesystem root");
 		return path.join(privateVolume, relative);
 	};
-	const target = map(sourceTarget), logicalTarget = map(originalTarget), privateCwd = map(cwd), marker = "pi-directory-" + randomUUID();
+	const target = map(sourceTarget), logicalTarget = map(originalTarget), privateCwd = map(originalCwd), marker = "pi-directory-" + randomUUID();
 	const files = new Map<string, string | undefined>(), loaded = new Set<string>(), pending = new Map<string, string>(), linkedConfigurations = new Set<string>();
 	const directories = new Set<string>();
 	const mkdir = async (target: string) => {
 		if (directories.has(target)) return;
 		await fs.mkdir(target, { recursive: true }); directories.add(target);
+	};
+	const linkDirectory = async (source: string, target: string) => {
+		if (source === target) return;
+		await mkdir(path.dirname(target));
+		const existing = await fs.realpath(target).catch(error => { if (error.code !== "ENOENT") throw error; });
+		if (existing !== await fs.realpath(source)) await fs.symlink(source, target, process.platform === "win32" ? "junction" : "dir");
 	};
 	let entries = 0, inputBytes = 0;
 	const load = async (source: string, target: string) => {
@@ -593,7 +599,7 @@ async function prepareCapturedGrep(view: ToolFilesystemOperations, cwd: string, 
 		if (source !== sourceTarget) { await rules(source, map(source)); await admitDirectory(map(source), "*"); }
 		if (source === volume) break;
 	}
-	await mkdir(privateCwd);
+	await mkdir(map(realCwd)); await linkDirectory(map(realCwd), privateCwd);
 	const parents = new Set([target]), deny = path.join(destination, "glob-deny");
 	if (query.glob) await fs.writeFile(deny, "*\n", { flag: "wx" });
 	const selectedFiles = async (flags: readonly string[] = []) => {
@@ -614,10 +620,7 @@ async function prepareCapturedGrep(view: ToolFilesystemOperations, cwd: string, 
 	await walk(sourceTarget, target);
 	if (directory) {
 		await expand(target);
-		if (logicalTarget !== target) {
-			await mkdir(path.dirname(logicalTarget));
-			await fs.symlink(target, logicalTarget, process.platform === "win32" ? "junction" : "dir");
-		}
+		await linkDirectory(target, logicalTarget);
 	}
 	while (pending.size) {
 		const frontier = [...pending.keys()];

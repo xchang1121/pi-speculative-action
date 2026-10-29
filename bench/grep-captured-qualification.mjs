@@ -204,7 +204,7 @@ async function qualifyNamespace() {
     ["link-glob-physical-name", { path: "search/internal-link", glob: "search/nested/keep.txt" }],
     ["link-glob-directory", { path: "search/cycle-link", glob: "**/blocked{,/**}" }],
     ["link-glob-negative-directory", { path: "search/cycle-link", glob: "!**/nested/" }],
-    ["unproven-cwd-glob", { glob: "search/a.txt" }, true, cwdAlias],
+    ["cwd-alias-glob", { glob: "search/a.txt" }, false, cwdAlias],
     ["explicit-dangling-link", { path: process.platform === "win32" ? "edge-dangling-link/dangling-link" : "search/dangling-link" }, true],
     ...(process.platform === "win32" ? [
       ["discovered-external-link", { path: "edge-external-link" }],

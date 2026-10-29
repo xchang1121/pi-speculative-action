@@ -41,6 +41,8 @@ npm run bench:suite -- --suite swe_smoke --paired --repeats 1 --max-turns 32 --t
 
 `toolWaitMs` 为 Actor 调用区间的并集，覆盖准备至结算；`adoptionWaitMs` 扣除已消费的执行区间，表示纯协调等待。开关两臂都从实际事件记录计算、复用与回退，关闭预测不把已发生的复用记为零；缺少任务事件时，计算时长保持未知。任务时间从 Host 初始化前到终态回收完成；数据集下载、checkout、依赖安装及结束后的补丁验证不计入。CPU、反事实开销及端到端净收益须独立测量。
 
+命令复用链逐项输出 T、H、未掩盖计算 T−H、掩盖比例 H/T 和计算加速比。直接执行、Actor 等待及采纳等待放在 `diagnostics` 中，均不参与该加速比；失败后回退时，未被最终消费的借用计算不计入 H。
+
 报告包含成功、失败、较慢和零命中样本。原计算来源在产生时固定，借用与恢复保留归属，失配结算不因晚到复用改写，真实复用仍计 H。`traces` 保留来源请求、预测、候选及 Actor 原事件，以 turn/decision/prediction/candidate ID 关联；预算拒绝见 `source_request.empty.cause`。事件时间为 epoch 毫秒，单调计算端点加 `metadata.monotonicTimeOrigin` 对齐；完整计算图、区间和原点按 `actor_issue_boundary_compute_v3` 保存并按版本比较。
 
 `traces.slowCalls` 排列等待至少 500ms 的调用，连接唯一结算及相关预测，重复调用 ID 标记歧义；`summary.slowCallCoverage` 按逐调用累计等待计占比，与并行区间并集分开。缺失或损坏计时证据列入 `unmeasuredRuns`，失败列入 `invalidRuns`，已确认 H 和等待覆盖保留在 `diagnostics`；复用仍由执行证明决定。prompt 或回收失败时保留 `benchmarkErrors`、计时和 usage 后以失败退出，套件保留已有报告并停止后续任务。

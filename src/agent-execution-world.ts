@@ -8,7 +8,7 @@ import { CapturedFilesystemObject, mapFilesystem, sameFilesystemIdentity, withFi
 import { PI_ACTION_SEMANTICS, type ActionKey, type ActionSemanticsRegistry } from "./action-semantics.ts";
 import { DEFAULTS } from "./common.ts";
 import type { ExecutionWorld, ExecutionScope, ExecutionResourceContext, WorldBranch, WorldOutput, WorldCheckpoint, WorldResultCapture } from "./execution-world.ts";
-import { effectCommitFailure } from "./effect-transaction.ts";
+import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { effectCapabilitiesCover, RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
 import { captureResourceVersion, collectResourceComputation, invalidateResourceInputs, releaseResourceVersion, resourceProofBytes, validateResourceVersion,
 	ResourceReadView, ResourceInputSession, type ResourceInputPersistence, type ResourceInput, type ResourceObservation, type ResourceVersionToken, type ToolFilesystemOperations, type ToolFilesystemStat } from "./resource-version.ts";
@@ -408,6 +408,7 @@ export function bindResourceOperation(execute: NonNullable<ToolInvocation["files
 				if (typeof input === "string" || input instanceof Uint8Array) { if (Buffer.byteLength(input) > owned.maxBytes) return; input = Buffer.from(input); }
 				owned.inputs.set(target, input); if (bytes(owned) > owned.maxBytes) owned.inputs.delete(target);
 			};
+			let effectsStarted = false;
 			const host: ToolFilesystemOperations = {
 				readFile: (target, maxBytes) => read(view => view.readFile(target, maxBytes), async () => { const content = await fs.readFile(target); retain(target, content); return content.subarray(0, maxBytes); }),
 				access: (target, writable) => {
@@ -422,13 +423,13 @@ export function bindResourceOperation(execute: NonNullable<ToolInvocation["files
 				}),
 				readdir: target => read(view => view.readdir(target), async () => { const names = await fs.readdir(target); retain(target, { names }); return names; }),
 				mkdir: async target => {
-					unproven();
+					effectsStarted = true; unproven();
 					const created = await fs.mkdir(target, { recursive: true });
 					if (created) for (let directory = target; relativeFilesystemPath(path.toNamespacedPath(created), path.toNamespacedPath(directory)) !== undefined; directory = path.dirname(directory)) {
 						retain(directory, {}); if (path.dirname(directory) === directory) break;
 					}
 				},
-				writeFile: async (target, content) => { unproven(); await fs.writeFile(target, content, "utf-8"); retain(target, content); },
+				writeFile: async (target, content) => { effectsStarted = true; unproven(); await fs.writeFile(target, content, "utf-8"); retain(target, content); },
 				prepare: async (binding, key, build, consume, hint, signal = request.signal) => {
 					let consuming = false, completed: { value: Awaited<ReturnType<typeof consume>> } | undefined;
 					const use: typeof consume = async value => { consuming = true; completed = { value: await consume(value) }; return completed.value; };
@@ -439,7 +440,13 @@ export function bindResourceOperation(execute: NonNullable<ToolInvocation["files
 					try { return await use(resource.value); } finally { await resource.dispose(); }
 				},
 			};
-			try { return await execute(host, request); }
+			try { return await (native && completeObservation ? collectResourceComputation(() => execute(host, request)) : execute(host, request)); }
+			catch (error) {
+				// Only an explicitly supplied observation fallback may repeat an effect-free attempt.
+				unproven();
+				if (!native || !completeObservation || effectsStarted || isPoisonedEffectCommit(error)) throw error;
+				request.signal.throwIfAborted(); return await native(request);
+			}
 			finally { if (session !== owned?.session) await session?.dispose(); }
 		},
 	};

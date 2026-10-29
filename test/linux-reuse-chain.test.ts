@@ -8,6 +8,7 @@ import path from "node:path";
 import { createWriteTool } from "@earendil-works/pi-coding-agent";
 import { expect, test } from "vitest";
 import { patternAwareSettings } from "../src/pattern-aware.ts";
+import { toolSpeedup } from "../src/task-timing.ts";
 import { idleResources } from "./agent-system-fixture.ts";
 import { createLinuxProcessBenchmark, holdOwnedProcessPublication, patternProcessHost, textOutput } from "./linux-process-fixture.ts";
 
@@ -67,7 +68,8 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 			expect(timing).toMatchObject({ toolComputeMs: expect.any(Number), hiddenComputeMs: expect.any(Number), adoptionWaitMs: expect.any(Number) });
 			expect(timing!.toolComputeMs!).toBeGreaterThanOrEqual(timing!.hiddenComputeMs);
 			expect(timing!.adoptionWaitMs!).toBeGreaterThanOrEqual(0); expect(timing!.adoptionWaitMs!).toBeLessThanOrEqual(ms);
-			return { ms, text: textOutput(result as never), hits: after.hits - before.hits, reused: timing!.reused === true, hiddenMs: timing!.hiddenComputeMs };
+			return { ms, text: textOutput(result as never), hits: after.hits - before.hits, reused: timing!.reused === true,
+				computeMs: timing!.toolComputeMs!, hiddenMs: timing!.hiddenComputeMs, adoptionMs: timing!.adoptionWaitMs!, speedup: toolSpeedup(timing!) };
 		};
 		return { fixture, workspace, host, step, tools, events };
 	} catch (error) { await fixture.dispose(); throw error; }
@@ -88,7 +90,10 @@ test.skipIf(process.platform !== "linux")("reuse chain", { timeout: 3_600_000 },
 		const command = (scenario.actual ?? scenario.next).replace("WORKSPACE", workspace);
 		const measured = await step("measured", command, scenario.detour ? 100 : scenario.think ?? 4000, scenario.during);
 		const started = performance.now(), native = execSync(command, { cwd: workspace, encoding: "utf8", shell: "/bin/bash" }), nativeMs = performance.now() - started;
-		rows.push(`${name.padEnd(26)} native ${nativeMs.toFixed(0).padStart(5)} ms  Actor ${measured.ms.toFixed(0).padStart(5)} ms  hidden ${measured.hiddenMs.toFixed(0)} ms`);
+		rows.push(JSON.stringify({ name, toolComputeMs: measured.computeMs, hiddenComputeMs: measured.hiddenMs,
+			unhiddenComputeMs: measured.computeMs - measured.hiddenMs, hiddenFraction: measured.computeMs > 0 ? measured.hiddenMs / measured.computeMs : null,
+			toolSpeedup: measured.speedup, fullyHidden: measured.computeMs === measured.hiddenMs && measured.hiddenMs > 0,
+			diagnostics: { nativeMs, actorWaitMs: measured.ms, adoptionWaitMs: measured.adoptionMs } }));
 		expect(measured.text.trim(), name).toBe(native.trim());
 		// An adopted branch may start computing after Actor issue and legitimately hide no earlier work.
 		if (scenario.reuse) expect(measured.reused, JSON.stringify({ name, measured, metrics: fixture.backend.metrics(), events: events.slice(-20) })).toBe(true);
