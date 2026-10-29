@@ -48,6 +48,7 @@ export class RuntimeLifecycleLane extends PendingTasks {
 	private tail: Promise<void> = Promise.resolve();
 	private closeTask?: Promise<void>;
 	private readonly released = new WeakMap<object, Promise<void>>();
+	private owned?: Set<{ readonly dispose: () => void | Promise<void> }> = new Set();
 
 	get sealed(): boolean {
 		return this.closeTask !== undefined;
@@ -76,8 +77,29 @@ export class RuntimeLifecycleLane extends PendingTasks {
 		return this.track(this.enqueue(operation));
 	}
 
+	/** Register an owned resource once; admitted work may finish acquiring it during shutdown. */
+	own<Resource extends { readonly dispose: () => void | Promise<void> }>(resource: Resource): Resource {
+		if (!this.released.has(resource)) {
+			if (this.owned) this.owned.add(resource);
+			else void this.release(resource);
+		}
+		return resource;
+	}
+
+	/** Drain borrowers, release their resources, then finalize the owner's metadata. */
+	dispose(finalize: () => void | Promise<void> = () => {}): Promise<void> {
+		return this.close(async () => {
+			await this.drain();
+			const resources = this.owned; this.owned = undefined;
+			await Promise.all([...resources ?? []].map(resource => this.release(resource)));
+			await this.drain();
+			await finalize();
+		});
+	}
+
 	release(resource?: { readonly dispose: () => void | Promise<void> }): Promise<void> {
 		if (!resource) return Promise.resolve();
+		this.owned?.delete(resource);
 		const existing = this.released.get(resource);
 		if (existing) return existing;
 		const task = this.track(Promise.resolve().then(async () => {

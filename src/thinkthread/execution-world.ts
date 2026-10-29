@@ -190,10 +190,13 @@ async function forkThinkThreadWorld(
 	const tool = toolName(context.toolName);
 	const settings = runnerSettings(context.action, autoResizeImages, context.cwd);
 	const dependencies = actionDependencies(context);
-	const source = context.parentCheckpoint
+	const { lease: source, lineage, depth } = context.parentCheckpoint
 		? world.pool.acquireCheckpoint(context.parentCheckpoint)
 		: await world.pool.acquireRoot(context.executionScope ?? { sessionID: context.cwd, turnID: context.callID });
-	TimelineInterval.use(source.lease.computation);
+	TimelineInterval.use(source.computation);
+	const lifecycle = new RuntimeLifecycleLane();
+	lifecycle.own({ dispose: source.release });
+	const { client, durable, pool } = world;
 	let target: SnapshotLease | undefined;
 	let inputs: Awaited<ReturnType<typeof captureSnapshotInputs>>;
 	try {
@@ -206,18 +209,17 @@ async function forkThinkThreadWorld(
 		});
 		if (snapshotInputs && !context.parentCheckpoint && PI_ACTION_SEMANTICS.effect(tool) === "observation" &&
 			dependencies.length && dependencies.every((dependency) => dependency.scope === "content" || dependency.scope === "entries")) {
-			inputs = await captureSnapshotInputs(world, context, source.lease, dependencies, decodeThinkThreadToolRunnerRequest(request));
+			inputs = await captureSnapshotInputs(world, context, source, dependencies, decodeThinkThreadToolRunnerRequest(request));
+			if (inputs) {
+				lifecycle.own(inputs.branch);
+				lifecycle.own({ dispose: inputs.version.release });
+			}
 			context.signal.throwIfAborted();
-			if (inputs) return thinkThreadWorldBranch({
-				output: inputs.output, source: source.lease, lineage: source.lineage, depth: source.depth,
-				resources: context.action.resources, capturedBytes: 0,
-				nativeInputs: inputs.version, reusableInputs: inputs.branch,
-				executionFingerprint: context.action.executionFingerprint, ...world, dependencies,
-			});
+			if (inputs) return branch(inputs.output, context.action.resources, 0);
 		}
 		const writes: FsRunWrites = PI_ACTION_SEMANTICS.effect(tool) === "observation" ? "deny" : "snapshot";
 		const runParams: FsRunKeyParamsV1 = {
-			snapshotId: source.lease.id,
+			snapshotId: source.id,
 			writes,
 			invocation: {
 				argv: [nodePath, runnerPath],
@@ -234,121 +236,88 @@ async function forkThinkThreadWorld(
 			target = world.pool.ownSnapshot({
 				snapshotId: run.targetSnapshotId,
 			});
+			lifecycle.own({ dispose: target.release });
 		}
 		context.signal.throwIfAborted();
 		if (run.runKey !== expectedKey.runKey) throw new Error("ThinkThread fs.run returned an unexpected run key");
 		assertSuccessfulRun(run);
 		const output = decodeThinkThreadToolRunnerResponse(outputBytes(run.outputChunks, "stdout"));
 		const resources = target
-			? await changedResources(world.client, source.lease.id, target.id)
+			? await changedResources(world.client, source.id, target.id)
 			: [...context.action.resources];
-		return thinkThreadWorldBranch({
-			output,
-			source: source.lease,
-			target,
-			lineage: source.lineage,
-			depth: source.depth,
-			resources,
-			capturedBytes: Math.max(0, run.changedBytes ?? 0),
-			executionFingerprint: context.action.executionFingerprint,
-			client: world.client,
-			durable: world.durable,
-			pool: world.pool,
-			dependencies,
-		});
+		return branch(output, resources, Math.max(0, run.changedBytes ?? 0));
 	} catch (error) {
-		await Promise.allSettled([inputs?.branch.dispose(), inputs?.version.release(), target?.release(), source.lease.release()]);
+		await lifecycle.dispose();
 		throw error;
 	}
-}
 
-interface ThinkThreadBranchInput {
-	readonly output: ToolSettlement;
-	readonly source: SnapshotLease;
-	readonly target?: SnapshotLease;
-	readonly lineage: string;
-	readonly depth: number;
-	readonly resources: readonly string[];
-	readonly capturedBytes: number;
-	readonly executionFingerprint: string;
-	readonly client: AgentPosixClient;
-	readonly durable: DurableFsExecutor;
-	readonly pool: ThinkThreadSnapshotPool;
-	readonly dependencies: readonly FsDependency[];
-	readonly nativeInputs?: ResourceVersionToken;
-	readonly reusableInputs?: WorldBranch<ToolSettlement>;
-}
-
-function thinkThreadWorldBranch(input: ThinkThreadBranchInput): WorldBranch<ToolSettlement> {
-	const { output, source, target, client, durable, pool, dependencies, nativeInputs, reusableInputs } = input;
-	const commit = new EffectCommit<ToolSettlement>();
-	const lifecycle = new RuntimeLifecycleLane();
-	const nativeCause = async () => {
-		try { if (nativeInputs) await assertInputAuthority(nativeInputs); }
-		catch (error) { return cause("freshness", "thinkthread_input_authority_changed", error instanceof Error ? error.message : String(error)); }
-		return undefined;
-	};
-	const validate = (): Promise<ResourceValidation> => lifecycle.serialize(() => TimelineInterval.outside(async () => {
-		const before = await nativeCause();
-		const result = before ? undefined : await client.fs.verify({ snapshotId: source.id, dependencies: [...dependencies] });
-		const changed = before ?? await nativeCause();
-		const metrics = { bytesRead: result?.comparedBytes ?? 0,
-			filesRead: result?.comparedEntries ?? 0, mode: "exact" as const };
-		return changed || result?.status !== "matched"
-			? { status: "stale", cause: changed ?? cause("freshness", "thinkthread_dependency_changed"), metrics }
-			: { status: "valid", metrics };
-	}));
-	async function commitOnce(): Promise<ToolSettlement> {
-		if (!target) {
-			const validation = await validate();
-			if (validation.status === "valid") return output;
-			throw effectCommitFailure(new Error("ThinkThread speculative observation is stale"), "recoverable", undefined, validation.cause);
-		}
-		try {
-			await durable.apply({ baseSnapshotId: source.id, targetSnapshotId: target.id, dependencies: [...dependencies], policyId: "safe_content_v1" });
-			await pool.invalidate();
-			return output;
-		} catch (error) {
-			if (error instanceof ThinkThreadDurableError && error.code === "FsApplyConflict") {
-				throw effectCommitFailure(
-					error,
-					"recoverable",
-					"ThinkThread workspace changed before speculative adoption",
-					cause("freshness", "thinkthread_apply_conflict", error.message),
-				);
+	function branch(output: ToolSettlement, resources: readonly string[], capturedBytes: number): WorldBranch<ToolSettlement> {
+		const nativeInputs = inputs?.version, reusableInputs = inputs?.branch;
+		const commit = new EffectCommit<ToolSettlement>();
+		const nativeCause = async () => {
+			try { if (nativeInputs) await assertInputAuthority(nativeInputs); }
+			catch (error) { return cause("freshness", "thinkthread_input_authority_changed", error instanceof Error ? error.message : String(error)); }
+			return undefined;
+		};
+		const validate = (): Promise<ResourceValidation> => lifecycle.serialize(() => TimelineInterval.outside(async () => {
+			const before = await nativeCause();
+			const result = before ? undefined : await client.fs.verify({ snapshotId: source.id, dependencies: [...dependencies] });
+			const changed = before ?? await nativeCause();
+			const metrics = { bytesRead: result?.comparedBytes ?? 0,
+				filesRead: result?.comparedEntries ?? 0, mode: "exact" as const };
+			return changed || result?.status !== "matched"
+				? { status: "stale", cause: changed ?? cause("freshness", "thinkthread_dependency_changed"), metrics }
+				: { status: "valid", metrics };
+		}));
+		async function commitOnce(): Promise<ToolSettlement> {
+			if (!target) {
+				const validation = await validate();
+				if (validation.status === "valid") return output;
+				throw effectCommitFailure(new Error("ThinkThread speculative observation is stale"), "recoverable", undefined, validation.cause);
 			}
-			throw error;
+			try {
+				await durable.apply({ baseSnapshotId: source.id, targetSnapshotId: target.id, dependencies: [...dependencies], policyId: "safe_content_v1" });
+				await pool.invalidate();
+				return output;
+			} catch (error) {
+				if (error instanceof ThinkThreadDurableError && error.code === "FsApplyConflict") {
+					throw effectCommitFailure(
+						error,
+						"recoverable",
+						"ThinkThread workspace changed before speculative adoption",
+						cause("freshness", "thinkthread_apply_conflict", error.message),
+					);
+				}
+				throw error;
+			}
 		}
+		return {
+			output, backend: WORLD_ID, resources: Object.freeze([...resources]),
+			get capturedBytes() { return capturedBytes + (reusableInputs?.capturedBytes ?? 0); },
+			inputSource: reusableInputs?.inputSource, inputResources: reusableInputs?.inputResources,
+			invalidateInputs: reusableInputs?.invalidateInputs, reconstructionScope: reusableInputs?.reconstructionScope,
+			...(reusableInputs?.reconstruct ? { reconstruct: (request: Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0]) => lifecycle.admit(async () => {
+				const settings = runnerSettings(request.action, true, nativeInputs!.root);
+				const { resolvePiToolInvocation } = await import("../pi-tool-invocation.ts");
+				const invocation = resolvePiToolInvocation(request.action.tool, request.args, { cwd: nativeInputs!.root, environment: {}, ...settings });
+				if (!invocation?.filesystem) return undefined;
+				// The stock executor consumes the shared sealed-data protocol; its proof belongs only to this query.
+				return reusableInputs.reconstruct!({ ...request, action: { ...request.action, executionContext: invocation } });
+			}) } : {}),
+			checkpoint: pool.checkpoint(target ?? source, lineage, depth + 1),
+			executionMetrics: Object.freeze({}),
+			compatibility: Object.freeze({ status: "compatible", backend: WORLD_ID, executionFingerprint: context.action.executionFingerprint }),
+			validate,
+			validateAndCommit: target || reusableInputs ? undefined : async () => {
+				await commit.result;
+				const validation = await validate();
+				if (validation.status === "valid") await lifecycle.track(commit.run(async () => output));
+				return validation;
+			},
+			commit: () => lifecycle.sealed ? Promise.reject(new Error("ThinkThread branch is disposed")) : lifecycle.track(commit.run(commitOnce)),
+			dispose: () => lifecycle.dispose(),
+		};
 	}
-	return {
-		output, backend: WORLD_ID, resources: Object.freeze([...input.resources]),
-		get capturedBytes() { return input.capturedBytes + (reusableInputs?.capturedBytes ?? 0); },
-		inputSource: reusableInputs?.inputSource, inputResources: reusableInputs?.inputResources,
-		invalidateInputs: reusableInputs?.invalidateInputs, reconstructionScope: reusableInputs?.reconstructionScope,
-		...(reusableInputs?.reconstruct ? { reconstruct: (request: Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0]) => lifecycle.admit(async () => {
-			const settings = runnerSettings(request.action, true, nativeInputs!.root);
-			const { resolvePiToolInvocation } = await import("../pi-tool-invocation.ts");
-			const invocation = resolvePiToolInvocation(request.action.tool, request.args, { cwd: nativeInputs!.root, environment: {}, ...settings });
-			if (!invocation?.filesystem) return undefined;
-			// The stock executor consumes the shared sealed-data protocol; its proof belongs only to this query.
-			return reusableInputs.reconstruct!({ ...request, action: { ...request.action, executionContext: invocation } });
-		}) } : {}),
-		checkpoint: pool.checkpoint(target ?? source, input.lineage, input.depth + 1),
-		executionMetrics: Object.freeze({}),
-		compatibility: Object.freeze({ status: "compatible", backend: WORLD_ID, executionFingerprint: input.executionFingerprint }),
-		validate,
-		validateAndCommit: target || reusableInputs ? undefined : async () => {
-			await commit.result;
-			const validation = await validate();
-			if (validation.status === "valid") await lifecycle.track(commit.run(async () => output));
-			return validation;
-		},
-		commit: () => lifecycle.sealed ? Promise.reject(new Error("ThinkThread branch is disposed")) : lifecycle.track(commit.run(commitOnce)),
-		dispose: () => lifecycle.close(async () => {
-			await lifecycle.drain();
-			await Promise.allSettled([target?.release(), source.release(), nativeInputs?.release(), reusableInputs?.dispose()]);
-		}),
-	};
 }
 
 /** Consume immutable regular files and directory entries through the stock operation seam. */

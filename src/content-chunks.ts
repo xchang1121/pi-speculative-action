@@ -24,7 +24,7 @@ export class ContentChunkPool {
 		if (process.platform !== "linux") throw new Error("chunked input leases require qualified Linux filesystem semantics");
 		this.store = store; this.limits = Object.freeze({ ...DEFAULT_CONTENT_LIMITS, ...limits });
 		if (!isSafeCount(this.limits.maxLogicalBytes) || this.limits.maxLogicalBytes > 65536 * CONTENT_CHUNK_BYTES) throw new Error("invalid content chunk budget");
-		this.artifacts = new ArtifactReadView(store.artifacts, this.limits);
+		this.artifacts = this.lifetime.own(new ArtifactReadView(store.artifacts, this.limits));
 	}
 	get storedBytes(): number { return this.artifacts.bytes; }
 	get openChunks(): number { return this.artifacts.artifacts; }
@@ -104,11 +104,7 @@ export class ContentChunkPool {
 			return readChunkRange(offset, size, index => this.block(manifest, index));
 		});
 	}
-	dispose(): Promise<void> {
-		return this.lifetime.close(async () => {
-			await this.lifetime.drain(); await this.artifacts.dispose();
-		});
-	}
+	dispose(): Promise<void> { return this.lifetime.dispose(); }
 	private async block(manifest: ChunkedContentManifest, index: number): Promise<Buffer> {
 		const reference = manifest.chunks[index], size = Math.min(CONTENT_CHUNK_BYTES, manifest.size - index * CONTENT_CHUNK_BYTES);
 		if (!reference) return (zeroChunk ??= Buffer.alloc(CONTENT_CHUNK_BYTES)).subarray(0, size);

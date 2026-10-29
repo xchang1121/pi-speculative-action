@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
 	type AgentPosixClient,
 	type DurableMethod,
-	type EmptyResultV1,
+	type OperationMap,
 	type FsApplyParamsV1,
 	type FsApplyV1,
 	type FsRequestStatusV1,
@@ -40,10 +40,7 @@ export class DurableFsExecutor {
 	}
 
 	async snapshotCreate(): Promise<FsSnapshotViewV1> {
-		const requestID = this.requestID();
-		return this.execute("fs.snapshot.create", requestID, () =>
-			this.client.fs.snapshotCreate({ requestId: requestID }),
-		);
+		return this.execute("fs.snapshot.create", {});
 	}
 
 	runKeyWithInput(params: FsRunKeyParamsV1, input: Uint8Array): Promise<FsRunKeyV1> {
@@ -63,12 +60,11 @@ export class DurableFsExecutor {
 			signal.throwIfAborted();
 		}
 		const request = {
-			...params, requestId: requestID,
+			...params,
 			invocation: { ...params.invocation, stdinPayloadId: payload.payloadId },
 		};
 		try {
-			return await this.execute("fs.run", requestID, () => this.client.fs.run(request), signal,
-				(params.limits?.timeoutMs ?? 120_000) + 5_000);
+			return await this.execute("fs.run", request, signal, (params.limits?.timeoutMs ?? 120_000) + 5_000, requestID);
 		} catch (error) {
 			// Only a proven non-admission leaves the uploaded payload locally owned.
 			if (error instanceof ThinkThreadDurableError && error.code === "not_sent") {
@@ -80,15 +76,11 @@ export class DurableFsExecutor {
 	}
 
 	async apply(params: Omit<FsApplyParamsV1, "requestId">): Promise<FsApplyV1> {
-		const requestID = this.requestID();
-		return this.execute("fs.apply", requestID, () => this.client.fs.apply({ ...params, requestId: requestID }));
+		return this.execute("fs.apply", params);
 	}
 
 	async snapshotRemove(snapshotID: FsSnapshotId): Promise<void> {
-		const requestID = this.requestID();
-		await this.execute<EmptyResultV1>("fs.snapshot.remove", requestID, () =>
-			this.client.fs.snapshotRemove({ snapshotId: snapshotID, requestId: requestID }),
-		);
+		await this.execute("fs.snapshot.remove", { snapshotId: snapshotID });
 	}
 
 	async drainCleanup(rounds = 3): Promise<number> {
@@ -98,94 +90,63 @@ export class DurableFsExecutor {
 		return this.pendingCloses.size;
 	}
 
-	private async execute<Result>(
-		method: DurableMethod,
-		requestID: RequestId,
-		invoke: () => Promise<Result>,
+	private async execute<Method extends DurableMethod>(
+		method: Method,
+		params: Omit<OperationMap[Method]["params"], "requestId">,
 		signal?: AbortSignal,
 		timeoutMs = 5_000,
-	): Promise<Result> {
+		requestID = this.requestID(),
+	): Promise<OperationMap[Method]["result"]> {
+		type Result = OperationMap[Method]["result"];
+		const request = { ...params, requestId: requestID } as OperationMap[Method]["params"];
 		const deadline = performance.now() + timeoutMs;
+		let status: FsRequestStatusV1 | undefined, lastError: unknown, attempts = 0, terminal = false;
 		const cancel = () => {
 			if (method === "fs.run") void this.client.fs.requestCancel({ requestId: requestID }).catch(() => undefined);
 		};
 		signal?.addEventListener("abort", cancel, { once: true });
 		try {
-			let lastError: unknown;
-			for (let attempt = 0; attempt < MAX_INVOKE_ATTEMPTS; attempt++) {
-				if (signal?.aborted) throw new ThinkThreadDurableError(method, requestID, "not_sent", "Cancelled before admission", signal.reason);
-				try {
-					const result = await invoke();
-					await this.close(requestID);
-					return result;
-				} catch (error) {
-					lastError = error;
-					const underlying = error instanceof WorkflowError ? error.cause : error;
-					const transport = underlying instanceof TransportError ? underlying : undefined;
-					if (transport?.delivery === "not_sent") continue;
-					if (transport?.delivery === "completion_unknown" || underlying instanceof RejectedError) {
-						const status = await this.status(method, requestID);
-						if (status === undefined) {
-							if (transport) continue;
-							throw error;
-						}
-						return await this.settleStatus<Result>(method, requestID, status, deadline, signal);
+			for (;;) {
+				if (!status) {
+					if (attempts++ === MAX_INVOKE_ATTEMPTS) throw new ThinkThreadDurableError(method, requestID, "not_sent",
+						`${method} could not be delivered after ${MAX_INVOKE_ATTEMPTS} attempts`, lastError);
+					if (signal?.aborted) throw new ThinkThreadDurableError(method, requestID, "not_sent", "Cancelled before admission", signal.reason);
+					try {
+						const result = await this.client.invoke(method, request); terminal = true; return result;
+					} catch (error) {
+						lastError = error;
+						const underlying = error instanceof WorkflowError ? error.cause : error;
+						const transport = underlying instanceof TransportError ? underlying : undefined;
+						if (transport?.delivery === "not_sent") continue;
+						if (transport?.delivery !== "completion_unknown" && !(underlying instanceof RejectedError)) throw error;
+						status = await this.status(method, requestID);
+						if (!status && !transport) throw error;
 					}
-					throw error;
+					continue;
+				}
+				if (status.method !== method) throw new ThinkThreadDurableError(method, requestID, "method_mismatch", `Request belongs to ${status.method}, not ${method}`);
+				switch (status.state) {
+					case "succeeded":
+					case "cancelled":
+						// A cancelled fs.run can still own a TARGET; its caller must receive and release it.
+						terminal = true; return status.result as Result;
+					case "failed":
+						terminal = true; throw new ThinkThreadDurableError(method, requestID, status.error.code, status.error.message);
+					case "needs_recovery":
+						throw new ThinkThreadRecoveryRequiredError(method, requestID, status.error?.message ?? `${method} requires Runtime recovery`, status.error);
+					case "closing":
+						throw new ThinkThreadDurableError(method, requestID, "response_closing", "Response is closing without a locally retained result");
+					case "accepted":
+					case "running":
+						if (performance.now() >= deadline) throw new ThinkThreadRecoveryRequiredError(method, requestID, "Request did not settle before its recovery deadline");
+						if (signal?.aborted && method === "fs.run") await this.client.fs.requestCancel({ requestId: requestID }).catch(() => undefined);
+						await new Promise((resolve) => setTimeout(resolve, STATUS_POLL_MS));
+						status = (await this.status(method, requestID)) ?? missingStatus(method, requestID);
 				}
 			}
-			throw new ThinkThreadDurableError(
-				method,
-				requestID,
-				"not_sent",
-				`${method} could not be delivered after ${MAX_INVOKE_ATTEMPTS} attempts`,
-				lastError,
-			);
 		} finally {
+			if (terminal) await this.close(requestID);
 			signal?.removeEventListener("abort", cancel);
-		}
-	}
-
-	private async settleStatus<Result>(
-		method: DurableMethod,
-		requestID: RequestId,
-		initial: FsRequestStatusV1,
-		deadline: number,
-		signal?: AbortSignal,
-	): Promise<Result> {
-		let status = initial;
-		for (;;) {
-			if (status.method !== method) {
-				throw new ThinkThreadDurableError(method, requestID, "method_mismatch", `Request belongs to ${status.method}, not ${method}`);
-			}
-			switch (status.state) {
-				case "succeeded":
-				case "cancelled": {
-					// A cancelled fs.run can still own a TARGET; its caller must receive and release it.
-					const result = status.result as Result;
-					await this.close(requestID);
-					return result;
-				}
-				case "failed": {
-					await this.close(requestID);
-					throw new ThinkThreadDurableError(method, requestID, status.error.code, status.error.message);
-				}
-				case "needs_recovery":
-					throw new ThinkThreadRecoveryRequiredError(method, requestID, status.error?.message ?? `${method} requires Runtime recovery`, status.error);
-				case "closing":
-					throw new ThinkThreadDurableError(method, requestID, "response_closing", "Response is closing without a locally retained result");
-				case "accepted":
-				case "running":
-					if (performance.now() >= deadline) {
-						throw new ThinkThreadRecoveryRequiredError(method, requestID, "Request did not settle before its recovery deadline");
-					}
-					if (signal?.aborted && method === "fs.run") {
-						await this.client.fs.requestCancel({ requestId: requestID }).catch(() => undefined);
-					}
-					await new Promise((resolve) => setTimeout(resolve, STATUS_POLL_MS));
-					status = (await this.status(method, requestID)) ?? missingStatus(method, requestID);
-					break;
-			}
 		}
 	}
 

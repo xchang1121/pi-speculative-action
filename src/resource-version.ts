@@ -273,7 +273,6 @@ export class ResourceReadView {
 	private inputEpoch = 0;
 	private sealed = false;
 	private pending?: Promise<void>;
-	private disposal?: Promise<void>;
 	private dependencies?: Set<string>;
 	private lookup?: ResourceInputLookup;
 	private missing?: () => Promise<ResourceInputSource>;
@@ -290,7 +289,7 @@ export class ResourceReadView {
 	private readonly load?: (dependency: ResourceDependency) => Promise<void>;
 	private readonly observeObject?: (target: string, capture: StableFilesystemCapture) => void;
 	readonly contents?: ContentChunkPool;
-	private readonly contentOwners = new Map<ContentChunkPool, { readonly dispose: () => Promise<void> }>();
+	private readonly contentOwners = new Set<ContentChunkPool>();
 	readonly verifyingInputs: boolean;
 	constructor(maxBytes: number, load?: (dependency: ResourceDependency) => Promise<void>, boundary?: ResourceReadView["boundary"],
 		observeObject?: ResourceReadView["observeObject"], storage?: ContentChunkPool | "verify", memory?: ResourceInputMemory) {
@@ -413,6 +412,7 @@ export class ResourceReadView {
 		if (previous?.object && retained.object !== previous.object) this.releaseObject(previous);
 		this.objectCount += Number(retained.object !== undefined) - Number(previous?.object !== undefined);
 		if (retained.type === "file" && retained.content instanceof ChunkedContent) this.retainContentPool(retained.content.pool);
+		if (retained.object) this.preparations().lifetime.own(retained.object);
 		this.entries.set(key, { ...retained, bytes });
 	}
 	// Windows F_OK observes the final reparse point, including a dangling junction.
@@ -465,7 +465,8 @@ export class ResourceReadView {
 		if (entry?.object !== null || (entry.type === "file" ? !capture.stat.isFile() || !Buffer.isBuffer(entry.content) || !entry.content.equals(capture.content)
 			: entry.type !== "directory" || !capture.stat.isDirectory() || capture.bytesRead > (entry.objectBytes ?? 0) ||
 				!entry.entries || !capture.entries || !sameValues(entry.entries, capture.entries))) return false;
-		this.entries.set(key, { ...entry, ...(entry.type === "file" ? { content: capture.content } : { entries: capture.entries }), object: capture.object, computation: capture.computation });
+		this.entries.set(key, { ...entry, ...(entry.type === "file" ? { content: capture.content } : { entries: capture.entries }),
+			object: this.preparations().lifetime.own(capture.object), computation: capture.computation });
 		return true;
 	}
 	access = async (target: string): Promise<void> => { await this.readFile(target, 0); };
@@ -589,7 +590,7 @@ export class ResourceReadView {
 					let entries = retention.bindings.get(identity);
 					if (!entries) retention.bindings.set(identity, entries = new Map());
 					if (!entries.has(key) || entries.get(key) === pending) {
-						pending.retained = true; entries.set(key, pending); destination.capturedBytes += bytes;
+						pending.retained = true; entries.set(key, retention.lifetime.own(pending)); destination.capturedBytes += bytes;
 					}
 				}
 				// The origin keeps a borrowed lookup; the destination owns its bytes and disposal.
@@ -712,29 +713,22 @@ export class ResourceReadView {
 				origin: this, destination: this, borrowers: 0, retained: true, shareable: true, cancellation: new SharedAbortScope(), waiting: new Set(),
 				ready: Promise.resolve(), declined: Promise.resolve(), value: snapshot.value, data: snapshot.data,
 				dispose: () => { if (entries!.get(key) === restored) entries!.delete(key); this.capturedBytes -= bytes; restored.value = undefined; restored.data = undefined; } };
-			entries.set(key, restored);
+			entries.set(key, prepared.lifetime.own(restored));
 		}
 	}
 	seal(): void { if (this.pending) this.failure ??= new Error("resource_snapshot_capture_pending"); this.assertComplete(); this.sealed = true; }
 	dispose(): void | Promise<void> {
 		this.failure = new Error("resource_snapshot_disposed");
 		if (this.owner) return;
-		if (this.disposal) return this.disposal;
-		for (const owner of this.contentOwners.values()) void this.preparations().lifetime.release(owner);
 		this.contentOwners.clear();
-		for (const entry of this.entries.values()) this.releaseObject(entry);
 		this.entries.clear(); this.objectCount = 0;
-		const pending = this.prepared ? this.prepared.lifetime.close(async () => {
-			await this.prepared!.lifetime.drain();
-			await Promise.allSettled([this.pending, ...[...this.prepared!.bindings.values()].flatMap(entries => [...entries.values()].filter(resource => resource.destination === this).map(resource =>
-				this.prepared!.lifetime.release(resource)))]);
-			this.prepared!.bindings.clear();
-		}) : this.pending?.then(() => {}, () => {});
-		if (pending) return this.disposal = pending.finally(() => { this.capturedBytes = 0; });
+		if (this.pending) this.preparations().lifetime.track(this.pending);
+		if (this.prepared) return this.prepared.lifetime.dispose(() => { this.prepared!.bindings.clear(); this.capturedBytes = 0; });
 		this.capturedBytes = 0;
 	}
 	private retainContentPool(pool: ContentChunkPool): void {
-		if (!this.contentOwners.has(pool)) this.contentOwners.set(pool, { dispose: pool.retain() });
+		if (this.contentOwners.has(pool)) return;
+		this.contentOwners.add(pool); this.preparations().lifetime.own({ dispose: pool.retain() });
 	}
 	private releaseObject(entry: CapturedResource): void {
 		if (entry.object) void this.preparations().lifetime.release(entry.object);
@@ -1306,11 +1300,9 @@ const persistentManagers = new WeakMap<ResourceInputPersistence, Map<string, Res
 /** One call's finite input leases; records, proof checks and publication stay with the existing manager/store. */
 export class ResourceInputSession {
 	private readonly lifecycle = new RuntimeLifecycleLane();
-	private readonly restored = new Map<string, { readonly tokens: ResourceVersionToken[]; readonly ready: Promise<readonly ResourceVersionToken[]> }>();
-	private readonly owners = new Map<string, () => void | Promise<void>>();
+	private readonly roots = new Map<string, { readonly manager: ResourceVersionManager; recovered?: Promise<readonly ResourceVersionToken[]> }>();
 	private readonly published = new WeakSet<ResourceVersionToken>();
 	private readonly persistence: ResourceInputPersistence;
-	private readonly releaseContents: () => Promise<void>;
 	readonly memory: ResourceInputMemory;
 	readonly contents: ContentChunkPool;
 	readonly configuration: ResourceInputPersistence;
@@ -1321,31 +1313,36 @@ export class ResourceInputSession {
 		this.memory = new ResourceInputMemory(maxBytes);
 		this.contents = new ContentChunkPool(configuration.store, { ...configuration.limits,
 			maxStoredBytes: Math.min(configuration.limits?.maxStoredBytes ?? DEFAULT_CONTENT_LIMITS.maxStoredBytes, configuration.store.limits.maxBytes) });
-		this.releaseContents = this.contents.retain(); this.persistence = { ...configuration, contents: this.contents, memory: this.memory };
+		this.lifecycle.own({ dispose: this.contents.retain() }); this.persistence = { ...configuration, contents: this.contents, memory: this.memory };
 	}
 	get bytes(): number { return this.memory.bytes; }
 	get remainingBytes(): number { return this.memory.remainingBytes; }
 	run<Value>(operation: () => Promise<Value>): Promise<Value> { return this.lifecycle.admit(operation); }
 	retain(token: ResourceVersionToken, metadataBytes?: number): ResourceVersionToken { return token.manager.retain(token, metadataBytes, this.memory); }
-	private manager(root: string): ResourceVersionManager {
+	private root(root: string) {
 		if (this.lifecycle.sealed) throw new Error("resource_input_session_closed");
-		const key = path.resolve(root), manager = resourceManager(key, this.persistence);
-		if (!this.owners.has(key)) this.owners.set(key, manager.acquire());
-		return manager;
+		const key = path.resolve(root);
+		let entry = this.roots.get(key);
+		if (!entry) {
+			const manager = resourceManager(key, this.persistence);
+			this.lifecycle.own({ dispose: manager.acquire() }); this.roots.set(key, entry = { manager });
+		}
+		return entry;
 	}
 	async capture(action: ActionKey | undefined, root: string, semantics: ActionSemanticsRegistry, maxBytes: number,
 		providedInputs?: ReadonlyMap<string, ResourceInput>): Promise<ResourceVersionToken> {
-		this.manager(root);
+		this.root(root);
 		return captureResourceVersion(action, root, semantics, Math.min(maxBytes, this.remainingBytes), providedInputs, this.persistence);
 	}
 	async recover(root: string, signal: AbortSignal): Promise<readonly ResourceVersionToken[]> {
-		const key = path.resolve(root), prior = this.restored.get(key); if (prior) return prior.ready;
-		const tokens: ResourceVersionToken[] = [], manager = this.manager(key);
-		const ready = (async () => {
-			for await (const { token } of manager.recover(() => this.remainingBytes, { signal })) tokens.push(token);
+		const entry = this.root(root);
+		return entry.recovered ??= this.lifecycle.track((async () => {
+			const tokens: ResourceVersionToken[] = [];
+			for await (const { token } of entry.manager.recover(() => this.remainingBytes, { signal })) {
+				this.lifecycle.own({ dispose: token.release }); tokens.push(token);
+			}
 			return tokens;
-		})();
-		this.restored.set(key, { tokens, ready }); return ready;
+		})());
 	}
 	async publish(token: ResourceVersionToken, signal?: AbortSignal, inputs: readonly ResourceVersionToken[] = []): Promise<void> {
 		if (signal?.aborted || this.lifecycle.sealed || this.published.has(token) || this.bytes > this.maxBytes ||
@@ -1353,14 +1350,7 @@ export class ResourceInputSession {
 		try { await token.manager.persist(token, inputs); this.published.add(token); }
 		catch { /* Cache publication cannot replay or replace an already-consumed operation. */ }
 	}
-	dispose(): Promise<void> {
-		return this.lifecycle.close(async () => {
-			await this.lifecycle.drain();
-			await Promise.allSettled([...this.restored.values()].map(value => value.ready));
-			await Promise.allSettled([...this.restored.values()].flatMap(value => value.tokens).map(token => token.release())); this.restored.clear();
-			await this.releaseContents(); await Promise.allSettled([...this.owners.values()].map(release => release())); this.owners.clear();
-		});
-	}
+	dispose(): Promise<void> { return this.lifecycle.dispose(() => this.roots.clear()); }
 }
 
 export function resourceDependencies(action: ActionKey, root: string, actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS) {

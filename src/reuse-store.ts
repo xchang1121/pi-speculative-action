@@ -191,7 +191,8 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 					catch (error) { await handle.close(); throw error; }
 					await source?.dispose(); image = undefined;
 				}
-				signal?.throwIfAborted(); this.values.set(reference.digest, { reference: Object.freeze({ ...reference }), object, image, blocks }); object = undefined;
+				signal?.throwIfAborted();
+				this.values.set(reference.digest, { reference: Object.freeze({ ...reference }), object: object && this.lifetime.own(object), image, blocks }); object = undefined;
 				return true;
 			} finally { try { await snapshot?.close(); } finally { await object?.dispose(); } }
 		});
@@ -223,7 +224,7 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 			else { const loan = object!.lend(); if (!loan) throw new Error("artifact object lease is closed"); loans.push(loan); transfer.push({ reference, object: loan.transfer }); }
 		} return { transfer, release }; } catch (error) { release(); throw error; }
 	}
-	dispose(): Promise<void> { return this.lifetime.close(async () => { await this.lifetime.drain(); await Promise.allSettled([...this.values.values()].map(value => value.object?.dispose())); this.values.clear(); this.released?.(); }); }
+	dispose(): Promise<void> { return this.lifetime.dispose(() => { this.values.clear(); this.released?.(); }); }
 	private value(reference: ArtifactReference) {
 		const value = this.values.get(reference.digest);
 		if (!value || value.reference.size !== reference.size) throw new Error(`artifact is outside the verified closure: ${reference.digest}`); return value;
