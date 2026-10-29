@@ -307,7 +307,8 @@ async function qualifySearchExtension() {
 			...options, onEvent: (event) => { options.onEvent?.(event);
 				if (event.type === "source_request" && event.request.settlement.status === "error") candidate?.reject(new Error(JSON.stringify(event.request.settlement)));
 				if (event.type === "candidate" && event.candidate.origin === "prediction" && event.state.status !== "running") candidate?.resolve(event.state);
-			}, onActorActionSettled: (value) => { options.onActorActionSettled?.(value); settlement?.resolve(value.settlement); },
+				if (event.type === "actor_action") settlement?.resolve(event.settlement);
+			},
 		}) });
 		const loader = new DefaultResourceLoader({ cwd, agentDir: agent, settingsManager, noExtensions: true, extensionFactories: [extension] });
 		await loader.reload();

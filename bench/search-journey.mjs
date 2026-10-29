@@ -18,8 +18,8 @@ export function searchJourney({ cwd, name, tools, args, invocation, world, resou
 		onEvent: (event) => {
 			if (event.type === "candidate" && event.candidate.origin === "prediction" && event.state.status !== "running") candidate.resolve(event.state);
 			if (event.type === "prediction" && event.settlement.observation === "unobserved") candidate.resolve(event.settlement);
+			if (event.type === "actor_action") feedback?.resolve(event.settlement);
 		},
-		onActorActionSettled: ({ settlement }) => feedback?.resolve(settlement),
 	});
 	return { host, candidate: candidate.promise, authorized: authorized.promise, actorCalls: () => actorCalls,
 		start: async (id, predict = true) => {
@@ -35,7 +35,7 @@ export function searchJourney({ cwd, name, tools, args, invocation, world, resou
 				const output = await host.execute({ turnID, id, tool: name, args: query, tools }, undefined, async (operation) => {
 					assert.deepEqual(operation.invocation?.identity, invocation.identity, "Actor fallback must retain the selected executor independently of K(a)");
 					actorCalls++;
-					return (await operation.invocation.authoritative({ args: operation.input, signal: operation.signal, callID: operation.callID })).result;
+					return (await operation.invocation.authoritative({ args: operation.input, signal: operation.signal ?? new AbortController().signal, callID: operation.callID })).result;
 				});
 				const settlement = await bounded(feedback.promise, "Actor settlement");
 				assert.equal(actorCalls - before, settlement.provider.kind === "actor" ? 1 : 0, "each fallback executes the original Actor exactly once");
