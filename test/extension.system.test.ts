@@ -11,7 +11,6 @@ import { ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { currentExecutionScope } from "../src/execution-world.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import type { ProcessExecutionBinding, ProcessHandoffRegistry } from "../src/process-handoff.ts";
-import * as operationPreparation from "../src/execution-preparation.ts";
 import type { PredictionSettlement } from "../src/settlement.ts";
 import { SynchronousProcessObserver } from "../src/linux-process-sync.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
@@ -154,24 +153,19 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 		},
 	});
 	const events: SpeculativeActionEvent<string>[] = [];
-	const served: [string, boolean][] = [], prepare = operationPreparation.createExecutionPreparation;
-	vi.spyOn(operationPreparation, "createExecutionPreparation").mockImplementation((...args) => {
-		const owner = prepare(...args);
-		return { ...owner, connect: runtime => {
-			const disconnect = owner.connect(runtime), unsubscribe = runtime.subscribe({ prediction_feedback: feedback => {
-				if (feedback.settlement.prediction.source === owner.source.id && adoptions(feedback.settlement).length)
-					served.push([feedback.settlement.prediction.id, feedback.served]);
-			} });
-			return () => { disconnect(); unsubscribe(); };
-		} };
-	});
-
+	const served: [string, boolean][] = [];
 	let qualificationHost: ReturnType<typeof createSpeculativeActionHost>;
 	const extension = createSpeculativeActionExtension({
-		createHost: (id, options) => qualificationHost = createSpeculativeActionHost(id, {
-		...options, resources: { initial: { cpuCount: 4, idleCpuCount: 4 }, sample: () => new Promise(() => {}) },
-		onEvent: event => { events.push(event); return options.onEvent?.(event); },
-	}) });
+		createHost: (id, options) => {
+			const host = qualificationHost = createSpeculativeActionHost(id, {
+				...options, resources: { initial: { cpuCount: 4, idleCpuCount: 4 }, sample: () => new Promise(() => {}) },
+				onEvent: event => { events.push(event); return options.onEvent?.(event); },
+			});
+			host.runtime.subscribe({ prediction_feedback: ({ settlement, served: consumed }) => {
+				if (settlement.prediction.source === "execution_preparation" && adoptions(settlement).length) served.push([settlement.prediction.id, consumed]);
+			} });
+			return host;
+		} });
 	const settingsManager = SettingsManager.inMemory({}, { projectTrusted: true });
 	const resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noExtensions: true, extensionFactories: [pi => {
 		api = pi; pi.registerTool(callback("format_rows")); if (native) pi.registerTool(callback("produce_notes"));

@@ -284,7 +284,7 @@ export class PatternAwareStore {
 		settings = { ...settings, presets: presetSelection(settings.presets, patternAwareDefaults.presets) };
 		this.settings = settings;
 		this.sessionBudgets = patternSessionBudgets(settings.maxPatterns);
-		this.sessions = new BoundedRecencyMap(this.sessionBudgets.sessions);
+		this.sessions = new BoundedRecencyMap(this.sessionBudgets.sessions, session => this.finishSessionState(session));
 		this.resolvedActionKeys = new BoundedRecencyMap(settings.maxPatterns);
 		this.sequenceModel = new PpmCountTrie(settings.maxContextLength);
 		this.persistenceFile = persistenceFile;
@@ -353,8 +353,7 @@ export class PatternAwareStore {
 		let session = this.sessions.get(first.sessionID);
 		if (!session) {
 			session = { history: [], pending: [], recurrentActions: new BoundedRecencyMap(this.sessionBudgets.recurrentActionsPerSession) };
-			const evicted = this.sessions.set(first.sessionID, session)?.value;
-			if (evicted) this.finishSessionState(evicted);
+			this.sessions.set(first.sessionID, session);
 		}
 		const history = session.history;
 		this.resolvePendingBatch(session, events);
@@ -1589,24 +1588,8 @@ export function applyBindingsVariants(bindings: Readonly<Record<string, PatternA
 }
 
 function requiresProvenance(targetPath: PatternAwarePath, value: unknown): boolean {
-	const key = String(targetPath.at(-1) ?? "")
-		.toLowerCase()
-		.replaceAll("_", "");
-	if (isPathField(key)) return true;
-	if (typeof value !== "string") return false;
-	return [
-		"command",
-		"content",
-		"newstring",
-		"oldstring",
-		"patch",
-		"pattern",
-		"query",
-		"replacement",
-		"script",
-		"text",
-		"url",
-	].some((name) => key === name || key.endsWith(name));
+	const key = String(targetPath.at(-1) ?? "").toLowerCase().replaceAll("_", "");
+	return isPathField(key) || typeof value === "string" && /(?:command|content|newstring|oldstring|patch|pattern|query|replacement|script|text|url)(?![\s\S])/.test(key);
 }
 
 function stablePayloadConstant(samples: ReadonlyArray<PatternSample>, minimum: number): boolean {
@@ -1710,20 +1693,7 @@ function normalizeResourcePath(value: string, resourceRoot?: string) {
 
 function isPathField(key: string) {
 	const normalized = key.toLowerCase();
-	return (
-		normalized === "path" ||
-		normalized === "paths" ||
-		normalized === "file" ||
-		normalized === "files" ||
-		normalized === "filepath" ||
-		normalized === "filename" ||
-		normalized === "directory" ||
-		normalized === "cwd" ||
-		normalized === "root" ||
-		normalized === "uri" ||
-		normalized.endsWith("path") ||
-		normalized.endsWith("paths")
-	);
+	return normalized.endsWith("path") || normalized.endsWith("paths") || ["file", "files", "filename", "directory", "cwd", "root", "uri"].includes(normalized);
 }
 
 function* uniqueBy<Value>(values: Iterable<Value>, keyFor: (value: Value) => string): Generator<Value> {
@@ -1792,15 +1762,7 @@ function isPathSource(field: PatternAwareDependencySource["field"], sourcePath: 
 	if (!value.length || /[\r\n"'|&<>]/.test(value)) return false;
 	const key = String(sourcePath.at(-1) ?? "").toLowerCase();
 	if (field === "output" && ["content", "diff", "message", "output", "preview", "stderr", "stdout", "text"].includes(key)) return false;
-	return (
-		key.includes("path") ||
-		key.includes("file") ||
-		key.includes("dir") ||
-		key === "cwd" ||
-		key === "root" ||
-		key === "name" ||
-		/[\\/]/.test(value)
-	);
+	return /path|file|dir/.test(key) || ["cwd", "root", "name"].includes(key) || /[\\/]/.test(value);
 }
 
 function transform(operation: PathTransform, value: string) {

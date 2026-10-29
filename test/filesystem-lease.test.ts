@@ -1,29 +1,16 @@
 import { afterAll, expect, test } from "vitest";
-import { link, lstat, mkdir, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, readdir, rename, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import { pinFilesystemObject } from "../src/filesystem-evidence.ts";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 import { temporaryDirectories, readText } from "./filesystem.ts";
 
 const directories = temporaryDirectories("pi-object-lease-");
 afterAll(() => directories.dispose());
 const output = { result: { content: [], details: {} }, isError: false };
-
-test("retains an object while its names move and disappear", async () => {
-	const root = await directories.create(), directory = path.join(root, "directory"), moved = path.join(root, "moved");
-	await mkdir(directory); await writeFile(path.join(directory, "input"), "base");
-	const lease = await pinFilesystemObject(path.join(directory, "input"));
-	try {
-		await rename(directory, moved);
-		expect((await lstat(path.join(moved, "input"), { bigint: true })).ino).toBe(lease.stat.ino);
-		await unlink(path.join(moved, "input")); await writeFile(path.join(moved, "input"), "next");
-		expect((await lstat(path.join(moved, "input"), { bigint: true })).ino).not.toBe(lease.stat.ino);
-	} finally { await lease.close(); }
-});
 
 test.for([false, true])("adopts a renamed private directory and its checkpoint successor (checkpoint=%s)", async checkpoint => {
 	const bare = await directories.create(), root = await directories.create(), service = new WorkspaceSandboxService();
