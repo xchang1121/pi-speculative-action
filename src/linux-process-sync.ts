@@ -18,7 +18,7 @@ type SerializedDependency = Omit<TimelineDependency, "computation" | "shared"> &
 export interface SynchronousProcessRequest {
 	readonly gate: number; readonly sourceRoot: string; readonly scope?: ExecutionScope;
 	readonly learn: boolean; readonly reuseEnabled?: boolean; readonly descriptors?: boolean | "inspect"; readonly skipRoot?: boolean;
-	readonly handoffs: ProcessHandoffTransfer;
+	readonly handoffs?: ProcessHandoffTransfer;
 	readonly inputs?: readonly CapturedFilesystemTransfer[];
 	readonly owners?: readonly number[];
 	readonly claims: SharedArrayBuffer;
@@ -144,17 +144,17 @@ export class SynchronousProcessObserver {
 
 	attach(request: SynchronousProcessRequest, commit?: WorkspaceSandboxService["commitDelta"], borrow?: ProcessHandoffLender) {
 		const id = ++this.sequence;
-		this.callbacks.set(id, AsyncResource.bind(async (method, args: { delta: Omit<SandboxExecutionDelta, "changes"> & { changes: ContentChangesTransfer<SandboxWorkspaceChange> }; key: Parameters<ProcessHandoffLender>[0]; excluded: Parameters<ProcessHandoffLender>[1] }, context) => {
+		this.callbacks.set(id, AsyncResource.bind(async (method, args: { delta: Omit<SandboxExecutionDelta, "changes"> & { changes: ContentChangesTransfer<SandboxWorkspaceChange> }; key: Parameters<ProcessHandoffLender>[0]; excluded: Parameters<ProcessHandoffLender>[1]; join?: boolean }, context) => {
 			if (method === "effects" && commit) {
 				const contents = new ContentChunkPool(this.store);
 				try { return await commit({ ...args.delta, changes: await receiveContentChanges(args.delta.changes, contents) }); }
 				finally { await contents.dispose(); }
 			}
-			if (method === "borrow" && borrow) return borrow(args.key, args.excluded, context.signal);
+			if (method === "borrow" && borrow) return borrow(args.key, args.excluded, context.signal, args.join);
 			throw new Error("native observation callback unavailable");
 		}));
-		const buffers = request.handoffs.results.flatMap(result => [...result.artifacts.flatMap(artifact => "bytes" in artifact ? [artifact.bytes.buffer as ArrayBuffer] : []),
-			...(result.continuation ? [result.continuation.image.buffer as ArrayBuffer] : [])]);
+		const buffers = request.handoffs?.results.flatMap(result => [...result.artifacts.flatMap(artifact => "bytes" in artifact ? [artifact.bytes.buffer as ArrayBuffer] : []),
+			...(result.continuation ? [result.continuation.image.buffer as ArrayBuffer] : [])]) ?? [];
 		const pending = this.rpc.request<SynchronousProcessResult>("observe", { id, request }, undefined, undefined, request.asynchronous ? [] : buffers);
 		void pending.completion.catch(() => undefined);
 		const attached = pending.receive();

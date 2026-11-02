@@ -135,7 +135,7 @@ async function serveNativeBackend(port: MessagePort, clock: Int32Array, options:
 						try { return await rpc.call<ToolSettlement>("effects", { id, delta: { ...delta, changes: loan.transfer } }); }
 						finally { loan.release(); }
 					} : undefined,
-					request.asynchronous ? (key, excluded, signal) => rpc.call<Awaited<ReturnType<ProcessHandoffLender>>>("borrow", { id, key, excluded }, signal) : undefined);
+					request.asynchronous ? (key, excluded, signal, join) => rpc.call<Awaited<ReturnType<ProcessHandoffLender>>>("borrow", { id, key, excluded, join }, signal) : undefined);
 				observations.get(id)!.release = completed.release; return completed.result;
 			} finally { grants.delete(id); }
 		};

@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
 import { captureFileDependency, ProcessReusePlanner, ProvenanceCertificateStore, sealProcessCertificate, sha256Digest, type ProcessProvenanceCertificate, type VerifiedArtifactClosure } from "../src/process-reuse.ts";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry } from "../src/process-handoff.ts";
+import { ArtifactReadView } from "../src/reuse-store.ts";
 import { CapturedFilesystemObject, cachedCapture, captureFileDigest, captureStableFile, hashExecutableFile } from "../src/filesystem-evidence.ts";
 import { ResourceObjectInputs } from "../src/agent-execution-world.ts";
 import { observeStrace, traceTail, writesWithin } from "../src/strace-observer.ts";
@@ -153,6 +154,48 @@ test("requires current owner authority for a one-shot result in its original tur
 	await f.consume(f.actor(), "owned result");
 	await f.consume(f.actor(), undefined);
 	expect(acceptScope).toHaveBeenCalledWith(f.common.scope, true); // Keep the live owner's weakly held callback alive.
+	for (const mode of ["borrow", "snapshot"] as const) {
+		const work = await f.reserve(owner), certificate = await f.publish(work, mode);
+		const lend = vi.spyOn(ArtifactReadView.prototype, "lend"), restore = vi.spyOn(ArtifactReadView.prototype, "restore");
+		const loan = f.registry.lend(f.common.scope), receiver = own(new ProcessHandoffRegistry(f.store, 64 * 1024));
+		expect(lend).not.toHaveBeenCalled();
+		const received = receiver.receive(mode === "snapshot" ? structuredClone(loan.snapshot()) : loan.borrow, f.common.scope, loan.adopted);
+		cleanup.push(() => { received.close(); loan.settle(); });
+		expect(restore).not.toHaveBeenCalled(); expect(receiver.hasResults).toBe(false);
+		if (mode === "snapshot") expect(received.mayHaveExecutable(f.request.executablePath)).toBe(true);
+		await expect(received.borrow(sha256Digest("unrelated"), new Set())).resolves.toBeUndefined();
+		await expect(received.borrow(f.common.key, new Set([certificate.id]))).resolves.toBeUndefined();
+		await expect(received.borrow(f.common.key, new Set(), AbortSignal.abort())).resolves.toBeUndefined();
+		expect(restore).not.toHaveBeenCalled(); expect(loan.claimed()).toBe(false);
+		const result = await receiver.acquire({ ...f.common, borrow: received.borrow });
+		expect(result.kind).toBe("hit");
+		if (result.kind === "hit") {
+			expect(f.output(result.plan)).toBe(mode); expect(loan.claimed()).toBe(true);
+			result.settle?.(true); result.settle?.(true);
+		}
+		received.close(); loan.settle(); loan.settle();
+		expect(receiver.hasResults).toBe(false);
+		await expect(received.borrow(f.common.key, new Set())).resolves.toBeUndefined();
+		await expect(loan.borrow(f.common.key, new Set())).resolves.toBeUndefined();
+		await f.consume(f.actor(), undefined);
+		lend.mockRestore(); restore.mockRestore();
+	}
+	const running = await f.reserve(owner), loan = f.registry.lend(f.common.scope), receiver = own(new ProcessHandoffRegistry(f.store, 64 * 1024));
+	const received = receiver.receive(loan.borrow, f.common.scope, loan.adopted);
+	cleanup.push(() => { received.close(); loan.settle(); });
+	f.registry.observeRunning(f.common.key, running, async () => { await f.publish(running, "joined"); return true; });
+	const joined = await receiver.acquire({ ...f.common, borrow: received.borrow });
+	expect(joined).toMatchObject({ kind: "hit", joined: true });
+	if (joined.kind === "hit") { expect(f.output(joined.plan)).toBe("joined"); joined.settle?.(false); }
+	received.close(); loan.settle();
+	await f.consume(f.actor(), "joined");
+	const reusable = await f.reserve(); await f.publish(reusable, "retained", 1, false);
+	const cachedLoan = f.registry.lend(f.common.scope), cachedReceiver = own(new ProcessHandoffRegistry(f.store, 64 * 1024));
+	const cached = cachedReceiver.receive(cachedLoan.borrow, f.common.scope, cachedLoan.adopted);
+	cleanup.push(() => { cached.close(); cachedLoan.settle(); });
+	const hit = await cachedReceiver.acquire({ ...f.common, borrow: cached.borrow });
+	expect(hit).toMatchObject({ kind: "hit", producer: expect.any(Object) });
+	if (hit.kind === "hit") { expect(f.output(hit.plan)).toBe("retained"); hit.settle?.(true); }
 });
 
 test.each(["released", "consumed", "lost", "raced", "clear", "gc", "copy", "damaged"])("preserves checkpoint claim ownership across store reopen (%s)", async mode => {

@@ -201,7 +201,7 @@ interface NativeObservation {
 	readonly bindings: Map<number, ProcessExecutionBinding>; readonly computations: TimelineDependency[]; readonly heldClock: ActorHeldClock;
 	readonly metrics: MutableLinuxProcessReuseMetrics; readonly adoptions: SynchronousProcessResult["adoptions"][number][]; claims?: Int32Array;
 	effects?: Pick<WorkspaceSandboxService, "commitDelta">;
-	source?: { readonly available: Int32Array; readonly borrow: ProcessHandoffBorrow };
+	source?: { readonly available: (executable: string) => boolean; readonly borrow: ProcessHandoffBorrow };
 }
 
 /** Linux-only process substrate. Unavailable dependencies remove the route instead of weakening it. */
@@ -437,7 +437,8 @@ export class LinuxProcessReuseBackend {
 			inputs = observation?.inputs?.lend(Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes));
 			observer = this.processOwner();
 			const attachment = observer.attach({ gate: options.gate, scope: options.scope, sourceRoot: options.sourceRoot, descriptors: options.descriptors,
-				skipRoot: options.skipRoot, asynchronous: options.asynchronous, learn: !!observation?.learn, reuseEnabled: observation?.reuseEnabled, handoffs: loan.transfer, inputs: inputs?.transfer,
+				skipRoot: options.skipRoot, asynchronous: options.asynchronous, learn: !!observation?.learn, reuseEnabled: observation?.reuseEnabled,
+				handoffs: options.asynchronous ? undefined : loan.snapshot(), inputs: inputs?.transfer,
 				owners: observer.grants(options.scope), claims: claims.buffer as SharedArrayBuffer, ordering: observation?.ordering.buffer as SharedArrayBuffer | undefined,
 				lender: options.asynchronous ? this.localSource.buffer as SharedArrayBuffer : undefined },
 				options.asynchronous ? delta => this.replayWorkspace.commitDelta(delta) : undefined, options.asynchronous ? loan.borrow : undefined);
@@ -481,11 +482,10 @@ export class LinuxProcessReuseBackend {
 	/** Worker endpoint; the normal policy, native transport and observation admission remain authoritative. */
 	async observeSynchronous(request: SynchronousProcessRequest, attached: (pid?: number) => void, finished: Promise<void>, commitDelta?: WorkspaceSandboxService["commitDelta"], borrow?: ProcessHandoffLender) {
 		let observation: NativeObservation | undefined;
-		const receive = (transfer: SynchronousProcessRequest["handoffs"]) => this.handoffs.receive(transfer, request.scope, (index, adoption) => {
+		const receivedHandoffs = this.handoffs.receive(request.handoffs ?? borrow ?? { results: [] }, request.scope, (index, adoption) => {
 			const computation = adoption.computation && serializeNativeDependency(adoption.computation);
 			observation?.adoptions.push({ owner: { loan: index }, adoption: { ...adoption, computation } });
 		});
-		const releases = [await receive(request.handoffs)];
 		let bindings: SynchronousProcessResult["bindings"] = [], computations: SynchronousProcessResult["computations"] = [];
 		const maxBytes = Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes);
 		const received = request.inputs && ResourceObjectInputs.receive(request.inputs, maxBytes);
@@ -495,15 +495,9 @@ export class LinuxProcessReuseBackend {
 				observation = this.observations.getStore();
 				observation!.claims = new Int32Array(request.claims);
 				if (commitDelta) observation!.effects = { commitDelta };
-				if (borrow && request.lender) {
-					const available = new Int32Array(request.lender);
-					observation!.source = { available, borrow: async (key, excluded, signal) => {
-						if (!Atomics.load(available, 0)) return;
-						const loan = await borrow(key, excluded, signal); if (!loan) return;
-						const received = await receive(loan.transfer); releases.push(received);
-						return { records: received.records, joined: loan.joined };
-					} };
-				}
+				const available = request.lender && new Int32Array(request.lender);
+				observation!.source = { available: executable => available ? !!Atomics.load(available, 0) : receivedHandoffs.mayHaveExecutable(executable),
+					borrow: (key, excluded, signal, join) => available && !Atomics.load(available, 0) ? Promise.resolve(undefined) : receivedHandoffs.borrow(key, excluded, signal, join) };
 				if (request.ordering) observation!.ordering = new Int32Array(request.ordering);
 				const boundary = await this.heldBoundary(), options = this.nativeObservation(request.sourceRoot, request.scope);
 				const descriptors = options.descriptors === true || request.descriptors === true ? true : options.descriptors || request.descriptors;
@@ -519,7 +513,7 @@ export class LinuxProcessReuseBackend {
 			loan = received?.inputs.lend(maxBytes);
 			return { result: { bindings, computations, adoptions: observation!.adoptions, metrics: observation!.metrics, inputs: loan?.transfer },
 				release: () => { loan?.release(); return received?.dispose(); } };
-		} finally { for (const release of releases) release(); if (!loan) await received?.dispose(); }
+		} finally { receivedHandoffs.close(); if (!loan) await received?.dispose(); }
 	}
 
 	resetNativeObservation(): Promise<void> {
@@ -1393,7 +1387,7 @@ export class LinuxProcessReuseBackend {
 				this.add(undefined, "misses"); return measured({ kind: "continue" });
 			}
 			if (learning) { observation!.pending++; reserved = true; }
-			const available = observation?.reuseEnabled !== false && (observation?.source && Atomics.load(observation.source.available, 0) ||
+			const available = observation?.reuseEnabled !== false && (observation?.source?.available(executablePath) ||
 				this.handoffs.mayHaveExecutable(executablePath) || await this.store.mayHaveCertificates(executablePath, process.signal) ||
 				scope && await this.store.mayHaveProcessCheckpoints(scope.sessionID, executablePath, process.signal) || this.handoffs.mayHaveExecutable(executablePath));
 			// Concurrent discovery is bounded, but a full retained set never shuts discovery off for the rest of the call.
