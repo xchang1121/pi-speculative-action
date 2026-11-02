@@ -305,12 +305,7 @@ export class ProvenanceCertificateStore {
 		}, touched);
 	}
 
-	async get(id: Sha256Digest, signal?: AbortSignal): Promise<ProcessProvenanceCertificate | undefined> {
-		digestHex(id);
-		const value = (await this.query("SELECT value FROM certificates WHERE id = ?", [id], true, signal))[0]?.value, certificate = decodeCertificate(value);
-		if (value !== undefined && certificate?.id !== id) throw new Error(`certificate integrity check failed for ${id}`);
-		return certificate;
-	}
+	get(id: Sha256Digest, signal?: AbortSignal): Promise<ProcessProvenanceCertificate | undefined> { return this.record("certificates", id, decodeCertificate, signal); }
 
 	/** Reserve once inside the capture's publication. Clear and collection never reset the issuer. */
 	issueProcessCheckpoint(): Promise<string> {
@@ -381,25 +376,11 @@ export class ProvenanceCertificateStore {
 			database.prepare("INSERT OR REPLACE INTO input_versions VALUES (?, ?)").run(id, stableStringify(record)); return record;
 		}, [`input:${id}`, ...record.artifacts.map(reference => this.objectKey(this.artifacts.artifactPath(reference.digest)))]);
 	}
-	async getInputVersion(id: Sha256Digest, signal?: AbortSignal): Promise<StoredInputVersion | undefined> {
-		digestHex(id);
-		const value = (await this.query("SELECT value FROM input_versions WHERE id = ?", [id], false, signal))[0]?.value, record = decodeInputVersion(value);
-		if (value !== undefined && record?.id !== id) throw new Error(`input version integrity check failed for ${id}`);
-		return record;
-	}
+	getInputVersion(id: Sha256Digest, signal?: AbortSignal): Promise<StoredInputVersion | undefined> { return this.record("input_versions", id, decodeInputVersion, signal); }
 	/** Finite discovery hints, newest publication first; every row still needs current input and CAS validation. */
 	async *candidatesInputVersions(limit: number, signal?: AbortSignal): AsyncGenerator<StoredInputVersion> {
 		if (!Number.isSafeInteger(limit) || limit < 1 || limit > 65536) throw new Error("invalid input discovery limit");
-		const candidates = await this.query("SELECT id FROM input_versions ORDER BY rowid DESC LIMIT ?", [limit], false, signal);
-		for (const { id } of candidates) {
-			signal?.throwIfAborted(); this.signal.throwIfAborted();
-			if (!isSha256Digest(id)) continue;
-			const record = await this.getInputVersion(id, signal).catch(() => {
-				signal?.throwIfAborted(); this.signal.throwIfAborted(); return undefined;
-			});
-			signal?.throwIfAborted(); this.signal.throwIfAborted();
-			if (record) yield record;
-		}
+		yield* this.records("SELECT id, value FROM input_versions ORDER BY rowid DESC LIMIT ?", [limit], decodeInputVersion, false, signal);
 	}
 
 	async findByWeakKey(weakKey: Sha256Digest, executablePath: string, excludedCertificates?: ReadonlySet<Sha256Digest>): Promise<readonly ProcessProvenanceCertificate[]> {
@@ -410,13 +391,9 @@ export class ProvenanceCertificateStore {
 
 	/** Indexes only select candidates; every yielded certificate still verifies its complete identity. */
 	async *candidatesByWeakKey(weakKey: Sha256Digest, executablePath: string, excludedCertificates?: ReadonlySet<Sha256Digest>, signal?: AbortSignal): AsyncGenerator<ProcessProvenanceCertificate> {
-		const candidates = await this.query("SELECT id FROM certificates WHERE weakKey = ? AND executable = ? ORDER BY createdAt DESC, id DESC", [weakKey, executablePath], true, signal);
-		for (const { id } of candidates) {
-			signal?.throwIfAborted();
-			if (!isSha256Digest(id) || excludedCertificates?.has(id)) continue;
-			const certificate = await this.get(id, signal).catch(() => undefined);
-			if (certificate?.weakKey === weakKey) yield certificate;
-		}
+		for await (const certificate of this.records("SELECT id, value FROM certificates WHERE weakKey = ? AND executable = ? ORDER BY createdAt DESC, id DESC",
+			[weakKey, executablePath], decodeCertificate, true, signal))
+			if (certificate.weakKey === weakKey && !excludedCertificates?.has(certificate.id)) yield certificate;
 	}
 
 	/** An unavailable optional cache is a miss; live handoffs have their own availability check. */
@@ -539,6 +516,20 @@ export class ProvenanceCertificateStore {
 	}
 
 	private objectKey(target: string): string { return path.relative(this.root, target).split(path.sep).join("/"); }
+	private async record<T extends { readonly id: Sha256Digest }>(table: "certificates" | "input_versions", id: Sha256Digest, decode: (value: unknown) => T | undefined, signal?: AbortSignal): Promise<T | undefined> {
+		digestHex(id);
+		const value = (await this.query(`SELECT value FROM ${table} WHERE id = ?`, [id], table === "certificates", signal))[0]?.value, record = decode(value);
+		if (value !== undefined && record?.id !== id) throw new Error(`record integrity check failed for ${id}`);
+		return record;
+	}
+	/** One read snapshot supplies each finite candidate set; exact dependency validation still grants adoption. */
+	private async *records<T extends { readonly id: Sha256Digest }>(sql: string, parameters: SQLInputValue[], decode: (value: unknown) => T | undefined,
+		migrate: boolean, signal?: AbortSignal): AsyncGenerator<T> {
+		for (const { id, value } of await this.query(sql, parameters, migrate, signal)) {
+			signal?.throwIfAborted(); this.signal.throwIfAborted();
+			const record = decode(value); if (record?.id === id) yield record;
+		}
+	}
 	/** Every committed read owns fresh SQLite state. Legacy migration remains an explicit writer operation. */
 	private query(sql: string, parameters: SQLInputValue[], migrate: boolean, signal?: AbortSignal): Promise<Record<string, SQLOutputValue>[]> {
 		return this.read(async signal => {

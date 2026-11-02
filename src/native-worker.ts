@@ -10,11 +10,10 @@ import { lendContentChanges } from "./content-chunks.ts";
 import type { WorkspaceTransactionCapture, WorkspaceTransactionOwnership } from "./workspace-transaction.ts";
 import type { ToolProcessInvocation, ToolSettlement } from "./tool-settlement.ts";
 import type { ProcessExecutionRequest } from "./process-execution.ts";
-import { serializeNativeDependency, type SynchronousProcessRequest, type SynchronousProcessResult, type SerializedProcessBinding } from "./linux-process-sync.ts";
+import { serializeNativeDependency, type SynchronousProcessRequest, type SerializedProcessBinding } from "./linux-process-sync.ts";
 
 // Composition stays in the worker entry: clients never import the services they delegate to.
 type NativeSessionInput = Parameters<LinuxProcessReuseBackend["open"]>[0] & { readonly hasScopeOwner?: boolean };
-type SessionSnapshot = Pick<SynchronousProcessResult, "bindings" | "computations" | "metrics">;
 
 async function serveWorkspaceObservation(port: MessagePort, clock: Int32Array, options: SandboxWorkspaceTransfer, workspaces: Map<string, SandboxWorkspaceContext>) {
 	const observation = Promise.resolve().then(() => restoreWorkspaceObservation(options, () => rpc.call("hints"))), captures = new Map<number, WorkspaceTransactionCapture>(); let sequence = 0;
@@ -75,7 +74,12 @@ async function serveNativeBackend(port: MessagePort, clock: Int32Array, options:
 				const { id, operation, value } = args as { id: number; operation: string; value: never }, dispatch = works.get(id)?.dispatch;
 				if (!dispatch) throw new Error("native work retired"); return dispatch(operation, value, context);
 			}
-			if (method === "snapshot") return sessionSnapshot(args as number);
+			if (method === "snapshot") {
+				const { id, field } = args as { id: number; field: "metrics" | "bindings" | "computations" }, session = works.get(id)?.session;
+				if (!session) throw new Error("native work retired");
+				return field === "metrics" ? session.metrics() : field === "bindings" ? session.executionBindings().flatMap(binding => backend!.serializeBinding(binding) ?? [])
+					: session.computationDependencies().flatMap(dependency => serializeNativeDependency(dependency) ?? []);
+			}
 			if (method === "cancel") { works.get(args as number)?.controller?.abort(new Error("native work cancelled")); return; }
 			if (method === "release") { const entry = works.get(args as number); works.delete(args as number); entry?.controller?.abort(new Error("native work retired")); return entry?.session?.close(); }
 			if (method === "commit") {
@@ -100,11 +104,6 @@ async function serveNativeBackend(port: MessagePort, clock: Int32Array, options:
 			for (const [id, owner] of retained) if (!owner.ownership.deref()) retained.delete(id);
 			return { live: backend!.hasReusableWork, metrics: backend!.producerMetrics() };
 		});
-		const sessionSnapshot = (id: number): SessionSnapshot => {
-			const session = works.get(id)?.session; if (!session) throw new Error("native work retired");
-			return { metrics: session.metrics(), bindings: session.executionBindings().flatMap(binding => backend!.serializeBinding(binding) ?? []),
-				computations: session.computationDependencies().flatMap(dependency => serializeNativeDependency(dependency) ?? []) };
-		};
 		const openSession = async (id: number, input: NativeSessionInput) => {
 			const entry = works.get(id)!;
 			const adopted = (adoption: ExecutionOperationAdoption) => backend!.recordWorkerAdoption(id, adoption);

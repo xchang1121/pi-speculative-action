@@ -81,11 +81,12 @@ describe("persisted computation evidence", () => {
 		const prepared = new TimelineInterval(2000, 2100), dependency = serializeNativeDependency({ computation: prepared, shared: [prepared], reused: true })!;
 		const translated = (value: typeof graph) => ({ ...value, nodes: value.nodes.map(node => ({ ...node, clock: "other-worker",
 			startedAt: node.startedAt - (offset ?? 0), completedAt: node.completedAt - (offset ?? 0), timeOrigin: offset === undefined ? undefined : performance.timeOrigin + offset })) });
-		const restored = restoreNativeDependency({ ...dependency, computation: translated(dependency.computation), shared: dependency.shared!.map(translated) })!;
+		const restored = restoreNativeDependency({ ...dependency, computation: translated(dependency.computation), shared: dependency.shared!.map(span => ({
+			startedAt: span.startedAt - (offset ?? 0), completedAt: span.completedAt - (offset ?? 0), timeOrigin: offset === undefined ? undefined : performance.timeOrigin + offset })) })!;
 		expect(new TaskTimeline(0).recordTool(new TimelineInterval(1900, 2200, [restored]), 2200)).toMatchObject({
 			toolComputeMs: offset === undefined ? undefined : 300, hiddenComputeMs: offset === undefined ? 0 : 100,
 			...(offset === undefined ? { hiddenComputeIncomplete: true } : {}) });
-		expect(restoreNativeDependency({ ...dependency, shared: [{ ...graph, root: "missing" }] })).toBeUndefined();
+		expect(restoreNativeDependency({ ...dependency, shared: [{ startedAt: 2000, completedAt: NaN, timeOrigin: performance.timeOrigin }] })).toBeUndefined();
 	});
 
 	it("rejects malformed or cyclic graphs without issuing a successful receipt", async () => {

@@ -13,7 +13,7 @@ import type { SandboxWorkspaceChange } from "./workspace-sandbox.ts";
 
 type SerializedDependency = Omit<TimelineDependency, "computation" | "shared"> & {
 	readonly computation: SerializedTimelineComputation;
-	readonly shared?: readonly SerializedTimelineComputation[];
+	readonly shared?: readonly ReturnType<typeof TimelineInterval.span>[];
 };
 export interface SynchronousProcessRequest {
 	readonly gate: number; readonly sourceRoot: string; readonly scope?: ExecutionScope;
@@ -38,7 +38,6 @@ export interface SynchronousProcessResult {
 	readonly inputs?: readonly CapturedFilesystemTransfer[];
 }
 type NativeSessionInput = Parameters<LinuxProcessReuseBackend["open"]>[0];
-type SessionSnapshot = Pick<SynchronousProcessResult, "bindings" | "computations" | "metrics">;
 const retiredSessions = new FinalizationRegistry<{ readonly owner: WeakRef<SynchronousProcessObserver>; readonly id: number; readonly signal?: AbortSignal; readonly abort: () => void }>(({ owner, id, signal, abort }) => {
 	signal?.removeEventListener("abort", abort);
 	void owner.deref()?.call("release", id).catch(() => undefined);
@@ -46,19 +45,19 @@ const retiredSessions = new FinalizationRegistry<{ readonly owner: WeakRef<Synch
 type WorkerState = { readonly live: boolean; readonly metrics: WorldReuseMetrics };
 /** Preserve producer identities; shared intervals will be translated into the receiving caller's clock. */
 export function serializeNativeDependency(dependency: TimelineDependency): SerializedDependency | undefined {
-	const computation = TimelineInterval.serialize(dependency.computation), shared = dependency.shared?.map(TimelineInterval.serialize);
-	return computation && (!shared || shared.every(span => span !== undefined)) ? { ...dependency, computation, shared } : undefined;
+	const computation = TimelineInterval.serialize(dependency.computation);
+	return computation && { ...dependency, computation, shared: dependency.shared?.map(TimelineInterval.span) };
 }
 export function restoreNativeDependency(dependency: SerializedDependency): TimelineDependency | undefined {
 	const computation = TimelineInterval.restore(dependency.computation), shared: TimelineInterval[] = [];
 	let uncertain = dependency.computeUncertain;
-	for (const graph of dependency.shared ?? []) {
-		const restored = TimelineInterval.restore(graph), origin = graph.nodes.find(node => node.id === graph.root)?.timeOrigin;
-		if (!restored) return;
-		if (origin === undefined) { uncertain = true; continue; }
+	for (const { startedAt, completedAt, timeOrigin } of dependency.shared ?? []) {
+		if (![startedAt, completedAt].every(Number.isFinite) || startedAt < 0 || completedAt < startedAt) return;
+		if (timeOrigin === undefined) { uncertain = true; continue; }
+		if (!Number.isFinite(timeOrigin)) return;
 		// Shared time cuts the enclosing caller's clock; the original computation keeps its producer clock.
-		const offset = origin - performance.timeOrigin;
-		shared.push(new TimelineInterval(restored.startedAt + offset, restored.completedAt + offset));
+		const offset = timeOrigin - performance.timeOrigin;
+		shared.push(new TimelineInterval(startedAt + offset, completedAt + offset));
 	}
 	return computation ? { ...dependency, computation, shared, ...(uncertain ? { computeUncertain: true } : {}) } : undefined;
 }
@@ -116,7 +115,7 @@ export class SynchronousProcessObserver {
 				scope: input.scope, hasScopeOwner: !!input.acceptOperationScope, producer: TimelineInterval.producer }, signal);
 			const call = <Value>(operation: string, value?: unknown, request?: ProcessExecutionRequest, decode?: (value: unknown) => Promise<Value>) =>
 				this.rpc.call<Value>("session", { id: lease.id, operation, value }, request?.signal, request?.onData, decode);
-			const snapshot = () => this.read<SessionSnapshot>("snapshot", lease.id);
+			const snapshot = <Field extends "bindings" | "computations" | "metrics">(field: Field) => this.read<SynchronousProcessResult[Field]>("snapshot", { id: lease.id, field });
 			let closing: Promise<void> | undefined;
 			const ownership = new ProcessHandoffOwnership(input.onOperationAdopted, input.acceptOperationScope, undefined, authority, async <Value>(apply: () => Promise<Value>) => {
 				let value: Value; this.callbacks.set(lease.id, async () => { value = await apply(); });
@@ -130,9 +129,9 @@ export class SynchronousProcessObserver {
 					const result = await call<Awaited<ReturnType<LinuxProcessSession["executeBinding"]>>>("binding", value);
 					return { ...result, output: result.output.map(event => ({ ...event, data: Buffer.from(event.data) })) };
 				},
-				metrics: () => Object.freeze(snapshot().metrics),
-				executionBindings: () => Object.freeze(snapshot().bindings.flatMap(binding => backend.restoreBinding(binding) ?? [])),
-				computationDependencies: () => Object.freeze(snapshot().computations.flatMap(dependency => restoreNativeDependency(dependency) ?? [])),
+				metrics: () => Object.freeze(snapshot("metrics")),
+				executionBindings: () => Object.freeze(snapshot("bindings").flatMap(binding => backend.restoreBinding(binding) ?? [])),
+				computationDependencies: () => Object.freeze(snapshot("computations").flatMap(dependency => restoreNativeDependency(dependency) ?? [])),
 				seal: _changes => call("seal", [], undefined, value => receiveContentChanges(value as ContentChangesTransfer<SandboxWorkspaceChange>, input.workspace.contents)),
 				validate: () => call("validate"),
 				close: () => closing ??= call<void>("close").finally(() => signal?.removeEventListener("abort", abort)),

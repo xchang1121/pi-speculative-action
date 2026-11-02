@@ -1255,8 +1255,8 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 	const captureStructure = async (attempt = 1): Promise<WorkspaceStructureSnapshot> => {
 		const last = attempt >= WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS, snapshot = await workspace.structure.capture().catch((error: unknown) => { if (last || !(isMissing(error) || error instanceof FilesystemCaptureChangedError)) throw error; });
 		return snapshot && (snapshot.complete || last) ? snapshot : captureStructure(attempt + 1);
-	}, frontier = new Map(workspace.baselineFrontier);
-	let lastStructure = workspace.initialStructure;
+	};
+	let frontier = new Map(workspace.baselineFrontier), lastStructure = workspace.initialStructure, fenced = false;
 	let retainedBytes = [...frontier.values()].reduce((total, state) => total + contentMemory(state?.content), 0);
 	const active = new Set<Capture>(), lock = new RuntimeLifecycleLane(), unknown = new Set<string>(); // Bytes last seen while others wrote.
 	let poisonReason = lastStructure.complete ? undefined : "workspace_structure_limit";
@@ -1265,7 +1265,6 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 	if (!poisonReason) {
 		try {
 			clock = await openWorkspaceChangeClock(workspace);
-			await captureBefore();
 		} catch (error) {
 			poisonReason = `workspace_transaction_clock:${errorMessage(error)}`;
 		}
@@ -1279,7 +1278,7 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 				poisonReason = `workspace_transaction_sync:${errorMessage(error)}`;
 				return undefined;
 			});
-			const capture: Capture = { contaminated: false, overlapped, before: start?.before, frontier: new Map(frontier), unknown: new Set(unknown), racing: start?.racing ?? [] };
+			const capture: Capture = { contaminated: false, overlapped, before: start?.before, frontier, unknown: new Set(unknown), racing: start?.racing ?? [] };
 			active.add(capture);
 			return {
 				readBefore: (resource, maxBytes) => lock.serialize(async () => {
@@ -1296,7 +1295,7 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 
 	function markUnread(current: WorkspaceStructureSnapshot): void {
 		for (const resource of regularStructureTransitions(lastStructure, current)) unknown.add(resource);
-		lastStructure = current;
+		lastStructure = current; fenced = false;
 	}
 
 	/**
@@ -1304,24 +1303,18 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 	 * must not reach what it observed, and nothing may touch its own paths after it ended or while it ran.
 	 */
 	async function finish(capture: Capture, ownership?: () => Promise<WorkspaceTransactionOwnership | undefined>): Promise<WorkspaceTransactionDelta> {
-		const settled = await lock.serialize(async (): Promise<WorkspaceTransactionDelta | { readonly after: WorkspaceStructureSnapshot; readonly capturedAt: number; readonly paths: readonly string[] }> => {
+		const settled = await lock.serialize(async () => {
 			if (!active.delete(capture)) return { complete: false, changes: [], reason: "transaction_already_settled" };
 			if (capture.contaminated || capture.overlapped && !ownership) return { complete: false, changes: [], reason: "overlapping_workspace_transaction" };
 			if (!capture.before) return { complete: false, changes: [], reason: poisonReason ?? "workspace_transaction_unavailable" };
 			try {
-				const after = await captureStructure();
-				if (!capture.overlapped) {
-					await advanceWorkspaceChangeClock(clock, after);
-					if (!sameWorkspaceChangeSnapshot(after, await captureStructure())) throw new Error("workspace changed while fencing transaction endpoint");
-				}
-				const capturedAt = Date.now();
-				markUnread(after);
-				return { after, capturedAt, paths: regularStructureTransitions(capture.before, after) };
+				const after = (await captureBefore(capture.overlapped)).before;
+				return { after, capturedAt: Date.now(), paths: regularStructureTransitions(capture.before, after), frontier, unknown: new Set(unknown) };
 			} catch (error) {
 				return { complete: false, changes: [], reason: `workspace_transaction_capture:${errorMessage(error)}`, before: capture.before };
 			}
 		});
-		if ("complete" in settled) return settled;
+		if (settled.reason !== undefined) return { complete: false, changes: [], reason: settled.reason, before: settled.before };
 		const { after, capturedAt, paths } = settled, before = capture.before!, owned: WorkspaceTransactionOwnership | undefined = capture.overlapped
 			? await ownership!().catch(() => undefined) : { written: new Set(paths), observed: new Map(), endedAt: capturedAt, interfered: async () => false };
 		const incomplete = (reason: string) => ({ complete: false, changes: [], reason, before, after });
@@ -1356,7 +1349,8 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 				const previous = before.entries.get(relativePath)?.kind !== "file" ? undefined
 					: capture.frontier.has(relativePath) ? capture.frontier.get(relativePath) : await workspace.readBase(relativePath);
 				const entry = after.entries.get(relativePath);
-				const current = entry?.kind === "file" ? await readRegularState(path.resolve(sandboxRoot, relativePath), undefined, undefined, workspace.contents) : undefined;
+				const current = entry?.kind !== "file" ? undefined : !settled.unknown.has(relativePath) && settled.frontier.has(relativePath) ? settled.frontier.get(relativePath)
+					: await readRegularState(path.resolve(sandboxRoot, relativePath), undefined, undefined, workspace.contents);
 				beforeBytes += contentMemory(previous?.content); afterBytes += contentMemory(current?.content);
 				if (Math.max(beforeBytes, afterBytes) > WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES) return "workspace transaction exceeds memory budget";
 				if (entry?.kind === "file" && (!current?.identity || statChangeDigest(current.identity) !== entry.changeDigest)) return `overlapping_workspace_write:${relativePath}`;
@@ -1366,7 +1360,6 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 			const failure = captured.find((change): change is string => typeof change === "string");
 			if (failure !== undefined) return incomplete(failure);
 			changes = captured as WorkspaceRegularDelta[];
-			if (!capture.overlapped && !sameWorkspaceChangeSnapshot(after, await captureStructure())) return incomplete("workspace changed while sealing transaction endpoint");
 		} catch (error) { return incomplete(`workspace_transaction_capture:${errorMessage(error)}`); }
 		// Both object names and their owned directories advance together; everything else stays as it began.
 		for (const name of new Set([...before.entries.keys(), ...after.entries.keys()])) {
@@ -1381,16 +1374,17 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 		try {
 			for (let attempt = 0; attempt < WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS; attempt++) {
 				const current = await captureStructure();
+				if (fenced && !unknown.size && sameWorkspaceChangeSnapshot(current, lastStructure)) return { before: lastStructure = current, racing: [] };
 				await advanceWorkspaceChangeClock(clock, current);
-				const fenced = await captureStructure();
-				if (!sameWorkspaceChangeSnapshot(current, fenced)) continue;
-				markUnread(fenced);
+				const checkpoint = await captureStructure();
+				if (!sameWorkspaceChangeSnapshot(current, checkpoint)) continue;
+				markUnread(checkpoint);
 				// Quiet again: retain every endpoint that moved since the last known frontier.
-				await captureTransitions([...unknown], fenced);
+				await captureTransitions([...unknown], checkpoint);
 				unknown.clear();
 				const verified = await captureStructure();
-				if (!sameWorkspaceChangeSnapshot(fenced, verified)) continue;
-				lastStructure = verified;
+				if (!sameWorkspaceChangeSnapshot(checkpoint, verified)) continue;
+				lastStructure = verified; fenced = true;
 				return { before: verified, racing: [] };
 			}
 			throw new Error("workspace did not stabilize before transaction execution");
@@ -1416,6 +1410,7 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 	});
 
 	async function captureTransitions(paths: readonly string[], after: WorkspaceStructureSnapshot): Promise<void> {
+		if (paths.length) frontier = new Map(frontier); // Existing execution records keep the original version map.
 		// The lock and overlap rejection keep this frontier unchanged, and each file the size its snapshot took, throughout the interval: read those at once.
 		const sizes = paths.map(relativePath => { const entry = after.entries.get(relativePath); return entry?.kind === "file" ? entry.size : undefined; });
 		if (!workspace.contents && sizes.reduce<number>((total, size) => total + (size ?? 0), 0) > WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES) throw new Error("workspace transaction after-state exceeds capture limit");

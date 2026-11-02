@@ -172,6 +172,10 @@ export class TimelineInterval {
 		evidence(computation).incomplete = true;
 		return computation;
 	}
+	/** A shared overlap needs only its time range, not another copy of its dependency graph. */
+	static span(computation: TimelineInterval) {
+		return { startedAt: computation.startedAt, completedAt: computation.completedAt, timeOrigin: computationTimeOrigin(computation) };
+	}
 
 	/** Persist the complete immutable evidence used by recordCall, regardless of graph size. */
 	static serialize(computation: TimelineInterval): SerializedTimelineComputation | undefined {
