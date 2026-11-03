@@ -1084,8 +1084,8 @@ static int image_load(struct decision_job *job, size_t length, const char *physi
 		/* An inherited nameless backing belongs to the captured kernel object, not
 		 * the temporary pathname used to reconstruct its private producer. */
 		for (unsigned fd = 0; fd < image->fd_count && image->files[i] < 0; fd++) if (image->fds[fd].device == map->device && image->fds[fd].inode == map->inode)
-			for (unsigned pin = 0; pin < job->capture_count; pin++) if (job->captures[pin].descriptor == image->fds[fd].source) {
-				image->files[i] = reopen_descriptor(job->captures[pin].duplicate, O_RDONLY | O_CLOEXEC); break;
+			for (unsigned pin = 0; pin < job->position_count; pin++) if (job->positions[pin].descriptor == image->fds[fd].source) {
+				image->files[i] = reopen_descriptor(job->positions[pin].duplicate, O_RDONLY | O_CLOEXEC); break;
 			}
 		struct stat state;
 		if (image->files[i] < 0) image->files[i] = open(map->path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -2200,11 +2200,13 @@ static int outside_references_locked(struct decision_job *job, int pin) {
 }
 
 static void discard_captures(struct decision_job *job) {
+	int cancellation; pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation);
 	for (unsigned index = 0; index < job->capture_count; index++) {
 		struct file_position *capture = &job->captures[index];
-		close(capture->duplicate); free(capture->content); free(capture->messages.entries); free(capture->locks.entries);
+		close(capture->duplicate); free(capture->content); free(capture->path); free(capture->messages.entries); free(capture->locks.entries);
 	}
 	free(job->captures); job->captures = NULL; job->capture_count = 0;
+	pthread_setcancelstate(cancellation, NULL);
 }
 
 /* Queue references extend the same OFD graph. Peek handles become bounded job pins;
@@ -2222,7 +2224,7 @@ static int capture_rights(struct decision_job *job, struct queue_messages *messa
 		if (count == MAX_POSITIONS) goto fail;
 		if (other == job->capture_count) {
 			if (other == MAX_POSITIONS || *next == INT_MAX) goto fail;
-			job->captures[job->capture_count++] = (struct file_position){.descriptor = (*next)++, .duplicate = pin};
+			job->captures[job->capture_count++] = (struct file_position){.descriptor = (*next)++, .duplicate = pin, .writer = -1, .content_length = -1};
 		} else close(pin);
 		messages->entries[message].rights.fds[right] = -1;
 		ids[count++] = job->captures[other].descriptor;
@@ -2256,7 +2258,7 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 		if (!S_ISREG(state.st_mode) && !S_ISDIR(state.st_mode) &&
 			!((null_device(&state) || event || S_ISFIFO(state.st_mode) || S_ISSOCK(state.st_mode)) && descriptor != 1 && descriptor != 2)) { close(pin); continue; }
 		if (job->capture_count == MAX_POSITIONS) { close(pin); goto fail; }
-		job->captures[job->capture_count++] = (struct file_position){.descriptor = descriptor, .duplicate = pin, .installed = 1};
+		job->captures[job->capture_count++] = (struct file_position){.descriptor = descriptor, .duplicate = pin, .writer = -1, .content_length = -1, .installed = 1};
 	}
 	for (unsigned index = 0; index < job->capture_count; index++) for (unsigned previous = index; previous && job->captures[previous].descriptor < job->captures[previous - 1].descriptor; previous--) {
 		struct file_position swap = job->captures[previous]; job->captures[previous] = job->captures[previous - 1]; job->captures[previous - 1] = swap;
@@ -2283,13 +2285,23 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 			if (origin && other && ((same == 0) != (origin == other))) goto fail;
 			if (!same) { capture->alias = job->captures[previous].descriptor; break; }
 		}
-		if (capture->directory && !(flags & O_PATH)) capture->content_length = directory_bytes(pin, &capture->content);
+		if (capture->directory) {
+			char link[64], endpoint[PATH_MAX]; snprintf(link, sizeof(link), "/proc/self/fd/%d", pin);
+			ssize_t length = readlink(link, endpoint, sizeof(endpoint) - 1);
+			if (length < 0 || length == sizeof(endpoint) - 1) goto fail;
+			endpoint[length] = 0; capture->path = strdup(endpoint); if (!capture->path) goto fail;
+			if (!(flags & O_PATH)) capture->content_length = directory_bytes(pin, &capture->content);
+		} else if (capture->event) {
+			uint64_t value; unsigned semaphore;
+			if (event_state(getpid(), pin, &value, &semaphore) != capture->event || !(capture->content = malloc(9))) goto fail;
+			memcpy(capture->content, &value, 8); capture->content[8] = semaphore; capture->content_length = 9;
+		}
 		else if (capture->stream && !capture->event) {
 			capture->content_length = capture->stream >= 4 ? socket_bytes(pin, &capture->content, &capture->eof, &capture->messages,
 				owned_pin(job->domain, pin), &job->needs_tracking) : pipe_bytes(pin, &capture->content, &capture->eof);
 			if (capture_rights(job, &capture->messages, &next) < 0) goto fail;
 		}
-		if (capture->content_length < 0) goto fail;
+		if ((capture->stream || (capture->directory && !(flags & O_PATH))) && capture->content_length < 0) goto fail;
 		if (S_ISREG(state.st_mode) && capture->alias == capture->descriptor && capture_file_locks(getpid(), pin, &capture->locks) < 0) goto fail;
 	}
 	/* Ordinary null stdin keeps its profile unless a handle or queued right shares it. */
@@ -2347,9 +2359,8 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 			fputc(']', out);
 		}
 		if (capture->event) {
-			uint64_t value; unsigned semaphore;
-			if (event_state(getpid(), pin, &value, &semaphore) != capture->event) goto fail;
-			fprintf(out, ",\"counter\":{\"id\":%u,\"value\":\"%" PRIu64 "\",\"semaphore\":%u}", capture->event - 1, value, semaphore);
+			uint64_t value; memcpy(&value, capture->content, 8);
+			fprintf(out, ",\"counter\":{\"id\":%u,\"value\":\"%" PRIu64 "\",\"semaphore\":%u}", capture->event - 1, value, capture->content[8]);
 		} else if ((capture->directory && !(capture->flags & O_PATH)) || capture->stream) {
 			fprintf(out, ",\"%s\":", capture->directory ? "directoryHex" : "queueHex");
 			json_hex(out, capture->content, (size_t)capture->content_length);
@@ -3063,11 +3074,11 @@ static int actor_decision(struct decision_job *job) {
 	if (!strcmp(line, "C")) return -1;
 	if (!strcmp(line, "F")) return -2;
 	if (!strcmp(line, "O")) return connection;
-	if (sscanf(line, "P %u %u %zu %u %u %zu %u %u", &code, &job->count, &total, &job->position_count, &job->resource_count,
+	if (sscanf(line, "P2 %u %u %zu %u %u %zu %u %u", &code, &job->count, &total, &job->position_count, &job->resource_count,
 		&image_bytes, &physical_length, &source_length) != 8 || code > 256 || (code == 256) != (image_bytes != 0) ||
 		image_bytes > IMAGE_BYTES + sizeof(struct image_header) + MAX_LINE || physical_length >= PATH_MAX || source_length >= PATH_MAX ||
 		(!image_bytes && (physical_length || source_length)) ||
-		job->count > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES || job->position_count > MAX_POSITIONS || job->resource_count > 1024) goto decline;
+		job->count > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES || job->position_count > job->capture_count || job->resource_count > 1024) goto decline;
 	if (job->position_count) {
 		job->positions = calloc(job->position_count, sizeof(*job->positions));
 		if (!job->positions) goto decline;
@@ -3078,34 +3089,21 @@ static int actor_decision(struct decision_job *job) {
 	size_t received = 0;
 	for (unsigned index = 0; index < job->position_count; index++) {
 		struct file_position *position = &job->positions[index];
-		unsigned path_length;
-		if (read_line(connection, line, sizeof(line)) < 0 ||
-			sscanf(line, "S %d %ju %ju %d %" SCNd64 " %" SCNd64 " %" SCNd64 " %d %u %d %d %d %d %u %d %d %u %u %u", &position->descriptor,
-				&position->device, &position->inode, &position->flags, &position->before, &position->after, &position->content_length, &position->after_flags, &path_length, &position->eof,
-				&position->capacity, &position->shutdown, &position->peer_shutdown, &position->peer_inode, &position->peer_queued, &position->allocated, &position->event, &position->messages.count, &position->socket_type) != 19 || position->messages.count > MAX_POSITIONS || position->eof < -1 || position->eof > 1 ||
-			(position->socket_type && position->socket_type != SOCK_STREAM && position->socket_type != SOCK_DGRAM && position->socket_type != SOCK_SEQPACKET) ||
-			position->capacity < 0 || position->shutdown < 0 || position->shutdown > 3 || position->peer_shutdown < 0 || position->peer_shutdown > 3 ||
-			position->peer_queued < 0 || position->allocated < 0 ||
-			position->descriptor < 0 || position->before < 0 || position->after < 0 || position->content_length < -1 ||
-			path_length >= PATH_MAX || path_length > total - received || position->after_flags < 0 || ((position->flags ^ position->after_flags) & ~(O_APPEND | O_NONBLOCK)) ||
-			(position->content_length >= 0 && (uint64_t)position->content_length > total - received - path_length)) goto decline;
-		unsigned messages = position->messages.count; position->messages.count = 0;
-		for (unsigned index = 0; index < messages; index++) {
-			struct queue_message message = {0}; int descriptor;
-			if (read_line(connection, line, sizeof(line)) < 0 || parse_queue_message(line, &descriptor, &message) < 0 || descriptor != position->descriptor ||
-				message.end > (uint64_t)position->content_length || append_message(&position->messages, &message) < 0) goto decline;
+		unsigned source; int flags; int64_t after, length;
+		if (read_line(connection, line, sizeof(line)) < 0 || sscanf(line, "S %u %" SCNd64 " %d %" SCNd64, &source, &after, &flags, &length) != 4 ||
+			source >= job->capture_count || after < 0 || flags < 0 || length < -1 || (length >= 0 && (uint64_t)length > total - received)) goto decline;
+		struct file_position *capture = &job->captures[source];
+		if (capture->duplicate < 0 || ((capture->flags ^ flags) & ~(O_APPEND | O_NONBLOCK)) ||
+			(length >= 0 && (capture->stream || capture->directory))) goto decline;
+		/* Transfer the original record, including its queue and OFD pins. The reply
+		 * carries effects only; it cannot replace the prestate used by admission. */
+		*position = *capture; *capture = (struct file_position){.duplicate = -1, .writer = -1};
+		position->alias = 0; position->after = after; position->after_flags = flags;
+		if (length >= 0) {
+			position->content_length = length;
+			if (length && (!(position->content = malloc((size_t)length)) || transfer(connection, position->content, (size_t)length, 0) < 0)) goto decline;
+			received += (size_t)length;
 		}
-		if (path_length) {
-			position->path = calloc((size_t)path_length + 1, 1);
-			if (!position->path || transfer(connection, position->path, path_length, 0) < 0) goto decline;
-			if (*position->path != '/' || strlen(position->path) != path_length) goto decline;
-			received += path_length;
-		}
-		if (position->content_length > 0) {
-			position->content = malloc((size_t)position->content_length);
-			if (!position->content || transfer(connection, position->content, (size_t)position->content_length, 0) < 0) goto decline;
-		}
-		if (position->content_length >= 0) received += (size_t)position->content_length;
 	}
 	job->events = calloc(job->count + job->resource_count + 1, sizeof(*job->events));
 	if (!job->events) goto decline;
@@ -3139,34 +3137,12 @@ static int actor_decision(struct decision_job *job) {
 		received += image_bytes + physical_length + source_length;
 	}
 	if (received != total) goto decline;
-	for (unsigned index = 0; index < job->position_count; index++) {
-		struct file_position *position = &job->positions[index];
-		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-		position->installed = 1;
-		for (unsigned capture = 0; capture < job->capture_count; capture++) if (job->captures[capture].descriptor == position->descriptor) {
-			position->duplicate = job->captures[capture].duplicate; job->captures[capture].duplicate = -1;
-			position->locks = job->captures[capture].locks; job->captures[capture].locks = (struct file_locks){0};
-			position->outside = job->captures[capture].outside;
-			position->installed = job->captures[capture].installed; break;
-		}
-		if (!job->capture_count) position->duplicate = duplicate_tracee_fd(job, (unsigned)position->descriptor);
-		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-	}
 	/* Replay may represent fewer queues than capture; prove external owners again. */
 	clear_references(job);
 	/* Capturing is not ownership: unused pins cannot prolong last-close lifetime. */
-	for (unsigned index = 0; index < job->capture_count; index++) { close(job->captures[index].duplicate); job->captures[index].duplicate = -1; }
+	discard_captures(job);
 	for (unsigned index = 0; index < job->position_count; index++) {
 		struct file_position *position = &job->positions[index];
-		struct stat state;
-		if (position->duplicate >= 0 && fstat(position->duplicate, &state) == 0) position->directory = S_ISDIR(state.st_mode);
-		if (position->event) position->stream = 6;
-		if (position->duplicate >= 0 && fstat(position->duplicate, &state) == 0 && (S_ISFIFO(state.st_mode) || S_ISSOCK(state.st_mode))) {
-			struct file_position current = {0};
-			if (stream_state(position->duplicate, &current) < 0) goto decline;
-			position->stream = current.stream;
-		}
-		if (position->stream && position->eof < 0) position->eof = 1;
 		struct resource_object *object = pin_object(job->domain, position->duplicate);
 		if (position->stream && (!object || (position->event ? object->event != position->event : position->stream >= 4 ? !object->channel : !object->pipe))) goto decline;
 		if (position->duplicate < 0 || !position_matches(position, job)) goto decline;

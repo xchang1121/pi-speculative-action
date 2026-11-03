@@ -18,6 +18,7 @@ import {
 } from "./provenance-certificate.ts";
 import { containsFilesystemPath } from "./path-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
+import { immutableSnapshot } from "./stable-json.ts";
 import { captureWorkspaceFileAliases } from "./process-observation.ts";
 import { qualifyNativeStartup, resolveLinuxExecHelper, startupScope } from "./process-startup.mjs";
 export { resolveLinuxExecHelper } from "./process-startup.mjs";
@@ -231,12 +232,12 @@ export type HeldExecDecision = { readonly observeTiming?: (timing: HeldExecTimin
 			readonly output: readonly { readonly fd: 1 | 2; readonly data: Buffer }[];
 			readonly resourceEvents?: readonly { readonly fd: number; readonly kind: ResourceTransitionKind; readonly data: Buffer; readonly requested?: number }[];
 			/** Applied after commit, before output. The caller owns predecessor proof and serialization of every OFD sharer. */
-			readonly descriptorOffsets?: readonly (Pick<HeldFileDescriptor, "fd" | "device" | "inode" | "flags" | "eof" | "capacity" | "socket" | "messages"> & {
-				readonly before: OFDPosition; readonly after: OFDPosition; readonly afterFlags?: number; readonly path?: string;
-				/** File replacement bytes, or the expected full pipe queue before consuming `after` bytes. */
+			readonly descriptorOffsets?: readonly {
+				/** The exact record supplied by this held execution; its native owner keeps the prestate. */
+				readonly source: HeldFileDescriptor; readonly after: OFDPosition; readonly afterFlags?: number;
+				/** Replacement bytes for a regular file. Queues and directories borrow their original capture. */
 				readonly content?: Buffer;
-				readonly event?: number;
-			})[];
+			}[];
 			/** Called only after the native tracer has made original execution impossible. */
 			readonly commit: () => Promise<void>;
 			readonly adopted?: () => void;
@@ -447,38 +448,32 @@ export class LinuxHeldExecBoundary {
 				if (native) completedAt = native.startedAt;
 				return;
 			}
-			const positions = decision.descriptorOffsets?.map(position => ({ ...position, afterFlags: position.afterFlags ?? position.flags })) ?? [];
+			const positions = decision.descriptorOffsets?.map(position => ({ ...position, index: request.descriptors?.indexOf(position.source) ?? -1,
+				afterFlags: position.afterFlags ?? position.source.flags })) ?? [];
 			const resourceEvents = decision.resourceEvents ?? [];
 			const continuation = decision.continuation;
 			const code = continuation ? 256 : decision.exitCode!;
 			const physicalRoot = Buffer.from(continuation?.physicalRoot ?? ""), sourceRoot = Buffer.from(continuation ? active.sourceRoot : "");
 			const total = [...decision.output, ...resourceEvents].reduce((sum, event) => sum + event.data.length, 0) +
-				positions.reduce((sum, position) => sum + (position.content?.length ?? 0) + Buffer.byteLength(position.path ?? ""), 0) +
+				positions.reduce((sum, position) => sum + (position.content?.length ?? 0), 0) +
 				(continuation?.image.length ?? 0) + physicalRoot.length + sourceRoot.length;
 			const descriptors = new Set<number>();
 			if (!isSafeCount(code, 0, continuation ? 256 : 255) ||
 				continuation && (!Buffer.isBuffer(continuation.image) || !continuation.image.length || continuation.image.length > 65 * 1024 * 1024 ||
 					!path.isAbsolute(continuation.physicalRoot) || continuation.physicalRoot.includes("\0") || physicalRoot.length >= 4096 || sourceRoot.length >= 4096) ||
 				decision.output.length > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES || positions.length > 64 || positions.some(position => {
-					const duplicate = descriptors.has(position.fd); descriptors.add(position.fd);
-					return duplicate || position.path !== undefined && (typeof position.path !== "string" || !path.isAbsolute(position.path) || position.path.includes("\0") || Buffer.byteLength(position.path) >= 4096) ||
-						!validQueueMessages(position.messages, position.content?.length ?? 0) ||
-						position.content !== undefined && !Buffer.isBuffer(position.content) ||
-						![position.capacity ?? 0, position.event ?? 0, ...Object.values(position.socket ?? {})].every(value => isSafeCount(value)) || (position.event ?? 0) > 0x80000000 ||
-						![position.before, position.after].every(isOFDPosition) ||
-						![position.fd, position.flags, position.afterFlags].every(value => isSafeCount(value)) ||
-						((position.flags ^ position.afterFlags) & ~0xc00) !== 0 ||
-						position.fd > 0x7fffffff || position.flags > 0x7fffffff || position.afterFlags > 0x7fffffff || ![position.device, position.inode].every(value =>
-							typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 0xffffffffffffffffn);
+					const duplicate = descriptors.has(position.source.fd); descriptors.add(position.source.fd);
+					return duplicate || position.index < 0 || !isOFDPosition(position.after) ||
+						position.content !== undefined && (position.source.type !== undefined || !Buffer.isBuffer(position.content)) ||
+						!isSafeCount(position.afterFlags, 0, 0x7fffffff) || ((position.source.flags ^ position.afterFlags) & ~0xc00) !== 0;
 				}) || resourceEvents.length > 1024 || resourceEvents.some(event => !descriptors.has(event.fd) ||
 					!RESOURCE_TRANSITIONS.includes(event.kind) || !Buffer.isBuffer(event.data) || event.data.length > 2 * 1024 * 1024 ||
 					event.requested !== undefined && (!isSafeCount(event.requested, 0, 2 * 1024 * 1024)))) return void socket.end("C\n");
 			// Once a proposal is delivered the peer may arm its exit stub, even if its ACK is lost.
 			prepared = true;
-			await writeProcessChannel(socket, Buffer.from(`P ${code} ${decision.output.length} ${total} ${positions.length} ${resourceEvents.length} ${continuation?.image.length ?? 0} ${physicalRoot.length} ${sourceRoot.length}\n`));
+			await writeProcessChannel(socket, Buffer.from(`P2 ${code} ${decision.output.length} ${total} ${positions.length} ${resourceEvents.length} ${continuation?.image.length ?? 0} ${physicalRoot.length} ${sourceRoot.length}\n`));
 			for (const position of positions) {
-				await writeProcessChannel(socket, Buffer.from(`S ${position.fd} ${position.device} ${position.inode} ${position.flags} ${position.before} ${position.after} ${position.content?.length ?? -1} ${position.afterFlags} ${Buffer.byteLength(position.path ?? "")} ${position.eof === undefined ? -1 : Number(position.eof)} ${position.capacity ?? 0} ${position.socket?.shutdown ?? 0} ${position.socket?.peerShutdown ?? 0} ${position.socket?.peerInode ?? 0} ${position.socket?.peerQueued ?? 0} ${position.socket?.allocated ?? 0} ${position.event ?? 0} ${position.messages?.length ?? 0} ${position.socket ? position.socket.type ?? 1 : 0}\n${position.messages?.map(message => `M ${position.fd} ${message.start} ${message.end} ${message.rights.length} ${message.rights.join(" ")}\n`).join("") ?? ""}`));
-				if (position.path) await writeProcessChannel(socket, Buffer.from(position.path));
+				await writeProcessChannel(socket, Buffer.from(`S ${position.index} ${position.after} ${position.afterFlags} ${position.content?.length ?? -1}\n`));
 				if (position.content) await writeProcessChannel(socket, position.content);
 			}
 			for (const event of resourceEvents) {
@@ -696,7 +691,7 @@ function parseRequest(line: string): WireRequest | undefined {
 			/^[0-9a-f]{48}$/.test(value.execution ?? "") && isSafeCount(value.pid, 1) &&
 			isSafeCount(value.tracer, 1) && (value.holder === undefined || isSafeCount(value.holder)) &&
 			(value.trackQueues === undefined || value.trackQueues === true && value.descriptors === undefined) &&
-			validDescriptors(value.descriptors) ? value as WireRequest : undefined;
+			validDescriptors(value.descriptors) ? immutableSnapshot(value as WireRequest) : undefined;
 	} catch {
 		return undefined;
 	}

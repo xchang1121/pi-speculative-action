@@ -1463,14 +1463,8 @@ export class LinuxProcessReuseBackend {
 					const effects = plan.certificate.result.resources!;
 					const ofd = effects.descriptions.find(effect => effect.id === input.alias)!;
 					const object = effects.objects.find(effect => effect.id === input.image)!;
-					return { fd: input.fd, before: input.offset, after: object.consumed ?? ofd.position?.after ?? 0,
-						device: descriptor.device, inode: descriptor.inode, flags: descriptor.flags, afterFlags: ofd.flags,
-						...(input.type === "directory" ? { path: input.sourcePath!, ...(!(input.flags & 0x200000) && resources.objects[input.image]!.content !== undefined ?
-							{ content: Buffer.from(resources.objects[input.image]!.content!, "base64") } : {}) } : {}),
-						...(input.type === "eventfd" ? { event: descriptor.counter!.id + 1, content: Buffer.from(resources.objects[input.image]!.content!, "base64") } : {}),
-						...(input.type === "pipe" || input.type === "socket" ? { content: Buffer.from(resources.objects[input.image]!.content!, "base64"), eof: resources.objects[input.image]!.queue!.eof,
-							capacity: descriptor.capacity, socket: descriptor.socket, messages: descriptor.messages }
-							: input.fd === input.image && object.content ? { content: plan.artifacts.read(object.content) } : {}) };
+					return { source: descriptor, after: object.consumed ?? ofd.position?.after ?? 0, afterFlags: ofd.flags,
+						...(input.fd === input.image && object.content ? { content: plan.artifacts.read(object.content) } : {}) };
 				}) } : {}),
 				commit: async () => {
 					try {
