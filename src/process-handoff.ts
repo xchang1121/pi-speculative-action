@@ -242,8 +242,6 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	async acquire<Plan extends { readonly certificate: ProcessProvenanceCertificate; readonly artifacts?: VerifiedArtifactClosure }>({ scope, producer, ...request }: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
 		scope = snapshotExecutionScope(scope);
 		const waits: { readonly handoff: ProcessHandoff; readonly interval: TimelineInterval }[] = [];
-		const borrowed = new Set<HandoffRecord>();
-		const retain = (record: HandoffRecord) => { if (!borrowed.has(record)) { borrowed.add(record); record.borrowers++; } };
 		const considered = new Map<HandoffRecord, Sha256Digest>();
 		const borrow = async (signal: AbortSignal, join: boolean) => {
 			const startedAt = performance.now(), imported = await request.borrow?.(request.key, new Set(considered.values()), signal, join);
@@ -259,33 +257,32 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				if (changed.signal.aborted) { changed = new AbortController(); historyChecked = false; considered.clear(); }
 				const stop = request.signal ? AbortSignal.any([changed.signal, request.signal]) : changed.signal;
 				const records = [...this.byKey.get(request.key)?.values() ?? []].filter(record => !request.excludeHandoff?.(record));
-				const completed = [...records].reverse().flatMap((record) => {
+				const completed = [...records].reverse().find(record => {
 					const state = record.state;
 					return state.status === "completed" && state.result && !considered.has(record) &&
-						(!oneShotResult(state.result.candidate) || record.ownership !== producer?.ownership && this.accepts(record, scope, !producer))
-						? [{ record, state, ...state.result }] : [];
+						(!oneShotResult(state.result.candidate) || record.ownership !== producer?.ownership && this.accepts(record, scope, !producer));
 				});
-				if (completed.length || !historyChecked) {
+				const state = completed?.state, result = state?.status !== "running" ? state?.result : undefined;
+				const candidate = result?.candidate;
+				if (candidate || !historyChecked) {
 					// Preserve live producer attribution without waiting for unfinished work ahead of history.
-					if (!completed.length && request.borrow) { await borrow(stop, false).catch(() => undefined); if (stop.aborted) continue; }
-					historyChecked ||= !completed.length;
-					for (const { record } of completed) retain(record);
-					const plan = completed.length
-						? await request.lookup(completed.map(({ candidate }) => candidate), undefined, new Map(completed.map(({ candidate, artifacts }) => [candidate.id, artifacts])))
+					if (!candidate && request.borrow) { await borrow(stop, false).catch(() => undefined); if (stop.aborted) continue; }
+					historyChecked ||= !candidate;
+					if (candidate) considered.set(completed!, candidate.id);
+					const plan = candidate
+						? await request.lookup([candidate], undefined, new Map([[candidate.id, result!.artifacts]]))
 						: await request.lookup(undefined, new Set(considered.values()));
 					let granted = false;
 					try {
 						if (this.disposed || request.signal?.aborted) break;
 						const release = () => { void this.lifetime.release(plan?.artifacts); };
-						if (plan && !completed.length) { granted = true; return { kind: "hit", plan, joined: waits.length > 0, settle: release }; }
-						const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
-						if (!selected) for (const { record, candidate } of completed) considered.set(record, candidate.id);
-						if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.has(selected.record)) {
-							const settle = this.claim(selected.record, oneShotResult(selected.candidate), producer, scope);
-							if (!settle) { considered.set(selected.record, selected.candidate.id); continue; }
+						if (plan && !candidate) { granted = true; return { kind: "hit", plan, joined: waits.length > 0, settle: release }; }
+						if (plan && completed && candidate === plan.certificate && completed.state === state && this.byKey.get(request.key)?.has(completed)) {
+							const settle = this.claim(completed, oneShotResult(plan.certificate), producer, scope);
+							if (!settle) continue;
 							granted = true;
-							return { kind: "hit", plan, joined: waits.length > 0, producer: selected.record, continuation: selected.continuation,
-								waiting: waits.filter(wait => wait.handoff === selected.record).map(wait => wait.interval),
+							return { kind: "hit", plan, joined: waits.length > 0, producer: completed, continuation: result!.continuation,
+								waiting: waits.filter(wait => wait.handoff === completed).map(wait => wait.interval),
 								settle: (consumed, forward) => { try { settle(consumed, forward); } finally { release(); } } };
 						}
 					} finally { if (!granted) await plan?.artifacts?.dispose(); }
@@ -296,7 +293,6 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				// Each producer advances independently; readiness never grants transfer authority.
 				await Promise.allSettled([...records.filter(record => record.ownership.acceptsScope(record.scope, scope, true) &&
 					(record.state.status === "running" || record.state.status === "reserved" || record.ownership.pendingWhole)).map(async record => {
-					retain(record);
 					const running = record.state.status === "running", startedAt = performance.now();
 					const ready = running ? (record.advance?.() ?? Promise.resolve(true)).then(advanced => advanced && record.completion.then(() => true))
 						: record.ownership.pendingWhole?.then(() => true, () => true) ?? new Promise<never>(() => {});
@@ -310,7 +306,6 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			return { kind: "miss", joined: waits.length > 0 };
 		} finally {
 			waiters.delete(wake); if (!waiters.size) this.waiters.delete(request.key); changed.abort();
-			for (const record of borrowed) record.borrowers--; this.trim();
 		}
 	}
 
