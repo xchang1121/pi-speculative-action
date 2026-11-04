@@ -7,7 +7,7 @@ import { randomBytes } from "node:crypto";
 import { configureNativeFilesystem, nativeProcessLibrary } from "./process-startup.mjs";
 import { on, once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
-import { constants as fsConstants, readFileSync, type BigIntStats } from "node:fs";
+import { readFileSync, type BigIntStats } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
@@ -1080,9 +1080,9 @@ export class LinuxProcessReuseBackend {
 							begin < processStarted || end < begin || end > performance.now()) throw new Error("invalid native continuation frontier");
 						return { frozen: { pid, fd, writing: [1, 20, 44, 46].includes(syscall), bytes }, computation: new TimelineInterval(begin, end) };
 					};
-					outcome = await runSpawn([ready.strace, `--process-library=${ready.processLibrary}`, `--exec-context-source=${dispatcher}`, `--exec-context-name=${invokedPath}`, `--exec-context-comm=${comm}`, ...(live ? [`--handoff-fd=${inheritedFiles.length + 3}`, `--handoff-image=${imagePath}`] : []), ...command.slice(1)], {
+					outcome = await runSpawn([ready.dispatcher, `--output-channel=${inheritedFiles.length + 3 + (live ? 1 : 0)}`, ready.strace, `--process-library=${ready.processLibrary}`, `--exec-context-source=${dispatcher}`, `--exec-context-name=${invokedPath}`, `--exec-context-comm=${comm}`, ...(live ? [`--handoff-fd=${inheritedFiles.length + 3}`, `--handoff-image=${imagePath}`] : []), ...command.slice(1)], {
 						// The child writes to (and may query) these sockets; their identity lets its observation recognize them.
-						tracers: session.tracers, outputRoot: traceRoot, onOutputEndpoints: (endpoints) => {
+						tracers: session.tracers, onOutputEndpoints: (endpoints) => {
 							session.nestedOutputEndpoints.add(outputEndpoints = endpoints);
 							if (captureWorkspace) session.topLevelOutputEndpoints = endpoints;
 						},
@@ -2547,7 +2547,6 @@ async function runSpawn(
 	options: Pick<ProcessExecutionRequest, "cwd" | "environment" | "signal" | "timeout"> & {
 		readonly stdin?: Buffer;
 		readonly onData?: (data: Buffer) => void;
-		readonly outputRoot?: string;
 		readonly tracers?: Set<number>;
 		readonly onOutputEndpoints?: (endpoints: readonly [string, string]) => void;
 		readonly inheritedFiles?: readonly number[];
@@ -2555,19 +2554,15 @@ async function runSpawn(
 	},
 ): Promise<SpawnOutcome> {
 	options.signal?.throwIfAborted();
-	await using channels = options.onOutputEndpoints ? await acquireOutputChannels(options.outputRoot!, options.signal) : undefined;
-	options.signal?.throwIfAborted();
-	if (channels) options.onOutputEndpoints!([channels.entries[0]!.endpoint, channels.entries[1]!.endpoint]);
 	const child = spawn(executable, args, {
 		cwd: options.cwd,
 		env: options.environment,
 		detached: true,
-		stdio: [options.stdin ? "pipe" : "ignore", ...(channels ? channels.entries.map((entry) => entry.target!) : ["pipe", "pipe"] as const),
-			...(options.inheritedFiles ?? []), ...(options.onControl ? ["pipe" as const] : [])],
+		stdio: [options.stdin ? "pipe" : "ignore", "pipe", "pipe", ...(options.inheritedFiles ?? []),
+			...(options.onControl ? ["pipe" as const] : []), ...(options.onOutputEndpoints ? ["pipe" as const] : [])],
 	});
 	if (child.pid) options.tracers?.add(child.pid);
 	const output: BufferedOutput[] = [];
-	child.once("spawn", () => channels?.releaseWriters());
 	const append = (fd: 1 | 2, value: Buffer) => {
 		const event = { fd, data: Buffer.from(value) } as const;
 		const previous = output.at(-1);
@@ -2576,11 +2571,23 @@ async function runSpawn(
 		} else output.push(event);
 		options.onData?.(event.data);
 	};
-	const sources = channels?.entries.map((entry) => entry.source) ?? [child.stdout!, child.stderr!];
-	const drained = Promise.all(sources.map((source, index) => {
+	const endpoints = options.onOutputEndpoints ? (async () => {
+		const channel = child.stdio.at(-1) as import("node:stream").Duplex;
+		let bytes = Buffer.alloc(0);
+		for await (const chunk of channel) {
+			bytes = Buffer.concat([bytes, chunk]);
+			if (bytes.length > 16) throw new Error("invalid output endpoint record");
+			if (bytes.length === 16) {
+				options.onOutputEndpoints!([`socket:[${bytes.readBigUInt64LE(0)}]`, `socket:[${bytes.readBigUInt64LE(8)}]`]);
+				channel.end("R");
+			}
+		}
+		if (bytes.length !== 16) throw new Error("output endpoints are unavailable");
+	})() : Promise.resolve();
+	const drained = Promise.all([endpoints, ...[child.stdout!, child.stderr!].map((source, index) => {
 		source.on("data", (value: Buffer) => append(index === 0 ? 1 : 2, value));
 		return finished(source, { readable: true, writable: false, cleanup: true });
-	}));
+	})]);
 	void drained.catch(() => undefined);
 	if (options.stdin) child.stdin?.end(options.stdin);
 	const terminate = () => { if (!child.pid) return; try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); } };
@@ -2590,7 +2597,7 @@ async function runSpawn(
 	const completed: Promise<Pick<SpawnOutcome, "code" | "signal">> = once(child, "close").then(([code, signal]) => ({ code, signal }));
 	let releaseControl: (() => void | Promise<void>) | undefined;
 	try {
-		if (options.onControl) releaseControl = options.onControl(child.stdio.at(-1) as import("node:stream").Duplex, () => child.kill("SIGUSR2"));
+		if (options.onControl) releaseControl = options.onControl(child.stdio[3 + (options.inheritedFiles?.length ?? 0)] as import("node:stream").Duplex, () => child.kill("SIGUSR2"));
 		const [result] = await Promise.all([completed, drained]);
 		if (options.signal?.aborted) throw new Error("aborted");
 		if (timedOut) throw new Error(`timeout:${options.timeout}`);
@@ -2601,42 +2608,6 @@ async function runSpawn(
 		options.signal?.removeEventListener("abort", terminate);
 		await releaseControl?.();
 	}
-}
-
-/** Own the write endpoints before inheritance; a running tracer may replace its descriptors. */
-async function acquireOutputChannels(parent: string, signal?: AbortSignal) {
-	const root = await mkdtemp(path.join(parent, "pi-process-output-")), directory = await open(root, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY)
-		.catch(async error => { await rm(root, { recursive: true, force: true }); throw error; });
-	const entries: { server: net.Server; source: net.Socket; target?: net.Socket; endpoint: string }[] = [];
-	const releaseWriters = () => { for (const entry of entries) entry.target?.destroy(); };
-	const dispose = async () => {
-		releaseWriters();
-		for (const entry of entries) entry.source.destroy();
-		await Promise.all(entries.map(({ server }) => closeServer(server)));
-		await directory.close();
-		await rm(root, { recursive: true, force: true });
-	};
-	try {
-		for (const fd of [1, 2]) {
-			signal?.throwIfAborted();
-			// /proc/net/unix retains the literal name across processes, including /proc/self.
-			const socketPath = `/proc/self/fd/${directory.fd}/${process.pid}-${path.basename(root)}-${fd}`;
-			const entry = { server: net.createServer({ pauseOnConnect: true }), source: new net.Socket({ signal }), endpoint: "" } as typeof entries[number];
-			entries.push(entry);
-			entry.source.on("error", () => undefined); // Abort may precede the stream-drain observer.
-			entry.server.maxConnections = 1;
-			entry.server.once("connection", (socket) => { entry.target = socket; });
-			await listenUnixSocket(entry.server, socketPath);
-			const accepted = once(entry.server, "connection");
-			await Promise.all([accepted, once(entry.source.connect(socketPath), "connect")]);
-			// One connected server endpoint in our private namespace; no Node private fd API.
-			const peers = (await readFile("/proc/net/unix", "utf8")).split("\n").map((line) => line.trim().split(/\s+/))
-				.filter((fields) => fields[7] === socketPath && fields[4] === "0001" && fields[5] === "03");
-			if (peers.length !== 1 || !/^\d+$/.test(peers[0]![6]!)) throw new Error("output_endpoint_identity_unproven");
-			entry.endpoint = `socket:[${peers[0]![6]}]`;
-		}
-		return { entries, releaseWriters, [Symbol.asyncDispose]: dispose };
-	} catch (error) { await dispose(); throw error; }
 }
 
 /** The native launcher's framing: output as "o<fd> <length>\n<bytes>", then "x <code>", "s <signal number>" or "b" (bypass in place). */

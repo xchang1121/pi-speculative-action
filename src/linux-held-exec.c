@@ -3942,6 +3942,18 @@ int main(int argc, char **argv) {
 	if (argc > 1 && !strcmp(argv[1], "--hold-pins")) return hold_pins(argc, argv);
 	int observing = argc > 1 && (!strcmp(argv[1], "--attach") || !strcmp(argv[1], "--attach-skip-code") || !strcmp(argv[1], "--probe-observation"));
 	if ((PI_SPEC_AUTHORITY_ONLY ? !observing : getauxval(AT_SECURE)) || (observing && prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) < 0)) return 64;
+	if (argc >= 3 && !strncmp(argv[1], "--output-channel=", 17)) {
+		const char *text = argv[1] + 17; char *end; errno = 0; unsigned long channel = strtoul(text, &end, 10);
+		if (!*text || errno || *end || channel < 3 || channel > INT_MAX) return 64;
+		uint64_t endpoints[2]; struct stat state; char ready;
+		for (unsigned index = 0; index < 2; index++) {
+			if (fstat(index + 1, &state) || !S_ISSOCK(state.st_mode)) return 70;
+			endpoints[index] = htole64(state.st_ino);
+		}
+		/* The parent records these inherited objects before any program can replace them. */
+		if (transfer((int)channel, endpoints, sizeof(endpoints), 1) || transfer((int)channel, &ready, 1, 0) || ready != 'R') return 70;
+		close((int)channel); execvp(argv[2], argv + 2); return 127;
+	}
 	if (argc == 2 && !strcmp(argv[1], "--probe-observation")) {
 		struct process_credentials credentials; unsigned long long extra = 1ULL << CAP_SYS_PTRACE;
 		return process_credentials(getpid(), &credentials) == 0 && !(credentials.permitted & ~extra) &&
