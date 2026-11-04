@@ -306,7 +306,7 @@ export class FilesystemObjectLease {
 			return { stat, handle: filesystemDescriptorHandle(owned, readable) };
 		} catch { return undefined; } finally { if (fd !== undefined) closeSync(fd); }
 	}
-	dispose(): Promise<void> { return this.lifetime.close(async () => { await this.lifetime.drain(); await this.handle.close(); }); }
+	dispose(): Promise<void> { return this.lifetime.dispose(() => this.handle.close()); }
 }
 
 /** A source observation owns a kernel-object lease; the observation alone never grants borrowing authority. */

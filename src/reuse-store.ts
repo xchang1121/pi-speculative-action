@@ -429,7 +429,7 @@ export class ProvenanceCertificateStore {
 	dispose(): Promise<void> {
 		this.stopped.abort(new Error("provenance store is closed"));
 		clearTimeout(this.maintenance); this.maintenance = undefined;
-		return this.lifecycle.close(async () => { await this.lifecycle.drain(); await this.artifacts.dispose(); await this.closeDatabase(); });
+		return this.lifecycle.dispose(async () => { await this.artifacts.dispose(); await this.closeDatabase(); });
 	}
 	private async closeDatabase(): Promise<void> {
 		clearTimeout(this.maintenance); this.maintenance = undefined;

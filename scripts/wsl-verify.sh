@@ -26,5 +26,5 @@ cd "$clone"
 [ -d node_modules ] && [ package-lock.json -ot node_modules ] || npm ci --no-audit --no-fund
 CARGO_HOME=${CARGO_HOME:-$HOME/.cargo} RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup} PATH=$HOME/.cargo/bin:$PATH HOME=$helper_home node ./src/setup-linux-process-backend.mjs
 bin=$helper_home/.local/bin
-PI_SPEC_SANDLOCK=$bin/pi-speculative-sandlock PI_SPEC_HELD_EXEC=$bin/pi-speculative-held-exec PI_SPEC_STRACE=$bin/pi-speculative-strace \
+PATH=$bin:$PATH PI_SPEC_SANDLOCK=$bin/pi-speculative-sandlock PI_SPEC_HELD_EXEC=$bin/pi-speculative-held-exec PI_SPEC_STRACE=$bin/pi-speculative-strace \
 	npx vitest --run --maxWorkers=1 --no-file-parallelism "$@"

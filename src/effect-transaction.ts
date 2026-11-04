@@ -179,9 +179,8 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 	const queryResources = new Set<() => Promise<void>>();
 	const abort = (): Promise<void> => {
 		if (!lifecycle.sealed && !["committed", "poisoned"].includes(attempt.stateValue) && !commit.result) attempt.stateValue = "aborting";
-		return lifecycle.close(async () => {
+		return lifecycle.dispose(async () => {
 			try {
-				await lifecycle.drain();
 				await Promise.allSettled([...queryResources].map(dispose => dispose()));
 				await sealed.dispose();
 			} finally {

@@ -494,7 +494,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			if (!this.complete(record.key, record)) this.remove(record);
 		}
 		this.completedCount = 0;
-		return this.lifetime.close(() => this.lifetime.drain());
+		return this.lifetime.dispose();
 	}
 
 	private reserve(key: Sha256Digest, executablePath: string, ownership: ProcessHandoffOwnership, scope?: ExecutionScope) {

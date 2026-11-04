@@ -47,6 +47,8 @@ pi
 
 Linux / WSL 2 需在扩展目录运行 `npm run setup:linux`，升级后重新运行；WSL checkout 放在 Linux 原生文件系统。Windows x64 使用随包提供的本地 NTFS 对象租约，无需另行编译。
 
+Linux 的透明子进程观察还需要合格的观察助手：通过 `PI_SPEC_HELD_EXEC_OBSERVER` 指向管理员部署、普通用户不可修改且具有 `CAP_SYS_PTRACE` 的独立 `.observer` 文件。助手核对调用者及目标进程身份，并在附着后释放该能力；工作负载本身不获得此权限。若启动环境已经设置 `no_new_privs`，助手也可在该约束下工作，但这会阻止依赖提权的 FUSE 挂载，不能用作完整验证环境的通用替代。权限不足时原工具正常执行，透明复用不可用。
+
 ## 支持边界
 
 - **文件与计算**：通过显式操作绑定共享输入和纯子计算；仅声明工具“只读”不能授权缓存其完整结果。写入通过工作区事务隔离、验新并提交。
@@ -64,6 +66,8 @@ npm run build
 npm test -- --maxWorkers=1 --no-file-parallelism
 npm run bench:check
 ```
+
+Windows 开发可在 WSL 中运行 `scripts/wsl-verify.sh`。它将当前提交和未提交改动复制到独立 Linux checkout，构建私有助手，并将其目录加入测试搜索路径；原工作区和用户安装保持独立。观察权限仍须按上文配置，脚本不自动授予权限。
 
 扩展接口见 [Pi Host API](./src/index.ts)、[core](./src/core.ts) 和 [process-reuse](./src/process-reuse.ts)。新预测来源提交计划，新执行后端实现执行世界契约；反馈通过 `runtime.subscribe()` 接收，结束时调用 `host.dispose()`。
 

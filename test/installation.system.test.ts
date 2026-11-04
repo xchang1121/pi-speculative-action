@@ -11,7 +11,10 @@ afterEach(directories.dispose);
 test.skipIf(process.platform !== "linux").each(["mirror", "source", "descendant", "foreign"])("verifies the working snapshot without resetting user checkouts (%s)", async mode => {
 	const root = await directories.create(), repo = path.join(root, "source"), bin = path.join(root, "bin"), work = path.join(root, "verification");
 	await Promise.all([mkdir(path.join(repo, "scripts"), { recursive: true }), mkdir(bin)]);
-	for (const command of ["node", "npm", "npx"]) await writeFile(path.join(bin, command), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+	for (const command of ["node", "npm"]) await writeFile(path.join(bin, command), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+	await writeFile(path.join(bin, "npx"), '#!/bin/sh\n[ "$(command -v fusermount3)" = "$PI_SPEC_WSL_WORK/home/.local/bin/fusermount3" ]\n', { mode: 0o755 });
+	const helpers = path.join(work, "home/.local/bin"); await mkdir(helpers, { recursive: true });
+	await writeFile(path.join(helpers, "fusermount3"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
 	const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 	await writeFile(path.join(repo, "scripts", "wsl-verify.sh"), await readFile(fileURLToPath(new URL("../scripts/wsl-verify.sh", import.meta.url))));
 	await writeFile(path.join(repo, "tracked"), "base");

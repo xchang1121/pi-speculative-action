@@ -1,16 +1,57 @@
-import { afterAll, expect, test } from "vitest";
-import { link, lstat, mkdir, readdir, rename, writeFile } from "node:fs/promises";
+import { afterAll, expect, test, vi } from "vitest";
+import { link, lstat, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
+import { ResourceVersionManager } from "../src/resource-version.ts";
+import { deferred, nextTurn } from "./async.ts";
 import { temporaryDirectories, readText } from "./filesystem.ts";
 
 const directories = temporaryDirectories("pi-object-lease-");
 afterAll(() => directories.dispose());
 const output = { result: { content: [], details: {} }, isError: false };
+
+test.for(["fresh", "stale", "closing", "alias", "alias-stale", "binary"])("transfers workspace inputs through their owner (%s)", async mode => {
+	const root = await directories.create(), service = new WorkspaceSandboxService(), target = path.join(root, "input");
+	const entered = deferred<void>(), release = deferred<void>(); let disposed = 0, closed = false;
+	const before = Buffer.from(mode === "binary" ? [0, 1, 255] : "before"), after = Buffer.from(mode === "binary" ? [0, 2, 254] : "after");
+	await writeFile(target, before);
+	if (mode.startsWith("alias")) await link(target, path.join(root, "alias"));
+	const snapshot = await service.capture({ cwd: root, driver: "git", execute: async workspace => {
+		await writeFile(path.join(workspace.sandboxRoot, "input"), after); return output;
+	} });
+	const action = PI_ACTION_SEMANTICS.buildKey("write", { path: "input", content: "after" }, root, "input-transfer")!;
+	const branch = service.branch({ cwd: root, action }, { ...snapshot, dispose: async () => { disposed++; await snapshot.dispose?.(); } });
+	const validate = ResourceVersionManager.prototype.validate;
+	const spy = mode === "closing" ? vi.spyOn(ResourceVersionManager.prototype, "validate").mockImplementation(async function(this: ResourceVersionManager, token) {
+		entered.resolve(); await release.promise; return validate.call(this, token);
+	}) : undefined;
+	let inputs: Awaited<ReturnType<NonNullable<typeof branch.takeReadInputs>>>;
+	try {
+		if (mode.endsWith("stale")) await writeFile(mode === "alias-stale" ? path.join(root, "alias") : target, "changed");
+		const reading = branch.takeReadInputs!(1024 * 1024);
+		if (mode === "closing") {
+			await Promise.race([entered.promise, reading.then(() => { throw new Error("input capture ended before validation"); })]);
+			const closing = Promise.resolve(branch.dispose()).then(() => { closed = true; });
+			await nextTurn(); expect(closed).toBe(false); expect(disposed).toBe(0);
+			release.resolve(); await closing;
+		}
+		inputs = await reading;
+		expect(!!inputs).toBe(!mode.endsWith("stale") && mode !== "closing");
+		if (inputs) {
+			expect((await inputs.validate!()).status).toBe("valid");
+			await branch.commit(); expect(await readFile(target)).toEqual(after);
+			const committed = await branch.takeCommittedInputs!(1024 * 1024);
+			try { expect(committed).toBeDefined(); expect((await committed!.validate!()).status).toBe("valid"); }
+			finally { await committed?.dispose(); }
+		}
+		expect(await branch.takeReadInputs!(1024 * 1024)).toBeUndefined();
+	} finally { release.resolve(); spy?.mockRestore(); await inputs?.dispose(); await branch.dispose(); await branch.dispose(); await service.dispose(); }
+	expect(disposed).toBe(1);
+});
 
 test.for([false, true])("adopts a renamed private directory and its checkpoint successor (checkpoint=%s)", async checkpoint => {
 	const bare = await directories.create(), root = await directories.create(), service = new WorkspaceSandboxService();

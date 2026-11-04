@@ -587,8 +587,7 @@ async function installController(
 			sdk.dispose();
 			ui?.setStatus(STATUS_KEY, undefined);
 			ui = undefined;
-			return lifecycle.close(async () => {
-				await lifecycle.drain();
+			return lifecycle.dispose(async () => {
 				const routes = executionRoutes();
 				return Promise.resolve().then(() => settingsStore.flush())
 				.finally(() => host.dispose())

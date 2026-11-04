@@ -392,8 +392,7 @@ export class WorkspaceSandboxService {
 	}
 
 	dispose(): Promise<void> {
-		return this.lifetime.close(async () => {
-			await this.lifetime.drain();
+		return this.lifetime.dispose(async () => {
 			try { await this.closePools(); }
 			finally {
 				this.overlayfsCapabilities.dispose();
@@ -509,55 +508,50 @@ export class WorkspaceSandboxService {
 		retiredWorkspaceCheckpoints.register(checkpoint, retainWorkspaceChanges(changes));
 		this.checkpoints.set(checkpoint, retained);
 		const commit = new EffectCommit<ToolSettlement>();
+		const lifetime = new RuntimeLifecycleLane();
 		const inputs = new Map<string, ResourceInput>();
 		const release = snapshot.dispose ?? retainWorkspaceChanges(changes);
-		let disposed = false, readInputs = false, transferred: ReturnType<NonNullable<WorldBranch<ToolSettlement>["takeCommittedInputs"]>> | undefined;
-		let disposal: Promise<void> | undefined, reading: ReturnType<NonNullable<WorldBranch<ToolSettlement>["takeReadInputs"]>> | undefined;
+		let reading = false, transferred = false;
 		return {
 			backend, checkpoint, output: snapshot.output, validate,
 			resources: Object.freeze([...new Set(changes.filter((change) => !change.validationOnly).map((change) => change.resource))]),
 			capturedBytes: changes.reduce((total, change) => total + sandboxChangeBytes(change), 0),
 			executionMetrics: Object.freeze({ ...snapshot.executionMetrics }),
 			compatibility: Object.freeze({ status: "compatible" as const, backend, executionFingerprint }),
-			commit: () => commit.run(() => {
-				if (disposed) throw effectCommitFailure(new Error("workspace branch is disposed"), "recoverable");
+			commit: () => lifetime.track(commit.run(() => {
+				if (lifetime.sealed) throw effectCommitFailure(new Error("workspace branch is disposed"), "recoverable");
 				return this.commit(snapshot, inputs).then(output => {
 				// A proven commit anchors future forks in the live workspace, independently of unadopted ancestors.
-				retained.committed = true; retained.parent = undefined; if (disposed) inputs.clear(); return output;
-			}); }),
+				retained.committed = true; retained.parent = undefined; if (lifetime.sealed) inputs.clear(); return output;
+			}); })),
 			takeReadInputs: maxBytes => {
-				if (reading) return Promise.resolve(undefined);
-				return reading = (async () => {
+				if (reading || lifetime.sealed || commit.result) return Promise.resolve(undefined);
+				reading = true;
+				return lifetime.admit(async () => {
 				// Every file this branch read keeps its pre-image until commit; each serves reads while it stays unchanged.
-				if (disposed || commit.result || readInputs) return undefined;
-				readInputs = true;
 				const preimages = new Map<string, ResourceInput>();
-				for (const change of changes) if (change.kind !== "directory" && change.before && !change.aliases && await textual(change.before)) preimages.set(change.target, change.before);
-				if (!preimages.size || disposed) return undefined;
+				for (const change of changes) if (change.kind !== "directory" && change.before) preimages.set(change.target, change.before);
+				if (!preimages.size || lifetime.sealed) return undefined;
 				const inputs = await createCommittedResourceInputs(action, sourceRoot, preimages, maxBytes).catch(() => undefined);
-				// Stamped only now: each file must still hold the bytes it was read with, or the owner would vouch for stale ones.
-				const current = inputs && await withFilesystemReadView(undefined, view => mapFilesystem([...preimages], async ([target, before]) => {
-					const content = before as ContentVersion;
-					return sameContent((await readRegularState(target, undefined, view, content instanceof ChunkedContent ? content.pool : undefined))?.content, content);
-				}))
-					.catch(async error => { await inputs.dispose(); throw error; });
-				if (inputs && !disposed && current?.every(Boolean)) return inputs;
+				// Supplied pre-images use the same exact proof as every other retained input.
+				const current = await inputs?.validate?.();
+				if (inputs && !lifetime.sealed && current?.status === "valid") return inputs;
 				await inputs?.dispose(); return undefined;
-				})();
+				});
 			},
 			takeCommittedInputs: async (maxBytes) => {
-				if (disposed || !retained.committed || transferred) return undefined;
-				return transferred = (async () => {
+				if (lifetime.sealed || !retained.committed || transferred) return undefined;
+				transferred = true;
+				return lifetime.admit(async () => {
 					if (!inputs.size) return undefined;
 					try {
 						const branch = await createCommittedResourceInputs(action, sourceRoot, inputs, maxBytes);
-						if (!disposed) return branch;
+						if (!lifetime.sealed) return branch;
 						await branch.dispose(); return undefined;
 					} finally { inputs.clear(); }
-				})();
+				});
 			},
-			dispose() { disposed = true; inputs.clear();
-				return disposal ??= Promise.allSettled([commit.result, reading, transferred]).then(release); },
+			dispose() { inputs.clear(); return lifetime.dispose(release); },
 		};
 	}
 
@@ -758,7 +752,7 @@ export class WorkspaceSandboxService {
 						const failure = closed.find((result) => result.status === "rejected");
 						if (failure) throw effectCommitFailure(failure.reason, "poisoned", "native file descriptor cleanup failed; completion is unknown");
 					}
-					if (inputs) for (const change of changes) if (!change.validationOnly && (change.kind === "directory" ? !change.after : await textual(change.after)))
+					if (inputs) for (const change of changes) if (!change.validationOnly && (change.kind !== "directory" || !change.after))
 						inputs.set(change.target, change.kind === "directory" ? null : change.after ?? null);
 					return execution.output;
 				},
@@ -1885,9 +1879,6 @@ function assertExistingInputPolicy(change: SandboxWorkspaceChange): void {
 }
 
 
-
-/** Tool reads serve text: bytes holding a NUL among their first 8000 (git's binary test) are never kept as an input. */
-const textual = async (content: ContentVersion | undefined) => !content || !(await readContent(content, 0, Math.min(8000, content.byteLength))).includes(0);
 
 function sandboxChangeBytes(change: SandboxWorkspaceChange | undefined): number {
 	return !change || change.kind === "directory" ? 0 : contentMemory(change.before) + contentMemory(change.after);

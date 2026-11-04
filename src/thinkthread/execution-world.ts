@@ -143,8 +143,7 @@ export function createThinkThreadExecutionWorld(
 		},
 		dispose: () => {
 			lifetime.abort();
-			return operations.close(async () => {
-				await operations.drain();
+			return operations.dispose(async () => {
 				const world = await prepared;
 				await world?.pool.dispose();
 			});
