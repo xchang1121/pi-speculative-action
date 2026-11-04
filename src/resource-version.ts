@@ -12,7 +12,7 @@ import {
 	FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath, filesystemEntryType, type FilesystemTypeEvidence, captureFilesystemDirectory, readFilesystemDirectory, resolveFilesystemDestination,
 } from "./filesystem-evidence.ts";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } from "./path-utils.ts";
-import { RuntimeLifecycleLane, SharedAbortScope } from "./runtime-lifecycle.ts";
+import { RuntimeLifecycleLane, SharedAbortScope, waitForCompletion } from "./runtime-lifecycle.ts";
 import { TimelineInterval } from "./task-timing.ts";
 import type { ValidationMetrics } from "./settlement.ts";
 import { ChunkedContent, ContentChunkPool, DEFAULT_CONTENT_LIMITS, parseContentManifest, contentDigest, contentMemory, readContent, type ContentVersion, type ContentChunkLimits, type ChunkedContentManifest } from "./content-chunks.ts";
@@ -492,12 +492,13 @@ export class ResourceReadView {
 				let accepted = building;
 				try {
 					// A composed waiter must take its own proof references before the producer can retire.
-					if (!building && !(cached.retained && cached.destination === owner ||
-						await Promise.race([cached.ready!.then(() => cached.shareable), cached.declined.then(() => cached.shareable),
-							...(!this.acceptProofs && cached.composed ? [cached.composed.then(() => cached.shareable && !cached.proofs?.length)] : [])]) &&
-						(!cached.proofs?.length || this.acceptProofs))) return undefined;
-					if (building) await cached.ready;
+					const ready = building ? cached.ready!.then(() => true) : cached.retained && cached.destination === owner ? Promise.resolve(true) :
+						Promise.race([cached.ready!.then(() => cached.shareable), cached.declined.then(() => cached.shareable),
+							...(!this.acceptProofs && cached.composed ? [cached.composed.then(() => cached.shareable && !cached.proofs?.length)] : [])])
+							.then(shareable => shareable && (!cached.proofs?.length || !!this.acceptProofs));
+					const readiness = await waitForCompletion(ready, signal);
 					signal?.throwIfAborted();
+					if (readiness.status !== "completed" || !readiness.value) return undefined;
 					if (registration && !registration.accepts(cached.value)) throw new Error("resource_preparation_data_invalid");
 					const dependencies = cached.origin === owner && cached.dependencies && this.dependencies ? new Set([...this.dependencies, ...cached.dependencies]) : undefined;
 					const sourceDependencies = source && cached.origin.entries === source.view.entries ? cached.dependencies : undefined;
@@ -526,8 +527,10 @@ export class ResourceReadView {
 				} finally {
 					this.preparing?.waiting.delete(cached);
 					withdraw();
-					if (!--cached.borrowers && !(cached.retained && !cached.revoked))
-						await TimelineInterval.outside(() => (cached.destination.prepared?.lifetime ?? prepared.lifetime).release(cached));
+					if (!--cached.borrowers && !(cached.retained && !cached.revoked)) {
+						const released = TimelineInterval.outside(() => (cached.destination.prepared?.lifetime ?? prepared.lifetime).release(cached));
+						if (!signal?.aborted) await released;
+					}
 				}
 			};
 			const reused = cached && compatible(cached) && await use(cached);
@@ -546,7 +549,7 @@ export class ResourceReadView {
 			const name = target && filesystemPathKey(target);
 			const pending: PreparedResource = { resource: name, origin: owner, destination: owner, borrowers: 0, boundary: this.boundary, cancellation: new SharedAbortScope(), waiting: new Set(),
 				declined: declined.promise, composed: composed?.promise,
-				dispose: async () => { try { await resource?.dispose(); } finally {
+				dispose: async () => { try { await pending.ready?.catch(() => undefined); await resource?.dispose(); } finally {
 					if (prepared.bindings.get(identity)?.get(key) === pending) prepared.bindings.get(identity)!.delete(key);
 					await Promise.allSettled(pending.proofs?.map(proof => proof.release()) ?? []);
 					if (pending.retained) pending.destination.capturedBytes -= bytes;
@@ -555,7 +558,7 @@ export class ResourceReadView {
 			let entries = prepared.bindings.get(identity);
 			if (!entries) prepared.bindings.set(identity, entries = new Map());
 			if (!entries.has(key) || !entries.get(key)!.retained && entries.get(key)!.cancellation.signal.aborted) entries.set(key, pending);
-			pending.ready = this.evaluate(async view => {
+			pending.ready = prepared.lifetime.track(this.evaluate(async view => {
 				view.preparing = pending;
 				const foreign = view.onForeignInputs; view.onForeignInputs = transferable => { if (transferable) composed?.resolve(); else declined.resolve(); foreign?.(transferable); };
 				view.collectProofs = this.acceptProofs ? new Map() : undefined;
@@ -594,7 +597,7 @@ export class ResourceReadView {
 					}
 				}
 				// The origin keeps a borrowed lookup; the destination owns its bytes and disposal.
-			});
+			}));
 			void pending.ready.finally(() => { declined.resolve(); composed?.resolve(); }).catch(() => {});
 			return (await use(pending, true))!.value;
 		});

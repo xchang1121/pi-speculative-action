@@ -5,11 +5,12 @@ import { createReadTool } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, test } from "vitest";
 import { bindResourceOperation } from "../src/agent-execution-world.ts";
 import { TimelineInterval } from "../src/task-timing.ts";
+import { ResourceReadView } from "../src/resource-version.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { ActionSemanticsRegistry, PI_ACTION_SEMANTICS, type ActionSemanticsDefinition } from "../src/action-semantics.ts";
 import { readText, temporaryDirectories } from "./filesystem.ts";
 import { expectHiddenCompute, idleResources, resourceWorld, systemHost } from "./agent-system-fixture.ts";
-import { onExit, deferred, gated } from "./async.ts";
+import { onExit, deferred, gated, nextTurn } from "./async.ts";
 import { textOutput } from "./linux-process-fixture.ts";
 import { toolUse } from "./model.ts";
 
@@ -20,6 +21,33 @@ const toolReply = (...args: Parameters<typeof fauxToolCall>) => fauxAssistantMes
 
 const directories = temporaryDirectories("pi-agent-system-");
 afterEach(directories.dispose);
+
+test.for(["producer", "borrower", "both"])("cancels a preparation waiter without waiting for shared computation (%s)", async cancelled => {
+	const view = new ResourceReadView(4096), binding = {}, gate = gated(), controllers = [new AbortController(), new AbortController()];
+	const results = ["pending", "pending"], pending: Promise<unknown>[] = [];
+	let builds = 0, disposed = 0, consumed = 0, productionSignal: AbortSignal | undefined;
+	const build = async (_view: unknown, signal: AbortSignal) => {
+		builds++; productionSignal = signal; await gate.wait();
+		return { value: 17, bytes: 8, dispose: () => { disposed++; } };
+	};
+	await using _cleanup = onExit(async () => { gate.release(); await Promise.allSettled(pending); await view.dispose(); });
+	for (let index = 0; index < 2; index++) {
+		const task = view.prepare(binding, "shared", build, async value => { consumed++; return value; }, undefined, controllers[index]!.signal);
+		pending.push(task);
+		void task.then(() => { results[index] = "fulfilled"; }, () => { results[index] = "rejected"; });
+		if (!index) await gate.entered;
+	}
+	await nextTurn();
+	for (const index of cancelled === "both" ? [0, 1] : [Number(cancelled === "borrower")]) controllers[index]!.abort(new Error("caller cancelled"));
+	await nextTurn();
+	expect(results).toEqual(controllers.map(controller => controller.signal.aborted ? "rejected" : "pending"));
+	expect({ builds, consumed, disposed, stopped: productionSignal?.aborted }).toEqual({ builds: 1, consumed: 0, disposed: 0, stopped: cancelled === "both" });
+	let closed = false;
+	const closing = cancelled === "both" ? Promise.resolve(view.dispose()).then(() => { closed = true; }) : undefined;
+	await nextTurn(); expect(closed).toBe(false);
+	gate.release(); await Promise.allSettled(pending); await (closing ?? view.dispose());
+	expect({ consumed, disposed }).toEqual({ consumed: cancelled === "both" ? 0 : 1, disposed: 1 });
+});
 
 test.for(["unbound", "bound", "default-unbound", "default-bound"])("requires actual resource bindings at every capture entry (%s)", async mode => {
 	const cwd = await directories.create(), definition = readDefinition("inspect_input"), args = { path: "input.txt" };
