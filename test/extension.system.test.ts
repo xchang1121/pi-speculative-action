@@ -201,16 +201,16 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 			if (!inspection) {
 				inspection = inspectProcessOwner(() => processOwner.call(this));
 				if (live) inspectionReady = inspection.inOwner(async (state, delayedSettlement) => {
-					state.errors = state.method((await state.load("../src/linux-process-backend.ts")).LinuxProcessReuseBackend.prototype, "setError");
-					state.publications = state.method((await state.load("../src/process-handoff.ts")).ProcessHandoffRegistry.prototype, "publish");
+					state.errors = state.method((await state.load("../dist/linux-process-backend.js")).LinuxProcessReuseBackend.prototype, "setError");
+					state.publications = state.method((await state.load("../dist/process-handoff.js")).ProcessHandoffRegistry.prototype, "publish");
 					if (delayedSettlement) {
-						const Store = (await state.load("../src/reuse-store.ts")).ProvenanceCertificateStore, claim = Store.prototype.claimProcessCheckpoint;
+						const Store = (await state.load("../dist/reuse-store.js")).ProvenanceCertificateStore, claim = Store.prototype.claimProcessCheckpoint;
 						state.method(Store.prototype, "claimProcessCheckpoint", async function (this: unknown, ...args: unknown[]) {
 							const settle = await claim.apply(this, args); return settle && (async (consumed: boolean) => {
 								await new Promise(resolve => setTimeout(resolve, 25)); await settle(consumed); state.settledAt = performance.now();
 							});
 						});
-						const Backend = (await state.load("../src/linux-process-backend.ts")).LinuxProcessReuseBackend, decide = Backend.prototype.decideHeldExec;
+						const Backend = (await state.load("../dist/linux-process-backend.js")).LinuxProcessReuseBackend, decide = Backend.prototype.decideHeldExec;
 						state.method(Backend.prototype, "decideHeldExec", async function (this: unknown, ...args: unknown[]) {
 							const decision = await decide.apply(this, args); return decision.kind !== "replay" ? decision : { ...decision,
 								observeTiming: (timing: unknown) => { state.timing = timing; decision.observeTiming?.(timing); } };
@@ -329,7 +329,7 @@ int main(int argc, char **argv) {
 			if (running) publication = await holdOwnedProcessPublication(inspection!);
 			if (preempted) {
 				await inspection!.inOwner(async state => {
-					const { ProvenanceCertificateStore } = await state.load("../src/reuse-store.ts"), publish = ProvenanceCertificateStore.prototype.withPublication;
+					const { ProvenanceCertificateStore } = await state.load("../dist/reuse-store.js"), publish = ProvenanceCertificateStore.prototype.withPublication;
 					state.publishedGate = state.deferred();
 					state.method(ProvenanceCertificateStore.prototype, "withPublication", async function (this: unknown, ...args: unknown[]) {
 						const result = await publish.apply(this, args); await state.publishedGate.promise; return result;

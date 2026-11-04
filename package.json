@@ -34,7 +34,7 @@
 	},
 	"pi": {
 		"extensions": [
-			"./src/extension.ts"
+			"./dist/extension.js"
 		]
 	},
 	"files": [
@@ -59,7 +59,7 @@
 		"setup:linux": "node ./src/setup-linux-process-backend.mjs",
 		"build:windows": "node ./src/setup-windows-filesystem.mjs",
 		"test": "vitest --run",
-		"prepack": "npm run build"
+		"prepare": "npm run build"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-agent-core": "*",

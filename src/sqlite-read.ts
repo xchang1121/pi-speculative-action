@@ -57,10 +57,7 @@ export class SQLiteReadOwner {
 		});
 	}
 	private launch(binary: string): Peer {
-		// Node does not strip TypeScript inside installed packages. They carry the
-		// matching compiled entry; a source checkout can use Node's native TS path.
-		const worker = entry.endsWith(".ts") && entry.split(path.sep).includes("node_modules") ? fileURLToPath(new URL("../dist/sqlite-read.js", import.meta.url)) : entry;
-		const child = startupScope.exit(() => fork(worker, ["--sqlite-reader", binary], {
+		const child = startupScope.exit(() => fork(new URL("../dist/sqlite-read.js", import.meta.url), ["--sqlite-reader", binary], {
 			execArgv: [], serialization: "advanced", silent: true, env: { ...process.env, NODE_OPTIONS: "" },
 		}));
 		const ready = Promise.withResolvers<void>(), closed = Promise.withResolvers<void>();

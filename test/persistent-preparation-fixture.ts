@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import path from "node:path";
-import { createClosedSearchProfile } from "../src/pi-tool-invocation.ts";
-import { ResourceVersionManager } from "../src/resource-version.ts";
-import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
+import { createClosedSearchProfile } from "../dist/pi-tool-invocation.js";
+import { ResourceVersionManager } from "@earendil-works/pi-speculative-action/core";
+import { ProvenanceCertificateStore } from "@earendil-works/pi-speculative-action/process-reuse";
 
 const [mode, root, cache] = process.argv.slice(2);
 assert.equal(mode, "produce");

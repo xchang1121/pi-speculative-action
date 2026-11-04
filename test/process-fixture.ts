@@ -27,7 +27,7 @@ export function storeMetadata<T>(root: string, run: (database: DatabaseSync) => 
 export function storePeer(root: string, certificate?: ProcessProvenanceCertificate,
 	checkpoint?: { readonly ticket: string; readonly action: "hold" | "consume" | "release" }) {
 	const child = spawn(process.execPath, ["--input-type=module", "--eval", `
-		const { ProvenanceCertificateStore } = await import(${JSON.stringify(new URL("../src/reuse-store.ts", import.meta.url).href)});
+		const { ProvenanceCertificateStore } = await import("@earendil-works/pi-speculative-action/process-reuse");
 		const { root, certificate, checkpoint } = await new Promise(resolve => process.once('message', resolve));
 		const alive = setInterval(() => {}, 1000), store = new ProvenanceCertificateStore(root);
 		let notice = 'collected';

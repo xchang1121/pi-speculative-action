@@ -77,7 +77,7 @@ export function connectNativeOwner<State = never>(kind: "backend" | "workspace",
 	invoke: Parameters<typeof createNativeRpc<State>>[2], observed?: (state: State) => void) {
 	if (!nativeOwner) {
 		const clients = new Set<(error: Error) => void>();
-		const worker = new Worker(new URL(import.meta.url.endsWith(".ts") ? "./native-worker.ts" : "./native-worker.js", import.meta.url), { workerData: { nativeProcessObserver: true },
+		const worker = new Worker(new URL("../dist/native-worker.js", import.meta.url), { workerData: { nativeProcessObserver: true },
 			execArgv: process.execArgv.filter(argument => !argument.startsWith("--input-type")) });
 		const owner = nativeOwner = { worker, clients, exited: new Promise<void>(resolve => worker.once("exit", () => {
 			for (const fail of clients) fail(new Error("native process owner exited"));

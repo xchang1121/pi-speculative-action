@@ -51,8 +51,8 @@ export const processTest: ReturnType<TestAPI<{ benchmark: typeof createLinuxProc
 
 export async function holdOwnedProcessPublication(fixture: Pick<LinuxProcessBenchmark, "inOwner">, beforeRelease = async () => {}, executablePath?: string) {
 	await fixture.inOwner(async (state, executablePath) => {
-		const { ProvenanceCertificateStore } = await state.load("../src/reuse-store.ts"), { ProcessHandoffRegistry } = await state.load("../src/process-handoff.ts"),
-			{ LinuxProcessReuseBackend } = await state.load("../src/linux-process-backend.ts"), { AsyncLocalStorage } = await state.load("node:async_hooks");
+		const { ProvenanceCertificateStore } = await state.load("../dist/reuse-store.js"), { ProcessHandoffRegistry } = await state.load("../dist/process-handoff.js"),
+			{ LinuxProcessReuseBackend } = await state.load("../dist/linux-process-backend.js"), { AsyncLocalStorage } = await state.load("node:async_hooks");
 		const publication = ProvenanceCertificateStore.prototype.withPublication, acquire = ProcessHandoffRegistry.prototype.acquire;
 		const execute = LinuxProcessReuseBackend.prototype.executeRequest, frames = new AsyncLocalStorage(); let held = false;
 		const pending = state.deferred(); state.release = pending.resolve; state.reached = state.deferred(); state.joined = false; state.joinedGate = state.deferred();
