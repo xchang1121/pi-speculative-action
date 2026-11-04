@@ -20,7 +20,7 @@ export interface ProvenanceValidationContext {
 	readonly fileDescriptors?: ReadonlyMap<number, { readonly contentDigest: Sha256Digest; readonly eof: boolean }>;
 	readonly maxFileBytes?: number;
 	/** Borrow only a view owned by the current execution world; other paths use this validation's source view. */
-	readonly readView?: (physicalPath: string) => FilesystemReadView | undefined;
+	readonly readView?: FilesystemReadView | ((physicalPath: string) => FilesystemReadView | undefined);
 	/** Taints whose semantics the consumer proves equivalent in its execution domain. */
 	readonly acceptedTaints?: readonly ProvenanceTaint[];
 }
@@ -81,13 +81,14 @@ export async function validateDynamicDependencyCertificate(
 	if (blockingTaints.length) return indeterminate(`tainted:${blockingTaints.join(",")}`);
 
 	const paths = certificate.dependencies.some(dependency => dependency.kind !== "fd");
-	return withFilesystemReadView(paths ? undefined : FilesystemReadView.ambient(), async (source): Promise<DynamicDependencyValidation> => {
+	const borrowed = typeof context.readView === "function" ? undefined : context.readView;
+	return withFilesystemReadView(paths ? borrowed : FilesystemReadView.ambient(), async (source): Promise<DynamicDependencyValidation> => {
 		const current: DynamicDependency[] = [];
 		const changed: string[] = [];
 		// Independent observations: checked concurrently, settled in certificate order (the strong key hashes that order).
 		const expectations = structuredClone(certificate.dependencies);
 		// Names missing from one directory, or its own entries, share one listing of it within a validation.
-		const readView = (target: string) => context.readView?.(target) ?? source;
+		const readView = (target: string) => (typeof context.readView === "function" ? context.readView(target) : borrowed) ?? source;
 		const list = sharedWalk(target => captureFilesystemEntry(target, "directory", readView(target)));
 		const checks = await mapFilesystem(expectations, async (expected): Promise<{ observed?: DynamicDependency; missing?: true } | string> => {
 			try {
@@ -129,6 +130,7 @@ export async function validateDynamicDependencyCertificate(
 			}
 		}
 
+		await borrowed?.verify();
 		return { ...(changed.length ? { status: "stale", changed: Object.freeze([...new Set(changed)]) } : { status: "valid" }), dependencies: Object.freeze(current), ...metrics() };
 	}).catch(error => { context.signal?.throwIfAborted(); return indeterminate(`validation_error:filesystem_view:${errorMessage(error)}`); });
 }

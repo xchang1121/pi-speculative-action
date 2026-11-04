@@ -9,12 +9,12 @@ import {
 	certificateReplayable, parseProcessCertificate, type ProcessProvenanceCertificate, type ProvenanceTaint,
 	referencedArtifacts,
 } from "./provenance-certificate.ts";
-import { CONTENT_CHUNK_BYTES as ARTIFACT_BLOCK_BYTES, readChunkRange, type ArtifactReference, validateArtifact } from "./artifact-reference.ts";
-import { digestObject, isSha256Digest, sha256Digest, sha256DigestAsync, type Sha256Digest } from "./stable-value-hash.ts";
+import { CONTENT_CHUNK_BYTES as ARTIFACT_BLOCK_BYTES, type ArtifactReference, validateArtifact } from "./artifact-reference.ts";
+import { digestObject, isSha256Digest, sha256DigestAsync, type Sha256Digest } from "./stable-value-hash.ts";
 import { stableStringify } from "./stable-json.ts";
 import { nonNegativeNumber, positiveInteger } from "./setting-input.ts";
 import { isMissing as missing } from "./error-utils.ts";
-import { FilesystemObjectLease, mapFilesystem, openAnonymousFilesystemFile, openFilesystemFile, withFilesystemReadView, type FilesystemObjectTransfer } from "./filesystem-evidence.ts";
+import { FilesystemObjectLease, mapFilesystem, openArtifactImage, sealArtifactImage, openFilesystemFile, withFilesystemReadView, type FilesystemObjectHandle, type FilesystemObjectTransfer } from "./filesystem-evidence.ts";
 import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
 import { isSafeCount } from "./number-utils.ts";
 import { SQLiteReadOwner } from "./sqlite-read.ts";
@@ -64,14 +64,36 @@ export class ArtifactCAS {
 	readonly root: string;
 	private readonly publish: typeof publishImmutable;
 	private readonly readers = new Set<ArtifactReadView>();
+	private readonly capture = new AsyncLocalStorage<ArtifactReadView>();
 
 	constructor(root: string, publish = publishImmutable) { this.root = path.resolve(root); this.publish = publish; }
+	get capturing(): boolean { return !!this.capture.getStore(); }
 
 	async put(value: string | Uint8Array): Promise<ArtifactReference> {
 		const bytes = Buffer.from(value);
 		const reference = Object.freeze({ digest: await sha256DigestAsync(bytes), size: bytes.byteLength }), target = this.artifactPath(reference.digest);
-		await this.publish(target, bytes);
+		const captured = this.capture.getStore();
+		if (captured) await captured.add(reference, undefined, { reference, bytes });
+		else await this.publish(target, bytes);
 		return reference;
+	}
+	/** A producer owns its versions directly. Only an accepted persistent root writes them to history. */
+	async withCapture<T>(operation: () => Promise<T>, limits: Partial<ArtifactReadLimits>): Promise<T> {
+		if (this.capture.getStore()) return operation();
+		const view = new ArtifactReadView(this, limits);
+		try { return await this.capture.run(view, operation); } finally { await view.dispose(); }
+	}
+	async materialize(references: readonly ArtifactReference[], source = this.capture.getStore()): Promise<void> {
+		for (const reference of new Map(references.map(reference => [reference.digest, reference])).values()) if (source?.has(reference)) {
+			const blocks: Buffer[] = [];
+			for (let offset = 0; offset < reference.size; offset += ARTIFACT_BLOCK_BYTES) blocks.push(await source.readRange(reference, offset, Math.min(ARTIFACT_BLOCK_BYTES, reference.size - offset)));
+			await this.publish(this.artifactPath(reference.digest), Buffer.concat(blocks, reference.size));
+		}
+	}
+	async share(references: readonly ArtifactReference[], source: ArtifactReadView): Promise<void> {
+		const captured = this.capture.getStore();
+		if (captured) { if (!await captured.restore(references, source)) throw new Error("owned artifact is unavailable"); }
+		else await this.materialize(references, source);
 	}
 
 	async get(reference: ArtifactReference, signal?: AbortSignal): Promise<Buffer | undefined> {
@@ -87,11 +109,11 @@ export class ArtifactCAS {
 	}
 
 	/** Load and integrity-check a complete effect closure before any replay side effect begins. */
-	async load(references: readonly ArtifactReference[], signal?: AbortSignal, retained?: VerifiedArtifactClosure, limits?: Partial<ArtifactReadLimits>): Promise<VerifiedArtifactClosure | undefined> {
-		const view = new ArtifactReadView(this, limits, () => this.readers.delete(view)), loan = retained?.lend(); let complete = false;
+	async load(references: readonly ArtifactReference[], signal?: AbortSignal, retained?: ArtifactSource, limits?: Partial<ArtifactReadLimits>): Promise<VerifiedArtifactClosure | undefined> {
+		const view = new ArtifactReadView(this, limits, () => this.readers.delete(view)); let complete = false;
 		this.readers.add(view);
-		try { complete = await view.restore(references, loan?.transfer, signal); return complete ? view : undefined; }
-		finally { loan?.release(); if (!complete) await view.dispose(); }
+		try { complete = await view.restore(references, retained ?? this.capture.getStore(), signal); return complete ? view : undefined; }
+		finally { if (!complete) await view.dispose(); }
 	}
 	async dispose(): Promise<void> { await Promise.all([...this.readers].map(view => view.dispose())); }
 
@@ -106,24 +128,25 @@ export interface VerifiedArtifactClosure {
 	readonly read: (reference: ArtifactReference) => Buffer;
 	readonly readRange: (reference: ArtifactReference, offset: number, length: number) => Promise<Buffer>;
 	readonly memoryBytes: number;
-	readonly lend: () => { readonly transfer: readonly ArtifactTransfer[]; readonly release: () => void };
+	readonly lend: (retain?: boolean) => { readonly transfer: readonly ArtifactTransfer[]; readonly release: () => void };
 	readonly dispose: () => Promise<void>;
 }
 
 export type ArtifactTransfer = { readonly reference: ArtifactReference } & ({ readonly object: FilesystemObjectTransfer } | { readonly bytes: Uint8Array });
+export type ArtifactSource = VerifiedArtifactClosure | readonly ArtifactTransfer[];
 interface ArtifactReadLimits { readonly maxReadBytes: number; readonly maxStoredBytes: number; readonly maxOpenChunks: number; }
 
 /** One verified content lease, shared by effect closures and input chunks. Linux owns objects; other adapters retain their existing byte images. */
 export class ArtifactReadView implements VerifiedArtifactClosure {
 	private readonly lifetime = new RuntimeLifecycleLane();
-	private readonly values = new Map<Sha256Digest, { readonly reference: ArtifactReference; readonly blocks: readonly Sha256Digest[];
-		readonly object?: FilesystemObjectLease; readonly image?: Buffer }>();
+	private readonly values = new Map<Sha256Digest, { readonly reference: ArtifactReference;
+		readonly object?: FilesystemObjectLease; readonly image?: Buffer; owners: number }>();
 	private readonly cas: ArtifactCAS;
 	private readonly released?: () => void;
 	private readonly limits: ArtifactReadLimits;
 	constructor(cas: ArtifactCAS, limits: Partial<ArtifactReadLimits> = {}, released?: () => void) {
 		this.cas = cas; this.released = released;
-		this.limits = Object.freeze({ maxReadBytes: limits.maxReadBytes ?? 64 * ARTIFACT_BLOCK_BYTES,
+		this.limits = Object.freeze({ maxReadBytes: limits.maxReadBytes ?? 65 * ARTIFACT_BLOCK_BYTES,
 			maxStoredBytes: limits.maxStoredBytes ?? 2 ** 31, maxOpenChunks: limits.maxOpenChunks ?? 1024 });
 		if (Object.values(this.limits).some(value => !isSafeCount(value)) || this.limits.maxReadBytes > 2 ** 30 || this.limits.maxOpenChunks > 65536)
 			throw new Error("invalid artifact lease budget");
@@ -131,114 +154,107 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 	get maxReadBytes(): number { return this.limits.maxReadBytes; }
 	get artifacts(): number { return this.values.size; }
 	get bytes(): number { return [...this.values.values()].reduce((sum, value) => sum + value.reference.size, 0); }
-	get memoryBytes(): number { return [...this.values.values()].reduce((sum, value) => sum + 160 + value.blocks.length * 80 + (value.image?.length ?? 0), 0); }
+	get memoryBytes(): number { return [...this.values.values()].reduce((sum, value) => sum + 160 + (value.image?.length ?? 0), 0); }
 	has(reference: ArtifactReference): boolean { return this.values.get(reference.digest)?.reference.size === reference.size; }
 	checkBudget(reference: ArtifactReference): void {
 		validateArtifact(reference);
 		if (!this.has(reference) && (this.bytes + reference.size > this.limits.maxStoredBytes || this.artifacts >= this.limits.maxOpenChunks))
 			throw new Error("artifact stored-byte or descriptor budget exceeded");
 	}
-	async restore(references: readonly ArtifactReference[], transfers?: readonly ArtifactTransfer[], signal?: AbortSignal): Promise<boolean> {
+	async restore(references: readonly ArtifactReference[], transfers?: ArtifactSource, signal?: AbortSignal): Promise<boolean> {
+		if (transfers && !(transfers instanceof ArtifactReadView) && "lend" in transfers) {
+			const loan = transfers.lend(); try { return await this.restore(references, loan.transfer, signal); } finally { loan.release(); }
+		}
 		const sizes = new Map<Sha256Digest, number>(); for (const reference of references) validateArtifact(reference, sizes);
-		const supplied = transfers && new Map(transfers.map(value => [value.reference.digest, value]));
-		if (supplied && supplied.size !== transfers!.length) throw new Error("duplicate artifact transfer");
+		const source = transfers instanceof ArtifactReadView ? transfers : undefined;
+		const supplied = transfers && !source ? new Map((transfers as readonly ArtifactTransfer[]).map(value => [value.reference.digest, value])) : undefined;
+		if (supplied && supplied.size !== (transfers as readonly ArtifactTransfer[]).length) throw new Error("duplicate artifact transfer");
 		for (const [digest, size] of sizes) {
 			const retained = supplied?.get(digest);
-			if (supplied && !retained || !await this.add({ digest, size }, signal, retained)) return false;
+			if (supplied && !retained || !await this.add({ digest, size }, signal, source ?? retained)) return false;
 		}
 		signal?.throwIfAborted(); return true;
 	}
-	add(reference: ArtifactReference, signal?: AbortSignal, supplied?: ArtifactTransfer): Promise<boolean> {
+	add(reference: ArtifactReference, signal?: AbortSignal, supplied?: ArtifactTransfer | ArtifactReadView): Promise<boolean> {
 		return this.lifetime.serialize(async () => {
 			signal?.throwIfAborted(); validateArtifact(reference);
+			if (supplied instanceof ArtifactReadView && supplied.lifetime.sealed) throw new Error("artifact lease is closed");
 			if (this.values.has(reference.digest)) { if (!this.has(reference)) throw new Error("conflicting artifact size"); return true; }
 			this.checkBudget(reference);
+			if (supplied instanceof ArtifactReadView) {
+				if (supplied.has(reference)) { const value = supplied.value(reference); value.owners++; this.values.set(reference.digest, value); return true; }
+				supplied = undefined;
+			}
 			if (supplied && (supplied.reference.digest !== reference.digest || supplied.reference.size !== reference.size)) throw new Error("artifact transfer identity mismatch");
-			let object: FilesystemObjectLease | undefined, image: Buffer | undefined, snapshot: FileHandle | undefined;
+			let handle: FilesystemObjectHandle | undefined, snapshot: FileHandle | undefined;
 			try {
-				if (supplied && "bytes" in supplied || process.platform !== "linux") {
-					image = supplied && "bytes" in supplied ? Buffer.from(supplied.bytes) : await this.cas.get(reference, signal);
-					if (!image) return false;
-					if (image.length !== reference.size) throw new Error("artifact integrity check failed: length");
-					if (process.platform === "linux") snapshot = await openAnonymousFilesystemFile(this.cas.root);
-				} else {
-					const imported = supplied && "object" in supplied ? FilesystemObjectLease.receive(supplied.object, true) : undefined;
-					if (supplied && !imported) return false;
-					const handle = imported?.handle ?? await openArtifactFile(this.cas.artifactPath(reference.digest));
-					if (!handle) return false;
-					try {
-						const stat = imported?.stat ?? await handle.stat({ bigint: true });
-						if (!stat.isFile() || stat.size !== BigInt(reference.size)) throw new Error("artifact integrity check failed: length");
-						object = new FilesystemObjectLease(handle, stat, true);
-					} catch (error) { await handle.close(); throw error; }
-					// A named CAS inode can be damaged in place. A lease owns verified bytes independently of that name and object.
-					if (!imported) snapshot = await openAnonymousFilesystemFile(this.cas.root);
+				const imported = supplied && "object" in supplied ? supplied : undefined;
+				let image = supplied && "bytes" in supplied ? Buffer.from(supplied.bytes) : !supplied && process.platform !== "linux"
+					? await readOptional(this.cas.artifactPath(reference.digest), reference.size, signal) : undefined;
+				if (imported) handle = FilesystemObjectLease.receive(imported.object, true)?.handle;
+				else if (!image && process.platform === "linux") handle = await openArtifactFile(this.cas.artifactPath(reference.digest));
+				if (!image && !handle) return false;
+				const stat = handle && await handle.stat({ bigint: true });
+				if (image && image.length !== reference.size || stat && (!stat.isFile() || stat.size !== BigInt(reference.size))) throw new Error("artifact integrity check failed: length");
+				if (process.platform === "linux") {
+					if (imported) { if (!sealArtifactImage(handle!.fd)) throw new Error("artifact image is not immutable"); }
+					else snapshot = await openArtifactImage();
 				}
-				const hash = createHash("sha256"), blocks: Sha256Digest[] = [];
+				const hash = createHash("sha256");
 				for (let offset = 0; offset < reference.size; offset += ARTIFACT_BLOCK_BYTES) {
 					signal?.throwIfAborted();
-					const block = await this.block({ reference, object, image, blocks: [] }, offset / ARTIFACT_BLOCK_BYTES, false);
-					hash.update(block); blocks.push(await sha256DigestAsync(block));
-					if (snapshot) for (let written = 0; written < block.length;) {
-						const { bytesWritten } = await snapshot.write(block, written, block.length - written, offset + written);
-						if (!bytesWritten) throw new Error("artifact snapshot write made no progress"); written += bytesWritten;
-					}
+					const block = image ? image.subarray(offset, offset + ARTIFACT_BLOCK_BYTES) : Buffer.allocUnsafe(Math.min(ARTIFACT_BLOCK_BYTES, reference.size - offset));
+					if (!image) await readArtifactRange(handle!, block, offset, signal);
+					hash.update(block);
+					await snapshot?.writeFile(block);
 				}
 				if (`sha256:${hash.digest("hex")}` !== reference.digest) throw new Error(`artifact integrity check failed for ${reference.digest}`);
 				if (snapshot) {
-					const handle = await open(`/proc/self/fd/${snapshot.fd}`, "r"), source = object;
-					try { object = new FilesystemObjectLease(handle, await handle.stat({ bigint: true }), true); }
-					catch (error) { await handle.close(); throw error; }
-					await source?.dispose(); image = undefined;
+					if (!sealArtifactImage(snapshot.fd, true)) throw new Error("artifact image sealing failed");
+					await handle?.close(); handle = snapshot; snapshot = undefined; image = undefined;
 				}
 				signal?.throwIfAborted();
-				this.values.set(reference.digest, { reference: Object.freeze({ ...reference }), object: object && this.lifetime.own(object), image, blocks }); object = undefined;
+				const object = handle && new FilesystemObjectLease(handle, await handle.stat({ bigint: true }), true);
+				this.values.set(reference.digest, { reference: Object.freeze({ ...reference }), object, image, owners: 1 }); handle = undefined;
 				return true;
-			} finally { try { await snapshot?.close(); } finally { await object?.dispose(); } }
+			} finally { try { await snapshot?.close(); } finally { await handle?.close(); } }
 		});
 	}
 	read(reference: ArtifactReference): Buffer {
 		if (this.lifetime.sealed) throw new Error("artifact lease is closed");
-		const value = this.value(reference); this.range(reference, 0, reference.size);
-		const result = Buffer.allocUnsafe(reference.size);
-		for (let offset = 0; offset < result.length; offset += ARTIFACT_BLOCK_BYTES) {
-			const block = result.subarray(offset, Math.min(result.length, offset + ARTIFACT_BLOCK_BYTES));
-			if (value.image) value.image.copy(block, 0, offset, offset + block.length);
-			else for (let count = 0; count < block.length;) { const read = readSync(value.object!.handle.fd, block, count, block.length - count, offset + count); if (!read) throw new Error("artifact truncated"); count += read; }
-			if (sha256Digest(block) !== value.blocks[offset / ARTIFACT_BLOCK_BYTES]) throw new Error("artifact integrity check failed");
-		}
+		const value = this.value(reference), result = this.range(reference, 0, reference.size);
+		if (value.image) value.image.copy(result);
+		else for (let count = 0; count < result.length;) { const read = readSync(value.object!.handle.fd, result, count, result.length - count, count); if (!read) throw new Error("artifact truncated"); count += read; }
 		return result;
 	}
 	readRange(reference: ArtifactReference, offset: number, length: number): Promise<Buffer> {
 		return this.lifetime.serialize(async () => {
-			const value = this.value(reference); this.range(reference, offset, length);
-			return readChunkRange(offset, length, index => this.block(value, index));
+			const value = this.value(reference), result = this.range(reference, offset, length);
+			if (value.image) value.image.copy(result, 0, offset, offset + length);
+			else await readArtifactRange(value.object!.handle, result, offset);
+			return result;
 		});
 	}
-	lend() {
+	lend(retain = true) {
 		if (this.lifetime.sealed) throw new Error("artifact lease is closed");
 		const loans: { readonly release: () => void }[] = [], transfer: ArtifactTransfer[] = [];
 		const release = () => { for (const loan of loans) loan.release(); };
 		try { for (const { reference, object, image } of this.values.values()) {
 			if (image) transfer.push({ reference, bytes: Uint8Array.from(image) });
-			else { const loan = object!.lend(); if (!loan) throw new Error("artifact object lease is closed"); loans.push(loan); transfer.push({ reference, object: loan.transfer }); }
+			else { const loan = object!.lend(retain); if (!loan) throw new Error("artifact object lease is closed"); loans.push(loan); transfer.push({ reference, object: loan.transfer }); }
 		} return { transfer, release }; } catch (error) { release(); throw error; }
 	}
-	dispose(): Promise<void> { return this.lifetime.dispose(() => { this.values.clear(); this.released?.(); }); }
+	dispose(): Promise<void> { return this.lifetime.dispose(async () => {
+		await Promise.all([...this.values.values()].map(value => --value.owners ? undefined : value.object?.dispose()));
+		this.values.clear(); this.released?.();
+	}); }
 	private value(reference: ArtifactReference) {
 		const value = this.values.get(reference.digest);
 		if (!value || value.reference.size !== reference.size) throw new Error(`artifact is outside the verified closure: ${reference.digest}`); return value;
 	}
-	private range(reference: ArtifactReference, offset: number, length: number): void {
+	private range(reference: ArtifactReference, offset: number, length: number): Buffer {
 		if (!isSafeCount(offset) || !isSafeCount(length) || offset + length > reference.size || length > this.maxReadBytes) throw new Error("artifact read budget exceeded");
-	}
-	private async block(value: ArtifactReadView["values"] extends Map<unknown, infer Value> ? Value : never, index: number, verify = true): Promise<Buffer> {
-		const offset = index * ARTIFACT_BLOCK_BYTES, size = Math.min(ARTIFACT_BLOCK_BYTES, value.reference.size - offset), buffer = Buffer.allocUnsafe(size);
-		if (value.image) value.image.copy(buffer, 0, offset, offset + size);
-		else await value.object!.borrow(async handle => {
-			for (let count = 0; count < size;) { const { bytesRead } = await handle.read!(buffer, count, size - count, offset + count); if (!bytesRead) throw new Error("artifact truncated"); count += bytesRead; }
-		});
-		if (verify && await sha256DigestAsync(buffer) !== value.blocks[index]) throw new Error("artifact integrity check failed"); return buffer;
+		return Buffer.allocUnsafe(length);
 	}
 }
 
@@ -282,11 +298,13 @@ export class ProvenanceCertificateStore {
 		// An admitted publication owns its remaining finite reads through shutdown.
 		return this.publication.getStore()?.active ? this.lifecycle.track(Promise.resolve().then(execute)) : this.lifecycle.admit(execute);
 	}
-	loadArtifacts(references: readonly ArtifactReference[], signal?: AbortSignal, retained?: VerifiedArtifactClosure): Promise<VerifiedArtifactClosure | undefined> {
+	loadArtifacts(references: readonly ArtifactReference[], signal?: AbortSignal, retained?: ArtifactSource): Promise<VerifiedArtifactClosure | undefined> {
 		return this.read(signal => this.artifacts.load(references, signal, retained, { maxStoredBytes: this.limits.maxBytes }), signal);
 	}
 	/** A finite publication owns its payloads until sealing; other processes cannot collect between its writes. */
-	withPublication<T>(operation: () => Promise<T>): Promise<T> { return this.exclusive(() => operation()); }
+	withPublication<T>(operation: () => Promise<T>, owned = false): Promise<T> {
+		return this.artifacts.capturing ? operation() : owned ? this.read(() => this.artifacts.withCapture(operation, { maxStoredBytes: this.limits.maxBytes })) : this.exclusive(() => operation());
+	}
 	configure(limits: Partial<ProvenanceStoreLimits>): void {
 		this.limitsValue = Object.freeze({ maxCertificates: positiveInteger(limits.maxCertificates, this.limits.maxCertificates), maxBytes: positiveInteger(limits.maxBytes, this.limits.maxBytes) });
 	}
@@ -295,14 +313,12 @@ export class ProvenanceCertificateStore {
 		if (certificate.result.continuation) return false;
 		const owned = parseProcessCertificate(certificate);
 		if (!owned) throw new Error("invalid process provenance certificate");
-		const references = referencedArtifacts(owned), touched = [`certificate:${owned.id}`, ...references.map(reference => this.objectKey(this.artifacts.artifactPath(reference.digest)))];
-		return this.exclusive(async database => {
-			await mapFilesystem(references, async reference => { if (!await this.artifacts.has(reference)) throw new Error(`certificate references missing artifact ${reference.digest}`); });
+		return this.publishRoot(`certificate:${owned.id}`, referencedArtifacts(owned), database => {
 			const stored = decodeCertificate(database.prepare("SELECT value FROM certificates WHERE id = ?").get(owned.id)?.value);
 			const valid = stored?.id === owned.id;
 			if (!valid) writeCertificate(database, owned);
 			return !valid;
-		}, touched);
+		});
 	}
 
 	get(id: Sha256Digest, signal?: AbortSignal): Promise<ProcessProvenanceCertificate | undefined> { return this.record("certificates", id, decodeCertificate, signal); }
@@ -323,19 +339,15 @@ export class ProvenanceCertificateStore {
 	async putProcessCheckpoint(ticket: string, input: Omit<StoredProcessCheckpoint, "schema" | "id" | "createdAt" | "ticket">): Promise<StoredProcessCheckpoint> {
 		const body = { ...input, schema: 1 as const, ticket, createdAt: Date.now() }, record = decodeProcessCheckpoint(stableStringify({ ...body, id: digestObject(body) }));
 		if (!record) throw new Error("invalid process checkpoint");
-		const references = checkpointArtifacts(record);
-		return this.exclusive(async database => {
+		return this.publishRoot(`checkpoint:${ticket}`, referencedArtifacts(record.certificate), async database => {
 			const owner = database.prepare("SELECT issuer, origin FROM checkpoint_owner WHERE singleton=1").get();
 			const issued = database.prepare("SELECT value FROM process_checkpoints WHERE ticket=?").get(ticket);
 			if (owner?.origin !== await realpath(this.root) || !ticket.startsWith(`${owner.issuer}:`) || !issued || issued.value !== null)
 				throw new Error("checkpoint ticket is no longer publishable");
-			const closure = await this.loadArtifacts(references);
-			if (!closure) throw new Error("checkpoint artifacts are unavailable");
-			await closure.dispose();
 			database.prepare("UPDATE process_checkpoints SET value=?, weakKey=?, executable=?, sessionID=?, createdAt=? WHERE ticket=?")
 				.run(stableStringify(record), record.certificate.weakKey, record.certificate.prototype.executablePath, record.sessionID, record.createdAt, ticket);
 			return record;
-		}, [`checkpoint:${ticket}`, ...references.map(reference => this.objectKey(this.artifacts.artifactPath(reference.digest)))]);
+		});
 	}
 	async mayHaveProcessCheckpoints(sessionID: string, executablePath?: string, signal?: AbortSignal): Promise<boolean> {
 		try { return !!(await this.query(`SELECT 1 FROM process_checkpoints WHERE sessionID=? AND claim IS NULL${executablePath ? " AND executable=?" : ""} LIMIT 1`,
@@ -369,12 +381,9 @@ export class ProvenanceCertificateStore {
 		const body = { schema: 1 as const, createdAt: Date.now(), payload, artifacts }, id = digestObject(body);
 		const record = decodeInputVersion(stableStringify({ ...body, id }));
 		if (!record) throw new Error("invalid persistent input version");
-		return this.exclusive(async database => {
-			await mapFilesystem(record.artifacts, async reference => {
-				if (!await this.artifacts.has(reference)) throw new Error(`input version references missing artifact ${reference.digest}`);
-			});
+		return this.publishRoot(`input:${id}`, record.artifacts, database => {
 			database.prepare("INSERT OR REPLACE INTO input_versions VALUES (?, ?)").run(id, stableStringify(record)); return record;
-		}, [`input:${id}`, ...record.artifacts.map(reference => this.objectKey(this.artifacts.artifactPath(reference.digest)))]);
+		});
 	}
 	getInputVersion(id: Sha256Digest, signal?: AbortSignal): Promise<StoredInputVersion | undefined> { return this.record("input_versions", id, decodeInputVersion, signal); }
 	/** Finite discovery hints, newest publication first; every row still needs current input and CAS validation. */
@@ -492,7 +501,7 @@ export class ProvenanceCertificateStore {
 				if (kind === "checkpoint") {
 					const record = decodeProcessCheckpoint(value);
 					return { key: `checkpoint:${id}`, kind, bytes: Buffer.byteLength(String(value)), modifiedAt: 0, createdAt: record?.createdAt ?? 0,
-						references: record?.ticket === id ? checkpointArtifacts(record) : undefined };
+						references: record?.ticket === id ? referencedArtifacts(record.certificate) : undefined };
 				}
 				const record = kind === "certificate" ? decodeCertificate(value) : decodeInputVersion(value), valid = record?.id === id;
 				const references = !valid ? undefined : kind === "input" ? (record as StoredInputVersion).artifacts
@@ -516,6 +525,17 @@ export class ProvenanceCertificateStore {
 	}
 
 	private objectKey(target: string): string { return path.relative(this.root, target).split(path.sep).join("/"); }
+	/** A persistent root adopts existing versions under the same metadata transaction. */
+	private publishRoot<T>(key: string, references: readonly ArtifactReference[], publish: (database: DatabaseSync) => T | Promise<T>): Promise<T> {
+		return this.exclusive(async database => {
+			const result = await publish(database);
+			await this.artifacts.materialize(references);
+			const closure = await this.loadArtifacts(references);
+			if (!closure) throw new Error("persistent root artifacts are unavailable");
+			await closure.dispose();
+			return result;
+		}, [key, ...references.map(reference => this.objectKey(this.artifacts.artifactPath(reference.digest)))]);
+	}
 	private async record<T extends { readonly id: Sha256Digest }>(table: "certificates" | "input_versions", id: Sha256Digest, decode: (value: unknown) => T | undefined, signal?: AbortSignal): Promise<T | undefined> {
 		digestHex(id);
 		const value = (await this.query(`SELECT value FROM ${table} WHERE id = ?`, [id], table === "certificates", signal))[0]?.value, record = decode(value);
@@ -655,7 +675,6 @@ function decodeCertificate(value: unknown): ProcessProvenanceCertificate | undef
 	try { return typeof value === "string" ? parseProcessCertificate(JSON.parse(value)) : undefined; } catch { return undefined; }
 }
 
-function checkpointArtifacts(record: StoredProcessCheckpoint): readonly ArtifactReference[] { return [...referencedArtifacts(record.certificate), record.image]; }
 function decodeProcessCheckpoint(value: unknown): StoredProcessCheckpoint | undefined {
 	try {
 		if (typeof value !== "string" || Buffer.byteLength(value) > 8 * 1024 * 1024) return;
@@ -692,20 +711,22 @@ async function openArtifactFile(target: string): Promise<FileHandle | undefined>
 	}, async handle => { await handle?.close(); });
 }
 
+async function readArtifactRange(file: FilesystemObjectHandle, bytes: Buffer, position: number, signal?: AbortSignal, exact = true): Promise<Buffer> {
+	let offset = 0;
+	while (offset < bytes.length) {
+		signal?.throwIfAborted();
+		const { bytesRead } = await file.read!(bytes, offset, bytes.length - offset, position + offset);
+		if (!bytesRead) break; offset += bytesRead;
+	}
+	signal?.throwIfAborted();
+	if (exact && offset !== bytes.length) throw new Error("artifact truncated");
+	return offset === bytes.length ? bytes : bytes.subarray(0, offset);
+}
 /** One extra byte proves a size mismatch without loading an arbitrarily enlarged corrupt object. */
 async function readOptional(target: string, size: number, signal?: AbortSignal): Promise<Buffer | undefined> {
 	signal?.throwIfAborted();
-	const file = await openArtifactFile(target);
-	if (!file) return;
-	try {
-		const bytes = Buffer.allocUnsafe(size + 1); let offset = 0;
-		while (offset < bytes.length) {
-			signal?.throwIfAborted();
-			const { bytesRead } = await file.read(bytes, offset, bytes.length - offset, offset);
-			if (!bytesRead) break; offset += bytesRead;
-		}
-		signal?.throwIfAborted(); return bytes.subarray(0, offset);
-	} finally { await file.close(); }
+	await using file = await openArtifactFile(target);
+	return file && await readArtifactRange(file, Buffer.allocUnsafe(size + 1), 0, signal, false);
 }
 
 async function verifyArtifact(reference: ArtifactReference, bytes?: Buffer): Promise<Buffer | undefined> {

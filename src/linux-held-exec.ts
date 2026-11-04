@@ -1,5 +1,6 @@
 import { isSafeCount } from "./number-utils.ts";
 import { isUtf8 } from "node:buffer";
+import { closeSync, openSync, readSync, lstatSync, statSync, realpathSync, constants } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import { on, once } from "node:events";
 import { AsyncResource } from "node:async_hooks";
@@ -14,18 +15,178 @@ import { captureHeldDirectory, captureStableFile, sameFilesystemIdentity } from 
 import type { ResourceObjectInputs } from "./agent-execution-world.ts";
 import { sha256Digest, type Sha256Digest } from "./stable-value-hash.ts";
 import {
-	isOFDPosition, type OFDPosition, RESOURCE_TRANSITIONS, type ResourceTransitionKind, type ProcessResourceEffects, type ArtifactReference,
+	isOFDPosition, type OFDPosition, RESOURCE_TRANSITIONS, type ResourceTransitionKind, type ProcessResourceEffects, type ArtifactReference, type DynamicDependency,
 } from "./provenance-certificate.ts";
 import { containsFilesystemPath } from "./path-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 import { immutableSnapshot } from "./stable-json.ts";
 import { captureWorkspaceFileAliases } from "./process-observation.ts";
-import { qualifyNativeStartup, resolveLinuxExecHelper, startupScope } from "./process-startup.mjs";
+import { nativeFilesystem, qualifyNativeStartup, resolveLinuxExecHelper, startupScope } from "./process-startup.mjs";
 export { resolveLinuxExecHelper } from "./process-startup.mjs";
 
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024 + 32768;
 const MAX_OUTPUT_EVENTS = 65_536;
 const MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
+
+/** Kernel collection shares the execution owner's lifetime, not its privileges. */
+export async function executionDomainCollector(binary: string) {
+	const socket = process.env.PI_SPEC_DOMAIN_SOCKET;
+	if (!socket) throw new Error("Linux process reuse requires an active cgroup/eBPF execution domain");
+	const request = (operation: number, domain = 0n, values: readonly (number | bigint)[] | Buffer = []) => {
+		const count = Buffer.isBuffer(values) ? Math.ceil(values.length / 8) : values.length;
+		if (count > 4096) throw new Error("execution domain query exceeds its batch limit");
+		const packet = Buffer.concat([Buffer.alloc(32784), Buffer.from(`${socket}\0`)]);
+		packet.writeUInt32LE(operation); packet.writeUInt32LE(count, 4); packet.writeBigUInt64LE(domain, 8);
+		if (Buffer.isBuffer(values)) values.copy(packet, 16);
+		else for (const [index, value] of values.entries()) packet.writeBigUInt64LE(BigInt(value), 16 + index * 8);
+		const status = nativeFilesystem?.(-15, packet);
+		if (status !== 0) throw new Error(`execution domain collector unavailable: ${status}`);
+		return packet;
+	};
+	const fingerprint = sha256Digest(Buffer.concat(await Promise.all(["c", "h"].map(extension =>
+		readFile(new URL(`../src/linux-execution-domain.${extension}`, import.meta.url))))));
+	const check = () => {
+		const hello = request(0);
+		if (hello.readBigUInt64LE(8) !== 15n || hello.readUInt32LE(4) !== 8 || hello.toString("ascii", 16, 80) !== fingerprint.slice(7))
+			throw new Error("execution domain collector changed; rebuild the Linux backend");
+	};
+	check();
+	return { fingerprint, check, open: () => {
+		const id = request(1).readBigUInt64LE(8); let closed = false, watching = false, descriptor: number | undefined;
+		return {
+			trace: (broker: string) => {
+				if (closed || descriptor !== undefined) throw new Error("execution record owner is unavailable");
+				descriptor = Number(request(11, id, Buffer.from(`${broker}\0`)).readBigUInt64LE(16));
+				let offset = 0;
+				return () => {
+					if (closed || descriptor === undefined) throw new Error("execution record owner is closed");
+					const fence = request(12, id), length = Number(fence.readBigUInt64LE(16));
+					if (fence.readUInt32LE(4) !== 4 || fence.readBigUInt64LE(32) || fence.readBigUInt64LE(24) > fence.readBigUInt64LE(40) || !isSafeCount(length, offset, 512 * 1024 * 1024))
+						throw new Error("execution records are incomplete");
+					const bytes = Buffer.allocUnsafe(length - offset);
+					if (readSync(descriptor, bytes, 0, bytes.length, offset) !== bytes.length) throw new Error("execution records changed while reading");
+					offset = length; return bytes;
+				};
+			},
+			launch: (command: readonly [string, ...string[]]): readonly [string, ...string[]] => [binary, "--execution-domain", String(id), socket, ...command],
+			watch: (roots: readonly string[]) => {
+				try { request(5, id, Buffer.from(`${roots.join("\0")}\0`)); watching = true; }
+				catch { watching = false; }
+			},
+			admit: (objects: readonly { readonly dev: bigint; readonly ino: bigint; readonly path: string }[]) => {
+				if (closed || !watching) return false;
+				try {
+					for (let index = 0; index < objects.length; index += 64) {
+						const descriptors: number[] = [], values: (number | bigint)[] = [];
+						try {
+							for (const info of objects.slice(index, index + 64)) {
+								const descriptor = openSync(info.path, 0x200000 | constants.O_NOFOLLOW);
+								descriptors.push(descriptor); values.push(descriptor, info.dev, info.ino);
+							}
+							request(13, id, values);
+						} finally { for (const descriptor of descriptors) closeSync(descriptor); }
+					}
+					return true;
+				} catch { return false; }
+			},
+			version: () => {
+				if (closed || !watching) return;
+				const answer = request(6, id);
+				return answer.readBigUInt64LE(24) || answer.readBigUInt64LE(32) ? undefined : answer.readBigUInt64LE(16);
+			},
+			changes: (since: bigint, inputs: readonly { readonly dev: bigint; readonly ino: bigint; readonly contents?: boolean }[]) => {
+				if (closed || !watching) return;
+				const objects = new Set<string>(), unstable = new Set<string>();
+				let version: bigint | undefined;
+				try {
+					for (let start = 0; start < Math.max(1, inputs.length); start += 1365) {
+						const batch = inputs.slice(start, start + 1365), values: (number | bigint)[] = [since];
+						for (const input of batch) values.push(input.dev, input.ino, input.contents === false ? 2 : 3);
+						const answer = request(7, id, values);
+						if (answer.readUInt32LE(4) !== values.length) return;
+						version ??= answer.readBigUInt64LE(16);
+						for (const [index, input] of batch.entries()) {
+							const flags = answer.readBigUInt64LE(40 + index * 24), key = `${input.dev}:${input.ino}`;
+							if (flags & 1n) objects.add(key); if (flags & 2n) unstable.add(key);
+						}
+					}
+					return { version: version!, objects, unstable };
+				} catch { return; }
+			},
+			close: () => { if (!closed) { closed = true; try { request(4, id); } finally { if (descriptor !== undefined) closeSync(descriptor); descriptor = undefined; } } },
+		};
+	} };
+}
+
+/** Bind a lookup to the collector's continuous history. The final check runs only
+ * after the native consumer has staged its immutable bytes and before it is armed. */
+export function executionDomainProof(collector: Awaited<ReturnType<typeof executionDomainCollector>>, root: string) {
+	const domain = collector.open();
+	domain.watch([root]);
+	const since = domain.version(), namespace = statSync("/proc/self/ns/mnt", { bigint: true });
+	let closed = false, reason = since === undefined ? "observer_unavailable" : "";
+	return {
+		get reason() { return reason; },
+		seal(dependencies: readonly DynamicDependency[], resolve: (target: string) => string | undefined): () => boolean {
+			const objects = new Map<string, { dev: bigint; ino: bigint; path: string }>(), bindings = new Map<string, { dev: bigint; ino: bigint; contents: boolean }>();
+			const lookedUp = new Map<string, { dev: bigint; ino: bigint }>();
+			let supported = since !== undefined;
+			const observe = (target: string, contents: boolean) => {
+				let first = true;
+				for (;;) {
+					try {
+						const previous = lookedUp.get(target), info = previous ?? lstatSync(target, { bigint: true }), key = `${info.dev}:${info.ino}`;
+						bindings.set(key, { dev: info.dev, ino: info.ino, contents: bindings.get(key)?.contents || first && contents });
+						if (first && contents) objects.set(key, { dev: info.dev, ino: info.ino, path: target });
+						if (previous) break;
+						lookedUp.set(target, { dev: info.dev, ino: info.ino });
+					} catch (error) { if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error; }
+					const parent = path.dirname(target); if (target === parent) break; target = parent; first = false;
+				}
+			};
+			try {
+				for (const input of dependencies) {
+					if (input.kind === "fd") continue;
+					if (input.kind === "lock") { reason = "unobserved_lock"; supported = false; continue; }
+					for (const logical of [input.path, ...(input.kind === "file" ? input.aliases ?? [] : [])]) {
+						let target = resolve(logical); if (!target) { reason = "unmapped_path"; supported = false; continue; }
+						if (input.kind === "absence") {
+							target = path.dirname(target);
+							for (;;) {
+								try { lstatSync(target); break; }
+								catch (error) {
+									if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "") || target === path.dirname(target)) throw error;
+									target = path.dirname(target);
+								}
+							}
+						}
+						observe(target, true);
+						// Preserve symlink lookup ancestors as well as the resolved object's ancestors.
+						try { observe(realpathSync.native(target), true); }
+						catch (error) { if (input.kind !== "symlink" || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+					}
+				}
+			} catch (error) { reason = `input_lookup:${(error as Error).message}`; supported = false; }
+			const inputs = [...bindings.values()], unchanged = () => {
+				const changes = domain.changes(since!, inputs);
+				if (changes && !changes.objects.size) return true;
+				reason = "input_changed_or_observer_discontinuity"; return false;
+			};
+			return () => {
+				try {
+					if (!supported || closed || !unchanged()) return false;
+					if (!domain.admit([...objects.values()])) {
+						reason = "input_census_unstable_or_unsupported"; return false;
+					}
+					if (!unchanged()) return false;
+					if (statSync("/proc/self/ns/mnt", { bigint: true }).ino !== namespace.ino) { reason = "mount_namespace_changed"; return false; }
+					return true;
+				} catch (error) { reason = `observer_error:${(error as Error).message}`; return false; }
+			};
+		},
+		close() { if (!closed) { closed = true; try { domain.close(); } catch { /* A lost owner already revoked its evidence. */ } } },
+	};
+}
 type NativeSpawn = (this: ChildProcess, options: object) => number;
 type NativeSyncSpawn = (this: unknown, options: object) => unknown;
 const nativeRequire = createRequire(import.meta.url);
@@ -75,8 +236,6 @@ export interface HeldExecProcess {
 	 * `owned` proves creation in the traced tree with no observed export; it does not
 	 * authorize content reuse or cover an external debugger duplicating its handles. */
 	readonly descriptors?: readonly HeldFileDescriptor[];
-	/** A cold queue needs an ownership-tracked launch before its shared peek cursor can be borrowed. */
-	readonly trackQueues?: true;
 }
 
 export type QueueMessage = { readonly start: number; readonly end: number; readonly rights: readonly number[] };
@@ -217,7 +376,7 @@ export interface HeldExecTiming {
 	readonly requestedAt: number;
 	readonly completedAt: number;
 	readonly committedAt?: number;
-	readonly barrier: "none" | "inspection" | "descriptors";
+	readonly barrier: "none" | "descriptors";
 	readonly outcome: "continued" | "adopted" | "declined" | "failed";
 	readonly native?: HeldExecClock;
 }
@@ -227,6 +386,8 @@ export type HeldExecDecision = { readonly observeTiming?: (timing: HeldExecTimin
 	| { readonly kind: "continue"; readonly observeCompletion?: (durationMs: number | undefined, clock?: HeldExecClock) => void | Promise<void> }
 	| ({
 			readonly kind: "replay";
+			/** Final proof after staging, while declining still leaves native execution intact. */
+			readonly validate: () => boolean | Promise<boolean>;
 			/** Release a reservation only when the native peer has definitely performed no adoption effects. */
 			readonly settle?: (consumed: boolean) => void | Promise<void>;
 			readonly output: readonly { readonly fd: 1 | 2; readonly data: Buffer }[];
@@ -253,7 +414,7 @@ export interface HeldObservation {
 	readonly scope?: ExecutionScope;
 	readonly signal?: AbortSignal;
 	readonly decide: (process: HeldExecProcess) => Promise<HeldExecDecision>;
-	readonly descriptors?: boolean | "inspect";
+	readonly descriptors?: boolean;
 	readonly skipRoot?: boolean;
 }
 
@@ -270,7 +431,6 @@ interface WireRequest {
 	readonly tracer: number;
 	readonly holder?: number;
 	readonly descriptors?: readonly HeldFileDescriptor[];
-	readonly trackQueues?: true;
 }
 
 /** A two-phase held-exec transport: arm the exit stub before committing reusable effects. */
@@ -377,8 +537,9 @@ export class LinuxHeldExecBoundary {
 		if (this.closing) throw new Error("native observation is closing");
 		const execution = randomBytes(24).toString("hex"), controller = new AbortController();
 		const observer = startupScope.exit(() => spawn(this.observerBinary, ["--attach"], { stdio: ["pipe", "pipe", "ignore", gate], env: {
+			PI_SPEC_DOMAIN_SOCKET: process.env.PI_SPEC_DOMAIN_SOCKET,
 			PI_SPEC_HELD_EXEC_SOCKET: this.socketPath, PI_SPEC_HELD_EXEC_TOKEN: this.token, PI_SPEC_HELD_EXEC_ID: execution,
-			...(options.descriptors ? { PI_SPEC_HELD_EXEC_DESCRIPTORS: options.descriptors === "inspect" ? "2" : "1" } : {}),
+			...(options.descriptors ? { PI_SPEC_HELD_EXEC_DESCRIPTORS: "1" } : {}),
 			...(options.skipRoot ? { PI_SPEC_HELD_EXEC_ROOT: "skip" } : {}),
 		} }));
 		observer.on("error", () => {}); observer.stdin?.on("error", () => {}); observer.unref();
@@ -392,7 +553,7 @@ export class LinuxHeldExecBoundary {
 			observer.stdin?.end(); for (const socket of active.sockets) socket.destroy();
 		};
 		const active = { ...options, signal, observer, retire, sequence: 0, failure: undefined as Error | undefined, decide: startupScope.exit(() => AsyncResource.bind(options.decide)),
-			barrier: (options.descriptors === "inspect" ? "inspection" : options.descriptors ? "descriptors" : "none") as HeldExecTiming["barrier"],
+			barrier: (options.descriptors ? "descriptors" : "none") as HeldExecTiming["barrier"],
 			pending: new Set<Promise<void>>(), sockets: new Set<net.Socket>(), completion: done.then(async (): Promise<void> => {
 				await Promise.allSettled(active.pending); signal.removeEventListener("abort", retire); this.active.delete(execution);
 				if (active.failure) throw active.failure;
@@ -438,7 +599,6 @@ export class LinuxHeldExecBoundary {
 				scope: active.scope,
 				...(active.signal ? { signal: active.signal } : {}),
 				...(request.descriptors ? { descriptors: request.descriptors } : {}),
-				...(request.trackQueues ? { trackQueues: true as const } : {}),
 			});
 			active.signal?.throwIfAborted();
 			if (decision.kind === "continue") {
@@ -469,8 +629,6 @@ export class LinuxHeldExecBoundary {
 				}) || resourceEvents.length > 1024 || resourceEvents.some(event => !descriptors.has(event.fd) ||
 					!RESOURCE_TRANSITIONS.includes(event.kind) || !Buffer.isBuffer(event.data) || event.data.length > 2 * 1024 * 1024 ||
 					event.requested !== undefined && (!isSafeCount(event.requested, 0, 2 * 1024 * 1024)))) return void socket.end("C\n");
-			// Once a proposal is delivered the peer may arm its exit stub, even if its ACK is lost.
-			prepared = true;
 			await writeProcessChannel(socket, Buffer.from(`P2 ${code} ${decision.output.length} ${total} ${positions.length} ${resourceEvents.length} ${continuation?.image.length ?? 0} ${physicalRoot.length} ${sourceRoot.length}\n`));
 			for (const position of positions) {
 				await writeProcessChannel(socket, Buffer.from(`S ${position.index} ${position.after} ${position.afterFlags} ${position.content?.length ?? -1}\n`));
@@ -487,7 +645,14 @@ export class LinuxHeldExecBoundary {
 			if (continuation) { await writeProcessChannel(socket, physicalRoot); await writeProcessChannel(socket, sourceRoot); await writeProcessChannel(socket, continuation.image); }
 			const acknowledgement = await readLine(socket);
 			if (acknowledgement === "N") { prepared = false; return void socket.end(); }
-			if (acknowledgement !== "A") throw new Error("held-exec adoption was not acknowledged");
+			if (acknowledgement !== "S") throw new Error("held-exec staging was not acknowledged");
+			if (!await decision.validate()) { outcome = "declined"; return void socket.end("C\n"); }
+			active.signal?.throwIfAborted();
+			// This grant owns the observed snapshot. Later source changes cannot alter the staged bytes.
+			// From this point a lost ACK may mean the peer has already armed its exit stub.
+			prepared = true;
+			await writeProcessChannel(socket, Buffer.from("G\n"));
+			if (await readLine(socket) !== "A") throw new Error("held-exec adoption was not acknowledged");
 			active.signal?.throwIfAborted();
 			await decision.commit();
 			committedAt = performance.now();
@@ -690,7 +855,6 @@ function parseRequest(line: string): WireRequest | undefined {
 		return /^[0-9a-f]{64}$/.test(value.token ?? "") &&
 			/^[0-9a-f]{48}$/.test(value.execution ?? "") && isSafeCount(value.pid, 1) &&
 			isSafeCount(value.tracer, 1) && (value.holder === undefined || isSafeCount(value.holder)) &&
-			(value.trackQueues === undefined || value.trackQueues === true && value.descriptors === undefined) &&
 			validDescriptors(value.descriptors) ? immutableSnapshot(value as WireRequest) : undefined;
 	} catch {
 		return undefined;

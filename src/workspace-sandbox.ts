@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { ChunkedContent, ContentChunkPool, captureContent, contentMemory, ownContent, readContent, sameContent, writeContent,
+import { ChunkedContent, ContentChunkPool, captureContent, captureFileContent, contentMemory, ownContent, readContent, sameContent, writeContent,
 	lendContentChanges, receiveContentChanges, type ContentChangesTransfer, type ContentVersion } from "./content-chunks.ts";
 import { ProvenanceCertificateStore } from "./reuse-store.ts";
 import { isSafeCount } from "./number-utils.ts";
@@ -20,7 +20,7 @@ import {
 } from "./agent-execution-world.ts";
 import type { WorldBranch, WorldCheckpoint, WorldExecutionMetrics } from "./execution-world.ts";
 import {
-	advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, fileIdentity, mapFilesystem, sameFilesystemIdentity, readFilesystemDirectory, openFilesystemFile,
+	advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, fileIdentity, mapFilesystem, sameFilesystemIdentity, readFilesystemDirectory, openFilesystemFile,
 	withFilesystemReadView, openFilesystemReadView, FilesystemReadView, FilesystemCaptureChangedError,
 	settledIdentity, sharedWalk, pinFilesystemObject, openAnonymousFilesystemFile, FILESYSTEM_OBSERVATION_FIELDS, FILESYSTEM_METADATA_FIELDS as SNAPSHOT_METADATA_FIELDS, type FilesystemObservationEvidence,
 } from "./filesystem-evidence.ts";
@@ -31,8 +31,8 @@ import {
 	type LinuxOverlayfsMount, type LinuxOverlayfsOptions,
 } from "./linux-overlayfs.ts";
 import {
-	captureWorkspaceStructure, captureWorkspaceStructureEntry, statChangeDigest, sameStructureEntry, workspaceStructureSnapshot, directoryEntriesDigest, diffWorkspaceStructures, ExecutionPathProjection,
-	type WorkspaceStructureSnapshot, type WorkspaceTransactionDiff,
+	captureWorkspaceStructure, WorkspaceStructureCapture, captureWorkspaceContent, captureWorkspaceStructureEntry, statChangeDigest, sameStructureEntry, workspaceStructureSnapshot, directoryEntriesDigest, diffWorkspaceStructures, ExecutionPathProjection,
+		type WorkspaceContentSnapshot, type FilesystemVersionSource, type WorkspaceStructureSnapshot, type WorkspaceStructureEntry, type WorkspaceTransactionDiff,
 } from "./process-observation.ts";
 import { ResourceVersionManager, type ResourceChangeSet, type ResourceVersionToken, type ResourceInput } from "./resource-version.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
@@ -147,10 +147,25 @@ interface WorkspaceObservation extends SandboxWorkspaceContext, SandboxWorkspace
 	readonly readBase: (resource: string, maxBytes?: number) => Promise<RegularFileState | undefined>;
 }
 
+const workspaceVersions = new WeakMap<WorkspaceStructureSnapshot, (resource: string) => Promise<ContentVersion | undefined>>();
+/** The interval borrows its original version, including after a later writer replaces that name. */
+export const workspaceInputVersion = (snapshot: WorkspaceStructureSnapshot, resource: string) => workspaceVersions.get(snapshot)?.(resource);
+
 function createWorkspaceObservation(data: SandboxWorkspaceObservation, sourceChanges: () => ResourceChangeSet, contents?: ContentChunkPool): WorkspaceObservation {
 	let workspace!: WorkspaceObservation;
 	const baseGit = bindGit(data.gitBinary, path.dirname(data.repository), ["--git-dir", data.repository]);
-	const structure: WorkspaceStructureDriver = { capture: () => captureSandboxStructure(data) };
+	const readBase = async (resource: string, maxBytes: number) => data.liveBase ? readLiveBase(data.liveBase, resource, maxBytes, contents)
+		: readGitTreeRegularState(baseGit, data.commit, resource, maxBytes, contents);
+	const versions = contents && sharedWalk((resource: string) => readBase(resource, contents.limits.maxLogicalBytes));
+	let retainedStructure: (() => Promise<WorkspaceStructureSnapshot>) | undefined;
+	const structure: WorkspaceStructureDriver = { capture: () => retainedStructure?.() ?? captureSandboxStructure(data), retain: versions => {
+		versions.watch(data.overlay ? data.clock.roots : [data.sandboxRoot]);
+		const retained = new WorkspaceStructureCapture(data.sandboxRoot, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, exclude: SNAPSHOT_EXCLUDES }, versions);
+		const overlay = data.overlay && createOverlayStructureCapture(data.sandboxRoot, data.overlay, versions);
+		const capture = overlay ?? (() => retained.capture());
+		retainedStructure = capture;
+		return () => { retained.clear(); if (retainedStructure === capture) retainedStructure = undefined; };
+	} };
 	const transactions = deferredWorkspaceTransactionDriver(() => createGitWorkspaceTransactionDriver(workspace));
 	workspace = {
 		...data, contents, structure, transactions, sourceChanges, observationExcludes: SNAPSHOT_EXCLUDES,
@@ -168,8 +183,9 @@ function createWorkspaceObservation(data: SandboxWorkspaceObservation, sourceCha
 		},
 		captureChanges: (frontier: readonly string[]) => collectSandboxChanges(workspace, frontier),
 		readBase: async (resource: string, maxBytes = contents?.limits.maxLogicalBytes ?? WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES) => {
-			if (data.liveBase) return readLiveBase(data.liveBase, resource, maxBytes, contents);
-			const state = await readGitTreeRegularState(baseGit, data.commit, resource, maxBytes, contents), mode = data.metadata?.modes.get(slash(resource)) ?? data.modes?.get(slash(resource));
+			const state = await (versions ? versions(resource) : readBase(resource, maxBytes));
+			if (state && state.content.byteLength > maxBytes) throw new Error("workspace input exceeds capture limit");
+			const mode = data.liveBase ? undefined : data.metadata?.modes.get(slash(resource)) ?? data.modes?.get(slash(resource));
 			return state && mode !== undefined ? { ...state, mode } : state;
 		},
 	};
@@ -177,7 +193,7 @@ function createWorkspaceObservation(data: SandboxWorkspaceObservation, sourceCha
 }
 
 async function captureSandboxStructure(data: Pick<SandboxWorkspaceObservation, "sandboxRoot" | "overlay" | "clock">, fence = false): Promise<WorkspaceStructureSnapshot> {
-	const snapshot = await (data.overlay ? captureOverlayWorkspaceStructure(data.sandboxRoot, data.overlay)
+	const snapshot = await (data.overlay ? createOverlayStructureCapture(data.sandboxRoot, data.overlay)()
 		: captureWorkspaceStructure(data.sandboxRoot, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, exclude: SNAPSHOT_EXCLUDES }));
 	if (fence) {
 		const clock = await openWorkspaceChangeClock(data);
@@ -279,6 +295,7 @@ interface AutoWorkspaceDriverDecision {
 
 function regularStructureTransitions(before: WorkspaceStructureSnapshot, after: WorkspaceStructureSnapshot): readonly string[] {
 	if (!before.complete || !after.complete) throw new Error("workspace_structure_limit");
+	if (before.entries === after.entries) return [];
 	const paths: string[] = [];
 	for (const relativePath of [...new Set([...before.entries.keys(), ...after.entries.keys()])].sort()) {
 		if (!relativePath) continue;
@@ -302,6 +319,7 @@ function workspaceAncestors(resource: string): string[] {
 
 function sameWorkspaceChangeSnapshot(left: WorkspaceStructureSnapshot, right: WorkspaceStructureSnapshot): boolean {
 	if (!left.complete || !right.complete || left.entries.size !== right.entries.size) return false;
+	if (left.entries === right.entries) return true;
 	for (const [relativePath, entry] of left.entries) { if (!sameStructureEntry(entry, right.entries.get(relativePath), "change")) return false; }
 	return true;
 }
@@ -518,8 +536,10 @@ export class WorkspaceSandboxService {
 			capturedBytes: changes.reduce((total, change) => total + sandboxChangeBytes(change), 0),
 			executionMetrics: Object.freeze({ ...snapshot.executionMetrics }),
 			compatibility: Object.freeze({ status: "compatible" as const, backend, executionFingerprint }),
-			commit: () => lifetime.track(commit.run(() => {
+			commit: () => lifetime.track(commit.run(async () => {
 				if (lifetime.sealed) throw effectCommitFailure(new Error("workspace branch is disposed"), "recoverable");
+				const current = await validate?.();
+				if (current && current.status !== "valid") throw effectCommitFailure(new Error("workspace inputs changed before commit"), "recoverable", undefined, current.cause);
 				return this.commit(snapshot, inputs).then(output => {
 				// A proven commit anchors future forks in the live workspace, independently of unadopted ancestors.
 				retained.committed = true; retained.parent = undefined; if (lifetime.sealed) inputs.clear(); return output;
@@ -1238,11 +1258,10 @@ async function preserveSnapshotMetadata(sourceRoot: string, sandboxRoot: string,
 }
 
 async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof createWorkspaceObservation>): Promise<WorkspaceTransactionDriver> {
-	// An interval that overlapped another keeps its own before-state: the frontier it began with, what was unreadable then,
-	// and what changed while its start was being fenced. Its writer's trace later names which changes are its own.
+	// Each interval borrows the domain's original versions. Its writer later attributes overlapping changes.
 	interface Capture {
 		contaminated: boolean; overlapped: boolean; readonly before?: WorkspaceStructureSnapshot;
-		readonly frontier: ReadonlyMap<string, RegularFileState | undefined>; readonly unknown: ReadonlySet<string>; readonly racing: readonly string[];
+		readonly versions?: WorkspaceContentSnapshot; readonly racing: readonly string[];
 	}
 	const { sandboxRoot } = workspace;
 	// Discard the entire unaccepted snapshot if a name disappears or an observed object changes during capture.
@@ -1250,11 +1269,22 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 		const last = attempt >= WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS, snapshot = await workspace.structure.capture().catch((error: unknown) => { if (last || !(isMissing(error) || error instanceof FilesystemCaptureChangedError)) throw error; });
 		return snapshot && (snapshot.complete || last) ? snapshot : captureStructure(attempt + 1);
 	};
-	let frontier = new Map(workspace.baselineFrontier), lastStructure = workspace.initialStructure, fenced = false;
-	let retainedBytes = [...frontier.values()].reduce((total, state) => total + contentMemory(state?.content), 0);
-	const active = new Set<Capture>(), lock = new RuntimeLifecycleLane(), unknown = new Set<string>(); // Bytes last seen while others wrote.
-	let poisonReason = lastStructure.complete ? undefined : "workspace_structure_limit";
+	let versions: WorkspaceContentSnapshot = { snapshot: workspace.initialStructure, files: new Map() }, fenced = false;
+	const active = new Set<Capture>(), lock = new RuntimeLifecycleLane();
+	let poisonReason = versions.snapshot.complete ? undefined : "workspace_structure_limit";
 	let clock: Awaited<ReturnType<typeof openWorkspaceChangeClock>> | undefined;
+	const retain = (snapshot: WorkspaceStructureSnapshot, capture = true) => captureWorkspaceContent(snapshot, versions, async (resource, entry) =>
+		capture ? captureFileContent(path.resolve(sandboxRoot, resource), Math.min(entry.size, workspace.contents?.limits.maxLogicalBytes ?? WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES), workspace.contents, { digest: false }) : undefined,
+		{ maxBytes: WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES, memory: workspace.contents ? true : undefined, required: true,
+			baseline: workspace.initialStructure, baselineMemory: resource => contentMemory(workspace.baselineFrontier.get(resource)?.content) });
+	const readVersion = async (original: WorkspaceContentSnapshot, resource: string, current = false): Promise<RegularFileState | undefined> => {
+		if (original.snapshot.entries.get(resource)?.kind !== "file") return;
+		if (!original.files.has(resource)) return workspace.baselineFrontier.has(resource) ? workspace.baselineFrontier.get(resource) : workspace.readBase(resource);
+		const file = original.files.get(resource);
+		if (file) return { content: file.content, identity: file.stat, mode: process.platform === "win32" ? 0 : Number(file.stat.mode & 0o777n) };
+		if (current) return readRegularState(path.resolve(sandboxRoot, resource), undefined, undefined, workspace.contents);
+		throw new Error("workspace transaction input is unavailable");
+	};
 
 	if (!poisonReason) {
 		try {
@@ -1272,25 +1302,26 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 				poisonReason = `workspace_transaction_sync:${errorMessage(error)}`;
 				return undefined;
 			});
-			const capture: Capture = { contaminated: false, overlapped, before: start?.before, frontier, unknown: new Set(unknown), racing: start?.racing ?? [] };
+			const capture: Capture = { contaminated: false, overlapped, before: start && { ...start.versions.snapshot }, versions: start?.versions, racing: start?.racing ?? [] };
+			const input = async (resource: string, maxBytes = Infinity) => {
+				if (capture.contaminated || !capture.before) throw new Error("workspace transaction input is unavailable");
+				const entry = capture.before.entries.get(resource);
+				if (entry?.kind === "file" && entry.size > maxBytes) throw new Error("workspace transaction input exceeds capture limit");
+				return (await readVersion(capture.versions!, resource))?.content;
+			};
+			if (capture.before) workspaceVersions.set(capture.before, input);
 			active.add(capture);
 			return {
 				readBefore: (resource, maxBytes) => lock.serialize(async () => {
-					if (!active.has(capture) || capture.contaminated || !capture.before || capture.unknown.has(resource)) throw new Error("workspace transaction input is unavailable");
+					if (!active.has(capture)) throw new Error("workspace transaction input is unavailable");
 					if (!isSafeCount(maxBytes)) throw new Error("workspace transaction input budget is invalid");
-					if (capture.before.entries.get(resource)?.kind !== "file") return undefined;
-					const state = capture.frontier.has(resource) ? capture.frontier.get(resource) : await workspace.readBase(resource, maxBytes);
-					if (state && state.content.byteLength > maxBytes) throw new Error("workspace transaction input exceeds capture limit");
-					return state && readContent(state.content, 0, state.content.byteLength);
+					const content = await input(resource, maxBytes);
+					if (content && content.byteLength > maxBytes) throw new Error("workspace transaction input exceeds capture limit");
+					return content && readContent(content, 0, content.byteLength);
 				}),
-				finish: (ownership) => finish(capture, ownership), abort: () => abort(capture),
+				finish: (ownership) => finish(capture, ownership), abort: unchanged => abort(capture, unchanged),
 			};
 		});
-
-	function markUnread(current: WorkspaceStructureSnapshot): void {
-		for (const resource of regularStructureTransitions(lastStructure, current)) unknown.add(resource);
-		lastStructure = current; fenced = false;
-	}
 
 	/**
 	 * Attribute an overlapped interval by its writer's trace: its changes are the paths it wrote, other changes are foreign and
@@ -1302,8 +1333,8 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 			if (capture.contaminated || capture.overlapped && !ownership) return { complete: false, changes: [], reason: "overlapping_workspace_transaction" };
 			if (!capture.before) return { complete: false, changes: [], reason: poisonReason ?? "workspace_transaction_unavailable" };
 			try {
-				const after = (await captureBefore(capture.overlapped)).before;
-				return { after, capturedAt: Date.now(), paths: regularStructureTransitions(capture.before, after), frontier, unknown: new Set(unknown) };
+				const { versions } = await captureBefore(capture.overlapped), after = versions.snapshot;
+				return { after, versions, capturedAt: Date.now(), paths: regularStructureTransitions(capture.before, after) };
 			} catch (error) {
 				return { complete: false, changes: [], reason: `workspace_transaction_capture:${errorMessage(error)}`, before: capture.before };
 			}
@@ -1338,13 +1369,10 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 			let beforeBytes = 0, afterBytes = 0;
 			// Its own paths' endpoints are independent reads; they are judged in order, the first that fails deciding.
 			const captured = await mapFilesystem(own, async (relativePath): Promise<string | WorkspaceRegularDelta> => {
-				if (capture.unknown.has(relativePath) && before.entries.get(relativePath)?.kind === "file") return `overlapping_workspace_before:${relativePath}`;
-				// Bytes last seen stand for a file only while it was there when this interval began.
-				const previous = before.entries.get(relativePath)?.kind !== "file" ? undefined
-					: capture.frontier.has(relativePath) ? capture.frontier.get(relativePath) : await workspace.readBase(relativePath);
+				if (capture.versions!.files.has(relativePath) && !capture.versions!.files.get(relativePath) && before.entries.get(relativePath)?.kind === "file") return `overlapping_workspace_before:${relativePath}`;
+				const previous = await readVersion(capture.versions!, relativePath);
 				const entry = after.entries.get(relativePath);
-				const current = entry?.kind !== "file" ? undefined : !settled.unknown.has(relativePath) && settled.frontier.has(relativePath) ? settled.frontier.get(relativePath)
-					: await readRegularState(path.resolve(sandboxRoot, relativePath), undefined, undefined, workspace.contents);
+				const current = await readVersion(settled.versions, relativePath, true);
 				beforeBytes += contentMemory(previous?.content); afterBytes += contentMemory(current?.content);
 				if (Math.max(beforeBytes, afterBytes) > WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES) return "workspace transaction exceeds memory budget";
 				if (entry?.kind === "file" && (!current?.identity || statChangeDigest(current.identity) !== entry.changeDigest)) return `overlapping_workspace_write:${relativePath}`;
@@ -1364,22 +1392,20 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 		return { complete: true, changes, before, after: capture.overlapped ? workspaceStructureSnapshot(after.root, entries, after.complete) : after };
 	}
 
-	async function captureBefore(overlapped = false): Promise<{ readonly before: WorkspaceStructureSnapshot; readonly racing: readonly string[] }> {
+	async function captureBefore(overlapped = false): Promise<{ readonly versions: WorkspaceContentSnapshot; readonly racing: readonly string[] }> {
 		try {
 			for (let attempt = 0; attempt < WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS; attempt++) {
 				const current = await captureStructure();
-				if (fenced && !unknown.size && sameWorkspaceChangeSnapshot(current, lastStructure)) return { before: lastStructure = current, racing: [] };
+				if (fenced && sameWorkspaceChangeSnapshot(current, versions.snapshot)) return { versions, racing: [] };
 				await advanceWorkspaceChangeClock(clock, current);
 				const checkpoint = await captureStructure();
 				if (!sameWorkspaceChangeSnapshot(current, checkpoint)) continue;
-				markUnread(checkpoint);
-				// Quiet again: retain every endpoint that moved since the last known frontier.
-				await captureTransitions([...unknown], checkpoint);
-				unknown.clear();
+				regularStructureTransitions(versions.snapshot, checkpoint);
+				fenced = false; versions = await retain(checkpoint);
 				const verified = await captureStructure();
 				if (!sameWorkspaceChangeSnapshot(checkpoint, verified)) continue;
-				lastStructure = verified; fenced = true;
-				return { before: verified, racing: [] };
+				fenced = true;
+				return { versions, racing: [] };
 			}
 			throw new Error("workspace did not stabilize before transaction execution");
 		} catch (error) {
@@ -1388,12 +1414,13 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 			const current = await captureStructure();
 			await advanceWorkspaceChangeClock(clock, current);
 			const before = await captureStructure(), racing = regularStructureTransitions(current, before);
-			markUnread(before);
-			return { before, racing };
+			regularStructureTransitions(versions.snapshot, before);
+			fenced = false; versions = await retain(before, false);
+			return { versions, racing };
 		}
 	}
 
-	const abort = (capture: Capture): Promise<void> => lock.serialize(async () => { if (active.delete(capture)) for (const other of active) other.contaminated = true; });
+	const abort = (capture: Capture, unchanged?: true): Promise<void> => lock.serialize(async () => { if (active.delete(capture) && !unchanged) for (const other of active) other.contaminated = true; });
 
 	const dispose = (): Promise<void> => lock.serialize(async () => {
 		for (const capture of active) capture.contaminated = true;
@@ -1402,20 +1429,6 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 		clock = undefined;
 		await closingClock?.handle.close();
 	});
-
-	async function captureTransitions(paths: readonly string[], after: WorkspaceStructureSnapshot): Promise<void> {
-		if (paths.length) frontier = new Map(frontier); // Existing execution records keep the original version map.
-		// The lock and overlap rejection keep this frontier unchanged, and each file the size its snapshot took, throughout the interval: read those at once.
-		const sizes = paths.map(relativePath => { const entry = after.entries.get(relativePath); return entry?.kind === "file" ? entry.size : undefined; });
-		if (!workspace.contents && sizes.reduce<number>((total, size) => total + (size ?? 0), 0) > WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES) throw new Error("workspace transaction after-state exceeds capture limit");
-		const currents = await mapFilesystem([...paths.keys()], async index => sizes[index] === undefined ? undefined : readRegularState(path.resolve(sandboxRoot, paths[index]!), sizes[index], undefined, workspace.contents));
-		for (const [index, relativePath] of paths.entries()) {
-			const current = currents[index], unchangedBytes = retainedBytes - contentMemory(frontier.get(relativePath)?.content);
-			if (unchangedBytes + contentMemory(current?.content) > WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES) throw new Error("workspace transaction after-state exceeds capture limit");
-			retainedBytes = unchangedBytes + contentMemory(current?.content);
-			frontier.set(relativePath, current);
-		}
-	}
 
 	return { begin, dispose };
 }
@@ -1725,53 +1738,41 @@ async function collectSandboxChanges(workspace: ReturnType<typeof createWorkspac
 	});
 }
 
-interface OverlayStructureRemoval { readonly resource: string; readonly descendantsOnly: boolean; }
-
-/**
- * Reconstruct the complete logical structure from one immutable lower snapshot plus the typed upper
- * journal. Only upper paths and their ancestor directories require fresh merged-view syscalls.
- */
-async function captureOverlayWorkspaceStructure(sandboxRoot: string, { baseline, device, upperRoot }: NonNullable<SandboxWorkspaceObservation["overlay"]>): Promise<WorkspaceStructureSnapshot> {
-	const frontier = await inspectOverlayStructureFrontier(upperRoot);
-	const entries = new Map([...baseline.entries].map(([name, entry]) => [name, entry.kind === "file" && entry.object
-		? { ...entry, object: `${device}:${entry.object.split(":")[1]}` } : entry]));
-	for (const removal of frontier.removals) {
-		const normalized = path.normalize(removal.resource);
-		const prefix = normalized ? `${normalized}${path.sep}` : "";
-		for (const candidate of entries.keys()) {
-			if (prefix && candidate.startsWith(prefix) || !removal.descendantsOnly && candidate === normalized) entries.delete(candidate);
+/** Changed upper objects select the merged paths to read; actual directory names
+ * decide visibility without a second implementation of OverlayFS whiteouts. */
+function createOverlayStructureCapture(sandboxRoot: string, { baseline, device, upperRoot }: NonNullable<SandboxWorkspaceObservation["overlay"]>, versions?: FilesystemVersionSource) {
+	const capture = new WorkspaceStructureCapture(upperRoot, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, layered: true,
+		visitEntry: relative => !isSnapshotExcluded(slash(relative)), observeStat: (relative, stat) => {
+			if (!stat.isDirectory() && !stat.isFile() && !(stat.isCharacterDevice() && stat.rdev === 0n)) throw new Error(`unsupported OverlayFS upper inode: ${relative}`);
+		} }, versions);
+	let previous: { readonly upper: WorkspaceStructureSnapshot; readonly merged: WorkspaceStructureSnapshot; readonly listings: ReadonlyMap<string, ReadonlySet<string>> } | undefined;
+	return async (): Promise<WorkspaceStructureSnapshot> => {
+		const retained = previous, upper = await capture.capture();
+		if (retained?.upper === upper) return retained.merged;
+		if (!upper.complete) throw new Error("OverlayFS structure frontier is incomplete");
+		const entries = new Map([...baseline.entries].map(([name, entry]) => [name, entry.kind === "file" && entry.object
+			? { ...entry, object: `${device}:${entry.object.split(":")[1]}` } : entry]));
+		const refresh = new Set<string>(), dirty = new Set<string>(), listings = new Map<string, ReadonlySet<string>>();
+		for (const [resource, entry] of upper.entries) for (const name of workspaceAncestors(resource)) {
+			refresh.add(name); if (retained?.upper.entries.get(resource) !== entry) dirty.add(name);
 		}
-	}
-	const refresh = [...frontier.refresh], refreshed = await mapFilesystem(refresh, resource => {
-		const target = resource ? path.resolve(sandboxRoot, resource) : sandboxRoot;
-		if (!containsFilesystemPath(sandboxRoot, target)) throw new Error(`OverlayFS frontier escapes workspace: ${resource}`);
-		return captureWorkspaceStructureEntry(target, resource ? [] : SNAPSHOT_EXCLUDES);
-	});
-	refresh.forEach((resource, index) => { const entry = refreshed[index]; if (entry) entries.set(resource, entry); else entries.delete(resource); });
-	const files = Math.max(0, entries.size - 1);
-	return workspaceStructureSnapshot(sandboxRoot, entries, baseline.complete && files <= WORKSPACE_TRANSACTION_MAX_FILES);
-}
-
-async function inspectOverlayStructureFrontier(upperRoot: string) {
-	const refresh = new Set<string>([""]), removals: OverlayStructureRemoval[] = [];
-	const addAncestors = (resource: string) => workspaceAncestors(resource).forEach(name => refresh.add(name));
-	const snapshot = await captureWorkspaceStructure(upperRoot, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, visitEntry: async (relative, entry) => {
-		const resource = slash(relative), name = path.basename(resource), parent = path.dirname(resource);
-		if (isSnapshotExcluded(resource)) return false;
-		if (name === ".wh..wh..opq") {
-			removals.push({ resource: parent === "." ? "" : parent, descendantsOnly: true }); addAncestors(parent); return false;
+		await mapFilesystem([...refresh], async resource => {
+			let entry: WorkspaceStructureEntry | undefined;
+			if (retained && !dirty.has(resource)) { entry = retained.merged.entries.get(resource); listings.set(resource, retained.listings.get(resource)!); }
+			else {
+				const captured = await captureFilesystemEntry(path.join(sandboxRoot, resource), "directory").catch(error => { if (!isMissing(error)) throw error; });
+				entry = captured ? captureWorkspaceStructureEntry(captured, resource ? [] : SNAPSHOT_EXCLUDES) : undefined;
+				listings.set(resource, new Set(captured?.entries?.map(child => child.name)));
+			}
+			if (entry) entries.set(resource, entry); else entries.delete(resource);
+		});
+		for (const name of entries.keys()) for (let current = name; current; current = path.dirname(current).replace(/^\.$/, "")) {
+			const names = listings.get(path.dirname(current).replace(/^\.$/, ""));
+			if (names && !names.has(path.basename(current))) { entries.delete(name); break; }
 		}
-		if (name.startsWith(".wh.")) throw new Error(`unsupported OverlayFS whiteout encoding: ${name}`);
-		if (entry.isCharacterDevice()) {
-			if ((await lstat(path.join(upperRoot, relative))).rdev !== 0) throw new Error(`unsupported OverlayFS device entry: ${resource}`);
-			removals.push({ resource, descendantsOnly: false }); addAncestors(parent); return false;
-		}
-		if (!entry.isDirectory() && !entry.isFile()) throw new Error(`unsupported OverlayFS upper inode: ${resource}`);
-		addAncestors(resource);
-		return entry.isDirectory();
-	} }).catch(error => { if (isMissing(error) && error.path === upperRoot) return undefined; throw error; });
-	if (snapshot && !snapshot.complete) throw new Error("OverlayFS structure frontier is incomplete");
-	return { refresh, removals: Object.freeze(removals) };
+		const merged = workspaceStructureSnapshot(sandboxRoot, entries, baseline.complete && entries.size - 1 <= WORKSPACE_TRANSACTION_MAX_FILES);
+		previous = { upper, merged, listings }; return merged;
+	};
 }
 
 /** The workspace's own structure for a live lower; undefined keeps the snapshot when a truncated walk cannot vouch for what it skipped. */
@@ -1829,9 +1830,8 @@ async function assertCommitTarget(change: SandboxWorkspaceChange, capture?: type
 async function readRegularState(target: string, maxBytes?: number, view?: FilesystemReadView, contents?: ContentChunkPool): Promise<RegularFileState | undefined> {
 	try {
 		const limit = Math.min(maxBytes ?? Infinity, contents?.limits.maxLogicalBytes ?? WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES);
-		const streamed = contents && await contents.capture(onChunk => captureStableFile(target, limit, false, { view, onChunk }));
-		const captured = streamed ? streamed.capture : await captureStableFile(target, limit, true, { digest: false, view });
-		return { content: streamed ? streamed.content : captured.content!, mode: process.platform === "win32" ? 0 : Number(captured.stat.mode & 0o777n), identity: captured.stat };
+		const captured = await captureFileContent(target, limit, contents, { digest: false, view });
+		return { content: captured.content, mode: process.platform === "win32" ? 0 : Number(captured.stat.mode & 0o777n), identity: captured.stat };
 	} catch (error) { if (isMissing(error)) return undefined; throw error; }
 }
 

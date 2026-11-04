@@ -1,10 +1,9 @@
 import type { BigIntStats, Stats } from "node:fs";
-import { contentDigest, sameContent, type ContentVersion } from "./content-chunks.ts";
+import { captureFileContent, contentMemory, sameContent, type ContentChunkPool, type FileContentVersion } from "./content-chunks.ts";
 import path from "node:path";
 import { containsFilesystemPath, relativeFilesystemPath, slash } from "./path-utils.ts";
-import { isMissing } from "./error-utils.ts";
 import {
-	type StableFilesystemCapture, FILESYSTEM_CONCURRENCY, mapFilesystem, type FilesystemTypeEvidence, FILESYSTEM_OBSERVATION_FIELDS,
+	FILESYSTEM_CONCURRENCY, mapFilesystem, type FilesystemTypeEvidence, FILESYSTEM_OBSERVATION_FIELDS,
 	filesystemEntryType, filesystemMetadataDigest, type FilesystemObservationEvidence, captureFilesystemEntry, type FilesystemReadView,
 } from "./filesystem-evidence.ts";
 import type { DynamicDependency } from "./provenance-certificate.ts";
@@ -43,39 +42,130 @@ export class ExecutionPathProjection {
 	isWorkspacePhysical(physicalPath: string): boolean { return containsFilesystemPath(this.workspaceRoot, physicalPath); }
 }
 
-export interface WorkspaceStructureCaptureOptions { readonly maxFiles?: number; readonly exclude?: readonly string[]; readonly observeStat?: (relative: string, stat: BigIntStats) => void | Promise<void>; readonly visitEntry?: (relative: string, entry: FilesystemTypeEvidence) => boolean | Promise<boolean>; readonly view?: FilesystemReadView; }
+export interface WorkspaceStructureCaptureOptions { readonly maxFiles?: number; readonly exclude?: readonly string[]; readonly observeStat?: (relative: string, stat: BigIntStats, unchanged?: boolean) => void | Promise<void>; readonly visitEntry?: (relative: string, entry: FilesystemTypeEvidence) => boolean | Promise<boolean>; readonly view?: FilesystemReadView; readonly layered?: true;
+	readonly content?: { readonly pool?: ContentChunkPool; readonly maxFileBytes: number; readonly maxBytes: number }; }
+
+interface WorkspaceCapturedVersion { readonly captured: Awaited<ReturnType<typeof captureFilesystemEntry>>; readonly entry: WorkspaceStructureEntry; }
+export interface WorkspaceContentSnapshot {
+	readonly snapshot: WorkspaceStructureSnapshot;
+	readonly files: ReadonlyMap<string, FileContentVersion | undefined>;
+}
+interface WorkspaceCapturedVersions extends WorkspaceContentSnapshot {
+	readonly entries: ReadonlyMap<string, WorkspaceCapturedVersion>;
+}
+
+/** A boundary retains original file versions; unchanged names share them across all later intervals. */
+export async function captureWorkspaceContent(snapshot: WorkspaceStructureSnapshot, previous: WorkspaceContentSnapshot | undefined,
+	read: (relative: string, entry: Extract<WorkspaceStructureEntry, { kind: "file" }>) => Promise<FileContentVersion | undefined>,
+	options: { readonly maxBytes: number; readonly memory?: true; readonly required?: true; readonly baseline?: WorkspaceStructureSnapshot;
+		readonly baselineMemory?: (relative: string) => number; readonly maxFileBytes?: number }): Promise<WorkspaceContentSnapshot> {
+	if (previous?.snapshot.entries === snapshot.entries && (!options.required || [...previous.files.values()].every(Boolean))) return previous;
+	const files = new Map<string, FileContentVersion | undefined>();
+	let remaining = options.maxBytes;
+	await mapFilesystem([...snapshot.entries], async ([relative, entry]) => {
+		if (entry.kind !== "file") return;
+		if (!previous?.files.has(relative) && options.baseline && sameStructureEntry(entry, options.baseline.entries.get(relative), "change")) {
+			remaining -= options.baselineMemory?.(relative) ?? 0;
+			if (remaining < 0) throw new Error("workspace transaction after-state exceeds capture limit");
+			return;
+		}
+		const reused = previous?.files.get(relative), prior = reused && sameStructureEntry(entry, previous!.snapshot.entries.get(relative), "change") ? reused : undefined;
+		if (entry.size > (options.maxFileBytes ?? Infinity) || !options.memory && entry.size > remaining) {
+			if (options.required) throw new Error("workspace transaction after-state exceeds capture limit");
+			files.set(relative, undefined); return;
+		}
+		if (!options.memory) remaining -= entry.size;
+		const content = prior ?? await read(relative, entry);
+		if (content && statChangeDigest(content.stat) !== entry.changeDigest) throw new Error(`workspace file version changed: ${relative}`);
+		if (options.memory && content) {
+			remaining -= contentMemory(content.content);
+			if (remaining < 0) throw new Error("workspace transaction after-state exceeds capture limit");
+		}
+		files.set(relative, content);
+	});
+	return { snapshot, files };
+}
+
+export interface FilesystemVersionSource {
+	readonly watch: (roots: readonly string[]) => void;
+	readonly admit?: (objects: readonly { readonly dev: bigint; readonly ino: bigint; readonly path: string }[]) => boolean;
+	readonly version: () => bigint | undefined;
+	readonly changes: (since: bigint, inputs: readonly { readonly dev: bigint; readonly ino: bigint }[]) =>
+		{ readonly version: bigint; readonly objects: ReadonlySet<string>; readonly unstable?: ReadonlySet<string> } | undefined;
+}
 
 /** Capture inode and directory semantics without reading regular-file contents. */
 export async function captureWorkspaceStructure(root: string, options: WorkspaceStructureCaptureOptions = {}): Promise<WorkspaceStructureSnapshot> {
-	const absoluteRoot = path.resolve(root);
+	return new WorkspaceStructureCapture(root, options).capture();
+}
+
+/** Original observations survive only while the kernel proves their objects and names unchanged. */
+export class WorkspaceStructureCapture {
+	private retained?: WorkspaceCapturedVersions & { readonly version: bigint; readonly objects: readonly { readonly dev: bigint; readonly ino: bigint }[] };
+	private readonly root: string;
+	private readonly options: WorkspaceStructureCaptureOptions;
+	private readonly versions?: FilesystemVersionSource;
+	constructor(root: string, options: WorkspaceStructureCaptureOptions = {}, versions?: FilesystemVersionSource) {
+		this.root = root; this.options = options; this.versions = versions;
+	}
+	clear(): void { this.retained = undefined; }
+	async capture(observeStat?: WorkspaceStructureCaptureOptions["observeStat"]): Promise<WorkspaceStructureSnapshot> {
+		return (await this.captureVersions(observeStat)).snapshot;
+	}
+	/** Each boundary borrows the original entries and content versions; a later capture replaces only changed entries. */
+	async captureVersions(observeStat?: WorkspaceStructureCaptureOptions["observeStat"]): Promise<WorkspaceCapturedVersions> {
+	const options = this.options, absoluteRoot = path.resolve(this.root), retained = this.retained;
+	const since = retained?.version ?? this.versions?.version(), changes = since === undefined ? undefined : this.versions?.changes(since, retained?.objects ?? []), version = changes?.version;
+	const objects = changes?.objects, previous = changes ? retained?.entries : undefined;
+	if (retained && objects && !objects.size) {
+		this.retained = { ...retained, version: changes!.version };
+		if (observeStat) await mapFilesystem([...retained.entries], async ([relative, { captured }]) => observeStat(relative, captured.info, true));
+		return retained;
+	}
+	const capturedEntries = new Map<string, WorkspaceCapturedVersion>(), admission: { dev: bigint; ino: bigint; path: string }[] = [];
 	const entries = new Map<string, WorkspaceStructureEntry>();
 	const excludes = new Set(options.exclude ?? [".git"]);
 	const maxFiles = Math.max(1, options.maxFiles ?? 100_000);
-	const pending = [""];
-	let files = 0, complete = true;
+	const pending = [{ relative: "", replaced: false }];
+	let files = 0, complete = !this.versions || changes !== undefined;
 	for (let cursor = 0; cursor < pending.length;) {
 		const batch = pending.slice(cursor, cursor + FILESYSTEM_CONCURRENCY);
 		cursor += batch.length;
-		const captured = await mapFilesystem(batch, async (relative) => {
-			const captured = await captureFilesystemEntry(path.join(absoluteRoot, relative), "directory", options.view);
+		const captured = await mapFilesystem(batch, async ({ relative, replaced }) => {
+			const prior = previous?.get(relative), reused = prior && !replaced && !objects!.has(`${prior.captured.info.dev}:${prior.captured.info.ino}`);
+			const captured = reused ? prior.captured : await captureFilesystemEntry(path.join(absoluteRoot, relative), "directory", options.view);
+			if (!reused) admission.push({ dev: captured.info.dev, ino: captured.info.ino, path: path.join(absoluteRoot, relative) });
 			if (!relative && !captured.info.isDirectory()) throw Object.assign(new Error("workspace root is not a directory"), { code: "ENOTDIR" });
-			await options.observeStat?.(relative, captured.info);
+			await (observeStat ?? (!reused ? options.observeStat : undefined))?.(relative, captured.info, previous ? !!reused : undefined);
 			const children = captured.entries ?? [];
-			const entry = captureExistingWorkspaceStructureEntry(captured, relative ? [] : [...excludes]);
-			return { relative, entry, children };
+			const entry = reused ? prior.entry : captureWorkspaceStructureEntry(captured, relative ? [] : [...excludes]);
+			capturedEntries.set(relative, reused ? prior : { captured, entry });
+			const moved = replaced || !!prior && (captured.info.dev !== prior.captured.info.dev || captured.info.ino !== prior.captured.info.ino) ||
+				captured.info.isDirectory() && !!changes?.unstable?.has(`${captured.info.dev}:${captured.info.ino}`);
+			return { relative, entry, children, replaced: moved };
 		});
-		for (const { relative, entry, children } of captured) {
+		for (const { relative, entry, children, replaced } of captured) {
 			entries.set(relative, entry);
 			for (const child of children.sort((left, right) => left.name.localeCompare(right.name))) {
 				if (!relative && excludes.has(child.name)) continue;
 				if (files + 1 > maxFiles) { complete = false; continue; }
 				files++;
 				if (options.visitEntry && !await options.visitEntry(path.join(relative, child.name), child)) continue;
-				pending.push(path.join(relative, child.name));
+				pending.push({ relative: path.join(relative, child.name), replaced });
 			}
 		}
 	}
-	return workspaceStructureSnapshot(absoluteRoot, entries, complete);
+	complete &&= this.versions?.admit?.(admission) !== false;
+	const snapshot = options.layered ? { root: absoluteRoot, entries, complete } : workspaceStructureSnapshot(absoluteRoot, entries, complete);
+	const content = options.content ? await captureWorkspaceContent(snapshot, retained, (relative, entry) =>
+		captureFileContent(path.join(absoluteRoot, relative), entry.size, options.content!.pool, { stat: capturedEntries.get(relative)!.captured.info }), options.content)
+		: { snapshot, files: new Map<string, FileContentVersion | undefined>() };
+	// Keep the starting epoch: writes during this walk are visited again on the next capture.
+	// A temporarily busy writer cannot revoke the older observations of unrelated objects.
+	if (snapshot.complete && version !== undefined) this.retained = { version, ...content, entries: capturedEntries,
+		objects: [...new Map([...capturedEntries.values()].map(({ captured: { info } }) => [`${info.dev}:${info.ino}`, { dev: info.dev, ino: info.ino }])).values()] };
+	return { ...content, entries: capturedEntries };
+	}
 }
 
 export function captureWorkspaceFileAliases(root?: string) {
@@ -110,17 +200,7 @@ export function workspaceStructureSnapshot(root: string, entries: Map<string, Wo
 	return Object.freeze({ root, entries, complete });
 }
 
-/** Capture one path without walking its descendants; used by typed mutation-frontier drivers. */
-export async function captureWorkspaceStructureEntry(
-	target: string,
-	excludeEntries: readonly string[] = [],
-	view?: FilesystemReadView,
-): Promise<WorkspaceStructureEntry | undefined> {
-	try { return captureExistingWorkspaceStructureEntry(await captureFilesystemEntry(target, "directory", view), excludeEntries); }
-	catch (error) { if (isMissing(error)) return undefined; throw error; }
-}
-
-function captureExistingWorkspaceStructureEntry(
+export function captureWorkspaceStructureEntry(
 	{ info: stat, link: linkTarget, entries: children }: Awaited<ReturnType<typeof captureFilesystemEntry>>,
 	excludeEntries: readonly string[] = [],
 ): WorkspaceStructureEntry {
@@ -267,15 +347,6 @@ export function diffWorkspaceStructures(
 		}))),
 		complete: true,
 	};
-}
-
-export async function hydrateWorkspaceFileEntry(entry: Extract<WorkspaceStructureEntry, { readonly kind: "file" }>,
-	content: ContentVersion | StableFilesystemCapture): Promise<Extract<WorkspaceTreeEntry, { readonly kind: "file" }> | undefined> {
-	if ("hash" in content) {
-		if (statChangeDigest(content.stat) !== entry.changeDigest) return undefined;
-		return { ...entry, digest: `sha256:${content.hash}` };
-	}
-	return content.byteLength === entry.size ? { ...entry, digest: contentDigest(content) } : undefined;
 }
 
 function regularDeltaFailure(

@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { execFileSync, spawn } from "node:child_process";
@@ -29,12 +29,14 @@ const adoptions = (settlement: PredictionSettlement) => settlement.observation =
 const directories = temporaryDirectories("pi-extension-system-");
 afterEach(async () => { vi.unstubAllEnvs(); vi.restoreAllMocks(); await directories.dispose(); });
 
-test.skipIf(process.platform !== "linux").each(["reuse", "stale", "environment", "outside-mount", "disabled", "routing-off"])(
+test.skipIf(process.platform !== "linux").each(["reuse", "stale", "environment", "outside-mount", "disabled", "routing-off", "no-domain", "lost-domain", "retired-domain"])(
 	"consumes finished Bash through the default Pi extension (%s)", { timeout: 60_000 }, async mode => {
 	const cwd = await directories.create(os.homedir()), agentDir = await directories.create(os.homedir());
 	vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
 	vi.stubEnv("PWD", mode === "outside-mount" ? "/proc" : cwd);
 	vi.stubEnv("BASH_TEST_VERSION", "first");
+	if (mode === "no-domain") vi.stubEnv("PI_SPEC_DOMAIN_SOCKET", undefined);
+	if (mode === "lost-domain") vi.stubEnv("PI_SPEC_DOMAIN_SOCKET", path.join(agentDir, "missing-collector"));
 	await writeFile(path.join(agentDir, "speculative-action.json"), JSON.stringify({ enabled: true, drafterEnabled: false,
 		reuseEnabled: mode !== "disabled", prepareObservedOperations: true, patternAware: { enabled: false },
 		executionRouting: { nativeFallback: mode !== "routing-off" }, predictionTimeoutMs: 30_000 }));
@@ -61,12 +63,15 @@ test.skipIf(process.platform !== "linux").each(["reuse", "stale", "environment",
 	const { session } = await createAgentSession({ cwd, agentDir, model: actor.getModel(), modelRuntime, settingsManager, resourceLoader: loader,
 		sessionManager: SessionManager.inMemory(cwd), tools: ["bash"] });
 	await using _session = onExit(async () => { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); });
+	let retiredSocket: string | undefined;
+	await using _collector = onExit(async () => { if (retiredSocket) await rename(`${retiredSocket}.retired`, retiredSocket); });
 	await session.bindExtensions({ mode: "print", onError: error => { throw error; } });
 	actor.setResponses([async () => {
 		await host.previewActorCall({ turnID: turn.turnID, id: "bash-default", tool: "bash", args: { command }, tools: turn.tools });
-		if (!["disabled", "routing-off"].includes(mode)) await expect.poll(() => events.some(event => event.type === "candidate" && event.state.status === "succeeded"), { timeout: 30_000 }).toBe(true);
+		if (!["disabled", "routing-off", "no-domain", "lost-domain"].includes(mode)) await expect.poll(() => events.some(event => event.type === "candidate" && event.state.status === "succeeded"), { timeout: 30_000 }).toBe(true);
 		if (mode === "stale") await writeFile(path.join(cwd, "value"), "two\n");
 		if (mode === "environment") vi.stubEnv("BASH_TEST_VERSION", "second");
+		if (mode === "retired-domain") { retiredSocket = process.env.PI_SPEC_DOMAIN_SOCKET!; await rename(retiredSocket, `${retiredSocket}.retired`); }
 		return response("bash", { command }, { id: "bash-default" });
 	}, fauxAssistantMessage("done")]);
 	await session.prompt("Build the program and run the Python check.");
@@ -75,13 +80,13 @@ test.skipIf(process.platform !== "linux").each(["reuse", "stale", "environment",
 	const settled = events.filter(event => event.type === "actor_action").at(-1)!;
 	expect(fallbacks, JSON.stringify(events)).toEqual(mode === "reuse" ? [] : ["bash"]);
 	// A rejected whole branch can still consume unchanged, independently validated child work.
-	if (["reuse", "environment", "disabled", "routing-off"].includes(mode))
+	if (["reuse", "environment", "disabled", "routing-off", "no-domain", "lost-domain", "retired-domain"].includes(mode))
 		expect((settled.computation?.hiddenComputeMs ?? 0) > 0).toBe(mode === "reuse");
 	if (mode === "reuse") expect(settled.settlement.provider).toMatchObject({ kind: "actor", origin: "preview" });
 	for (const entry of forbidden) expect(entry).not.toHaveBeenCalled();
 });
 
-test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-stale", "-running", "-retired", "-unkeyed", "-inputs", "-inputs-stale", "-sync-producer", "-sync-consumer", "-sync-both", "-sync-stale", "-sync-lost", "-sync-inputs", "-sync-inputs-stale", "-sync-inputs-preempted", "-sync-inputs-preempted-stale", "-cold", "-cold-stale", "-sync-cold", "-sync-cold-stale", "-continuation", "-continuation-stale", "-continuation-cancel", "-continuation-cold", "-continuation-cold-stale", "-continuation-cold-session", "-continuation-cold-damaged", "-continuation-cold-context", "-continuation-cold-lost"].map(mode => `native${mode}`) : [])])("runs Pi session contracts through the default entry (%s)", { timeout: 60_000 }, async mode => {
+test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-stale", "-staged-stale", "-staged-lost", "-staged-error", "-running", "-retired", "-unkeyed", "-inputs", "-inputs-stale", "-sync-producer", "-sync-consumer", "-sync-both", "-sync-stale", "-sync-lost", "-sync-inputs", "-sync-inputs-stale", "-sync-inputs-preempted", "-sync-inputs-preempted-stale", "-cold", "-cold-stale", "-sync-cold", "-sync-cold-stale", "-continuation", "-continuation-stale", "-continuation-cancel", "-continuation-cold", "-continuation-cold-stale", "-continuation-cold-session", "-continuation-cold-damaged", "-continuation-cold-context", "-continuation-cold-lost"].map(mode => `native${mode}`) : [])])("runs Pi session contracts through the default entry (%s)", { timeout: 60_000 }, async mode => {
 	const enabled = mode !== "off", native = mode.startsWith("native"), running = mode === "native-running" || mode === "native-retired";
 	const live = mode.startsWith("native-continuation");
 	const restart = live && mode.includes("cold"), phase = restart ? process.env.PI_TEST_CONTINUATION_PHASE : undefined;
@@ -112,7 +117,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 		return;
 	}
 	const consuming = restart && phase !== "produce";
-	const stale = mode.endsWith("stale"), inputs = mode.includes("inputs"), cold = mode.includes("cold"), preempted = mode.includes("preempted"), synchronous = (callID: string) => mode.startsWith("native-sync") &&
+	const staged = mode.includes("-staged-"), stale = mode.endsWith("stale"), inputs = mode.includes("inputs"), cold = mode.includes("cold"), preempted = mode.includes("preempted"), synchronous = (callID: string) => mode.startsWith("native-sync") &&
 		(!mode.endsWith("producer") && !mode.endsWith("consumer") || callID === (mode.endsWith("producer") ? "seed" : "check"));
 	const cwd = restart ? process.env.PI_TEST_CONTINUATION_ROOT! : await directories.create(native ? os.homedir() : undefined), agentDir = path.join(cwd, "agent");
 	await mkdir(agentDir, { recursive: true }); vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
@@ -200,6 +205,22 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 		vi.spyOn(ownerPrototype, "processOwner").mockImplementation(function (this: LinuxProcessReuseBackend) {
 			if (!inspection) {
 				inspection = inspectProcessOwner(() => processOwner.call(this));
+				if (staged) inspectionReady = inspection.inOwner(async (state, cwd, mode) => {
+					const Backend = (await state.load("../dist/linux-process-backend.js")).LinuxProcessReuseBackend, decide = Backend.prototype.decideHeldExec;
+					state.method(Backend.prototype, "decideHeldExec", async function (this: unknown, ...args: unknown[]) {
+						const decision = await decide.apply(this, args);
+						const boundary = decision.validate ? "validate" : "commit";
+						return decision.kind !== "replay" ? decision : { ...decision, [boundary]: async () => {
+							state.changedAfterStaging = true;
+							if (mode.endsWith("error")) throw new Error("admission interrupted after staging");
+							if (mode.endsWith("stale")) await state.fs.writeFile(cwd + "/notes.txt", "fresh\n");
+							const socket = mode.endsWith("lost") ? process.env.PI_SPEC_DOMAIN_SOCKET : undefined;
+							if (socket) await state.fs.rename(socket, socket + ".held");
+							try { return await decision[boundary](); }
+							finally { if (socket) await state.fs.rename(socket + ".held", socket); }
+						} };
+					});
+				}, cwd, mode);
 				if (live) inspectionReady = inspection.inOwner(async (state, delayedSettlement) => {
 					state.errors = state.method((await state.load("../dist/linux-process-backend.js")).LinuxProcessReuseBackend.prototype, "setError");
 					state.publications = state.method((await state.load("../dist/process-handoff.js")).ProcessHandoffRegistry.prototype, "publish");
@@ -276,8 +297,9 @@ int main(int argc, char **argv) {
 			await commitBenchmarkFixture(cwd, "default-live-continuation");
 			}
 			const availableImage = () => inspection!.inOwner(state => state.publications.mock.calls.some((call: any) => {
-				const [key, work, certificate, , continuation] = call.arguments;
-				return certificate?.result.continuation && continuation?.image.length > 0 && call.this.results(key, work.scope).some((current: any) => current.id === certificate.id);
+				const [key, work, certificate, continuation] = call.arguments;
+				return certificate?.result.continuation && continuation?.image.size > 0 && continuation.image.digest === certificate.result.continuation.imageDigest &&
+					call.this.results(key, work.scope).some((current: any) => current.id === certificate.id);
 			}));
 			let preparationError: unknown;
 			const checkID = phase === "repeat" ? "check-again" : "check";
@@ -296,9 +318,9 @@ int main(int argc, char **argv) {
 			if (phase === "produce") {
 				expect(calls).toEqual(["seed"]);
 				const checkpoint = await inspection!.inOwner(async state => {
-					const call = state.publications.mock.calls.find((call: any) => call.arguments[4]?.checkpoint), store = Reflect.get(call.this, "store");
+					const call = state.publications.mock.calls.find((call: any) => call.arguments[3]?.checkpoint), store = Reflect.get(call.this, "store");
 					for await (const record of store.processCheckpoints(call.arguments[0], call.arguments[2].prototype.executablePath, call.arguments[1].scope.sessionID))
-						if (record.ticket === call.arguments[4].checkpoint) return { cache: store.root, record, imagePath: store.artifacts.artifactPath(record.image.digest) };
+						if (record.ticket === call.arguments[3].checkpoint) return { cache: store.root, record, imagePath: store.artifacts.artifactPath(record.image.digest) };
 					throw new Error("published checkpoint is missing");
 				});
 				await writeFile(path.join(cwd, "produced.json"), JSON.stringify({ pid: process.pid, session: sessionManager.getSessionId(), file: sessionManager.getSessionFile(), ...checkpoint }));
@@ -344,12 +366,15 @@ int main(int argc, char **argv) {
 			expect(inputBinding).toBeDefined();
 			if (publication) await publication.ready(); else await expect.poll(() => backend!.bindingStale(inputBinding!), { timeout: 5000 }).toBe(false);
 			await expect(readFile(path.join(cwd, "marker"))).rejects.toMatchObject({ code: "ENOENT" });
-			if (stale) await writeFile(path.join(cwd, "notes.txt"), "fresh\n");
+			await inspectionReady;
+			if (stale && !staged) await writeFile(path.join(cwd, "notes.txt"), "fresh\n");
 			return call("format_rows", remaining, "check");
 		}, fauxAssistantMessage("done")]);
 		await session.prompt("Produce notes, edit the input, then render the remaining work.");
 		// A named inherited input prepares a new version after the edit; adoption still checks the actual held graph.
-		const results = toolResults(), reused = !stale;
+		const results = toolResults(), reused = !stale && !staged;
+		if (staged) expect(await inspection!.inOwner(state => state.changedAfterStaging), JSON.stringify({
+			metrics: backend!.metrics(), actor: backend!.actorMetrics(), events: events.filter(event => event.type === "candidate") })).toBe(true);
 		if (mode === "native-sync-lost") {
 			expect(results.at(-1)).toMatchObject({ isError: true }); expect(JSON.stringify(results.at(-1))).toContain("native handoff failed");
 			expect(await readText(cwd, "marker")).toBe("once"); expect(calls).toEqual(["seed", "check"]); return;
@@ -369,7 +394,11 @@ int main(int argc, char **argv) {
 		expect(!reused || mode === "native-retired" ? [[]] : nested || inputs ? [[owned]] : [[exact], [{ ...exact, served: false }, owned]])
 			.toContainEqual(adopted.map(({ prediction, relation }) => ({ child: prediction.actionID.endsWith(inputBinding!.key), ...relation,
 				served: credit.get(prediction.id) })).sort((a, b) => a.kind.localeCompare(b.kind)));
-		if (mode === "native-retired") expect(predictions.filter(event => event.settlement.prediction.id === predictions[0]!.settlement.prediction.id)).toMatchObject([{ settlement: { observation: "unobserved", cause: { code: "operation_not_observed" } } }]);
+		if (mode === "native-retired") {
+			// An earlier preparation can be preempted by the intervening write; the retired prediction must still settle without adoption.
+			expect(predictions.every(event => event.settlement.observation === "unobserved"), JSON.stringify(predictions)).toBe(true);
+			expect(predictions.at(-1)).toMatchObject({ settlement: { observation: "unobserved", cause: { code: "operation_not_observed" } } });
+		}
 		expect(!!settled.settlement.actionKeyHash).toBe(mode !== "native-unkeyed");
 		if (publication) expect(await publication.joined()).toBe(true);
 		expect(events.filter(event => event.type === "candidate" && event.state.status === "cancelled" && event.state.cause.code === "tool_disabled" && event.state.executionMs > 0)).toEqual([]);

@@ -89,6 +89,28 @@ processTest.for([false, true])("adopts compiled work once and rejects changed so
 	await h.host.finishTurn("actor");
 });
 
+processTest.for([false, true])("revalidates prepared inputs at whole-branch commit (%s)", { timeout: 30_000 }, async (changed, { benchmark }) => {
+	const f = await benchmark("pi-commit-admission-", "git", {}, os.homedir()), command = "./step";
+	await f.write("input.txt", "before\n");
+	await f.write("marker", "");
+	await f.compile("step", { code: '#include <fcntl.h>\n#include <unistd.h>\nint main(void){char b[64];int f=open("input.txt",O_RDONLY);if(f<0)return 1;int n=read(f,b,sizeof(b));close(f);if(n<0)return 2;f=open("marker",O_WRONLY|O_APPEND);if(f<0)return 3;int ok=write(f,"once",4)==4;close(f);return !ok||write(1,b,n)!=n;}\n' });
+	await f.prepare();
+	const branch = await f.fork(command);
+	await using _branch = onExit(async () => { await branch.dispose(); });
+	const validation = await branch.validate!();
+	expect(validation, JSON.stringify({ validation, metrics: f.backend.metrics() })).toMatchObject({ status: "valid" });
+	if (changed) {
+		await f.write("input.txt", "after\n");
+		await expect(branch.commit()).rejects.toMatchObject({ disposition: "recoverable" });
+		expect(await f.read("marker")).toBe("");
+		expect(textOutput(await f.tool.execute("fallback", { command }))).toBe("after\n");
+	} else {
+		expect(textOutput((await branch.commit()).result)).toBe("before\n");
+		await branch.commit();
+	}
+	expect(await f.read("marker")).toBe("once");
+});
+
 processTest.for(["failure", "timeout", "cancel"])("preserves default Bash failure and cancellation (%s)", { timeout: 30_000 }, async (mode, { benchmark }) => {
 	const f = await benchmark("pi-bash-default-failure-", "git", {}, os.homedir());
 	const world = createCompletedProcessExecutionWorld({ coordinator: f.coordinator, tools: ["bash"], storeRoot: path.join(f.root, "finished") });

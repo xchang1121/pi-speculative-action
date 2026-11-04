@@ -1,10 +1,12 @@
 import { isSafeCount } from "./number-utils.ts";
-import { open, readdir } from "node:fs/promises";
+import { type FileHandle, open } from "node:fs/promises";
 import path from "node:path";
+import { getSystemErrorName } from "node:util";
 import { containsLogicalPath } from "./path-utils.ts";
 import { type DependencyRole, type ProvenanceTaint, type ResourceTransitionKind } from "./provenance-certificate.ts";
 import { FILESYSTEM_OBSERVATION_FIELDS, type FilesystemObservationField, filesystemObservationDigest } from "./filesystem-evidence.ts";
 import { type Sha256Digest } from "./stable-value-hash.ts";
+import { stableEqual } from "./stable-json.ts";
 
 const CONFINEMENT_SENSITIVE_SYSCALLS = new Set([
 	"seccomp", "capget", "capset", "mount", "umount2", "pivot_root", "swapon", "swapoff", "reboot",
@@ -13,18 +15,20 @@ const CONFINEMENT_SENSITIVE_SYSCALLS = new Set([
 	"process_vm_writev", "open_by_handle_at", "name_to_handle_at", "quotactl", "acct", "lookup_dcookie",
 	"io_setup", "io_submit", "io_uring_setup", "io_uring_enter", "io_uring_register", "personality",
 ]);
-const SYSCALL_FILTER = `trace=%file,%process,%network,%ipc,%desc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,getrlimit,setrlimit,prlimit64,prctl,mmap,${[...CONFINEMENT_SENSITIVE_SYSCALLS].join(",")}`;
+const SYSCALL_FILTER = `trace=%file,%process,%network,%ipc,%desc,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,getrlimit,setrlimit,prlimit64,prctl,mmap,${[...CONFINEMENT_SENSITIVE_SYSCALLS].join(",")}`;
+const STREAM_ENDPOINT = /^(\d+)<(?:pipe|UNIX(?:-[A-Z]+)?):\[(\d+)(?:->(\d+))?(?:,"(?:\\.|[^"\\])*")?\]>$/;
 
 /** One production trace shape shared by execution and dependency-ablation paths. */
 export function straceCommand(
 	strace: string,
 	tracePrefix: string,
 	command: readonly string[],
-	streams = false,
+	_streams = false,
 	continuation = false,
+	kernelMetadata = false,
 ): readonly [string, ...string[]] {
 	// Its sandbox launcher's threads would pay a ptrace stop per call they serve; a file's bytes are captured from the filesystem, a stream's only here.
-	return [strace, "--kill-on-exit", "--trace-children-only", "--elide-path-data", streams ? "-f" : "-ff", "-q", "-ttt", "-yy", "-v", "-s", "65535", "-e", continuation ? "trace=all" : SYSCALL_FILTER, "-o", streams ? `${tracePrefix}.stream` : tracePrefix, ...command];
+	return [strace, "--kill-on-exit", "--trace-children-only", "--elide-path-data", ...(kernelMetadata ? ["--seccomp-bpf"] : []), "-f", "-q", "-ttt", "-yy", "-v", "-s", "33554433", "-e", continuation ? "trace=all" : SYSCALL_FILTER, "-o", `${tracePrefix}.stream`, ...command];
 }
 
 export type ObservedProcessPath =
@@ -35,6 +39,7 @@ export type ObservedProcessPath =
 	| ({ readonly path: string; readonly role: "metadata"; readonly followSymlinks: boolean; readonly afterWrite?: true } & StatObservation);
 
 export interface StraceObservation {
+	readonly output?: readonly { readonly fd: 1 | 2; readonly data: Buffer }[];
 	readonly complete: boolean;
 	readonly paths: readonly ObservedProcessPath[];
 	readonly taints: readonly ProvenanceTaint[];
@@ -59,16 +64,24 @@ export interface StraceObservation {
 }
 
 export interface StraceObservationOptions {
+	readonly metadata?: ReturnType<typeof nativeMetadataTrace>;
+	/** A native exec boundary in this trace; the original execution owns all records. */
+	readonly execution?: { readonly pid: number; readonly start: number };
+	readonly captureOutput?: true;
+	/** Original output OFDs stay in the domain; their observed status must end as it began. */
+	readonly outputFlags?: readonly [number, number];
 	/** Exact root launch alias; the prototype separately binds the installed executable bytes. */
 	readonly launchPath?: string;
 	/** Writes owned by a brokered launcher and its descendants: relative workspace names or absolute external paths. */
 	readonly brokeredWrites?: (pid: number) => readonly string[] | undefined;
+	/** These original records already belong to child evidence imported by the caller. */
+	readonly fileEvidence?: (record: object) => boolean;
 	/** The session's private branch, where a descriptor on a copy shows the copy: it stands for the host path it shadows. */
 	readonly privateUpper?: string;
 	/** Bounded prefix lookup for running work; its evidence is always incomplete. */
 	readonly previewBytes?: number;
 	/** The owned tracer sealed this complete prefix before the pending syscall's entry, while capturing the stopped target. */
-	readonly frozen?: { readonly pid: number; readonly bytes: number };
+	readonly frozen?: { readonly pid: number; readonly bytes: number; readonly at?: number };
 	/**
 	 * Workspace roots whose driver-specific unsupported errors must invalidate adoption. This keeps
 	 * a COW substrate from changing a command result when the Actor filesystem supports the syscall.
@@ -86,22 +99,24 @@ export interface StraceObservationOptions {
 	readonly inheritedHandles?: readonly { readonly fd: number; readonly installed?: false; readonly description?: number; readonly inode: string; readonly flags: number; readonly outside: number; readonly queuedBytes?: number; readonly queueData?: Buffer; readonly packet?: boolean; readonly messages?: readonly import("./linux-held-exec.ts").QueueMessage[] }[];
 }
 
-interface TraceFile { readonly pid: number; readonly lines: readonly TraceLine[]; }
+interface TraceFile { readonly pid: number; readonly lines: readonly TraceRecord[]; }
 
 type TraceRoot = TraceFile & { readonly start: number };
 interface TraceProcess extends TraceRoot { readonly cwd: string | undefined; readonly fs: { shared: boolean; changed: boolean }; }
 interface TraceLine {
+	readonly native?: { readonly entered: number; readonly paths: readonly string[] | undefined; readonly observation: StatObservation | undefined; readonly descriptor: boolean; readonly nullDevice: boolean };
 	readonly order?: number;
 	readonly name: string;
 	readonly args: readonly string[];
 	readonly result: string;
 	readonly failure?: string;
 }
+const pathObservations = new WeakMap<TraceLine, { readonly cwd: string; readonly paths: readonly string[] | undefined }>();
 const TRACE_DELIMITERS: Readonly<Record<string, string>> = { "(": ")", "[": "]", "{": "}", "<": ">" }, QUOTED_RUN = /(?:[^"\\]|\\.)+/ys, ANNOTATION_RUN = /(?:[^<>\\]|\\.)+/ys, PLAIN_RUN = /[^"\\()[\]{}<>,/]+/y;
 
 /** Delimit once: quoted paths and descriptor annotations are data, never syscall syntax; what means nothing where it stands is passed whole. */
 function parseTraceLine(line: string): TraceLine {
-	if (/^\+\+\+ (?:exited with \d+|killed by SIG[A-Z0-9]+(?: \(core dumped\))?) \+\+\+\s*$/.test(line)) return { name: "terminated", args: [], result: "0" };
+	if (/^\+\+\+ (?:exited with \d+|killed by SIG[A-Z0-9]+(?: \(core dumped\))?) \+\+\+\s*$|^pi_domain_exit\(\d+\) = 0$/.test(line)) return { name: "terminated", args: [], result: "0" };
 	const head = /^\s*([a-zA-Z0-9_]+)\(/.exec(line);
 	const empty = { name: head?.[1] ?? "", args: [], result: "" };
 	if (!head && (!line.trim() || /^(?:\+\+\+|---)/.test(line))) return empty;
@@ -147,6 +162,131 @@ function parseTraceLine(line: string): TraceLine {
 
 type TraceRecord = TraceLine & { readonly pid: number; readonly at: number; readonly text: string };
 
+/** The kernel owns each invocation. Views retain this record while its broker acknowledgement arrives. */
+export function nativeMetadataTrace(read: () => Buffer, privateUpper: string) {
+	type Call = { readonly line: { -readonly [Key in keyof TraceRecord]: TraceRecord[Key] }; readonly number: number; readonly arguments: readonly bigint[]; returned?: Buffer; response?: Buffer;
+		requested: boolean; canceled: boolean; failed: boolean; error?: string; ended?: number; seen: number; path?: string; pathRank: number; observation?: StatObservation };
+	const calls = new Map<bigint, Call>(), files = new Map<number, TraceRecord[]>();
+	const inputs = new Map<string, { readonly image?: string; readonly sealed: boolean; readonly links: readonly (readonly [string, string])[] }>();
+	const inputFrames = new Map<bigint, { readonly chunks: Buffer[]; bytes: number }>();
+	const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+	let failure: Error | undefined;
+	return { files, get inputs(): ReadonlyMap<string, ReturnType<typeof inputs.get>> {
+		if (failure) throw failure;
+		if (inputFrames.size) throw new Error("native input record is incomplete");
+		return inputs;
+	}, read() {
+		if (failure) throw failure;
+		try {
+		const bytes = read(), changed = new Map<bigint, Call>();
+		for (let offset = 0; offset < bytes.length;) {
+			if (bytes.length - offset < 48) throw new Error("truncated native record");
+			const task = bytes.readBigUInt64LE(offset + 8), at = Number(bytes.readBigUInt64LE(offset + 16)) / 1e6,
+				id = bytes.readBigUInt64LE(offset + 24), kind = Number(bytes.readBigUInt64LE(offset + 32)), size = bytes.readUInt32LE(offset + 40), error = bytes.readInt32LE(offset + 44);
+			if (!id || size > 4096 || offset + 48 + size > bytes.length) throw new Error("invalid native record");
+			const body = bytes.subarray(offset + 48, offset + 48 + size); offset += (48 + size + 7) & ~7;
+			if (kind === 12) {
+				if (error || size !== 16) throw new Error("invalid native process record");
+				const name = ({ 39: "getpid", 110: "getppid", 121: "getpgid", 124: "getsid" } as Record<number, string>)[Number(body.readBigUInt64LE(0))];
+				if (!name) throw new Error("unknown native process observation");
+				const pid = Number(task & 0xffffffffn);
+				appendGrouped(files, pid, Object.freeze({ pid, at: Date.now(), text: "", order: at, name, args: [], result: String(body.readBigInt64LE(8)),
+					native: { entered: at, paths: [], observation: undefined, descriptor: false, nullDevice: false } }));
+				continue;
+			}
+			if ([10, 11, 138, 139].includes(kind)) {
+				let frame = inputFrames.get(id);
+				if (error || !size || !!frame !== ((kind & 127) === 11)) throw new Error("invalid native input frame");
+				if (!frame) inputFrames.set(id, frame = { chunks: [], bytes: 0 });
+				frame.bytes += size; frame.chunks.push(body);
+				if (frame.bytes > 2 * 1024 * 1024 || inputFrames.size > 256) throw new Error("native input record exceeds its bound");
+				if (!(kind & 128)) continue;
+				const row = JSON.parse(text.decode(Buffer.concat(frame.chunks))) as { path: string; image?: string; sealed?: boolean; ambiguous?: boolean; links?: [string, string][] };
+				inputFrames.delete(id);
+				if (typeof row.path !== "string" || !path.posix.isAbsolute(row.path) || row.path.includes("\0")) throw new Error("invalid native input pathname");
+				const previous = inputs.get(row.path);
+				if (row.ambiguous === true) { if (previous) inputs.set(row.path, { sealed: false, links: [] }); continue; }
+				if (typeof row.image !== "string" || !/^[0-9a-f]{16}$/.test(row.image) || typeof row.sealed !== "boolean" || !Array.isArray(row.links) || row.links.length > 40 ||
+					row.links.some(link => !Array.isArray(link) || link.length !== 2 || typeof link[0] !== "string" || !path.posix.isAbsolute(link[0]) || typeof link[1] !== "string" || link.some(value => value.includes("\0"))))
+					throw new Error("invalid native input index");
+				if (!previous && inputs.size >= 8192) throw new Error("native input index exceeds its bound");
+				const agreeing = previous?.image === row.image && stableEqual(previous.links, row.links);
+				if (agreeing && previous!.sealed === row.sealed) continue;
+				inputs.set(row.path, previous && !agreeing ? { sealed: false, links: [] }
+					: { image: row.image, sealed: row.sealed, links: row.links });
+				continue;
+			}
+			let call = calls.get(id);
+			if (kind === 8) {
+				if (call || error || size !== 56) throw new Error("invalid native entry");
+				const number = Number(body.readBigUInt64LE(8)), name = ({ 4: "stat", 5: "fstat", 6: "lstat", 17: "pread64", 18: "pwrite64", 262: "newfstatat", 332: "statx" } as Record<number, string>)[number];
+				if (!name) throw new Error("unknown native metadata call");
+				const args = Array.from({ length: 5 }, (_, index) => body.readBigUInt64LE(16 + index * 8)), pid = Number(task & 0xffffffffn);
+				const descriptor = number === 5 || number === 17 || number === 18 || !!((number === 262 || number === 332) && args[number === 262 ? 3 : 2]! & 0x1000n);
+				const state: Call = { number, arguments: args, requested: false, canceled: false, failed: false, pathRank: 0, seen: Date.now(), line: {
+					pid, at: Date.now(), text: "", order: at, name, args: [], result: "", failure: "native_metadata_pending",
+					native: { entered: at, paths: undefined, observation: undefined, descriptor, nullDevice: false },
+				} };
+				calls.set(id, state); changed.set(id, state); appendGrouped(files, pid, state.line); continue;
+			}
+			if (!call) throw new Error("native record has no kernel entry");
+			call.seen = Date.now(); changed.set(id, call);
+			if (error) { call.error = "native_metadata_unreadable"; continue; }
+			if (kind === 0) { if (call.requested || size !== 80 || body.readUInt32LE(8) !== call.line.pid || body.readInt32LE(16) !== call.number) throw new Error("native request changed"); call.requested = true; }
+			else if (kind === 4) { if (call.response || size !== 24) throw new Error("invalid native response"); call.response = body; }
+			else if (kind === 5) call.failed = true;
+			else if (kind === 9) { call.canceled = true; call.ended = at; }
+			else if (kind === 6) {
+				if (call.returned || size < 32 || body.readBigInt64LE(0) !== BigInt(call.number) || body.readUInt32LE(24) !== size - 32 ||
+					(size - 32 !== (body.readBigInt64LE(8) < 0n || call.number === 17 || call.number === 18 ? 0 : call.number === 332 ? 256 : 144))) throw new Error("invalid native return");
+				call.returned = body; call.ended = at;
+			} else if (kind === 1 || kind === 7) {
+				let value = text.decode(body).replace(/\0$/, "");
+				if (value.includes("\0")) throw new Error("invalid native pathname");
+				if (value.startsWith(`${privateUpper}/`)) value = value.slice(privateUpper.length);
+				const rank = kind === 1 ? 3 : Number(task & 0xffffffffn) !== call.line.pid ? 2 : 1;
+				if (rank === call.pathRank && value !== call.path) call.error = "native_metadata_path_changed";
+				if (rank > call.pathRank) { call.path = value; call.pathRank = rank; }
+			} else throw new Error("unknown native metadata record");
+		}
+		// Complete the original record once; its many consumers share these parsed values.
+		for (const [id, state] of changed) {
+			const { line, number, arguments: args, returned, response } = state, result = returned?.readBigInt64LE(8), flags = number === 262 ? 3 : 2, positional = number === 17 || number === 18;
+			line.at = state.seen; line.order = state.ended ?? line.native!.entered;
+			if (state.canceled || result !== undefined && [-512n, -513n, -514n, -516n].includes(result)) line.name = "";
+			line.result = result === undefined ? "" : result >= 0n ? String(result) : `-1 ${getSystemErrorName(Number(result))}`;
+			line.failure = !line.name ? undefined : state.error ?? (positional ? !returned ? "native_metadata_pending" : result! >= 0n && !state.path ? "native_io_path_missing" : undefined : !returned || !state.requested || !response
+				? state.failed ? "native_metadata_rejected" : "native_metadata_pending"
+				: response.readUInt32LE(20) > 1 || response.readInt32LE(16) > 0 || !(response.readUInt32LE(20) & 1) &&
+					result !== (response.readInt32LE(16) ? BigInt(response.readInt32LE(16)) : response.readBigInt64LE(8)) ? "native_metadata_response_changed" : undefined);
+			const arguments_ = args.map(String), data = returned?.subarray(32);
+			if (positional) arguments_[3] = String(BigInt.asIntN(64, args[3]!));
+			if (number === 262 || number === 332) arguments_[flags] = args[flags]! & 0x100n ? "AT_SYMLINK_NOFOLLOW" : "0";
+			if (line.native!.descriptor) arguments_[0] = `${args[0]}<${state.path ?? "anonymous"}>`;
+			line.args = arguments_;
+			line.native = { ...line.native!, paths: state.path?.startsWith("/") && !state.path.startsWith("/memfd:") && !state.path.endsWith(" (deleted)") ? [walkedPath(state.path)] : state.path || positional && result !== undefined && result < 0n ? [] : undefined,
+				observation: !positional && !line.failure && result === 0n ? state.observation ??= nativeStatObservation(data!, number === 332) : undefined,
+				nullDevice: !!data?.length && (number === 332 ? data.readUInt16LE(28) & 0xf000 : data.readUInt32LE(24) & 0xf000) === 0x2000 &&
+					(number === 332 ? data.readUInt32LE(128) === 1 && data.readUInt32LE(132) === 3 : data.readBigUInt64LE(40) === 259n) };
+			if (returned && (positional || state.requested && response)) { Object.freeze(line); calls.delete(id); }
+		}
+		} catch (error) { throw failure = error instanceof Error ? error : new Error("native execution record failed", { cause: error }); }
+	} };
+}
+
+function nativeStatObservation(bytes: Buffer, extended: boolean): StatObservation {
+	const integer = (offset: number, size = 8, signed = false) => size === 2 ? BigInt(bytes.readUInt16LE(offset)) : size === 4 ? BigInt(bytes.readUInt32LE(offset)) : signed ? bytes.readBigInt64LE(offset) : bytes.readBigUInt64LE(offset);
+	const time = (offset: number) => integer(offset, 8, true) * 1000000000n + integer(offset + 8, extended ? 4 : 8);
+	const device = (offset: number) => linuxDevice(integer(offset, 4), integer(offset + 4, 4));
+	const values = extended ? { dev: device(136), ino: integer(32), mode: integer(28, 2), nlink: integer(16, 4), uid: integer(20, 4), gid: integer(24, 4), rdev: device(128),
+		size: integer(40), blksize: integer(4, 4), blocks: integer(48), atimeNs: time(64), mtimeNs: time(112), ctimeNs: time(96) }
+		: { dev: integer(0), ino: integer(8), nlink: integer(16), mode: integer(24, 4), uid: integer(28, 4), gid: integer(32, 4), rdev: integer(40),
+			size: integer(48, 8, true), blksize: integer(56, 8, true), blocks: integer(64, 8, true), atimeNs: time(72), mtimeNs: time(88), ctimeNs: time(104) };
+	const mask = extended ? bytes.readUInt32LE(0) : 0x7ff, masks: Partial<Record<FilesystemObservationField, number>> = { mode: 3, nlink: 4, uid: 8, gid: 16, atimeNs: 32, mtimeNs: 64, ctimeNs: 128, ino: 256, size: 512, blocks: 1024 };
+	const fields = mask & ~0x3ffff || (mask & 0x7ff) === 0x7ff ? FILESYSTEM_OBSERVATION_FIELDS : FILESYSTEM_OBSERVATION_FIELDS.filter(name => mask & (masks[name] ?? 0));
+	return { digest: filesystemObservationDigest(values, fields), ...(fields.length < FILESYSTEM_OBSERVATION_FIELDS.length ? { fields } : {}) };
+}
+
 function appendGrouped<Key, Value>(groups: Map<Key, Value[]>, key: Key, value: Value): void {
 	(groups.get(key) ?? groups.set(key, []).get(key)!).push(value);
 }
@@ -155,17 +295,16 @@ function appendGrouped<Key, Value>(groups: Map<Key, Value[]>, key: Key, value: V
 function traceDecoder() {
 	const pending = new Map<string, { text: string; pid: number; at: number; order?: number }[]>(), times = new Map<number, number>();
 	let sequence = 0;
-	return (contents: string, filePID?: number, growing = false) => {
+	return Object.assign((contents: string) => {
 		const rows = contents.split(/\r?\n/), complete = new Map<number, TraceRecord[]>();
-		if (filePID !== undefined) complete.set(filePID, []);
 		for (const [index, raw] of rows.entries()) {
-			const order = filePID === undefined ? sequence++ : undefined;
+			const order = sequence++;
 			if (!raw.trim()) continue;
-			const process = filePID === undefined ? /^(\d+)\s+(.*)$/.exec(raw) : [raw, String(filePID), raw];
+			const process = /^(\d+)\s+(.*)$/.exec(raw);
 			if (!process) throw new Error("invalid ordered trace record");
-			const stamp = /^(\d+\.\d+) (.*)$/.exec(process[2]!), text = stamp?.[2] ?? process[2]!;
-			const current = { pid: Number(process[1]), at: stamp ? Number(stamp[1]) * 1000 : NaN, order };
-			const fragment = growing && index === rows.length - 1;
+			const stamp = /^(\d+\.\d+)(?:@(\d+\.\d+))? (.*)$/.exec(process[2]!), text = stamp?.[3] ?? process[2]!;
+			const current = { pid: Number(process[1]), at: stamp ? Number(stamp[1]) * 1000 : NaN, order: stamp?.[2] ? Number(stamp[2]) * 1000 : order };
+			const fragment = index === rows.length - 1;
 			current.at = Math.max(times.get(current.pid) ?? 0, current.at); times.set(current.pid, current.at);
 			const unfinished = /^\s*([a-zA-Z0-9_]+)\(.*\s<unfinished \.\.\.>\s*$/.exec(text), resumed = /^\s*<\.\.\.\s*([a-zA-Z0-9_]+) resumed>(.*)$/.exec(text);
 			const name = unfinished?.[1] ?? resumed?.[1], key = `${current.pid}:${name}`;
@@ -177,12 +316,14 @@ function traceDecoder() {
 			if (pending.get(key)?.length === 0) pending.delete(key);
 			const line = resumed ? prefix ? parseTraceLine(`${prefix.text}${resumed[2]}`)
 				: { name: name!, args: [], result: "", failure: `resumed_without_unfinished:${key}` } : parseTraceLine(text);
+			// Restart codes stay inside the kernel; only the eventual return is visible to the program.
+			if (/^\? ERESTART(?:SYS|NOINTR|NOHAND|_RESTARTBLOCK)\b/.test(line.result)) continue;
 			appendGrouped(complete, current.pid, { ...current, ...line, ...(fragment ? { failure: "partial" } : {}), text, ...(prefix ? { at: prefix.at,
-				order: /^(?:write|writev|sendto|sendmsg|fork|vfork|clone|clone3)$/.test(name!) ? prefix.order : order } : {}) });
+				order: /^(?:write|writev|sendto|sendmsg|fork|vfork|clone|clone3)$/.test(name!) ? prefix.order : current.order } : {}) });
 		}
-		for (const [key, calls] of pending) appendGrouped(complete, calls[0]!.pid, { ...calls[0]!, name: key.slice(key.indexOf(":") + 1), args: [], result: "", failure: `unfinished:${key}` });
 		return complete;
-	};
+	}, { pending: (): TraceRecord[] => [...pending].flatMap(([key, calls]) => calls.map(call => ({ ...call,
+		name: key.slice(key.indexOf(":") + 1), args: [], result: "", failure: `unfinished:${key}` }))) });
 }
 
 /** Reduce handle lifetimes to object releases. Aliases and CLONE_FILES share references;
@@ -246,7 +387,7 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 				if (handle?.object.inode.startsWith("eventfd:")) { handle.object.peer = handle.object; return handle; }
 				return;
 			}
-			const match = /^(\d+)<(?:pipe|UNIX(?:-[A-Z]+)?):\[(\d+)(?:->(\d+))?\]>$/.exec(argument ?? "");
+			const match = STREAM_ENDPOINT.exec(argument ?? "");
 			if (!match || !options.inheritedStreams?.includes(match[2]!)) return;
 			const object = resource(match[2]!);
 			if (match[3]) { object.peer = resource(match[3]); object.peer.peer = object; }
@@ -542,38 +683,28 @@ function selectTraceRoot(files: readonly TraceFile[], target: string, initialCwd
 }
 
 /**
- * Decode a strace -ff transcript. The parser deliberately fails closed: only the target
+ * Decode the execution's ordered transcript. The parser deliberately fails closed: only the target
  * exec and its recursively identified descendants contribute a replayable certificate.
  */
 export async function observeStrace(
-	tracePrefix: string,
+	tracePrefix: string | TraceTail,
 	executablePath: string,
 	initialCwd: string,
 	options: StraceObservationOptions = {},
 ): Promise<StraceObservation> {
-	const files: TraceFile[] = [];
-	let remaining = options.frozen?.bytes ?? options.previewBytes, frontier = false;
-	if (remaining !== undefined && (!isSafeCount(remaining))) throw new Error("invalid trace preview budget");
-	for await (const chunk of traceChunks(tracePrefix, undefined, remaining)) {
-		if (options.frozen && chunk.pid !== undefined) throw new Error("continuation requires one ordered trace");
-		remaining = chunk.remaining;
-		let contents = chunk.bytes.toString("utf8");
-		if (options.privateUpper) contents = contents.replaceAll(`<${options.privateUpper}/`, "</");
-		for (const [pid, lines] of traceDecoder()(contents, chunk.pid)) {
-			if (options.frozen?.pid === pid) {
-				frontier = contents.endsWith("\n") && !lines.some(line => /^--- /.test(line.text));
-			}
-			files.push({ pid, lines });
-		}
-	}
+	await using owned = typeof tracePrefix === "string" ? traceTail(tracePrefix, initialCwd, options) : undefined;
+	const source = owned ?? tracePrefix as TraceTail;
+	const { records: files, frontier } = await source.read();
 	const target = path.posix.resolve(initialCwd, executablePath);
-	const root = selectTraceRoot(files, options.launchPath ?? target, initialCwd);
+	const file = options.execution && files.find(file => file.pid === options.execution!.pid);
+	const root = options.execution ? file ? { ...file, start: options.execution.start } : { reason: "execution_trace_missing" }
+		: selectTraceRoot(files, options.launchPath ?? target, initialCwd);
 	if ("reason" in root) return { complete: false, paths: [], taints: ["trace_incomplete"], tracedProcesses: 0, incompleteReasons: [root.reason] };
 
 	const byPID = new Map(files.map((file) => [file.pid, file]));
 	const selected = new Map<number, TraceProcess>([[root.pid, { ...root, cwd: path.posix.resolve(initialCwd), fs: { shared: false, changed: false } }]]);
 	const incomplete = new Set<string>(options.previewBytes === undefined ? [] : ["preview_only"]);
-	if (options.frozen && (!frontier || root.pid !== options.frozen.pid || remaining !== 0)) incomplete.add("continuation_frontier_unproven");
+	if (options.frozen && (!frontier || root.pid !== options.frozen.pid)) incomplete.add("continuation_frontier_unproven");
 	for (const [pid, process] of selected) {
 		if (process.lines.at(-1)?.name !== "terminated" && options.frozen?.pid !== pid) incomplete.add(`process_exit_unproven:${pid}`);
 		let cwd = process.cwd;
@@ -609,6 +740,7 @@ export async function observeStrace(
 		else if (!unsupportedSyscalls.has(name)) unsupportedSyscallsTruncated = true;
 	};
 	const opened = new Map<number, Set<number>>(); // Descriptors a process opened itself, whose status flags it chose.
+	const capturedOutput: Array<{ fd: 1 | 2; data: Buffer; order: number }> = []; let outputBytes = 0;
 	const ownPipes = new Set<string>(); // Pipes and socket pairs the traced processes created, by inode.
 	// The semantic roots are one workspace seen from the sandbox and from its source: name a file by its place in it.
 	const locks = new Map<string, boolean>(), changedMetadata = new Set<string>(), written = new Set<string>(), writable = new Set<string>(), external = new Set<string>(), workspaceName = (target: string) =>
@@ -617,6 +749,21 @@ export async function observeStrace(
 		? resourceTransitions(selected, root.pid, options) : { journal: [], handled: new Set<TraceLine>(), retained: [], finalHandles: [] };
 	const semanticRoots = (options.guardFilesystemSemanticsWithin ?? []).map((value) => path.posix.resolve(value));
 	const brokered = brokeredProcessSegments(selected, options);
+	const outputPipes = new Set(options.unchangedOutputPipes);
+	if (options.outputFlags) for (const [index, endpoint] of options.outputEndpoints?.entries() ?? []) {
+		if (!endpoint.startsWith("pipe:")) continue;
+		const initial = options.outputFlags[index]!, mask = 0xc00;
+		let flags: number | undefined = initial;
+		for (const line of [...selected.values()].flatMap(process => process.lines.slice(process.start))
+			.filter(line => /^fcntl(?:64)?$/.test(line.name) && (line.args[0] ?? "").endsWith(`<${endpoint}>`)).sort((a, b) => a.order! - b.order!)) {
+			if (line.args[1] === "F_SETFL" && syscallSucceeded(line)) flags = symbolicMask(line.args[2], FILE_FLAGS);
+			if (line.args[1] === "F_GETFL" && syscallSucceeded(line) && (flags === undefined || (Number.parseInt(line.result) & mask) !== (flags & mask))) {
+				incomplete.add("output_status_changed_outside_execution");
+			}
+		}
+		if (flags !== undefined && (flags & mask) === (initial & mask)) outputPipes.add(endpoint);
+		else incomplete.add("output_status_changed_during_execution");
+	}
 	const observeMetadata = (observedPath: string, followSymlinks: boolean, { digest, fields }: StatObservation) => {
 		lookupFailures.set(observedPath, undefined);
 		const identity = `metadata:${followSymlinks}:${fields?.join(",") ?? ""}:${observedPath}`;
@@ -626,146 +773,159 @@ export async function observeStrace(
 		if (previous && previous.digest !== digest) changedMetadata.add(observedPath);
 		metadata.set(identity, { path: observedPath, role: "metadata", followSymlinks, digest, ...(fields ? { fields } : {}), ...(afterWrite ? { afterWrite: true } : {}) });
 	};
-	for (const [pid, { lines, start, cwd: initial, fs }] of selected) {
-		// -ff files cannot order another task's chdir against this task's pathname lookup.
-		if (fs.changed) { incomplete.add("shared_cwd_mutation"); continue; }
-		let cwd = initial;
+	const cwds = new Map([...selected].map(([pid, process]) => [pid, process.cwd]));
+	// One domain order preserves a child's read before a later parent write and FD inheritance at the actual fork.
+	const ordered = [...selected].flatMap(([pid, process]) => {
+		if (process.fs.changed) { incomplete.add("shared_cwd_mutation"); return []; }
+		return process.lines.slice(process.start, brokered.get(pid)).map((line, index) => ({ line, initial: index === 0 }));
+	}).sort((left, right) => left.line.order! - right.line.order!);
+	for (const { line, initial } of ordered) {
+		const { pid } = line;
+		if (pid === root.pid && initial && options.launchPath && !options.execution) continue;
+		let cwd = cwds.get(pid);
 		if (!cwd) { incomplete.add(`cwd_unknown:${pid}`); cwd = path.posix.resolve(initialCwd); }
-		for (let index = start; index < lines.length; index++) {
-			if (index >= (brokered.get(pid) ?? Infinity)) break;
-			if (pid === root.pid && index === start && options.launchPath) continue;
-			const line = lines[index]!;
-			const spawned = spawnedPID(line);
-			if (spawned) opened.set(spawned, new Set(opened.get(pid)));
-			const own = opened.get(pid) ?? opened.set(pid, new Set()).get(pid)!, result = Number.parseInt(line.result ?? "", 10);
-			// Files and pipes the traced processes created stay private to them, through duplication and inheritance.
-			if (/^(?:open|openat|openat2|creat)$/.test(line.name) && isSafeCount(result)) { own.add(result); if (writesPath(line)) writable.add(absoluteDescriptorPath(line.result) ?? ""); }
-			else if (/^pipe2?$/.test(line.name) && result === 0) for (const pipe of (line.args[0] ?? "").matchAll(/<pipe:\[(\d+)\]>/g)) ownPipes.add(pipe[1]!);
-			else if (line.name === "socketpair" && result === 0) for (const end of (line.args[3] ?? "").matchAll(/<UNIX(?:-[A-Z]+)?:\[(\d+)/g)) ownPipes.add(end[1]!);
-			else if (/^dup[23]?$|^fcntl(?:64)?$/.test(line.name) && (line.name.startsWith("dup") || /^F_DUPFD/.test(line.args[1] ?? "")) && isSafeCount(result)) {
-				if (own.has(Number.parseInt(line.args[0] ?? "", 10))) own.add(result); else own.delete(result);
-			} else if (line.name === "close") own.delete(Number.parseInt(line.args[0] ?? "", 10));
-			else if (line.name === "close_range" && result === 0 && !line.args[2]?.includes("CLOSE_RANGE_CLOEXEC"))
-				for (const fd of own) if (fd >= Number(line.args[0]) && fd <= (/^~0/.test(line.args[1] ?? "") ? Infinity : Number(line.args[1]))) own.delete(fd);
-			if (line.failure) { incomplete.add(line.failure); continue; }
-			const { name: syscall, args } = line, succeeded = syscallSucceeded(line);
-			if (!syscall) continue;
-			// Descriptor images have their own sealed effects; explicitly naming one still observes its pathname.
-			const observedPaths = syscallPaths(line, cwd)?.filter(target => !options.inheritedFileImages?.includes(target) ||
-				!(writesPath(line) || syscall === "mmap") || PATH_ARGUMENTS[syscall]?.some(([pathname]) => pathname !== undefined));
-			if (options.frozen && !continuationCall(line, index === start)) incomplete.add(`continuation_state:${syscall}`);
-			if (syscall === "getpid" || syscall === "getppid" || syscall === "getsid" || syscall === "getpgid") { taints.add("pid_observation"); }
-			const endpoint = /^\d+<(?:pipe|UNIX(?:-[A-Z]+)?):\[(\d+)(?:->\d+)?\]>$/.exec(args[0] ?? "")?.[1];
-			const stream = endpoint && options.inheritedStreams?.includes(endpoint) || options.inheritedStreams?.some(inode => inode.startsWith("eventfd:")) && /^\d+<anon_inode:\[eventfd\]>$/.test(args[0] ?? "");
-			const streamCall = streamCalls.has(line);
-			if (stream && /^(?:read|write|readv|writev|sendto|recvfrom|sendfile|vmsplice)$/.test(syscall) && !streamCall) unsupported(syscall);
-			if (options.inheritedStreams?.length && /^(?:poll|ppoll|select|pselect6|epoll_.*)$/.test(syscall) && !streamCall && !internalPoll(line, ownPipes)) unsupported(syscall);
-			// A local socket reaches another process only once connected: a refused path (an NSS cache that is absent here) is a
-			// pathname dependency, validated absent where the Actor runs.
-			const refused = syscall === "connect" && /^-1 (?:ENOENT|ECONNREFUSED|EACCES)\b/.test(line.result) ? /\bsun_path="(\/[^"]+)"/.exec(args[1] ?? "")?.[1] : undefined;
-			if (refused) { observePath(refused, "input", /^-1 ENOENT\b/.test(line.result) ? "ENOENT" : undefined); continue; }
-			const output = !!options.outputEndpoints?.includes(`socket:[${/^\d+<UNIX-STREAM:\[(\d+)/.exec(args[0] ?? "")?.[1]}]`);
-			const outputQuery = output && /^(?:getsockname|getpeername|getsockopt)$/.test(syscall);
-			// Created pairs stay within the tree only while they neither open another connection nor send to another address.
-			const localCall = endpoint && ownPipes.has(endpoint) && (syscall === "sendto" ? args[4] === "NULL" && args[5] === "0"
-				: syscall === "sendmsg" ? streamMessage(args[1]) !== undefined : !/^(?:connect|bind|listen|accept|accept4|sendmmsg)$/.test(syscall));
-			if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line) && !streamCall && !outputQuery && !(/^socket(?:pair)?$/.test(syscall) && /^AF_UNIX\b/.test(args[0] ?? "")) &&
-				!localCall) taints.add("network");
-			if (IPC_SYSCALLS.has(syscall)) taints.add("ipc");
-			// Descriptor-local state is internal; reproduced OFD flags are sealed with their final offsets. A lock taken without waiting,
-			// or a query that found the range free, depends only on no one else holding one, which a replay probes; a refusal, or a
-			// holder found, saw another. One taken by waiting ends the same way natively, however long it waited; a release reveals nothing.
-			const record = /^fcntl(?:64)?$/.test(syscall) ? /^F_(?:OFD_)?(GETLK|SETLK|SETLKW)(?:64)?$/.exec(args[1] ?? "")?.[1] : undefined;
-			const lock = syscall === "flock" ? /\bLOCK_NB\b/.test(args[1] ?? "") && /\bLOCK_(SH|EX)\b/.exec(args[1] ?? "")?.[1]
-				: record && record !== "SETLKW" && /\bl_type=F_(RD|WR|UN)LCK\b/.exec(args[2] ?? "")?.[1], locked = absoluteDescriptorPath(args[0]);
-			if (lock && !streamCall && (record === "GETLK" || lock !== "UN")) {
-				if (locked && succeeded && (record === "GETLK") === (lock === "UN")) locks.set(locked, locks.get(locked) || lock !== "SH" && lock !== "RD");
-				else taints.add("ipc");
+		const spawned = spawnedPID(line);
+		if (spawned) opened.set(spawned, new Set(opened.get(pid)));
+		const own = opened.get(pid) ?? opened.set(pid, new Set()).get(pid)!, result = Number.parseInt(line.result ?? "", 10);
+		// Files and pipes the traced processes created stay private to them, through duplication and inheritance.
+		if (/^(?:open|openat|openat2|creat)$/.test(line.name) && isSafeCount(result)) { own.add(result); if (writesPath(line)) writable.add(absoluteDescriptorPath(line.result) ?? ""); }
+		else if (/^pipe2?$/.test(line.name) && result === 0) for (const pipe of (line.args[0] ?? "").matchAll(/<pipe:\[(\d+)\]>/g)) ownPipes.add(pipe[1]!);
+		else if (line.name === "socketpair" && result === 0) for (const end of (line.args[3] ?? "").matchAll(/<UNIX(?:-[A-Z]+)?:\[(\d+)/g)) ownPipes.add(end[1]!);
+		else if (/^dup[23]?$|^fcntl(?:64)?$/.test(line.name) && (line.name.startsWith("dup") || /^F_DUPFD/.test(line.args[1] ?? "")) && isSafeCount(result)) {
+			if (own.has(Number.parseInt(line.args[0] ?? "", 10))) own.add(result); else own.delete(result);
+		} else if (line.name === "close") own.delete(Number.parseInt(line.args[0] ?? "", 10));
+		else if (line.name === "close_range" && result === 0 && !line.args[2]?.includes("CLOSE_RANGE_CLOEXEC"))
+			for (const fd of own) if (fd >= Number(line.args[0]) && fd <= (/^~0/.test(line.args[1] ?? "") ? Infinity : Number(line.args[1]))) own.delete(fd);
+		if (line.failure) { incomplete.add(line.failure); continue; }
+		const { name: syscall, args } = line, succeeded = syscallSucceeded(line);
+		if (!syscall) continue;
+		if (options.captureOutput && succeeded && /^(?:write|writev|sendto|sendmsg|sendfile|splice|vmsplice)$/.test(syscall)) {
+			const endpoint = STREAM_ENDPOINT.exec(args[syscall === "splice" ? 2 : 0] ?? "")?.[2];
+			const channel = endpoint === undefined ? -1 : options.outputEndpoints?.findIndex(value => value.endsWith(`:[${endpoint}]`)) ?? -1;
+			if (channel >= 0 && result > 0) {
+				const bytes = /^"((?:\\.|[^"\\])*)"$/.exec(args[1] ?? "");
+				const vector = syscall === "writev" ? queueVectors(args[1], Number(args[2])) : syscall === "sendmsg" ? streamMessage(args[1]) : undefined;
+				const data = bytes ? decodeCBytes(bytes[1]!) : vector?.data;
+				if (!data || data.length < result || line.order === undefined || (outputBytes += result) > 32 * 1024 * 1024) incomplete.add("output_bytes_unproven");
+				else capturedOutput.push({ fd: channel === 0 ? 1 : 2, data: data.subarray(0, result), order: line.order });
 			}
-			if (/^fcntl(?:64)?$/.test(syscall) && !record) {
-				const command = args[1] ?? "";
-				if (!/^F_(?:GETFD|SETFD|DUPFD|DUPFD_CLOEXEC)$/.test(command) &&
-					// A descriptor this process opened reports the flags it chose; an inherited one's flags need evidence.
-					// Standard streams' status flags are part of the pinned execution context.
-					!(command === "F_GETFL" && (own.has(Number.parseInt(args[0] ?? "", 10)) || /^[012]</.test(args[0] ?? ""))) && !((command === "F_GETFL" || command === "F_SETFL" && succeeded &&
-						(args[2] ?? "").split("|").every(flag => /^(?:O_(?:RDONLY|WRONLY|RDWR|APPEND|NONBLOCK|NDELAY|LARGEFILE|DIRECTORY|DSYNC|SYNC|NOFOLLOW)|0)$/.test(flag))) &&
-						(options.inheritedFileImages?.includes(absoluteDescriptorPath(args[0]) ?? /^\d+<(pipe:\[\d+\])>$/.exec(args[0] ?? "")?.[1] ?? "") || stream || output ||
-							options.unchangedOutputPipes?.includes(/^\d+<(pipe:\[\d+\])>$/.exec(args[0] ?? "")?.[1] ?? "") ||
-							own.has(Number.parseInt(args[0] ?? "", 10)) || ownPipes.has(endpoint ?? ""))))
-					unsupported(syscall);
-			}
-			// An unprivileged process holds no capabilities, sandboxed or not (the observer runs as the Actor's user).
-			const noCapabilities = syscall === "capget" && process.getuid?.() !== 0 && /\{effective=0, permitted=0, inheritable=0\}\) = 0$/.test(`${args.join(", ")}) = ${line.result}`);
-			const limit = syscall === "prlimit64" ? args[1] : /^(?:getrlimit|setrlimit)$/.test(syscall) ? args[0] : undefined;
-			// A refused io_uring leaves libuv on epoll and its thread pool: the same results, every file call traced.
-			if (syscall === "io_uring_setup" && /^-1 EPERM\b/.test(line.result)) continue;
-			if (!noCapabilities && (CONFINEMENT_SENSITIVE_SYSCALLS.has(syscall) || /^-1 (?:EACCES|EPERM)\b/.test(line.result) ||
-				syscall === "prctl" && !/^PR_(?:GET_NAME|SET_NAME|SET_VMA)$/.test(args[0] ?? "") ||
-				["clone", "clone3", "fork", "vfork"].includes(syscall) && /^-1 EAGAIN\b/.test(line.result) ||
-				limit === "RLIMIT_CORE" && syscall !== "setrlimit" && succeeded)) {
-				taints.add("confinement_observation");
-			}
-			// A time set on a file the tree opened for writing reaches its effects, which carry each file's modification time.
-			if (/^(?:utime|utimes|utimensat|futimesat)$/.test(syscall) && !(observedPaths ?? [""]).every(target => writable.has(target))) unsupported(syscall);
-			if (
-				// Even a failed setter can mutate a limit; sandbox caps and foreign limits are unmodeled.
-				(syscall === "setrlimit" || syscall === "prlimit64" && args[2] !== "NULL") &&
-					(syscall === "prlimit64" && args[0] !== "0" || limit === "RLIMIT_NPROC" || limit === "RLIMIT_CORE") ||
-				UNMODELED_FILE_SEMANTICS_SYSCALLS.has(syscall) && !streamCall ||
-				(syscall === "pipe2" && /O_DIRECT|O_EXCL/.test(args[1] ?? "")) ||
-				(syscall === "ioctl" && unmodeledFileIoctl(line))
-			) {
+		}
+		// Descriptor images have their own sealed effects; explicitly naming one still observes its pathname.
+		const observedPaths = syscallPaths(line, cwd)?.filter(target => !options.inheritedFileImages?.includes(target) ||
+			!(writesPath(line) || syscall === "mmap") || PATH_ARGUMENTS[syscall]?.some(([pathname]) => pathname !== undefined));
+		if (options.frozen && !continuationCall(line, initial)) incomplete.add(`continuation_state:${syscall}`);
+		if (syscall === "getpid" || syscall === "getppid" || syscall === "getsid" || syscall === "getpgid") { taints.add("pid_observation"); }
+		const endpoint = STREAM_ENDPOINT.exec(args[0] ?? "")?.[2];
+		const stream = endpoint && options.inheritedStreams?.includes(endpoint) || options.inheritedStreams?.some(inode => inode.startsWith("eventfd:")) && /^\d+<anon_inode:\[eventfd\]>$/.test(args[0] ?? "");
+		const streamCall = streamCalls.has(line);
+		if (stream && /^(?:read|write|readv|writev|sendto|recvfrom|sendfile|vmsplice)$/.test(syscall) && !streamCall) unsupported(syscall);
+		if (options.inheritedStreams?.length && /^(?:poll|ppoll|select|pselect6|epoll_.*)$/.test(syscall) && !streamCall && !internalPoll(line, ownPipes)) unsupported(syscall);
+		// A local socket reaches another process only once connected: a refused path (an NSS cache that is absent here) is a
+		// pathname dependency, validated absent where the Actor runs.
+		const refused = syscall === "connect" && /^-1 (?:ENOENT|ECONNREFUSED|EACCES)\b/.test(line.result) ? /\bsun_path="(\/[^"]+)"/.exec(args[1] ?? "")?.[1] : undefined;
+		if (refused) { observePath(refused, "input", /^-1 ENOENT\b/.test(line.result) ? "ENOENT" : undefined); continue; }
+		const output = !!options.outputEndpoints?.includes(`socket:[${/^\d+<UNIX-STREAM:\[(\d+)/.exec(args[0] ?? "")?.[1]}]`);
+		const outputQuery = output && /^(?:getsockname|getpeername|getsockopt)$/.test(syscall);
+		// Created pairs stay within the tree only while they neither open another connection nor send to another address.
+		const localCall = endpoint && ownPipes.has(endpoint) && (syscall === "sendto" ? args[4] === "NULL" && args[5] === "0"
+			: syscall === "sendmsg" ? streamMessage(args[1]) !== undefined : !/^(?:connect|bind|listen|accept|accept4|sendmmsg)$/.test(syscall));
+		if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line) && !streamCall && !outputQuery && !(/^socket(?:pair)?$/.test(syscall) && /^AF_UNIX\b/.test(args[0] ?? "")) &&
+			!localCall) taints.add("network");
+		if (IPC_SYSCALLS.has(syscall)) taints.add("ipc");
+		// Descriptor-local state is internal; reproduced OFD flags are sealed with their final offsets. A lock taken without waiting,
+		// or a query that found the range free, depends only on no one else holding one, which a replay probes; a refusal, or a
+		// holder found, saw another. One taken by waiting ends the same way natively, however long it waited; a release reveals nothing.
+		const record = /^fcntl(?:64)?$/.test(syscall) ? /^F_(?:OFD_)?(GETLK|SETLK|SETLKW)(?:64)?$/.exec(args[1] ?? "")?.[1] : undefined;
+		const lock = syscall === "flock" ? /\bLOCK_NB\b/.test(args[1] ?? "") && /\bLOCK_(SH|EX)\b/.exec(args[1] ?? "")?.[1]
+			: record && record !== "SETLKW" && /\bl_type=F_(RD|WR|UN)LCK\b/.exec(args[2] ?? "")?.[1], locked = absoluteDescriptorPath(args[0]);
+		if (lock && !streamCall && (record === "GETLK" || lock !== "UN")) {
+			if (locked && succeeded && (record === "GETLK") === (lock === "UN")) locks.set(locked, locks.get(locked) || lock !== "SH" && lock !== "RD");
+			else taints.add("ipc");
+		}
+		if (/^fcntl(?:64)?$/.test(syscall) && !record) {
+			const command = args[1] ?? "";
+			if (!/^F_(?:GETFD|SETFD|DUPFD|DUPFD_CLOEXEC)$/.test(command) &&
+				// A descriptor this process opened reports the flags it chose; an inherited one's flags need evidence.
+				// Standard streams' status flags are part of the pinned execution context.
+				!(command === "F_GETFL" && (own.has(Number.parseInt(args[0] ?? "", 10)) || /^[012]</.test(args[0] ?? ""))) && !((command === "F_GETFL" || command === "F_SETFL" && succeeded &&
+					(args[2] ?? "").split("|").every(flag => /^(?:O_(?:RDONLY|WRONLY|RDWR|APPEND|NONBLOCK|NDELAY|LARGEFILE|DIRECTORY|DSYNC|SYNC|NOFOLLOW)|0)$/.test(flag))) &&
+					(options.inheritedFileImages?.includes(absoluteDescriptorPath(args[0]) ?? /^\d+<(pipe:\[\d+\])>$/.exec(args[0] ?? "")?.[1] ?? "") || stream || output ||
+						outputPipes.has(/^\d+<(pipe:\[\d+\])>$/.exec(args[0] ?? "")?.[1] ?? "") ||
+						own.has(Number.parseInt(args[0] ?? "", 10)) || ownPipes.has(endpoint ?? ""))))
 				unsupported(syscall);
+		}
+		// An unprivileged process holds no capabilities, sandboxed or not (the observer runs as the Actor's user).
+		const noCapabilities = syscall === "capget" && process.getuid?.() !== 0 && /\{effective=0, permitted=0, inheritable=0\}\) = 0$/.test(`${args.join(", ")}) = ${line.result}`);
+		const limit = syscall === "prlimit64" ? args[1] : /^(?:getrlimit|setrlimit)$/.test(syscall) ? args[0] : undefined;
+		// A refused io_uring leaves libuv on epoll and its thread pool: the same results, every file call traced.
+		if (syscall === "io_uring_setup" && /^-1 EPERM\b/.test(line.result)) continue;
+		if (!noCapabilities && (CONFINEMENT_SENSITIVE_SYSCALLS.has(syscall) || /^-1 (?:EACCES|EPERM)\b/.test(line.result) ||
+			syscall === "prctl" && !/^PR_(?:GET_NAME|SET_NAME|SET_VMA)$/.test(args[0] ?? "") ||
+			["clone", "clone3", "fork", "vfork"].includes(syscall) && /^-1 EAGAIN\b/.test(line.result) ||
+			limit === "RLIMIT_CORE" && syscall !== "setrlimit" && succeeded)) {
+			taints.add("confinement_observation");
+		}
+		// A time set on a file the tree opened for writing reaches its effects, which carry each file's modification time.
+		if (/^(?:utime|utimes|utimensat|futimesat)$/.test(syscall) && !(observedPaths ?? [""]).every(target => writable.has(target))) unsupported(syscall);
+		if (
+			// Even a failed setter can mutate a limit; sandbox caps and foreign limits are unmodeled.
+			(syscall === "setrlimit" || syscall === "prlimit64" && args[2] !== "NULL") &&
+				(syscall === "prlimit64" && args[0] !== "0" || limit === "RLIMIT_NPROC" || limit === "RLIMIT_CORE") ||
+			UNMODELED_FILE_SEMANTICS_SYSCALLS.has(syscall) && !streamCall ||
+			(syscall === "pipe2" && /O_DIRECT|O_EXCL/.test(args[1] ?? "")) ||
+			(syscall === "ioctl" && unmodeledFileIoctl(line))
+		) {
+			unsupported(syscall);
+		}
+		// A filesystem's statistics vary over time like the clock, whose taint every trace carries; the sandbox reports the one a
+		// native run sees, the workspace's own included.
+		if (/^f?statfs$/.test(syscall)) continue;
+		const listed = /^getdents(?:64)?$/.test(syscall) ? absoluteDescriptorPath(args[0]) : undefined;
+		const directoryImage = !!listed && !!options.inheritedDirectoryImages?.includes(listed);
+		// A listed directory's entry set is its dependency; readdir order and d_ino are volatile identity, as a descriptor's is.
+		const listing = !!listed && !directoryImage && succeeded;
+		if (listing) { taints.add("descriptor_observation"); listedPaths.add(listed!); if (paths.get(listed!) !== "executable") paths.set(listed!, "input"); }
+		if (UNMODELED_METADATA_SYSCALLS.has(syscall) && !listing && (succeeded ? !directoryImage : directoryImage)) {
+			unsupported(syscall);
+			incomplete.add(`unmodeled_metadata:${syscall}:${pid}`);
+		}
+		if (semanticRoots.length && workspaceDriverSemanticGap(line, observedPaths, semanticRoots)) {
+			unsupported(syscall);
+			incomplete.add(`filesystem_semantics:${syscall}:${pid}`);
+		}
+		if (succeeded && writesPath(line)) for (const target of observedPaths ?? []) { const name = workspaceName(target); if (name) written.add(name); else external.add(target); }
+		if (options.fileEvidence?.(line)) { const changed = tracedCwd(line, cwd); if (changed) cwds.set(pid, changed); else incomplete.add(`cwd_unknown:${pid}`); continue; }
+		const [structure, flags] = MODELED_METADATA_SYSCALLS.get(syscall) ?? [];
+		if (structure && succeeded) {
+			// A recreated null device has the same I/O semantics, but may have a different device-node inode.
+			if (line.native?.nullDevice || /<char 1:3>>$/.test(args[0] ?? "")) { taints.add("descriptor_observation"); continue; }
+			// The returned ABI fields are the observation. Program names and argv cannot prove a field unused.
+			const observed = line.native?.observation;
+			if (!observedPaths?.length || !observed) {
+				// fstat, or an empty *at name, of a pipe or socket
+				if (line.native?.descriptor || descriptorTarget(line) && !quotedArgument(args[1])) taints.add("descriptor_observation");
+				else { unsupported(syscall); incomplete.add(`unparsed_metadata:${syscall}:${pid}`); }
 			}
-			// A filesystem's statistics vary over time like the clock, whose taint every trace carries; the sandbox reports the one a
-			// native run sees, the workspace's own included.
-			if (/^f?statfs$/.test(syscall)) continue;
-			const listed = /^getdents(?:64)?$/.test(syscall) ? absoluteDescriptorPath(args[0]) : undefined;
-			const directoryImage = !!listed && !!options.inheritedDirectoryImages?.includes(listed);
-			// A listed directory's entry set is its dependency; readdir order and d_ino are volatile identity, as a descriptor's is.
-			const listing = !!listed && !directoryImage && succeeded;
-			if (listing) { taints.add("descriptor_observation"); listedPaths.add(listed!); if (paths.get(listed!) !== "executable") paths.set(listed!, "input"); }
-			if (UNMODELED_METADATA_SYSCALLS.has(syscall) && !listing && (succeeded ? !directoryImage : directoryImage)) {
-				unsupported(syscall);
-				incomplete.add(`unmodeled_metadata:${syscall}:${pid}`);
+			if (observed && observed.fields?.length !== 0) {
+				const followSymlinks = syscall !== "lstat" && !(flags && /\bAT_SYMLINK_NOFOLLOW\b/.test(args[flags] ?? ""));
+				for (const metadataPath of observedPaths ?? []) observeMetadata(metadataPath, followSymlinks, observed);
 			}
-			if (semanticRoots.length && workspaceDriverSemanticGap(line, observedPaths, semanticRoots)) {
-				unsupported(syscall);
-				incomplete.add(`filesystem_semantics:${syscall}:${pid}`);
-			}
-			if (succeeded && writesPath(line)) for (const target of observedPaths ?? []) { const name = workspaceName(target); if (name) written.add(name); else external.add(target); }
-			const [structure, flags] = MODELED_METADATA_SYSCALLS.get(syscall) ?? [];
-			if (structure && succeeded) {
-				// A recreated null device has the same I/O semantics, but may have a different device-node inode.
-				if (/<char 1:3>>$/.test(args[0] ?? "")) { taints.add("descriptor_observation"); continue; }
-				// The returned ABI fields are the observation. Program names and argv cannot prove a field unused.
-				const observed = statObservationDigest(args[structure] ?? "");
-				if (!observedPaths?.length || !observed) {
-					// fstat, or an empty *at name, of a pipe or socket
-					if (descriptorTarget(line) && !quotedArgument(args[1])) taints.add("descriptor_observation");
-					else { unsupported(syscall); incomplete.add(`unparsed_metadata:${syscall}:${pid}`); }
-				}
-				if (observed && observed.fields?.length !== 0) {
-					const followSymlinks = syscall !== "lstat" && !(flags && /\bAT_SYMLINK_NOFOLLOW\b/.test(args[flags] ?? ""));
-					for (const metadataPath of observedPaths ?? []) observeMetadata(metadataPath, followSymlinks, observed);
-				}
-				continue;
-			}
-			if (!PATH_ARGUMENTS[syscall]) continue;
-			const role: DependencyRole = syscall === "execve" || syscall === "execveat" ? "executable" : "input";
-			if (!observedPaths) incomplete.add(`unresolved_pathname:${syscall}:${pid}`);
-			const nonEmpty = /^(?:rmdir|unlinkat|rename(?:at2?)?)$/.test(syscall) && /^-1 (?:ENOTEMPTY|EEXIST)\b/.test(line.result);
-			// Creating a name can fail on its parent; a multi-path syscall does not identify the failed operand.
-			const failure = observedPaths?.length === 1 && !writesPath(line) ? /^-1 (ENOENT|ENOTDIR)\b/.exec(line.result)?.[1] as "ENOENT" | "ENOTDIR" | undefined : undefined;
-			for (const observed of observedPaths ?? []) {
-				observePath(observed, role, failure);
-				if (nonEmpty) listedPaths.add(observed);
-			}
-			if ((syscall === "chdir" || syscall === "fchdir") && succeeded) {
-				const changed = tracedCwd(line, cwd);
-				if (changed) cwd = changed;
-				else incomplete.add(`${syscall}_unparsed:${pid}`);
-			}
+			continue;
+		}
+		if (!PATH_ARGUMENTS[syscall]) continue;
+		const role: DependencyRole = syscall === "execve" || syscall === "execveat" ? "executable" : "input";
+		if (!observedPaths) incomplete.add(`unresolved_pathname:${syscall}:${pid}`);
+		const nonEmpty = /^(?:rmdir|unlinkat|rename(?:at2?)?)$/.test(syscall) && /^-1 (?:ENOTEMPTY|EEXIST)\b/.test(line.result);
+		// Creating a name can fail on its parent; a multi-path syscall does not identify the failed operand.
+		const failure = observedPaths?.length === 1 && !writesPath(line) ? /^-1 (ENOENT|ENOTDIR)\b/.exec(line.result)?.[1] as "ENOENT" | "ENOTDIR" | undefined : undefined;
+		for (const observed of observedPaths ?? []) {
+			observePath(observed, role, failure);
+			if (nonEmpty) listedPaths.add(observed);
+		}
+		if ((syscall === "chdir" || syscall === "fchdir") && succeeded) {
+			const changed = tracedCwd(line, cwd);
+			if (changed) cwds.set(pid, changed);
+			else incomplete.add(`${syscall}_unparsed:${pid}`);
 		}
 	}
 	// A workspace file the traced processes wrote changes under their own hands; its later state is their effect, not an input.
@@ -780,6 +940,7 @@ export async function observeStrace(
 	if (incomplete.size) taints.add("trace_incomplete");
 	return {
 		complete: !incomplete.size,
+		...(options.captureOutput ? { output: capturedOutput.sort((left, right) => left.order - right.order).map(({ fd, data }) => ({ fd, data })) } : {}),
 		...(options.inheritedHandles || options.inheritedStreams ? { resourceJournal: resourceJournal.sort((a, b) => a.order - b.order).map(({ order, ...event }) => event), retainedDescriptions: retained,
 			...(options.frozen ? { finalHandles } : {}) } : {}),
 		paths: Object.freeze([...[...paths].map(([observedPath, role]) => ({ path: observedPath, role: sharedObjectRole(observedPath, role),
@@ -876,58 +1037,105 @@ function internalPoll(line: TraceLine, ownPipes: ReadonlySet<string>): boolean {
 	return entries.length > 0 && entries.every(([, target, events]) => events === "0" || ownPipes.has(/^<pipe:\[(\d+)\]>$/.exec(target ?? "")?.[1] ?? ""));
 }
 
-/** A traced execution's workspace writes so far (it may still run), stamped in wall-clock ms; an unresolvable name is undefined. */
-export interface TracedWrite { readonly paths?: readonly string[]; readonly at: number; readonly opened: boolean; readonly mapped?: true }
-
-/** Read complete or growing transcripts through one bounded inventory; only newline-terminated records advance a tail. */
-async function* traceChunks(tracePrefix: string, offsets = new Map<string, number>(), remaining = Infinity) {
-	const directory = path.dirname(tracePrefix), prefix = `${path.basename(tracePrefix)}.`;
-	for (const name of await readdir(directory)) {
-		if (!remaining) break;
-		if (!name.startsWith(prefix)) continue;
-		const pid = name === `${prefix}stream` ? undefined : Number(name.slice(prefix.length));
-		if (pid !== undefined && !isSafeCount(pid, 1)) throw new Error("invalid trace filename");
-		await using handle = await open(path.join(directory, name), "r");
-		const info = await handle.stat(), offset = offsets.get(name) ?? 0;
-		if (!info.isFile() || info.size < offset) throw new Error("trace shrank or is not a regular file");
-		const buffer = Buffer.allocUnsafe(Math.min(remaining, info.size - offset));
-		const bytes = buffer.subarray(0, (await handle.read(buffer, 0, buffer.length, offset)).bytesRead), complete = bytes.lastIndexOf(10) + 1;
-		if (bytes.length !== buffer.length) throw new Error("trace changed while reading");
-		offsets.set(name, offset + complete); remaining -= bytes.length;
-		yield { pid, bytes, remaining };
-	}
-}
+/** A traced execution's workspace writes so far, stamped in wall-clock ms; an unresolvable name is undefined. */
+export interface TracedWrite { readonly paths?: readonly string[]; readonly at: number; readonly opened: boolean; readonly mapped?: true; readonly pid?: number }
 
 /** A trace read as it grows, each record parsed once however often it is asked: its writes so far, and when it last named each absolute path (by name, through a
- * descriptor, or against the cwd its process followed from `cwd`, unknown until its fork is on record; a failed lookup names one too), in wall-clock milliseconds. */
-export interface TraceTail { readonly writes: readonly TracedWrite[]; readonly seen: ReadonlyMap<string, number>; readonly unsafe: boolean; read(): Promise<TraceTail> }
+ * descriptor, or against the cwd its process followed from `cwd`, unknown until its fork is on record; a failed lookup names one too), in wall-clock milliseconds.
+ * Native metadata is conservatively seen when collected; its independent monotonic stamp owns ordering, without converting filesystem timestamps. */
+export interface TraceTail extends AsyncDisposable {
+	readonly writes: readonly TracedWrite[]; readonly seen: ReadonlyMap<string, number>; readonly unsafe: boolean;
+	readonly records: readonly TraceFile[]; journal(pid: number): readonly TraceRecord[] | undefined; readonly frontier: boolean; read(): Promise<TraceTail>;
+}
 
-export function traceTail(tracePrefix: string, cwd: string): TraceTail {
-	const writes: TracedWrite[] = [], seen = new Map<string, number>(), offsets = new Map<string, number>(),
-		cwds = new Map<number, { cwd?: string }>(), decode = traceDecoder(); // One process's cwd, or several's a fork let share it.
-	let reading: Promise<unknown> = Promise.resolve(), root: number | undefined, unsafe = false;
+export function traceTail(tracePrefix: string | TraceTail, cwd: string, options: Pick<StraceObservationOptions, "privateUpper" | "previewBytes" | "frozen" | "execution" | "metadata"> = {}): TraceTail {
+	const writes: TracedWrite[] = [], seen = new Map<string, number>(),
+		files = new Map<number, TraceRecord[]>(), cwds = new Map<number, { cwd?: string }>(), decode = traceDecoder();
+	const ordered = new Map<number, TraceFile>();
+	const positions = new Map(options.execution ? [[options.execution.pid, options.execution.start]] : []);
+	const nativePositions = new Map<number, number>(), births = new Map<number, number>(), pendingMetadata = new Set<TraceRecord>();
+	let reading: Promise<unknown> = Promise.resolve(), queued: Promise<TraceTail> | undefined, root = options.execution?.pid, unsafe = false, frontier = false, partial: TraceRecord[] = [];
+	let remaining = options.frozen?.bytes ?? options.previewBytes, closed = false, offset = 0;
+	let stream: FileHandle | undefined;
+	if (remaining !== undefined && !isSafeCount(remaining)) throw new Error("invalid trace preview budget");
 	const advance = async () => {
-		const records: TraceRecord[] = [];
-		for await (const { pid, bytes } of traceChunks(tracePrefix, offsets)) {
-			for (const lines of decode(bytes.toString("utf8"), pid, true).values()) for (const line of lines) records.push(line);
+		if (closed) throw new Error("trace owner closed");
+		for (const line of partial) ordered.delete(line.pid);
+		if (typeof tracePrefix === "string" && !stream) stream = await open(`${tracePrefix}.stream`, "r").catch(error => { if (error?.code !== "ENOENT") throw error; return undefined; });
+		const records: TraceRecord[] = []; partial = [];
+		if (typeof tracePrefix !== "string") {
+			await tracePrefix.read();
+			for (const [pid, start] of positions) for (const line of tracePrefix.journal(pid)?.slice(start) ?? []) {
+				if (line.failure === "partial" || line.failure?.startsWith("unfinished:")) { partial.push(line); continue; }
+				positions.set(pid, (positions.get(pid) ?? 0) + 1); records.push(line); appendGrouped(files, pid, line);
+				const child = spawnedPID(line); if (child && !positions.has(child)) positions.set(child, 0);
+			}
+		} else if (stream && remaining !== 0) {
+			const info = await stream.stat();
+			if (!info.isFile() || info.size < offset) throw new Error("trace shrank or is not a regular file");
+			const bytes = Buffer.allocUnsafe(Math.min(remaining ?? Infinity, info.size - offset));
+			if ((await stream.read(bytes, 0, bytes.length, offset)).bytesRead !== bytes.length) throw new Error("trace changed while reading");
+			offset += bytes.lastIndexOf(10) + 1; // A partial final record is reread on the next advance.
+			if (remaining !== undefined) remaining -= bytes.length;
+			let contents = bytes.toString("utf8");
+			if (options.privateUpper) contents = contents.replaceAll(`<${options.privateUpper}/`, "</");
+			for (const [pid, lines] of decode(contents)) {
+				if (options.frozen?.pid === pid) frontier = contents.endsWith("\n") && !lines.some(line => /^--- /.test(line.text));
+				for (const line of lines) if (line.failure === "partial") partial.push(line); else {
+					root ??= pid; records.push(line); appendGrouped(files, pid, line);
+					const child = spawnedPID(line); if (child) births.set(child, line.order!);
+				}
+			}
 		}
+		if (typeof tracePrefix === "string" && options.metadata) {
+			options.metadata.read();
+			for (const [pid, lines] of files) {
+				const native = options.metadata.files.get(pid) ?? [], first = births.get(pid) ?? (pid === root ? lines[0]!.order! : undefined);
+				// A child may make only kernel-collected calls before its first text record (even its exit).
+				if (first === undefined) continue;
+				for (let index = nativePositions.get(pid) ?? 0; index < native.length; index++) {
+					const line = native[index]!;
+					if (line.native!.entered < first || line.native!.entered >= (options.frozen?.at ?? Infinity)) continue;
+					lines.push(line); records.push(line);
+				}
+				nativePositions.set(pid, native.length);
+			}
+		}
+		for (const line of pendingMetadata) if (!line.failure || line.failure !== "native_metadata_pending") { pendingMetadata.delete(line); records.push(line); }
+		for (const line of records) ordered.delete(line.pid);
 		records.sort((a, b) => a.at - b.at); root ??= records[0]?.pid; // A fork precedes its child's records, a chdir the forks after it; the first is the root's.
 		for (const line of records) {
 			const { pid, at } = line;
+			if (line.native && line.failure === "native_metadata_pending") { pendingMetadata.add(line); continue; }
 			// Path mutations are journaled below. Waiting or installing an image cannot itself mutate file data or names.
 			unsafe ||= !Number.isFinite(at) || !!line.failure && !/^(?:wait(?:4|id|pid)|execve(?:at)?)$/.test(line.name) || syscallSucceeded(line) &&
 				(/^(?:mount|umount2?|move_mount|pivot_root|chroot|setns|unshare|io_uring_setup|io_submit|[fl]?setxattr|[fl]?removexattr)$/.test(line.name) || line.name === "ioctl" && unmodeledFileIoctl(line));
 			if (line.failure) continue;
 			const process = cwds.get(pid) ?? (pid === root ? cwds.set(pid, { cwd }).get(pid) : undefined), paths = syscallPaths(line, process?.cwd ?? ""), child = spawnedPID(line);
 			const mapped = line.name === "mmap" && /\bMAP_SHARED(?:_VALIDATE)?\b/.test(line.args[3] ?? "");
-			if (syscallSucceeded(line) && (writesPath(line) || mapped)) writes.push({ ...(paths?.every(target => target.startsWith("/")) ? { paths } : {}), at,
+			if (syscallSucceeded(line) && (writesPath(line) || mapped)) writes.push({ ...(paths?.every(target => target.startsWith("/")) ? { paths } : {}), at, pid,
 				opened: /^open(?:at2?)?$/.test(line.name) || line.name === "mmap", ...(line.name === "mmap" ? { mapped: true } : {}) });
 			for (const target of [...paths ?? [], ...line.args.flatMap(arg => absoluteDescriptorPath(arg) ?? [])]) if (target.startsWith("/")) seen.set(target, Math.max(seen.get(target) ?? 0, at));
 			if (process) process.cwd = tracedCwd(line, process.cwd);
 			if (child && !cwds.has(child)) { const shared = sharesFilesystem(line); cwds.set(child, shared && process ? process : { cwd: shared === false ? process?.cwd : undefined }); }
 		}
 	};
-	return { writes, seen, get unsafe() { return unsafe; }, read() { const next = reading.then(advance); reading = next.catch(() => { unsafe = true; }); return next.then(() => this); } };
+	return { async [Symbol.asyncDispose]() { closed = true; await reading; await stream?.close(); stream = undefined; }, writes, seen, get unsafe() { return unsafe || [...partial, ...decode.pending()].some(line => !/^(?:wait(?:4|id|pid)|execve(?:at)?)$/.test(line.name)); }, get frontier() { return frontier && remaining === 0; },
+		journal(pid) { const pending = [...partial, ...decode.pending()].filter(line => line.pid === pid); return pending.length ? [...files.get(pid) ?? [], ...pending] : files.get(pid); },
+		get records() {
+			const pending = [...partial, ...decode.pending()];
+			for (const line of [...pending, ...pendingMetadata]) ordered.delete(line.pid);
+			return [...new Set([...files.keys(), ...pending.map(line => line.pid)])].map(pid => {
+				const entry = ordered.get(pid) ?? { pid, lines: [...this.journal(pid)!].sort((a, b) => (a.order ?? Infinity) - (b.order ?? Infinity)) };
+				ordered.set(pid, entry); return entry;
+			});
+		},
+		read() {
+			if (queued) return queued;
+			// A batch starts after every caller it serves. Requests arriving during a read join the next batch.
+			const next = reading.then(() => { queued = undefined; return advance(); });
+			reading = next.catch(() => { unsafe = true; }); return queued = next.then(() => this);
+		} };
 }
 
 /** Whether writes reached `targets` within [since, until], or held one open to write by `until`. An unresolvable write counts. */
@@ -984,6 +1192,9 @@ function sharesFilesystem(line: TraceLine): boolean | undefined {
 function syscallSucceeded(line: TraceLine): boolean { return /^(?:0x[0-9a-f]+|[0-9]+)(?:\b|<)/i.test(line.result); }
 
 function syscallPaths(line: TraceLine, cwd: string): readonly string[] | undefined {
+	if (line.native) return line.native.paths;
+	const previous = pathObservations.get(line);
+	if (previous?.cwd === cwd) return previous.paths;
 	const paths = (PATH_ARGUMENTS[line.name] ?? []).map(([pathname, dirfd, descriptorPath]) => {
 		// strace names AT_FDCWD by the kernel's cwd, which a sandbox serving chdir itself never moves: the traced cwd is the process's.
 		const descriptor = dirfd === undefined ? undefined : line.args[dirfd], current = dirfd === undefined || /^(?:AT_FDCWD|-100)(?:<|$)/.test(descriptor ?? "");
@@ -996,7 +1207,8 @@ function syscallPaths(line: TraceLine, cwd: string): readonly string[] | undefin
 		// Without a name or a directory, a failed call looked nothing up and a successful one is unresolved.
 		return value && base ? [walkedPath(`${base}/${value}`)] : syscallSucceeded(line) ? undefined : [];
 	});
-	return paths.includes(undefined) ? undefined : paths.flat() as string[];
+	const observed = paths.includes(undefined) ? undefined : paths.flat() as string[];
+	pathObservations.set(line, { cwd, paths: observed }); return observed;
 }
 
 /** Keep `..`: only a walk over the recorded tree knows whether it leaves a symlinked directory. */
@@ -1016,49 +1228,7 @@ function descriptorTarget(line: TraceLine): boolean {
 	return Boolean(target && (!target.startsWith("/") || target.startsWith("/memfd:")));
 }
 
-const STAT_MODE_BITS: Readonly<Record<string, bigint>> = { S_IFSOCK: 0o140000n, S_IFLNK: 0o120000n, S_IFREG: 0o100000n, S_IFBLK: 0o060000n,
-	S_IFDIR: 0o040000n, S_IFCHR: 0o020000n, S_IFIFO: 0o010000n, S_ISUID: 0o004000n, S_ISGID: 0o002000n, S_ISVTX: 0o001000n };
-
-/** Normalize the successful kernel stat structure printed by strace -v; statx prints the same fields under its own names. */
 type StatObservation = { readonly digest: Sha256Digest; readonly fields?: readonly FilesystemObservationField[] };
-
-/** Statx masks select returned fields; unknown bits require the full stat image. */
-const STATX_FIELD_MASKS: Readonly<Record<string, readonly FilesystemObservationField[]>> = { STATX_TYPE: ["mode"], STATX_MODE: ["mode"],
-	STATX_NLINK: ["nlink"], STATX_UID: ["uid"], STATX_GID: ["gid"], STATX_ATIME: ["atimeNs"], STATX_MTIME: ["mtimeNs"], STATX_CTIME: ["ctimeNs"],
-	STATX_INO: ["ino"], STATX_SIZE: ["size"], STATX_BLOCKS: ["blocks"], STATX_BASIC_STATS: FILESYSTEM_OBSERVATION_FIELDS, STATX_ALL: FILESYSTEM_OBSERVATION_FIELDS,
-	...Object.fromEntries(["MNT_ID", "MNT_ID_UNIQUE", "BTIME", "DIOALIGN", "DIO_READ_ALIGN", "SUBVOL", "WRITE_ATOMIC"].map((flag) => [`STATX_${flag}`, []])) };
-
-function statObservationDigest(structure: string): StatObservation | undefined {
-	const flags = /\bstx_mask=([A-Z_|0-9x]+)/.exec(structure)?.[1]?.split("|");
-	const mask = flags?.every((flag) => STATX_FIELD_MASKS[flag]) ? flags.flatMap((flag) => STATX_FIELD_MASKS[flag]!) : undefined;
-	const line = structure.replace(/\bstx_(r?dev)_major=(\w+), stx_\1_minor=(\w+)/g, "st_$1=makedev($2, $3)")
-		.replace(/\bstx_([amc]time)=\{tv_sec=(-?\d+), tv_nsec=(\d+)\}/g, "st_$1=$2, st_$1_nsec=$3").replace(/\bstx_/g, "st_");
-	const field = (name: string): bigint | undefined => parseInteger(new RegExp(`\\b${name}=(-?(?:0x[0-9a-f]+|0[0-7]+|[0-9]+))`, "i").exec(line)?.[1]);
-	const device = (name: string): bigint | undefined => {
-		const match = new RegExp(`\\b${name}=makedev\\(([^,]+),\\s*([^\\)]+)\\)`).exec(line);
-		if (!match) return field(name) ?? (name === "st_rdev" ? 0n : undefined);
-		const major = parseInteger(match[1]);
-		const minor = parseInteger(match[2]);
-		return major === undefined || minor === undefined ? undefined : linuxDevice(major, minor);
-	};
-	const modeText = /\bst_mode=([^,}]+)/.exec(line)?.[1]?.trim();
-	const mode = modeText?.split("|").reduce<bigint | undefined>((combined, token) => {
-		const bits = STAT_MODE_BITS[token] ?? parseInteger(token);
-		return bits === undefined || combined === undefined ? undefined : combined | bits;
-	}, 0n);
-	const time = (name: string): bigint | undefined => {
-		const seconds = field(name), nanos = field(`${name}_nsec`);
-		return seconds === undefined || nanos === undefined ? undefined : seconds * 1_000_000_000n + nanos;
-	};
-	const fields = mask ? FILESYSTEM_OBSERVATION_FIELDS.filter(field => mask.includes(field)) : FILESYSTEM_OBSERVATION_FIELDS;
-	const evidence = Object.fromEntries(fields.map(name => [name,
-		name === "mode" ? mode
-		: name === "dev" || name === "rdev" ? device(`st_${name}`)
-		: name.endsWith("Ns") ? time(`st_${name.slice(0, -2)}`) : field(`st_${name}`),
-	]));
-	if (fields.some(field => evidence[field] === undefined)) return undefined;
-	return { digest: filesystemObservationDigest(evidence, fields), ...(fields.length < FILESYSTEM_OBSERVATION_FIELDS.length ? { fields } : {}) };
-}
 
 function parseInteger(value: string | undefined): bigint | undefined {
 	if (!value) return undefined;

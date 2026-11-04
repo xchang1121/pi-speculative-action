@@ -26,5 +26,7 @@ cd "$clone"
 [ -d node_modules ] && [ package-lock.json -ot node_modules ] || npm ci --no-audit --no-fund
 CARGO_HOME=${CARGO_HOME:-$HOME/.cargo} RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup} PATH=$HOME/.cargo/bin:$PATH HOME=$helper_home node ./src/setup-linux-process-backend.mjs
 bin=$helper_home/.local/bin
-PATH=$bin:$PATH PI_SPEC_SANDLOCK=$bin/pi-speculative-sandlock PI_SPEC_HELD_EXEC=$bin/pi-speculative-held-exec PI_SPEC_STRACE=$bin/pi-speculative-strace \
-	npx vitest --run --maxWorkers=1 --no-file-parallelism "$@"
+sudo -- "$bin/pi-speculative-domain" --user "$(id -u)" env PATH="$bin:$PATH" \
+	PI_SPEC_HELD_EXEC_OBSERVER="${PI_SPEC_HELD_EXEC_OBSERVER:?Configure an administrator-owned observer before verification}" \
+	PI_SPEC_SANDLOCK="$bin/pi-speculative-sandlock" PI_SPEC_HELD_EXEC="$bin/pi-speculative-held-exec" PI_SPEC_STRACE="$bin/pi-speculative-strace" \
+	"$(command -v node)" "$clone/node_modules/vitest/vitest.mjs" --run --maxWorkers=1 --no-file-parallelism "$@"

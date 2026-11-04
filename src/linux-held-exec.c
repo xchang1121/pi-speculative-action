@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "linux-execution-domain.h"
 #include <dirent.h>
 #include <elf.h>
 #include <linux/prctl.h>
@@ -257,6 +258,20 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
 			if (length != 12) return NULL;
 			memcpy(&directory, bytes, 4); memcpy(&maximum, (char *)bytes + 4, 8);
 			value = snapshot_database((int32_t)le32toh(directory), le64toh(maximum));
+		} else if (operation == -13) {
+			if (length) return NULL;
+			value = memfd_create("pi-artifact", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+		} else if (operation == -14) {
+			int32_t fields[2]; if (length != sizeof(fields)) return NULL;
+			memcpy(fields, bytes, sizeof(fields));
+			int fd = (int32_t)le32toh(fields[0]), seals = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
+			value = fields[1] ? fcntl(fd, F_ADD_SEALS, seals) : fcntl(fd, F_GET_SEALS);
+			if (value >= 0) value = fields[1] || (value & seals) == seals;
+		} else if (operation == -15) {
+			if (length <= sizeof(struct pi_domain_packet) || strnlen((char *)bytes + sizeof(struct pi_domain_packet), length - sizeof(struct pi_domain_packet)) != length - sizeof(struct pi_domain_packet) - 1) return NULL;
+			struct pi_domain_packet packet; memcpy(&packet, bytes, sizeof(packet));
+			value = pi_domain_exchange((char *)bytes + sizeof(packet), &packet);
+			if (!value) memcpy(bytes, &packet, sizeof(packet));
 		} else if (operation == -7) {
 			uint32_t fd; if (length < 5) return NULL; memcpy(&fd, bytes, sizeof(fd));
 			struct stat entry;
@@ -268,7 +283,7 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
 			if (length < 24) return NULL;
 			value = syscall(SYS_getdents64, operation, bytes, length);
 		}
-		if (value >= 0 && (operation == -5 || operation == -6 || operation == -12)) {
+		if (value >= 0 && (operation == -5 || operation == -6 || operation == -12 || operation == -13)) {
 			/* Native ownership never crosses this synchronous call. Node tracks the adopted
 			 * duplicate even if its worker terminates while the JavaScript callback runs. */
 			napi_value fd, receiver;
@@ -278,7 +293,7 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
 		}
 		if (value < 0) value = -errno;
 	} else if (operation == -11) {
-		value = 2; /* Filesystem ABI: synchronous adoption, ext4 read-only root, no mount crossings. */
+		value = 3; /* Filesystem ABI: synchronous adoption, ext4 read-only root, sealed content images. */
 	} else if (!operation && startup_gate[0] < 0) {
 		if (!socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, startup_gate)) value = startup_gate[1];
 	} else if (operation > 0 && startup_gate[0] >= 0 && !startup_observer) {
@@ -303,7 +318,6 @@ napi_value napi_register_module_v1(napi_env env, napi_value exports) {
 #define MAX_OUTPUT_BYTES (512UL * 1024 * 1024)
 #define MAX_POSITIONS 64
 #define MAX_HANDLES 256
-#define MAX_OBJECTS 1024
 #define MAX_INPUT_BYTES (2UL * 1024 * 1024)
 #define MAX_REQUEST_BYTES (MAX_INPUT_BYTES * 2 + MAX_LINE)
 
@@ -326,26 +340,10 @@ struct file_position {
 	struct file_locks locks;
 };
 
-struct descriptor_origin { int fd, cloexec, access; unsigned long id; unsigned object; };
-struct resource_object {
-	dev_t device; ino_t inode; mode_t type;
-	unsigned internal, foreign, pipe, event, messages, socket_type, anonymous;
-	unsigned long channel;
-};
-struct descriptor_table {
-	unsigned references, count, active, complete;
-	unsigned long epoch, generation;
-	struct descriptor_origin entries[MAX_HANDLES];
-};
-
 /* Track provenance without keeping kernel handles alive beyond their native lifetime. */
 struct descriptor_domain {
-	int enabled, escaped;
-	unsigned uncertain;
-	unsigned long next;
+	unsigned long long id;
 	struct traced_process **processes;
-	unsigned initialized, incomplete, object_count;
-	struct resource_object objects[MAX_OBJECTS];
 };
 
 struct output_event {
@@ -355,7 +353,7 @@ struct output_event {
 };
 
 struct process_image;
-struct file_reference { dev_t device; ino_t inode; int access, pin, queue; };
+struct file_reference { struct pi_domain_file file; int pin; };
 struct decision_job {
 	struct process_image *image;
 	pthread_t thread;
@@ -370,8 +368,8 @@ struct decision_job {
 	struct traced_process *process;
 	char *context;
 	struct file_reference *references;
-	unsigned reference_count;
-	int reference_state, needs_tracking;
+	unsigned reference_count, reference_capacity;
+	int reference_state;
 	struct file_position *captures;
 	unsigned capture_count;
 };
@@ -381,12 +379,7 @@ struct traced_process {
 	int fd, armed, stopped, pending, delivered, listening, historical, awaiting_parent, vforking;
 	struct decision_job *job;
 	struct traced_process *next;
-	struct descriptor_table *table;
-	unsigned long call_epoch, mutation_generation;
-	int mutation, uncertain;
-	long syscall;
-	unsigned long arguments[6];
-	int descriptor_count, descriptors[MAX_HANDLES], internal_message;
+
 };
 
 static int replace_with_exit(pid_t pid, unsigned code) {
@@ -535,9 +528,18 @@ static long image_invoke(pid_t pid, unsigned long at, long number, const unsigne
 	call.rdi = args[0]; call.rsi = args[1]; call.rdx = args[2]; call.r10 = args[3]; call.r8 = args[4]; call.r9 = args[5];
 	int unmapping = at == IMAGE_SCRATCH && number == SYS_munmap && args[0] == IMAGE_SCRATCH;
 	if (ptrace(PTRACE_SETREGS, pid, 0, &call) < 0) return -1;
-	for (unsigned step = 0; step < (unmapping ? 2U : 1U); step++)
-		if (ptrace(unmapping ? PTRACE_SYSCALL : PTRACE_CONT, pid, 0, 0) < 0 || image_wait(pid, &status) < 0 ||
-			WSTOPSIG(status) != (unmapping ? SIGTRAP | 0x80 : SIGTRAP) || (unsigned)status >> 16) return -1;
+	for (unsigned step = 0; step < (unmapping ? 2U : 1U); step++) {
+		for (;;) {
+			if (ptrace(unmapping ? PTRACE_SYSCALL : PTRACE_CONT, pid, 0, 0) < 0 || image_wait(pid, &status) < 0) return -1;
+			if ((unsigned)status >> 16 != PTRACE_EVENT_SECCOMP) break;
+			unsigned long tag;
+			if (WSTOPSIG(status) != SIGTRAP || ptrace(PTRACE_GETEVENTMSG, pid, 0, &tag) < 0 || (tag && tag != 0x5049)) return -1;
+			/* The broker's direct-entry filter reserves this unused sixth argument.
+			 * The saved application registers are restored after the private call. */
+			if (tag == 0x5049 && ptrace(PTRACE_POKEUSER, pid, offsetof(struct user_regs_struct, r9), 0x5049545200000000UL) < 0) return -1;
+		}
+		if (WSTOPSIG(status) != (unmapping ? SIGTRAP | 0x80 : SIGTRAP) || (unsigned)status >> 16) return -1;
+	}
 	if (ptrace(PTRACE_GETREGS, pid, 0, &call) < 0 || call.rip != at + (unmapping ? 2 : 3) ||
 		(bootstrap && ptrace(PTRACE_POKETEXT, pid, at, original) < 0) || ptrace(PTRACE_SETREGS, pid, 0, &saved) < 0) return -1;
 	return (long)call.rax;
@@ -784,9 +786,9 @@ int pi_restore_exec_context(pid_t pid, const char *source, const char *invoked, 
 		if (bytes < 0) break;
 		if (bytes > 8192 || fields[count][bytes - 1]) goto done;
 	}
-	if (ferror(record) || count < 5 || count == 32 || (strcmp(fields[0], "B") && strcmp(fields[0], "N")) || *fields[1] != '/') goto done;
+	if (ferror(record) || count < 6 || count == 32 || (strcmp(fields[0], "B") && strcmp(fields[0], "N")) || *fields[1] != '/' || *fields[count - 1] != '/') goto done;
 	name = fields[2]; comm = fields[3];
-	prefix = count - 5; eligible = !strcmp(fields[0], "B");
+	prefix = count - 6; eligible = !strcmp(fields[0], "B");
 	if (!eligible) {
 		if (invoked && strcmp(name, source)) { name = invoked; comm = command; consumed = 1; }
 	}
@@ -807,11 +809,11 @@ int pi_restore_exec_context(pid_t pid, const char *source, const char *invoked, 
 	if (prefix) {
 		size_t before = header->mm.arg_end - header->mm.arg_start, added = 0;
 		if (!argc || before > 4 * 1024 * 1024) goto done;
-		for (unsigned index = 5; index < count; index++) added += strlen(fields[index]) + 1;
+		for (unsigned index = 5; index + 1 < count; index++) added += strlen(fields[index]) + 1;
 		arguments = malloc(added + before); if (!arguments || image_memory(pid, header->mm.arg_start, arguments + added, before, 0) < 0) goto done;
 		size_t skipped = strnlen(arguments + added, before) + 1; if (skipped > before) goto done;
 		memmove(arguments + added, arguments + added + skipped, before - skipped); argument_bytes = added + before - skipped;
-		for (unsigned index = 5, offset = 0; index < count; index++) { size_t size = strlen(fields[index]) + 1; memcpy(arguments + offset, fields[index], size); offset += size; }
+		for (unsigned index = 5, offset = 0; index + 1 < count; index++) { size_t size = strlen(fields[index]) + 1; memcpy(arguments + offset, fields[index], size); offset += size; }
 		memmove(vector + argc + prefix, vector + argc + 1, bytes - (argc + 1) * 8);
 		vector[0] = argc + prefix - 1; aux += prefix - 1; bytes += 8 * (prefix - 1);
 	}
@@ -1352,10 +1354,18 @@ static int broker_reply(struct broker_job *job) {
 		int fd, value, consumed = -1; unsigned long long length;
 		if (!newline) return -1;
 		char kind = *at;
-		if ((kind == 'o' || kind == 'i') && sscanf(at + 1, "%d %llu%n", &fd, &length, &consumed) == 2 && at + 1 + consumed == newline && fd >= 1 &&
+		if ((kind == 'o' || kind == 'i' || kind == 'f') && sscanf(at + 1, "%d %llu%n", &fd, &length, &consumed) == 2 && at + 1 + consumed == newline && fd >= 1 &&
 			length <= (unsigned long long)(end - newline - 1)) {
 			int pin = -1; for (int index = 0; index < job->count; index++) if (job->numbers[index] == fd) pin = job->files[index];
 			if (pin < 0) return -1;
+			if (kind == 'f') {
+				uint32_t flags; int before = fcntl(pin, F_GETFL);
+				if (length != sizeof(flags) || before < 0) return -1;
+				memcpy(&flags, newline + 1, sizeof(flags));
+				if (flags & ~(O_ACCMODE | O_APPEND | O_NONBLOCK | 0x8000)) return -1;
+				flags = (before & ~(O_APPEND | O_NONBLOCK)) | (flags & (O_APPEND | O_NONBLOCK));
+				if (fcntl(pin, F_SETFL, flags) < 0 || fcntl(pin, F_GETFL) != (int)flags) return -1;
+			}
 			for (size_t offset = 0; kind == 'i' && offset < length; offset++) {
 				unsigned char seen;
 				if (transfer(pin, &seen, 1, 0) < 0 || seen != (unsigned char)newline[1 + offset]) return -1;
@@ -1364,7 +1374,7 @@ static int broker_reply(struct broker_job *job) {
 			at = newline + 1 + length; continue;
 		}
 		if (newline + 1 != end) return -1;
-		if (newline == at + 1 && *at == 'b') return -2;
+		if (newline == at + 1 && (*at == 'b' || *at == 'c')) return *at == 'b' ? -2 : -3;
 		if (sscanf(at, "x %d%n", &value, &consumed) == 1 && at + consumed == newline && value >= 0 && value <= 255) return value;
 		return sscanf(at, "s %d%n", &value, &consumed) == 1 && at + consumed == newline && value > 0 && value < NSIG ? 256 + value : -1;
 	}
@@ -1387,13 +1397,13 @@ static void *broker_decide(void *context) {
 done:
 	shutdown(job->channel[1], SHUT_WR); return NULL;
 }
-void *pi_broker_start(pid_t pid, const char *source, int *notification) {
+void *pi_broker_event(pid_t pid, const char *source, int status, int *notification) {
 	*notification = -1;
 	struct broker_job *job = calloc(1, sizeof(*job));
 	if (!job) return NULL;
 	job->pid = pid; job->channel[0] = job->channel[1] = job->connection = -1;
 	for (int index = 0; index < MAX_HANDLES; index++) job->files[index] = -1;
-	job->count = descriptor_numbers(pid, 0, job->numbers, MAX_HANDLES);
+	job->count = status < 0 ? descriptor_numbers(pid, 0, job->numbers, MAX_HANDLES) : 0;
 	struct decision_job target = {.pid = pid, .pidfd = -1};
 	int captured = job->count >= 0, outputs = 0;
 	for (int index = 0; captured && index < job->count; index++) {
@@ -1401,7 +1411,7 @@ void *pi_broker_start(pid_t pid, const char *source, int *notification) {
 		if (job->numbers[index] == 1 || job->numbers[index] == 2) outputs |= 1 << job->numbers[index];
 	}
 	close(target.pidfd);
-	if (!captured || outputs != 6) { broker_free(job); return NULL; }
+	if (!captured || (status < 0 && outputs != 6)) { broker_free(job); return NULL; }
 	char configuration[PATH_MAX], token[256]; FILE *file = NULL, *out = NULL;
 	if (!source || snprintf(configuration, sizeof(configuration), "%s.configuration", source) >= (int)sizeof(configuration) ||
 		!(file = fopen(configuration, "re")) || !fgets(job->address.sun_path, sizeof(job->address.sun_path), file) || !fgets(token, sizeof(token), file)) goto fail;
@@ -1409,8 +1419,8 @@ void *pi_broker_start(pid_t pid, const char *source, int *notification) {
 	job->address.sun_path[strcspn(job->address.sun_path, "\n")] = token[strcspn(token, "\n")] = 0;
 	fclose(file); file = NULL;
 	out = open_memstream(&job->request, &job->request_size); if (!out) goto fail;
-	fputs("{\"token\":", out); json_bytes(out, token, strlen(token)); fprintf(out, ",\"pid\":%d,\"descriptors\":[", pid);
-	int pipes = broker_pipes(out, job); fputs("]}", out); int written = ferror(out); if (fclose(out)) written = 1; out = NULL;
+	fputs("{\"token\":", out); json_bytes(out, token, strlen(token)); fprintf(out, ",\"pid\":%d,\"status\":%d,\"descriptors\":[", pid, status);
+	int pipes = status < 0 ? broker_pipes(out, job) : 0; fputs("]}", out); int written = ferror(out); if (fclose(out)) written = 1; out = NULL;
 	if (pipes < 0) { broker_free(job); return NULL; }
 	if (written || (job->connection = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0 || socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, job->channel) < 0 ||
 		pthread_create(&job->thread, NULL, broker_decide, job)) goto fail;
@@ -1420,12 +1430,13 @@ fail:
 	if (out) fclose(out);
 	broker_free(job); *notification = -2; return NULL;
 }
-/* 1 resumes native code, 2 exits with the brokered result, 2+signal delivers that signal. */
+/* 0 records native execution in this domain, 1 resumes, 2 exits, 2+signal delivers a signal. */
 int pi_broker_finish(void *context, int cancel) {
 	struct broker_job *job = context; int result = -1;
 	if (cancel) pthread_cancel(job->thread);
 	pthread_join(job->thread, NULL);
 	if (cancel || job->result == -2) result = 1;
+	else if (job->result == -3) result = 0;
 	else if (job->result >= 0) {
 		unsigned signal = job->result > 256 ? (unsigned)job->result - 256 : 0;
 		if (replace_with_exit(job->pid, signal ? 128 + signal : (unsigned)job->result) < 0) goto done;
@@ -1461,23 +1472,6 @@ static int probe_context(const char *root, const char *script) {
 	if (child < 0 || waitpid(child, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 42) return 71;
 	pid_t pid = getpid();
 	return transfer(3, &pid, sizeof(pid), 1) == 0 && transfer(3, &ready, 1, 0) == 0 && ready == 'R' ? 0 : 70;
-}
-
-static struct descriptor_origin descriptor_origin(struct traced_process *process, int fd) {
-	for (unsigned index = 0; process->table && index < process->table->count; index++)
-		if (process->table->entries[index].fd == fd) return process->table->entries[index];
-	return (struct descriptor_origin){.fd = fd};
-}
-
-static void set_descriptor_origin(struct traced_process *process, struct descriptor_domain *domain,
-	struct descriptor_origin entry) {
-	struct descriptor_table *table = process->table;
-	for (unsigned index = 0; index < table->count; index++) if (table->entries[index].fd == entry.fd) {
-		table->entries[index] = table->entries[--table->count]; break;
-	}
-	if (!entry.id) return;
-	if (table->count == sizeof(table->entries) / sizeof(table->entries[0])) { domain->escaped = 1; return; }
-	table->entries[table->count++] = entry;
 }
 
 /* fdinfo identifies locks owned by this OFD. Process-owned locks remain a separate
@@ -1558,234 +1552,43 @@ static int same_object(const struct file_position *left, const struct file_posit
 	return left->device == right->device && left->inode == right->inode && left->event == right->event;
 }
 
-/* Object history grants no OFD identity. Foreign ancestry is sticky, including
- * inode recycling: it can only refuse a later proof, never manufacture one. */
-static unsigned remember_object(struct descriptor_domain *domain, pid_t pid, int fd, int foreign) {
-	struct stat state;
-	if (descriptor_stat(pid, fd, &state) < 0) { domain->incomplete = 1; return 0; }
-	unsigned event = !(state.st_mode & S_IFMT) ? event_state(pid, fd, NULL, NULL) : 0;
-	unsigned index = 0;
-	while (index < domain->object_count && !(domain->objects[index].device == state.st_dev &&
-		domain->objects[index].inode == state.st_ino && domain->objects[index].type == (state.st_mode & S_IFMT) && domain->objects[index].event == event)) index++;
-	if (index == MAX_OBJECTS) { domain->incomplete = 1; return 0; }
-	if (index == domain->object_count) domain->objects[domain->object_count++] =
-		(struct resource_object){.device = state.st_dev, .inode = state.st_ino, .type = state.st_mode & S_IFMT, .event = event};
-	if (foreign) domain->objects[index].foreign = 1;
-	return index + 1;
+/* Preparation and preflight use the same private kernel counter image. */
+static int counter_image(const unsigned char *content, size_t length, int flags) {
+	uint64_t value;
+	if (length != 9 || content[8] > 1) return -1;
+	memcpy(&value, content, 8); if (value == UINT64_MAX) return -1;
+	int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK | (content[8] ? EFD_SEMAPHORE : 0));
+	if (fd < 0) return -1;
+	if ((value && write(fd, &value, 8) != 8) || fcntl(fd, F_SETFL, flags) < 0) { close(fd); return -1; }
+	return fd;
 }
 
-static struct resource_object *origin_object(struct descriptor_domain *domain, struct descriptor_origin origin) {
-	return origin.object ? &domain->objects[origin.object - 1] : NULL;
+/* Every query names a live OFD; the collector retains no descriptor or pin. */
+static int domain_request(struct descriptor_domain *domain, struct pi_domain_packet *packet) {
+	if (!domain || !domain->id) return -1;
+	packet->domain = domain->id;
+	return pi_domain_exchange(getenv("PI_SPEC_DOMAIN_SOCKET"), packet);
 }
 
-static struct resource_object *pin_object(struct descriptor_domain *domain, int pin) {
-	struct stat state;
-	if (!domain || fstat(pin, &state) < 0) return NULL;
-	unsigned event = !(state.st_mode & S_IFMT) ? event_state(getpid(), pin, NULL, NULL) : 0;
-	for (unsigned index = 0; index < domain->object_count; index++) {
-		struct resource_object *object = &domain->objects[index];
-		if (object->device == state.st_dev && object->inode == state.st_ino && object->type == (state.st_mode & S_IFMT) && object->event == event) return object;
-	}
-	return NULL;
+static int start_descriptor_domain(struct descriptor_domain *domain, pid_t root) {
+	struct pi_domain_packet packet = {.operation = PI_DOMAIN_OPEN};
+	if (pi_domain_exchange(getenv("PI_SPEC_DOMAIN_SOCKET"), &packet) < 0 || packet.count || !packet.domain) return -1;
+	domain->id = packet.domain;
+	packet.operation = PI_DOMAIN_TRACK; packet.count = 1; packet.values[0] = root;
+	return domain_request(domain, &packet);
 }
 
-static struct descriptor_origin created_origin(struct traced_process *process, struct descriptor_domain *domain,
-	int fd, int cloexec, int pipe, unsigned long channel) {
-	int flags = descriptor_info(process->pid, fd, NULL);
-	if (flags < 0) domain->incomplete = 1;
-	struct descriptor_origin origin = {.fd = fd, .cloexec = cloexec, .id = ++domain->next,
-		.object = remember_object(domain, process->pid, fd, 0), .access = flags < 0 ? 3 : (flags & O_ACCMODE) + 1};
-	struct resource_object *object = origin_object(domain, origin);
-	if (object) { object->internal = 1; object->pipe |= pipe; if (channel) object->channel = channel; }
-	return origin;
+static void close_descriptor_domain(struct descriptor_domain *domain) {
+	struct pi_domain_packet packet = {.operation = PI_DOMAIN_CLOSE, .domain = domain->id};
+	if (domain->id) (void)pi_domain_exchange(getenv("PI_SPEC_DOMAIN_SOCKET"), &packet);
+	domain->id = 0;
 }
 
-/* Recover aliases with KCMP_FILE first. An orphaned internal transfer can create
- * a fresh OFD node only when every external import is accounted for and the
- * object has exclusively internal ancestry. No kernel reference is retained. */
-static struct descriptor_origin received_origin(struct traced_process *process, struct descriptor_domain *domain, int fd) {
-	int flags = descriptor_info(process->pid, fd, NULL);
-	if (flags >= 0) for (struct traced_process *source = *domain->processes; source; source = source->next) {
-		if (source->historical || !source->table || source->table->active) continue;
-		for (unsigned index = 0; index < source->table->count; index++) {
-			struct descriptor_origin entry = source->table->entries[index];
-			if (source->table == process->table && entry.fd == fd) continue;
-			if (syscall(SYS_kcmp, process->pid, source->pid, KCMP_FILE, fd, entry.fd) != 0) continue;
-			entry.fd = fd; entry.cloexec = !!(flags & O_CLOEXEC); return entry;
-		}
-	}
-	unsigned id = remember_object(domain, process->pid, fd, 0);
-	struct resource_object *object = id ? &domain->objects[id - 1] : NULL;
-	int owned = flags >= 0 && process->internal_message && !domain->incomplete && object && object->internal && !object->foreign;
-	if (!owned && object) object->foreign = 1;
-	return (struct descriptor_origin){.fd = fd, .cloexec = flags >= 0 && (flags & O_CLOEXEC),
-		.id = owned ? ++domain->next : 0, .object = id, .access = (flags & O_ACCMODE) + 1};
-}
-
-static struct descriptor_table *copy_descriptor_table(struct traced_process *source) {
-	struct descriptor_table *table = calloc(1, sizeof(*table));
-	if (!table) return NULL;
-	if (source && source->table && !source->table->active && source->call_epoch == source->table->epoch) {
-		table->count = source->table->count;
-		memcpy(table->entries, source->table->entries, table->count * sizeof(*table->entries));
-		table->complete = source->table->complete;
-	}
-	if (!source) table->complete = 1;
-	table->references = 1; table->generation = 1;
-	return table;
-}
-
-static void drop_descriptor_table(struct traced_process *process, struct descriptor_domain *domain) {
-	if (process->uncertain) { domain->uncertain--; process->uncertain = 0; domain->escaped = 1; }
-	struct descriptor_table *table = process->table;
-	if (!table) return;
-	if (process->mutation) { table->active--; table->count = 0; table->generation++; table->complete = 0; process->mutation = 0; }
-	if (!--table->references) free(table);
-	process->table = NULL;
-}
-
-static int detach_descriptor_table(struct traced_process *process, struct descriptor_domain *domain) {
-	struct descriptor_table *old = process->table;
-	if (!old || (old->references == 1 && !old->active && process->call_epoch == old->epoch)) return 0;
-	struct descriptor_table *table = copy_descriptor_table(process);
-	if (!table) return -1;
-	drop_descriptor_table(process, domain); process->table = table;
-	return 0;
-}
-
-/* Called at syscall stops, on the tracer thread. No tracing cost in the ordinary mode. */
-static int observe_descriptor_syscall(struct traced_process *process, struct descriptor_domain *domain) {
-	if (domain->escaped) return 0;
-	pid_t pid = process->pid;
-	struct __ptrace_syscall_info info;
-	if (ptrace(PTRACE_GET_SYSCALL_INFO, pid, sizeof(info), &info) < 0) return -1;
-	if (info.arch != AUDIT_ARCH_X86_64) { domain->escaped = 1; return 0; }
-	if (!process->table && !(process->table = copy_descriptor_table(NULL))) return -1;
-	struct descriptor_table *table = process->table;
-	if (!domain->initialized) {
-		int fds[MAX_HANDLES], count = descriptor_numbers(pid, 0, fds, MAX_HANDLES);
-		domain->initialized = 1;
-		if (count < 0) domain->incomplete = 1;
-		for (int index = 0; index < count; index++) (void)remember_object(domain, pid, fds[index], 1);
-	}
-	if (info.op == PTRACE_SYSCALL_INFO_ENTRY) {
-		process->syscall = (long)info.entry.nr;
-		for (unsigned index = 0; index < 6; index++) process->arguments[index] = info.entry.args[index];
-	}
-	long number = process->syscall;
-	unsigned long first = process->arguments[0], second = process->arguments[1], third = process->arguments[2];
-	int receiving = number == SYS_recvmsg || number == SYS_recvmmsg;
-	int message = receiving || number == SYS_sendmsg || number == SYS_sendmmsg;
-	int pair = number == SYS_pipe || number == SYS_pipe2 || number == SYS_socketpair;
-	int detached = (number == SYS_unshare && first == CLONE_FILES) || (number == SYS_close_range && (third & CLOSE_RANGE_UNSHARE));
-	if (info.op == PTRACE_SYSCALL_INFO_ENTRY) {
-		/* These can publish handles outside the traced tree or bypass its syscall stops. */
-		int escapes = number == SYS_io_setup || number == SYS_io_submit || number == SYS_io_uring_setup ||
-			number == SYS_io_uring_enter || number == SYS_io_uring_register || number == SYS_ptrace ||
-			number == SYS_process_vm_writev || number == SYS_splice || number == SYS_tee ||
-			(number == SYS_unshare && (first & ~(unsigned long)CLONE_FILES)) || number == SYS_setns;
-		if (number == SYS_clone) escapes |= (first & 0x00800000) != 0; /* CLONE_UNTRACED */
-		/* Packet boundaries cannot be reconstructed from a byte snapshot. */
-		escapes |= (number == SYS_pipe2 && (second & ~(unsigned long)(O_CLOEXEC | O_NONBLOCK))) ||
-			(number == SYS_fcntl && second == F_SETFL && (third & O_DIRECT)) ||
-			(number == SYS_sendmsg && (third & MSG_OOB)) ||
-			((number == SYS_sendto || number == SYS_sendmmsg) && (process->arguments[3] & MSG_OOB));
-		/* clone3 flags live in mutable shared memory: prove attachment from the kernel event instead. */
-		struct resource_object *channel = origin_object(domain, descriptor_origin(process, (int)first));
-		process->internal_message = message && !table->active && channel && channel->channel != 0 && channel->socket_type != SOCK_DGRAM;
-		/* A message only affects its immutable channel, not unrelated objects. Queue
-		 * references are inspected from the kernel under the next tree lease. */
-		if (process->internal_message) for (unsigned index = 0; index < domain->object_count; index++)
-			if (domain->objects[index].channel == channel->channel) domain->objects[index].messages = 1;
-		if (number == SYS_clone3 || number == SYS_ioctl || message || number == SYS_connect ||
-			(number == SYS_sendto && process->arguments[4])) { process->uncertain = 1; domain->uncertain++; }
-		if (escapes) domain->escaped = 1;
-		process->call_epoch = table->epoch;
-		process->mutation = number == SYS_close || (number == SYS_close_range && !detached) || number == SYS_dup ||
-			number == SYS_dup2 || number == SYS_dup3 || number == SYS_open || number == SYS_openat ||
-			number == SYS_openat2 || number == SYS_creat || number == SYS_memfd_create || number == SYS_eventfd || number == SYS_eventfd2 || pair || receiving || number == SYS_pidfd_getfd ||
-			(number == SYS_fcntl && (second == F_SETFD || second == F_DUPFD || second == F_DUPFD_CLOEXEC));
-		if (process->mutation) {
-			table->epoch++;
-			/* Exit-stop order cannot prove overlapping mutations' kernel order.
-			 * Later uncontended calls can establish fresh origins without disabling the domain. */
-			if (table->active++) { table->count = 0; table->generation++; process->mutation_generation = 0; }
-			else process->mutation_generation = table->generation;
-		}
-		/* Dropping uncertain provenance before a failing close/dup is safe; retaining a stale slot is not. */
-		if (number == SYS_close) set_descriptor_origin(process, domain, (struct descriptor_origin){.fd = (int)first});
-		if ((number == SYS_dup2 || number == SYS_dup3) && first != second)
-			set_descriptor_origin(process, domain, (struct descriptor_origin){.fd = (int)second});
-		if (pair || receiving) process->descriptor_count = descriptor_numbers(pid, 0, process->descriptors, MAX_HANDLES);
-	}
-	if (info.op != PTRACE_SYSCALL_INFO_EXIT) return 0;
-	if (process->uncertain) {
-		domain->uncertain--; process->uncertain = 0;
-		/* A channel cannot change peers, but a shared table could replace its FD
-		 * while the kernel reads it. An in-flight call never grants adoption. */
-		if (!info.exit.is_error && !(message && process->internal_message &&
-			table->epoch == process->call_epoch + (unsigned)receiving && table->active == (unsigned)receiving)) domain->escaped = 1;
-	}
-	if (process->mutation) {
-		process->mutation = 0; table->active--;
-		if (!process->mutation_generation || process->mutation_generation != table->generation) { domain->incomplete = 1; return 0; }
-	}
-	if ((info.exit.is_error && !receiving) || domain->escaped) return 0;
-	/* A successful split changes only the caller's table; failure preserves sharing. */
-	if (detached) {
-		if (detach_descriptor_table(process, domain) < 0) return -1;
-		table = process->table;
-	}
-	if (number == SYS_close_range) for (unsigned index = 0; index < table->count;) {
-		struct descriptor_origin *entry = &table->entries[index];
-		if ((unsigned)entry->fd < (unsigned)first || (unsigned)entry->fd > (unsigned)second) { index++; continue; }
-		if (third & CLOSE_RANGE_CLOEXEC) { entry->cloexec = 1; index++; }
-		else set_descriptor_origin(process, domain, (struct descriptor_origin){.fd = entry->fd});
-	}
-	struct descriptor_origin source = descriptor_origin(process, (int)first);
-	int fd = (int)info.exit.rval;
-	if (pair || receiving) {
-		int installed[MAX_HANDLES], count = descriptor_numbers(pid, 0, installed, MAX_HANDLES), added = 0;
-		if (count < 0 || process->descriptor_count < 0) return 0;
-		for (int index = 0; index < count; index++) {
-			int previous = 0;
-			while (previous < process->descriptor_count && installed[index] != process->descriptors[previous]) previous++;
-			if (previous == process->descriptor_count) installed[added++] = installed[index];
-		}
-		if (pair && added != 2) return 0;
-		/* Datagram peer changes and addressed sends revoke this closed-pair proof. */
-		unsigned long type = second & ~(unsigned long)(SOCK_CLOEXEC | SOCK_NONBLOCK);
-		unsigned long channel = number == SYS_socketpair && first == AF_UNIX && !third &&
-			(type == SOCK_STREAM || type == SOCK_SEQPACKET || type == SOCK_DGRAM) ? ++domain->next : 0;
-		/* recvmsg may install rights before failing to write its userspace result. */
-		if (receiving && !process->internal_message && added) { domain->escaped = 1; return 0; }
-		for (int index = 0; index < added; index++) {
-			struct descriptor_origin origin = receiving ? received_origin(process, domain, installed[index])
-				: created_origin(process, domain, installed[index], number != SYS_pipe && (second & O_CLOEXEC), number != SYS_socketpair, channel);
-			struct resource_object *object = origin_object(domain, origin);
-			if (object && channel) object->socket_type = type;
-			set_descriptor_origin(process, domain, origin);
-		}
-	} else if (number == SYS_pidfd_getfd) {
-		set_descriptor_origin(process, domain, received_origin(process, domain, fd));
-	} else if (number == SYS_fcntl && second == F_SETFD) {
-		source.cloexec = (third & FD_CLOEXEC) != 0; set_descriptor_origin(process, domain, source);
-	} else if (number == SYS_dup || number == SYS_dup2 || number == SYS_dup3 ||
-		(number == SYS_fcntl && (second == F_DUPFD || second == F_DUPFD_CLOEXEC))) {
-		source.fd = fd; source.cloexec = (number == SYS_dup2 && first == second && source.cloexec) ||
-			(number == SYS_dup3 && (third & O_CLOEXEC)) || (number == SYS_fcntl && second == F_DUPFD_CLOEXEC);
-		set_descriptor_origin(process, domain, source);
-	} else if (number == SYS_open || number == SYS_openat || number == SYS_creat || number == SYS_memfd_create || number == SYS_eventfd || number == SYS_eventfd2) {
-		unsigned long flags = number == SYS_open || number == SYS_eventfd2 ? second : number == SYS_openat ? third : 0;
-		struct descriptor_origin origin = created_origin(process, domain, fd, (flags & O_CLOEXEC) || (number == SYS_memfd_create && (second & 1)), 0, 0);
-		struct resource_object *object = origin_object(domain, origin);
-		if (object && number == SYS_memfd_create) object->anonymous = 1;
-		set_descriptor_origin(process, domain, origin);
-	} else if (number == SYS_openat2) {
-		int flags = descriptor_info(pid, fd, NULL);
-		if (flags >= 0) set_descriptor_origin(process, domain, created_origin(process, domain, fd, (flags & O_CLOEXEC) != 0, 0, 0));
-	}
-	return 0;
+static int pin_object(struct descriptor_domain *domain, int pin, struct pi_domain_file *file) {
+	struct pi_domain_packet packet = {.operation = PI_DOMAIN_FILE, .count = 2, .values = {getpid(), pin}};
+	if (pin < 0 || domain_request(domain, &packet) < 0 || packet.count != 2 + sizeof(*file) / 8 || packet.values[0] || packet.values[1]) return 0;
+	memcpy(file, packet.values + 2, sizeof(*file));
+	return file->id && file->owner == domain->id;
 }
 
 static int null_device(const struct stat *state) {
@@ -1963,14 +1766,13 @@ static ssize_t control_prefix(int fd, void *bytes, size_t length, void *fault) {
 /* This cursor is shared by every socket handle. Only the stopped owned tree may
  * lend it; simple head snapshots continue to need no mutation or tracking. */
 static int owned_pin(struct descriptor_domain *domain, int pin) {
-	if (!domain || !domain->enabled || domain->escaped || domain->uncertain || domain->incomplete) return 0;
-	struct resource_object *object = pin_object(domain, pin);
-	return object && object->internal && !object->foreign;
+	struct pi_domain_file file;
+	return pin_object(domain, pin, &file);
 }
 
 /* Capture bytes and ancillary barriers together. The snapshot owns installed peek
  * handles until they are mapped to the existing OFD graph, never to synthetic FDs. */
-static int socket_bytes(int fd, unsigned char **bytes, int *eof, struct queue_messages *messages, int exclusive, int *needs_tracking) {
+static int socket_bytes(int fd, unsigned char **bytes, int *eof, struct queue_messages *messages, int exclusive) {
 	int length, result = -1, moved = 0; *bytes = NULL;
 	void *fault = MAP_FAILED;
 	struct pollfd ready = {.fd = fd, .events = POLLIN | POLLRDHUP};
@@ -1998,7 +1800,7 @@ static int socket_bytes(int fd, unsigned char **bytes, int *eof, struct queue_me
 		if (append_message(messages, &message) < 0) goto done;
 		rights.count = 0; result = (int)copied; goto done;
 	}
-	if (!exclusive) { if (needs_tracking) *needs_tracking = 1; goto done; }
+	if (!exclusive) goto done;
 	close_rights(&rights);
 	if (peek_cursor(fd, 0) < 0) goto done;
 	moved = 1;
@@ -2069,18 +1871,23 @@ static int stream_state(int fd, struct file_position *state) {
 static void clear_references(struct decision_job *job) {
 	int cancellation; pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation);
 	for (unsigned index = 0; index < job->reference_count; index++) close(job->references[index].pin);
-	free(job->references); job->references = NULL; job->reference_count = 0; job->reference_state = 0;
+	free(job->references); job->references = NULL; job->reference_count = job->reference_capacity = 0; job->reference_state = 0;
 	pthread_setcancelstate(cancellation, NULL);
 }
 
-static int add_reference(struct decision_job *job, const struct stat *state, int flags, int pin) {
-	if (flags < 0) return -1;
-	if (pin >= 0 && S_ISSOCK(state->st_mode)) for (unsigned index = 0; index < job->reference_count; index++) {
-		const struct file_reference *entry = &job->references[index];
-		if (entry->pin >= 0 && entry->device == state->st_dev && entry->inode == state->st_ino) { close(pin); return 0; }
+static int add_reference(struct decision_job *job, const struct pi_domain_file *file, int pin) {
+	if (job->reference_count == job->reference_capacity) {
+		unsigned capacity = job->reference_capacity ? job->reference_capacity * 2 : MAX_HANDLES;
+		if (capacity > PI_DOMAIN_RECORDS) return -1;
+		void *records = realloc(job->references, capacity * sizeof(*job->references));
+		if (!records) return -1;
+		job->references = records; job->reference_capacity = capacity;
 	}
-	if (job->reference_count == MAX_OBJECTS) return -1;
-	job->references[job->reference_count++] = (struct file_reference){state->st_dev, state->st_ino, (flags & O_ACCMODE) + 1, pin, S_ISSOCK(state->st_mode)};
+	if (pin >= 0 && S_ISSOCK(file->attributes)) for (unsigned index = 0; index < job->reference_count; index++) {
+		const struct file_reference *entry = &job->references[index];
+		if (entry->pin >= 0 && entry->file.device == file->device && entry->file.inode == file->inode) { close(pin); pin = -1; break; }
+	}
+	job->references[job->reference_count++] = (struct file_reference){*file, pin};
 	return 0;
 }
 
@@ -2111,51 +1918,48 @@ static int queue_owners_locked(struct decision_job *job) {
 	struct descriptor_domain *domain = job->domain;
 	if (job->reference_state) return job->reference_state > 0 ? 0 : -1;
 	job->reference_state = -1;
-	job->references = calloc(MAX_OBJECTS, sizeof(*job->references));
-	if (!job->references) return -1;
 	for (struct traced_process *process = *domain->processes; process; process = process->next) {
-		if (process->historical || (!domain->enabled && process == job->process)) continue;
-		int fds[MAX_HANDLES], count = descriptor_numbers(process->pid, 0, fds, MAX_HANDLES);
-		if (count < 0) return -1;
-		for (int index = 0; index < count; index++) {
-			struct stat state;
-			if (domain->enabled) {
-				struct resource_object *object = origin_object(domain, descriptor_origin(process, fds[index]));
-				if (!object || !object->messages) continue;
-				state = (struct stat){.st_dev = object->device, .st_ino = object->inode, .st_mode = S_IFSOCK};
-			} else {
-				if (descriptor_stat(process->pid, fds[index], &state) < 0) return -1;
-				if (!S_ISFIFO(state.st_mode) && !S_ISSOCK(state.st_mode)) continue;
-				if (add_reference(job, &state, descriptor_info(process->pid, fds[index], NULL), -1) < 0) return -1;
+		if (process->historical) continue;
+		struct pi_domain_packet packet = {.operation = PI_DOMAIN_FILE, .count = 2, .values = {process->pid, ULLONG_MAX}};
+		if (domain_request(domain, &packet) < 0 || packet.count < 2 || (packet.count - 2) % (sizeof(struct pi_domain_file) / 8) || packet.values[0] || packet.values[1]) return -1;
+		for (unsigned index = 2; index < packet.count; index += sizeof(struct pi_domain_file) / 8) {
+			struct pi_domain_file file; memcpy(&file, packet.values + index, sizeof(file)); int pin = -1;
+			if (S_ISSOCK(file.attributes) && !represented_queue(job, file.device, file.inode)) {
+				struct decision_job source = {.pid = process->pid, .pidfd = -1};
+				pin = duplicate_tracee_fd(&source, (unsigned)file.descriptor); close(source.pidfd);
+				if (pin < 0) return -1;
 			}
-			if (!S_ISSOCK(state.st_mode) || represented_queue(job, state.st_dev, state.st_ino)) continue;
-			struct decision_job source = {.pid = process->pid, .pidfd = -1};
-			int pin = duplicate_tracee_fd(&source, (unsigned)fds[index]); close(source.pidfd);
-			if (pin < 0) return -1;
-			if (add_reference(job, &state, fcntl(pin, F_GETFL), pin) < 0) { close(pin); return -1; }
+			if (add_reference(job, &file, pin) < 0) { close(pin); return -1; }
 		}
 	}
 	for (unsigned cursor = 0; cursor < job->reference_count; cursor++) {
 		struct file_reference source = job->references[cursor];
-		if (source.pin < 0 || !source.queue || represented_queue(job, source.device, source.inode)) continue;
+		if (source.pin < 0 || !S_ISSOCK(source.file.attributes) || represented_queue(job, source.file.device, source.file.inode)) continue;
 		unsigned char *bytes; int eof; struct queue_messages messages = {0};
-		int valid = socket_bytes(source.pin, &bytes, &eof, &messages, owned_pin(domain, source.pin), &job->needs_tracking) >= 0;
+		int valid = socket_bytes(source.pin, &bytes, &eof, &messages, owned_pin(domain, source.pin)) >= 0;
 		free(bytes);
 		for (unsigned message = 0; valid && message < messages.count; message++) for (unsigned index = 0; valid && index < messages.entries[message].rights.count; index++) {
-			int reference = messages.entries[message].rights.fds[index]; struct stat state;
-			if (fstat(reference, &state) < 0 || add_reference(job, &state, fcntl(reference, F_GETFL), reference) < 0) { valid = 0; break; }
+			int reference = messages.entries[message].rights.fds[index]; struct pi_domain_file file = {0};
+			(void)pin_object(domain, reference, &file);
+			if (!file.task) { valid = 0; break; }
+			file.task = 0;
+			if (add_reference(job, &file, reference) < 0) { valid = 0; break; }
 			messages.entries[message].rights.fds[index] = -1;
 		}
 		close_messages(&messages); if (!valid) return -1;
 	}
-	for (unsigned index = 0; domain->enabled && index < domain->object_count; index++) {
-		const struct resource_object *queue = &domain->objects[index];
-		if (!queue->messages || represented_queue(job, queue->device, queue->inode)) continue;
-		unsigned reference = 0;
-		while (reference < job->reference_count && (job->references[reference].device != queue->device || job->references[reference].inode != queue->inode)) reference++;
-		/* Unrooted cyclic queues still own their rights until the kernel destroys them. */
-		struct socket_state state;
-		if (reference == job->reference_count && socket_state(queue->inode, &state) != 1) return -1;
+	{
+		struct pi_domain_packet packet = {.operation = PI_DOMAIN_QUEUES};
+		if (domain_request(domain, &packet) < 0 || packet.count < 2 || packet.count % 2 || packet.values[0] || packet.values[1]) return -1;
+		for (unsigned index = 2; index < packet.count; index += 2) {
+			dev_t device = packet.values[index]; ino_t inode = packet.values[index + 1];
+			if (represented_queue(job, device, inode)) continue;
+			unsigned reference = 0;
+			while (reference < job->reference_count && (job->references[reference].file.device != device || job->references[reference].file.inode != inode)) reference++;
+			/* Queued cycles still own rights until the last kernel object is freed. */
+			struct socket_state state;
+			if (reference == job->reference_count && socket_state(inode, &state) != 1) return -1;
+		}
 	}
 	job->reference_state = 1;
 	return 0;
@@ -2164,37 +1968,15 @@ static int queue_owners_locked(struct decision_job *job) {
 /* The frozen kernel table proves current owners even during an unrelated close.
  * Streams count endpoint access; files and counters require exact OFD identity. */
 static int outside_references_locked(struct decision_job *job, int pin) {
-	struct descriptor_domain *domain = job->domain;
 	struct stat state; if (fstat(pin, &state) < 0) return -1;
 	int description = !S_ISFIFO(state.st_mode) && !S_ISSOCK(state.st_mode), unknown = description ? -1 : 3, access = 0;
-	if (!domain || (domain->enabled && (!owned_pin(domain, pin) || !job->process->table || !job->process->table->complete))) return unknown;
-	for (struct traced_process *process = *domain->processes; (description || domain->enabled) && process; process = process->next) {
-		if (process == job->process || process->historical) continue;
-		int fds[MAX_HANDLES], count = descriptor_numbers(process->pid, 0, fds, MAX_HANDLES);
-		if (count < 0) return unknown;
-		for (int index = 0; index < count; index++) {
-			if (!description) {
-				struct stat current;
-				if (descriptor_stat(process->pid, fds[index], &current) < 0) return unknown;
-				if (current.st_dev == state.st_dev && current.st_ino == state.st_ino) {
-					int flags = descriptor_info(process->pid, fds[index], NULL); if (flags < 0) return unknown;
-					access |= (flags & O_ACCMODE) + 1;
-				}
-				continue;
-			}
-			long same = syscall(SYS_kcmp, process->pid, getpid(), KCMP_FILE, fds[index], pin);
-			if (same < 0) return -1;
-			if (!same) return 1;
-		}
-	}
-	if (queue_owners_locked(job) < 0) return unknown;
+	struct pi_domain_file object;
+	if (!pin_object(job->domain, pin, &object) || queue_owners_locked(job) < 0) return unknown;
 	for (unsigned index = 0; index < job->reference_count; index++) {
-		if (job->references[index].device != state.st_dev || job->references[index].inode != state.st_ino) continue;
-		if (!description) { access |= job->references[index].access; continue; }
-		if (job->references[index].pin < 0) continue;
-		long same = syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, job->references[index].pin, pin);
-		if (same < 0) return -1;
-		if (!same) return 1;
+		const struct pi_domain_file *file = &job->references[index].file;
+		if (file->task == (unsigned)job->pid || file->device != object.device || file->inode != object.inode) continue;
+		if (!description) access |= (file->flags & O_ACCMODE) + 1;
+		else if (file->id == object.id) return 1;
 	}
 	return access & 3;
 }
@@ -2280,9 +2062,6 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 		for (unsigned previous = 0; previous < index; previous++) {
 			long same = syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, pin, job->captures[previous].duplicate);
 			if (same < 0) goto fail;
-			unsigned long origin = capture->installed ? descriptor_origin(job->process, capture->descriptor).id : 0;
-			unsigned long other = job->captures[previous].installed ? descriptor_origin(job->process, job->captures[previous].descriptor).id : 0;
-			if (origin && other && ((same == 0) != (origin == other))) goto fail;
 			if (!same) { capture->alias = job->captures[previous].descriptor; break; }
 		}
 		if (capture->directory) {
@@ -2298,7 +2077,7 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 		}
 		else if (capture->stream && !capture->event) {
 			capture->content_length = capture->stream >= 4 ? socket_bytes(pin, &capture->content, &capture->eof, &capture->messages,
-				owned_pin(job->domain, pin), &job->needs_tracking) : pipe_bytes(pin, &capture->content, &capture->eof);
+				owned_pin(job->domain, pin)) : pipe_bytes(pin, &capture->content, &capture->eof);
 			if (capture_rights(job, &capture->messages, &next) < 0) goto fail;
 		}
 		if ((capture->stream || (capture->directory && !(flags & O_PATH))) && capture->content_length < 0) goto fail;
@@ -2338,8 +2117,7 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 	out = fmemopen(line, capacity, "w+"); if (!out) goto fail;
 	for (unsigned index = 0; index < job->capture_count; index++) {
 		struct file_position *capture = &job->captures[index];
-		int pin = capture->duplicate, owned = capture->installed ? !job->domain->escaped && !job->domain->uncertain && job->process->table &&
-			!job->process->table->active && descriptor_origin(job->process, capture->descriptor).id != 0 : owned_pin(job->domain, pin);
+		int pin = capture->duplicate, owned = owned_pin(job->domain, pin);
 		struct stat state; if (fstat(pin, &state) < 0) goto fail;
 		fprintf(out,
 			"%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"offset\":%s%jd%s,\"owned\":%s%s",
@@ -2427,7 +2205,7 @@ static int position_state_matches(const struct file_position *position, const st
 		unsigned char *bytes;
 		struct file_position current = {0};
 		struct queue_messages messages = {0};
-		int eof, size = position->stream >= 4 ? socket_bytes(position->duplicate, &bytes, &eof, &messages, owned_pin(job->domain, position->duplicate), NULL) : pipe_bytes(position->duplicate, &bytes, &eof);
+		int eof, size = position->stream >= 4 ? socket_bytes(position->duplicate, &bytes, &eof, &messages, owned_pin(job->domain, position->duplicate)) : pipe_bytes(position->duplicate, &bytes, &eof);
 		int matches = stream_state(position->duplicate, &current) == 0 && current.stream == position->stream && current.socket_type == position->socket_type &&
 			current.capacity == position->capacity && current.shutdown == position->shutdown && current.peer_shutdown == position->peer_shutdown && current.peer_inode == position->peer_inode &&
 			current.peer_queued == position->peer_queued && current.allocated == position->allocated &&
@@ -2521,26 +2299,18 @@ static int transfer_message(struct decision_job *job, int fd, const struct outpu
 /* The same graph is instantiated with kernel lock semantics during preflight.
  * No real lock is acquired until the common resource transaction is committed. */
 static int closed_lock_object(struct decision_job *job, int pin) {
-	struct descriptor_domain *domain = job->domain;
-	struct resource_object *object = pin_object(domain, pin);
-	if (!owned_pin(domain, pin) || !object->anonymous || queue_owners_locked(job) < 0) return 0;
-	for (unsigned index = 0; index < job->reference_count; index++)
-		if (job->references[index].device == object->device && job->references[index].inode == object->inode) return 0;
-	for (struct traced_process *process = *domain->processes; process; process = process->next) {
-		if (process->historical) continue;
-		int fds[MAX_HANDLES], count = descriptor_numbers(process->pid, 0, fds, MAX_HANDLES);
-		if (!process->table || !process->table->complete || count < 0) return 0;
-		for (int index = 0; index < count; index++) {
-			struct stat state;
-			if (descriptor_stat(process->pid, fds[index], &state) < 0) return 0;
-			if (state.st_dev != object->device || state.st_ino != object->inode) continue;
-			unsigned represented = 0;
-			while (represented < job->position_count && syscall(SYS_kcmp, process->pid, getpid(), KCMP_FILE, fds[index], job->positions[represented].duplicate) != 0) represented++;
-			if (represented == job->position_count) return 0;
-			struct file_locks locks = {0};
-			int valid = capture_file_locks(process->pid, fds[index], &locks) == 0;
-			free(locks.entries); if (!valid) return 0;
-		}
+	struct pi_domain_file object;
+	if (!pin_object(job->domain, pin, &object) || !(object.attributes & (1ULL << 32)) || queue_owners_locked(job) < 0) return 0;
+	for (unsigned index = 0; index < job->reference_count; index++) {
+		const struct pi_domain_file *file = &job->references[index].file;
+		if (file->device != object.device || file->inode != object.inode) continue;
+		if (!file->task) return 0;
+		unsigned represented = 0;
+		while (represented < job->position_count && syscall(SYS_kcmp, (pid_t)file->task, getpid(), KCMP_FILE, (int)file->descriptor, job->positions[represented].duplicate) != 0) represented++;
+		if (represented == job->position_count) return 0;
+		struct file_locks locks = {0};
+		int valid = capture_file_locks((pid_t)file->task, (int)file->descriptor, &locks) == 0;
+		free(locks.entries); if (!valid) return 0;
 	}
 	return 1;
 }
@@ -2625,8 +2395,8 @@ static int resource_events(struct decision_job *job, int apply) {
 	int selected[MAX_POSITIONS] = {0}, lock_fds[MAX_POSITIONS], cancellation = PTHREAD_CANCEL_ENABLE;
 	int locks = lock_positions(job, selected);
 	for (unsigned index = 0; index < MAX_POSITIONS; index++) lock_fds[index] = -1;
-	if (locks) pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation);
-	struct { unsigned char *bytes; size_t length, produced, consumed; uint64_t counter; unsigned semaphore, writes; int eof, shutdown, owner, writable, flags, description, error; } queues[MAX_POSITIONS] = {0};
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation);
+	struct { unsigned char *bytes; size_t length, produced, consumed; unsigned writes; int eof, shutdown, owner, writable, flags, description, error; } queues[MAX_POSITIONS] = {0};
 	size_t message_capacity = job->resource_count;
 	for (unsigned index = 0; index < job->position_count; index++) message_capacity += job->positions[index].messages.count;
 	struct control_message { int object; size_t start, end; unsigned count, rights[MAX_POSITIONS]; } *messages = calloc(message_capacity ? message_capacity : 1, sizeof(*messages));
@@ -2655,8 +2425,8 @@ static int resource_events(struct decision_job *job, int apply) {
 			}
 		}
 		if (position->event) {
-			if (position->content_length != 9) goto done;
-			memcpy(&queues[index].counter, position->content, 8); queues[index].semaphore = position->content[8]; continue;
+			if (!apply && (lock_fds[index] = counter_image(position->content, position->content_length, position->flags | O_NONBLOCK)) < 0) goto done;
+			continue;
 		}
 		queues[index].length = (size_t)(position->content_length - position->after);
 		queues[index].eof = position->eof; queues[index].shutdown = position->shutdown;
@@ -2748,28 +2518,20 @@ static int resource_events(struct decision_job *job, int apply) {
 		if (position->peer_inode) for (unsigned other = 0; other < job->position_count; other++)
 			if (job->positions[other].stream >= 4 && job->positions[other].inode == position->peer_inode) { peer = queues[other].owner; break; }
 		if (position->event && (event->kind < 3 || event->kind == 7)) {
-			uint64_t value = 0, limit = UINT64_MAX - 1;
+			uint64_t value = 0; int writing = event->kind == 2, error = 0;
 			if (event->kind == 7) {
 				if (event->length != 4 && event->length != 12) goto done;
-				int writing = event->data[0], error = event->data[2] | (int)event->data[3] << 8;
+				writing = event->data[0]; error = event->data[2] | (int)event->data[3] << 8;
 				if (writing > 1 || event->data[1] || (writing && event->requested >= 8 && event->length != 12)) goto done;
 				if (event->length == 12) memcpy(&value, event->data + 4, 8);
-				int invalid = event->requested < 8 || (writing && value == UINT64_MAX);
-				int blocked = (queues[handle].flags & O_NONBLOCK) && (writing ? value > limit - queues[object].counter : !queues[object].counter);
-				if (!(error == EINVAL ? invalid : error == EAGAIN && !invalid && blocked)) goto done;
+				if (error != EINVAL && (error != EAGAIN || !(queues[handle].flags & O_NONBLOCK))) goto done;
 			} else {
 				if (event->kind == 1 || event->length != 8 || event->requested < 8) goto done;
 				memcpy(&value, event->data, 8);
-				if (event->kind == 0) {
-					if (!queues[object].counter || value != (queues[object].semaphore ? 1 : queues[object].counter)) goto done;
-					queues[object].counter -= value;
-					if (apply) { uint64_t actual; if (read(position->duplicate, &actual, 8) != 8 || actual != value) goto done; }
-				} else {
-					if (value > limit - queues[object].counter) goto done;
-					queues[object].counter += value;
-					if (apply && write(position->duplicate, &value, 8) != 8) goto done;
-				}
 			}
+			int fd = apply ? position->duplicate : lock_fds[object]; uint64_t actual = value;
+			ssize_t transferred = syscall(writing ? SYS_write : SYS_read, fd, &actual, event->requested);
+			if ((transferred < 0 ? errno : 0) != error || (!error && (transferred != 8 || actual != value))) goto done;
 			continue;
 		}
 		if (event->kind < 2) {
@@ -2867,9 +2629,12 @@ static int resource_events(struct decision_job *job, int apply) {
 			uint32_t request[3];
 			if (event->length != sizeof(request)) goto done;
 			memcpy(request, event->data, sizeof(request));
-			unsigned ready = position->event ? (queues[object].counter ? POLLIN : 0) | (queues[object].counter < UINT64_MAX - 1 ? POLLOUT : 0)
-				: queues[object].length || packet_head ? POLLIN | POLLRDNORM : 0;
-			if (position->event) { /* Counter readiness is exact, independent of queue capacity. */ }
+			unsigned ready = queues[object].length || packet_head ? POLLIN | POLLRDNORM : 0;
+			if (position->event) {
+				struct pollfd state = {.fd = apply ? position->duplicate : lock_fds[object], .events = POLLIN | POLLOUT | POLLPRI};
+				if (poll(&state, 1, 0) < 0) goto done;
+				ready = state.revents;
+			}
 			else if (position->stream >= 4) {
 				if (queues[object].shutdown & 1) ready |= POLLIN | POLLRDNORM | POLLRDHUP;
 				if (queues[object].shutdown == 3 || (position->stream == 5 && position->socket_type != SOCK_DGRAM)) ready |= POLLHUP;
@@ -2930,7 +2695,7 @@ done:
 	free(messages);
 	for (unsigned index = 0; index < job->position_count; index++) free(queues[index].bytes);
 	for (unsigned index = 0; index < job->position_count; index++) if (!job->positions[index].alias) close(lock_fds[index]);
-	if (locks) pthread_setcancelstate(cancellation, NULL);
+	pthread_setcancelstate(cancellation, NULL);
 	return result;
 }
 
@@ -2938,8 +2703,9 @@ done:
 static int image_context(struct decision_job *job) {
 	int current[MAX_HANDLES], count = descriptor_numbers(job->pid, 0, current, MAX_HANDLES);
 	unsigned long call = job->image->header.registers.rax, descriptor = job->image->header.registers.rdi;
-	int valid = count >= 0 && job->process->table &&
-		job->process->table->references == 1 && !job->process->table->active;
+	int valid = count >= 0;
+	for (struct traced_process *other = *job->domain->processes; valid && other; other = other->next)
+		if (other != job->process && !other->historical) valid = syscall(SYS_kcmp, job->pid, other->pid, KCMP_FILES, 0, 0) > 0;
 	int input = pi_process_image_frontier(call) == 2 || ((descriptor == 1 || descriptor == 2) &&
 		(call == SYS_write || call == SYS_writev || call == SYS_sendto || call == SYS_sendmsg));
 	for (int i = 0; valid && i < count; i++) {
@@ -2958,28 +2724,6 @@ static int image_context(struct decision_job *job) {
 		} else valid &= fd < 3 && source == fd && job->image->fds[i].flags == descriptor_info(job->pid, fd, NULL);
 	}
 	return valid && input && image_status(job->pid, 1) == 0 && image_qualify(job) == 0 ? 0 : -1;
-}
-
-static int image_descriptor_table(struct decision_job *job) {
-	struct descriptor_table *table = job->process->table;
-	struct descriptor_origin final[MAX_HANDLES] = {0}; unsigned count = 0;
-	for (unsigned i = 0; i < job->image->fd_count; i++) {
-		int source = job->image->fds[i].source;
-		final[i] = descriptor_origin(job->process, source);
-		const struct file_position *position = resource_position(job, source);
-		if (position && !position->installed) {
-			struct resource_object *object = pin_object(job->domain, position->duplicate);
-			if (!object || !object->internal || object->foreign) return -1;
-			final[i] = (struct descriptor_origin){.id = ++job->domain->next,
-				.object = (unsigned)(object - job->domain->objects) + 1, .access = (position->after_flags & O_ACCMODE) + 1};
-			for (unsigned previous = 0; previous < i; previous++) if (job->image->fds[previous].source == source) final[i].id = final[previous].id;
-		}
-		final[i].fd = job->image->fds[i].fd; final[i].cloexec = !!(job->image->fds[i].flags & O_CLOEXEC);
-	}
-	for (unsigned i = 0; i < job->image->fd_count; i++) if (final[i].id) table->entries[count++] = final[i];
-	table->count = count;
-	job->process->call_epoch = ++table->epoch; table->generation++;
-	return 0;
 }
 
 static void release_position_fds(struct decision_job *job) {
@@ -3064,7 +2808,7 @@ static int actor_decision(struct decision_job *job) {
 	int request_length = snprintf(line, sizeof(line),
 		"{\"token\":\"%s\",\"execution\":\"%s\",\"pid\":%ld,\"tracer\":%ld,\"holder\":%ld%s",
 		job->token, job->execution_id, (long)job->pid, (long)getpid(), (long)job->holder,
-		captured ? ",\"descriptors\":[" : job->needs_tracking ? ",\"trackQueues\":true" : "");
+		captured ? ",\"descriptors\":[" : "");
 	int sent = request_length > 0 && request_length < (int)sizeof(line) && transfer(connection, line, (size_t)request_length, 1) == 0 &&
 		(!captured || transfer(connection, descriptors, strlen(descriptors), 1) == 0) && transfer(connection, captured ? "]}\n" : "}\n", captured ? 3 : 2, 1) == 0;
 	free(descriptors); job->context = NULL;
@@ -3143,11 +2887,10 @@ static int actor_decision(struct decision_job *job) {
 	discard_captures(job);
 	for (unsigned index = 0; index < job->position_count; index++) {
 		struct file_position *position = &job->positions[index];
-		struct resource_object *object = pin_object(job->domain, position->duplicate);
-		if (position->stream && (!object || (position->event ? object->event != position->event : position->stream >= 4 ? !object->channel : !object->pipe))) goto decline;
+		struct pi_domain_file object = {0};
+		if (job->domain && !pin_object(job->domain, position->duplicate, &object)) goto decline;
+		if (position->stream && (position->event ? object.event != position->event : position->stream >= 4 ? !object.channel : (object.attributes & S_IFMT) != S_IFIFO)) goto decline;
 		if (position->duplicate < 0 || !position_matches(position, job)) goto decline;
-		if (job->domain && (job->domain->escaped || job->domain->uncertain || !job->process->table ||
-			job->process->table->active || (position->installed ? !descriptor_origin(job->process, position->descriptor).id : !owned_pin(job->domain, position->duplicate)))) goto decline;
 		for (unsigned previous = 0; previous < index; previous++) {
 			const struct file_position *other = &job->positions[previous];
 			if (!position->stream && !position->directory && position->content_length >= 0 && other->content_length >= 0 &&
@@ -3174,6 +2917,9 @@ static int actor_decision(struct decision_job *job) {
 	}
 	if (resource_events(job, 0) < 0) goto decline;
 	if (job->image && image_context(job) < 0) goto decline;
+	/* Staging owns only private buffers and pins. The source proof is checked
+	 * after this acknowledgement, while native execution remains available. */
+	if (transfer(connection, "S\n", 2, 1) < 0 || read_line(connection, line, sizeof(line)) < 0 || strcmp(line, "G")) return -1;
 	/* From the first text mutation onward, failure terminates the entire trace tree. */
 	if (request_tracer(job, 125) < 0) return -2;
 	if (transfer(connection, "A\n", 2, 1) < 0 || read_line(connection, line, sizeof(line)) < 0 || strcmp(line, "R")) return -2;
@@ -3201,7 +2947,7 @@ static int actor_decision(struct decision_job *job) {
 		release_position_fds(job);
 	}
 	/* Output may feed another tracee. Release the offset lease before a pipe write can block. */
-	if (job->domain && job->domain->enabled && request_tracer(job, 256) < 0) return -2;
+	if (job->domain && request_tracer(job, 256) < 0) return -2;
 	for (unsigned index = job->resource_count; index < job->resource_count + job->count; index++) {
 		struct output_event *event = &job->events[index];
 		if (transfer(job->outputs[event->fd], event->data, event->length, 1) < 0) return -2;
@@ -3271,7 +3017,7 @@ static void finish_observation(struct traced_process *observer, int completed) {
 	close(observer->fd); observer->fd = -1;
 }
 
-static void release_process(struct traced_process **processes, pid_t pid, struct descriptor_domain *domain, int completed) {
+static void release_process(struct traced_process **processes, pid_t pid, int completed) {
 	struct traced_process **cursor = processes;
 	while (*cursor) {
 		struct traced_process *observer = *cursor;
@@ -3283,19 +3029,18 @@ static void release_process(struct traced_process **processes, pid_t pid, struct
 			free_job(observer->job);
 		}
 		finish_observation(observer, completed);
-		pthread_mutex_lock(&process_list_lock); drop_descriptor_table(observer, domain); pthread_mutex_unlock(&process_list_lock);
 		free(observer);
 	}
 }
 
 /* No decision remains. Detach ready tracees; blocked vfork parents stay protected until VFORK_DONE. */
-static int release_tracees(struct traced_process **processes, struct descriptor_domain *domain, int *acknowledged) {
+static int release_tracees(struct traced_process **processes, int *acknowledged) {
 	int live = 0, waiting = 0;
 	for (struct traced_process *item = *processes; item;) {
 		if (!item->historical) {
 			if (item->stopped && !item->listening && !item->awaiting_parent) {
 				if (ptrace(PTRACE_DETACH, item->pid, 0, item->delivered) < 0 && errno != ESRCH) return -1;
-				release_process(processes, item->pid, domain, 0); item = *processes; live = waiting = 0; continue;
+				release_process(processes, item->pid, 0); item = *processes; live = waiting = 0; continue;
 			}
 			live = 1;
 			if (!item->vforking) {
@@ -3357,7 +3102,7 @@ static int hold_pins(int argc, char **argv) {
 
 static int trace(const char *socket_path, const char *token, const char *execution_id,
 	int skip, unsigned skip_code, int descriptors, int skip_root) {
-	struct descriptor_domain domain = {.enabled = descriptors == 1};
+	struct descriptor_domain domain = {0};
 	pid_t barrier = 0;
 	sigset_t blocked, original;
 	sigemptyset(&blocked); sigaddset(&blocked, SIGCHLD); sigaddset(&blocked, SIGPIPE);
@@ -3391,7 +3136,6 @@ static int trace(const char *socket_path, const char *token, const char *executi
 					int stopped;
 					reply = ptrace(PTRACE_SYSCALL, item->pid, 0, 0) == 0 && image_wait(item->pid, &stopped) == 0 &&
 						WSTOPSIG(stopped) == (SIGTRAP | 0x80) && image_restore(item->pid, job) == 0 ? 'Y' : 'N';
-					if (reply == 'Y' && image_descriptor_table(job) < 0) reply = 'N';
 				} else if (code == 256 && descriptors && item->armed) {
 					item->pending = 0; if (barrier == item->pid) barrier = 0;
 					reply = 'Y';
@@ -3430,7 +3174,7 @@ static int trace(const char *socket_path, const char *token, const char *executi
 						item->pending = 0; barrier = 0; goto manage_descriptors;
 					}
 				} else if (!item->job && !item->awaiting_parent) {
-					if (ptrace(item->listening ? PTRACE_LISTEN : !domain.enabled || domain.escaped ? PTRACE_CONT : PTRACE_SYSCALL, item->pid, 0, item->delivered) < 0 && errno != ESRCH) goto fatal;
+					if (ptrace(item->listening ? PTRACE_LISTEN : PTRACE_CONT, item->pid, 0, item->delivered) < 0 && errno != ESRCH) goto fatal;
 					item->stopped = 0; item->delivered = 0; item->listening = 0;
 				}
 			}
@@ -3440,7 +3184,7 @@ static int trace(const char *socket_path, const char *token, const char *executi
 			for (struct traced_process *item = processes; item; item = item->next) busy |= item->job != NULL;
 			if (!busy) {
 				retiring = draining = 1;
-				int live = release_tracees(&processes, &domain, &acknowledged);
+				int live = release_tracees(&processes, &acknowledged);
 				if (live < 0) goto fatal;
 				if (!live) break;
 			}
@@ -3472,7 +3216,7 @@ static int trace(const char *socket_path, const char *token, const char *executi
 			if (pid == root) root_status = status;
 			for (struct traced_process *item = processes; item; item = item->next)
 				if (item->pid == pid && item->armed) goto fatal;
-			release_process(&processes, pid, &domain, 1);
+			release_process(&processes, pid, 1);
 			continue;
 		}
 		if (!WIFSTOPPED(status)) continue;
@@ -3497,14 +3241,14 @@ static int trace(const char *socket_path, const char *token, const char *executi
 		if (event == PTRACE_EVENT_EXEC && !process_owned(pid, &credentials)) retiring = draining = 1;
 		/* libuv's fork still contains the host's CLOEXEC pins. Start ancestry at
 		 * the actual launch, where only descriptors inherited by the program remain. */
-		if (event == PTRACE_EVENT_EXEC) launched = 1;
-		if (event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_VFORK_DONE) current->vforking = event == PTRACE_EVENT_VFORK;
-		if (descriptors && delivered == (SIGTRAP | 0x80)) {
-			if (!draining && launched && observe_descriptor_syscall(current, &domain) < 0) goto fatal;
-			delivered = 0;
+		if (event == PTRACE_EVENT_EXEC && !launched) {
+			launched = 1;
+			if (descriptors && start_descriptor_domain(&domain, pid) < 0) retiring = draining = 1;
 		}
+		if (event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_VFORK_DONE) current->vforking = event == PTRACE_EVENT_VFORK;
+		if (descriptors && delivered == (SIGTRAP | 0x80)) delivered = 0;
 		if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
-			if (!launched) domain.escaped = 1;
+			if (!launched && descriptors) retiring = draining = 1;
 			unsigned long child;
 			if (ptrace(PTRACE_GETEVENTMSG, pid, 0, &child) < 0) goto fatal;
 			struct traced_process *known = processes;
@@ -3512,13 +3256,7 @@ static int trace(const char *socket_path, const char *token, const char *executi
 			if (!known && track_process(&processes, (pid_t)child) < 0) goto fatal;
 			if (!known) known = processes;
 			known->awaiting_parent = 0;
-			if (domain.enabled && !domain.escaped) {
-				if (current->uncertain && current->syscall == SYS_clone3) { current->uncertain = 0; domain.uncertain--; }
-				long shared = syscall(SYS_kcmp, pid, child, KCMP_FILES, 0, 0);
-				if (shared < 0) domain.escaped = 1;
-				else if (!shared && current->table) { known->table = current->table; known->table->references++; }
-				else if (!(known->table = copy_descriptor_table(current))) goto fatal;
-			}
+
 		}
 		if (!draining && event == PTRACE_EVENT_STOP && delivered != SIGTRAP) {
 			if (descriptors) { current->listening = 1; continue; }
@@ -3531,19 +3269,9 @@ static int trace(const char *socket_path, const char *token, const char *executi
 			if (ptrace(PTRACE_GETEVENTMSG, pid, 0, &previous) < 0) goto fatal;
 			/* A non-leader exec replaces its TID without a separate death notification. */
 			if ((pid_t)previous != pid) {
-				for (struct traced_process *item = processes; item; item = item->next) if (item->pid == (pid_t)previous && !item->historical) {
-					drop_descriptor_table(current, &domain);
-					current->table = item->table; item->table = NULL; current->call_epoch = item->call_epoch;
-					break;
-				}
-				release_process(&processes, (pid_t)previous, &domain, 0);
+				release_process(&processes, (pid_t)previous, 0);
 			}
-			/* exec unshares CLONE_FILES before closing only this image's CLOEXEC slots. */
-			if (detach_descriptor_table(current, &domain) < 0) goto fatal;
-			for (unsigned index = 0; current->table && index < current->table->count;)
-				if (current->table->entries[index].cloexec) set_descriptor_origin(current, &domain,
-					(struct descriptor_origin){.fd = current->table->entries[index].fd});
-				else index++;
+
 		}
 		if (event == PTRACE_EVENT_EXEC && ++exec_events > 1) {
 			if (!draining && skip && replace_with_exit(pid, skip_code) < 0) goto fatal;
@@ -3554,7 +3282,6 @@ static int trace(const char *socket_path, const char *token, const char *executi
 					if (item->fd >= 0) {
 						if (track_process(&processes, pid) < 0) goto fatal;
 						item->historical = 1;
-						processes->table = item->table; item->table = NULL;
 						item = processes;
 						item->stopped = 1;
 					}
@@ -3570,8 +3297,8 @@ static int trace(const char *socket_path, const char *token, const char *executi
 		current->stopped = 0;
 	held:;
 	}
-	while (processes) release_process(&processes, processes->pid, &domain, 0);
-	free(polling); close(signals);
+	while (processes) release_process(&processes, processes->pid, 0);
+	close_descriptor_domain(&domain); free(polling); close(signals);
 	pthread_sigmask(SIG_SETMASK, &original, NULL);
 	if (root_status < 0) return retiring ? 0 : 125;
 	if (WIFEXITED(root_status)) return WEXITSTATUS(root_status);
@@ -3581,8 +3308,8 @@ static int trace(const char *socket_path, const char *token, const char *executi
 fatal:
 	for (struct traced_process *item = processes; item; item = item->next) kill(item->pid, SIGKILL);
 	while (waitpid(-1, &status, __WALL) > 0 || errno == EINTR) {}
-	while (processes) release_process(&processes, processes->pid, &domain, 0);
-	free(polling); close(signals);
+	while (processes) release_process(&processes, processes->pid, 0);
+	close_descriptor_domain(&domain); free(polling); close(signals);
 	return 125;
 }
 
@@ -3705,16 +3432,11 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		} else if (position->duplicate >= 0) {
 			/* O_PATH images and the other end of an already reconstructed socketpair. */
 		} else if (position->stream == 6) {
-			uint64_t value;
-			if (!journal || position->before || load_queue_image(position) < 0 || position->content_length != 9 || position->content[8] > 1) goto done;
-			memcpy(&value, position->content, 8);
-			if (value == UINT64_MAX) goto done;
-			int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK | (position->content[8] ? EFD_SEMAPHORE : 0));
+			if (!journal || position->before || load_queue_image(position) < 0) goto done;
+			int fd = counter_image(position->content, position->content_length, position->flags);
 			if (fd < 0) goto done;
-			int valid = (!value || write(fd, &value, 8) == 8) && fcntl(fd, F_SETFL, position->flags) == 0;
-			if (valid) position->duplicate = fcntl(fd, F_DUPFD_CLOEXEC, minimum);
+			position->duplicate = fcntl(fd, F_DUPFD_CLOEXEC, minimum);
 			close(fd); position->object = (int)index;
-			if (!valid) goto done;
 		} else if (position->stream) {
 			if (position->before || (position->flags & ~(O_ACCMODE | O_APPEND | O_NONBLOCK | 0x8000))) goto done;
 			for (unsigned previous = 0; previous < index; previous++) if (positions[previous].stream && !strcmp(position->path, positions[previous].path)) {
@@ -3954,6 +3676,13 @@ int main(int argc, char **argv) {
 		if (transfer((int)channel, endpoints, sizeof(endpoints), 1) || transfer((int)channel, &ready, 1, 0) || ready != 'R') return 70;
 		close((int)channel); execvp(argv[2], argv + 2); return 127;
 	}
+	if (argc >= 5 && !strcmp(argv[1], "--execution-domain")) {
+		char *end; errno = 0; unsigned long long id = strtoull(argv[2], &end, 10);
+		if (!id || errno || *end || strspn(argv[2], "0123456789") != strlen(argv[2])) return 64;
+		struct pi_domain_packet packet = {.operation = PI_DOMAIN_JOIN, .domain = id};
+		if (pi_domain_exchange(argv[3], &packet)) return 70;
+		execvp(argv[4], argv + 4); return 127;
+	}
 	if (argc == 2 && !strcmp(argv[1], "--probe-observation")) {
 		struct process_credentials credentials; unsigned long long extra = 1ULL << CAP_SYS_PTRACE;
 		return process_credentials(getpid(), &credentials) == 0 && !(credentials.permitted & ~extra) &&
@@ -3967,7 +3696,7 @@ int main(int argc, char **argv) {
 		char *descriptors = getenv("PI_SPEC_HELD_EXEC_DESCRIPTORS"), *skip = getenv("PI_SPEC_HELD_EXEC_ROOT");
 		if (!probe && (!socket || !token || !id)) return 64;
 		return trace(socket, token, id, probe, probe ? (unsigned)atoi(argv[2]) : 0,
-			descriptors && !strcmp(descriptors, "1") ? 1 : descriptors && !strcmp(descriptors, "2") ? 2 : 0, !!skip);
+			descriptors && !strcmp(descriptors, "1"), !!skip);
 	}
 	if (argc >= 2 && (!strcmp(argv[1], "--exec") || !strcmp(argv[1], "--exec-closed-input") || !strcmp(argv[1], "--exec-fds"))) {
 		int descriptors = !strcmp(argv[1], "--exec-fds"), name = descriptors ? 5 : 3, output_flags[2] = {-1, -1};

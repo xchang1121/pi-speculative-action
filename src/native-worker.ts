@@ -81,7 +81,7 @@ async function serveNativeBackend(port: MessagePort, clock: Int32Array, options:
 					: session.computationDependencies().flatMap(dependency => serializeNativeDependency(dependency) ?? []);
 			}
 			if (method === "cancel") { works.get(args as number)?.controller?.abort(new Error("native work cancelled")); return; }
-			if (method === "release") { const entry = works.get(args as number); works.delete(args as number); entry?.controller?.abort(new Error("native work retired")); return entry?.session?.close(); }
+			if (method === "release") { const entry = works.get(args as number); works.delete(args as number); entry?.controller?.abort(new Error("native work retired")); return entry?.session?.dispose?.() ?? entry?.session?.close(); }
 			if (method === "commit") {
 				const entry = works.get(args as number); if (!entry?.session) throw new Error("native work retired");
 				return entry.session.ownership.commit(() => entry.apply());
@@ -97,7 +97,7 @@ async function serveNativeBackend(port: MessagePort, clock: Int32Array, options:
 				for (const observation of observations.values()) { observation.finish(); void observation.release?.(); }
 				rpc.fail(new Error("native process owner closing"));
 				for (const entry of works.values()) entry.controller.abort(new Error("native process owner closing"));
-				return Promise.allSettled([...works.values()].map(entry => entry.session?.close())).then(() => backend!.dispose()).finally(() => port.close());
+				return Promise.allSettled([...works.values()].map(entry => entry.session?.dispose?.() ?? entry.session?.close())).then(() => backend!.dispose()).finally(() => port.close());
 			}
 			throw new Error(`unknown native work operation: ${method}`);
 		}, () => {
@@ -111,7 +111,7 @@ async function serveNativeBackend(port: MessagePort, clock: Int32Array, options:
 				grant.scope.turnID === scope.turnID && grant.scope.callID === scope.callID && grant.owners?.includes(id));
 			const session = entry.session = await backend!.open({ ...input, signal: entry.controller.signal, onOperationAdopted: adopted, acceptOperationScope: input.hasScopeOwner ? accept : undefined,
 				onOperationJoinable: available => { entry.available = available; } });
-			if (entry.controller.signal.aborted) { await session.close(); entry.controller.signal.throwIfAborted(); }
+			if (entry.controller.signal.aborted) { await (session.dispose?.() ?? session.close()); entry.controller.signal.throwIfAborted(); }
 			retained.set(id, { ownership: new WeakRef(session.ownership), adopted, accept });
 			entry.dispatch = AsyncResource.bind(async (operation: string, value: unknown, context: NativeRpcContext) => {
 				if (operation === "execute") return session.executor.execute({ ...value as ProcessExecutionRequest, ...context });

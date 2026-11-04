@@ -2,16 +2,18 @@ import { createHash } from "node:crypto";
 import type { FileHandle } from "node:fs/promises";
 import { CONTENT_CHUNK_BYTES, parseContentManifest, readChunkRange, type ChunkedContentManifest, type ArtifactReference } from "./artifact-reference.ts";
 export { CONTENT_CHUNK_BYTES, parseContentManifest, type ChunkedContentManifest } from "./artifact-reference.ts";
-import { ArtifactReadView, type ArtifactTransfer, type ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
+import { ArtifactReadView, type ArtifactTransfer, type ArtifactSource, type ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { isSafeCount } from "./number-utils.ts";
 import { sha256Digest, sha256DigestAsync, type Sha256Digest } from "./stable-value-hash.ts";
+import { captureStableFile, type StableFilesystemCapture } from "./filesystem-evidence.ts";
 
 export interface ContentChunkLimits {
 	readonly maxLogicalBytes: number; readonly maxStoredBytes: number; readonly maxOpenChunks: number; readonly maxReadBytes: number;
 }
 export const DEFAULT_CONTENT_LIMITS: ContentChunkLimits = Object.freeze({ maxLogicalBytes: 2 ** 31, maxStoredBytes: 2 ** 30, maxOpenChunks: 1024, maxReadBytes: 16 * CONTENT_CHUNK_BYTES });
 let zeroChunk: Buffer | undefined;
+const verifiedManifests = new WeakSet<ChunkedContentManifest>();
 
 /** One view owns one bounded, serialized I/O lane and retains each distinct content block once. */
 export class ContentChunkPool {
@@ -35,66 +37,40 @@ export class ContentChunkPool {
 		return () => { if (held) { held = false; if (!--this.owners) return this.dispose(); } return Promise.resolve(); };
 	}
 	lend() { return this.artifacts.lend(); }
-	async capture<T extends { readonly bytesRead: number; readonly hash: string }>(read: (sink: (chunk: Buffer) => Promise<void>) => Promise<T>): Promise<{ capture: T; content: ChunkedContent }> {
+	async capture<T extends { readonly bytesRead: number }>(read: (sink: (chunk: Buffer) => Promise<void>) => Promise<T>): Promise<{ capture: T & { readonly hash: string }; content: ChunkedContent }> {
 		return this.store.read(signal => this.lifetime.serialize(async () => {
-			const chunks: (ArtifactReference | null)[] = [], buffer = Buffer.allocUnsafe(CONTENT_CHUNK_BYTES);
-			let offset = 0, size = 0;
-			const flush = async () => {
-				const bytes = buffer.subarray(0, offset);
-				if (bytes.equals((zeroChunk ??= Buffer.alloc(CONTENT_CHUNK_BYTES)).subarray(0, offset))) chunks.push(null);
-				else {
-					const reference = { digest: await sha256DigestAsync(bytes), size: bytes.length };
-					await this.artifacts.add(reference, signal, { reference, bytes }); chunks.push(reference);
-				}
-				offset = 0;
-			};
-			const capture = await read(async chunk => {
-				signal.throwIfAborted();
-				if (size + chunk.length > this.limits.maxLogicalBytes) throw new Error("content logical budget exceeded");
-				size += chunk.length;
-				for (let cursor = 0; cursor < chunk.length;) {
-					const count = Math.min(chunk.length - cursor, buffer.length - offset);
-					chunk.copy(buffer, offset, cursor, cursor + count); cursor += count; offset += count;
-					if (offset === buffer.length) await flush();
-				}
-			});
-			if (offset) await flush();
-			signal.throwIfAborted();
-			if (size !== capture.bytesRead) throw new Error("content capture size mismatch");
-			return { capture, content: new ChunkedContent(this, parseContentManifest({ size, digest: `sha256:${capture.hash}`, chunks })) };
+			const { capture, manifest } = await captureContentBlocks(read, async bytes => {
+				const reference = { digest: await sha256DigestAsync(bytes), size: bytes.length };
+				await this.artifacts.add(reference, signal, { reference, bytes }); return reference;
+			}, this.limits.maxLogicalBytes, signal);
+			return { capture, content: new ChunkedContent(this, manifest) };
 		}));
 	}
 	/** Reopen and verify every block and the complete digest before granting a cold input lease. */
-	restore(value: unknown, transfers?: readonly ArtifactTransfer[], signal?: AbortSignal): Promise<ChunkedContent> {
+	restore(value: unknown, transfers?: ArtifactSource | ContentChunkPool, signal?: AbortSignal): Promise<ChunkedContent> {
 		return this.store.read(signal => this.lifetime.serialize(async () => {
-			const manifest = parseContentManifest(value);
+			const manifest = verifiedManifests.has(value as ChunkedContentManifest) ? value as ChunkedContentManifest : parseContentManifest(value);
+			if (transfers instanceof ContentChunkPool && transfers.closed) throw new Error("content lease is closed");
 			if (manifest.size > this.limits.maxLogicalBytes) throw new Error("content logical budget exceeded");
-			if (transfers && !await this.artifacts.restore(manifest.chunks.filter(reference => reference !== null), transfers, signal)) {
+			if (!await this.artifacts.restore(manifest.chunks.filter(reference => reference !== null), transfers instanceof ContentChunkPool ? transfers.artifacts : transfers, signal)) {
 				throw new Error("content transfer is unavailable");
 			}
-			const digest = createHash("sha256");
-			for (let index = 0; index < manifest.chunks.length; index++) {
-				signal.throwIfAborted();
-				const reference = manifest.chunks[index];
-				if (reference && !await this.artifacts.add(reference, signal)) throw new Error("content chunk is unavailable");
-				digest.update(await this.block(manifest, index));
+			if (!verifiedManifests.has(manifest)) {
+				const digest = createHash("sha256");
+				for (let index = 0; index < manifest.chunks.length; index++) {
+					signal.throwIfAborted();
+					digest.update(await this.block(manifest, index));
+				}
+				if (`sha256:${digest.digest("hex")}` !== manifest.digest) throw new Error("content manifest integrity check failed");
+				verifiedManifests.add(manifest);
 			}
-			if (`sha256:${digest.digest("hex")}` !== manifest.digest) throw new Error("content manifest integrity check failed");
 			signal.throwIfAborted();
 			return new ChunkedContent(this, manifest);
 		}), signal);
 	}
 	/** Renew roots under the caller's publication transaction, even after GC unlinked our pinned blocks. */
 	publish(manifest: ChunkedContentManifest, store = this.store): Promise<void> {
-		return this.lifetime.admit(() => store.withPublication(async () => {
-			const published = new Set<Sha256Digest>();
-			for (let index = 0; index < manifest.chunks.length; index++) {
-				const reference = manifest.chunks[index];
-				if (reference && !published.has(reference.digest)) {
-					await store.artifacts.put(await this.block(manifest, index)); published.add(reference.digest);
-				}
-			}
-		}));
+		return this.lifetime.admit(() => store.withPublication(() => store.artifacts.share(manifest.chunks.filter(reference => reference !== null), this.artifacts)));
 	}
 	read(manifest: ChunkedContentManifest, maxBytes?: number, offset = 0): Promise<Buffer> {
 		return this.lifetime.serialize(async () => {
@@ -126,6 +102,17 @@ export class ChunkedContent {
 
 /** Byte arguments remain an adapter boundary; captured Linux file versions use the same immutable chunks as inputs. */
 export type ContentVersion = Uint8Array | ChunkedContent;
+export type FileContentVersion = Omit<StableFilesystemCapture, "content"> & { readonly content: ContentVersion };
+/** A private preimage and a workspace input retain the same sealed blocks. */
+export async function captureFileContent(target: string, maxBytes: number, pool?: ContentChunkPool,
+	observed?: Omit<NonNullable<Parameters<typeof captureStableFile>[3]>, "onChunk">): Promise<FileContentVersion> {
+	if (pool) {
+		const { capture, content } = await pool.capture(onChunk => captureStableFile(target, Math.min(maxBytes, pool.limits.maxLogicalBytes), false, { ...observed, digest: false, onChunk }));
+		return { ...capture, content };
+	}
+	const captured = await captureStableFile(target, maxBytes, true, observed);
+	return { ...captured, content: captured.content! };
+}
 export const contentDigest = (value: ContentVersion): Sha256Digest => value instanceof ChunkedContent ? value.manifest.digest : sha256Digest(value);
 export const sameContent = (left: ContentVersion | undefined, right: ContentVersion | undefined): boolean =>
 	left === undefined || right === undefined ? left === right : left.byteLength === right.byteLength && contentDigest(left) === contentDigest(right);
@@ -134,39 +121,61 @@ export const contentMemory = (value: ContentVersion | undefined): number => valu
 export const readContent = (value: ContentVersion, offset = 0, length = value.byteLength - offset): Promise<Buffer> =>
 	value instanceof ChunkedContent ? value.readRange(offset, length) : Promise.resolve(Buffer.from(value.subarray(offset, offset + length)));
 export async function captureContent(pool: ContentChunkPool, value: ContentVersion | string): Promise<ChunkedContent> {
-	if (value instanceof ChunkedContent && value.pool === pool) return value;
+	if (value instanceof ChunkedContent) return value.pool === pool ? value : pool.restore(value.manifest, value.pool);
 	return (await pool.capture(async sink => {
-		const digest = createHash("sha256"); let bytesRead = 0;
+		let bytesRead = 0;
 		const size = typeof value === "string" ? value.length : value.byteLength;
 		for (let offset = 0; offset < size;) {
 			let end = Math.min(size, offset + CONTENT_CHUNK_BYTES);
 			if (typeof value === "string" && end < size && value.charCodeAt(end - 1) >= 0xd800 && value.charCodeAt(end - 1) <= 0xdbff) end--;
 			const block = typeof value === "string" ? Buffer.from(value.slice(offset, end)) : await readContent(value, offset, end - offset);
-			digest.update(block); bytesRead += block.length; await sink(block); offset = end;
+			bytesRead += block.length; await sink(block); offset = end;
 		}
-		return { bytesRead, hash: digest.digest("hex") };
+		return { bytesRead };
 	})).content;
 }
 export async function restoreArtifactContent(pool: ContentChunkPool, value: ArtifactReference | ChunkedContentManifest, artifacts: VerifiedArtifactClosure): Promise<ChunkedContent> {
-	if ("chunks" in value) { const loan = artifacts.lend(); try { return await pool.restore(value, loan.transfer); } finally { loan.release(); } }
+	if ("chunks" in value) return pool.restore(value, artifacts);
 	return (await pool.capture(async sink => {
 		for (let offset = 0; offset < value.size; offset += CONTENT_CHUNK_BYTES) await sink(await artifacts.readRange(value, offset, Math.min(CONTENT_CHUNK_BYTES, value.size - offset)));
-		return { bytesRead: value.size, hash: value.digest.slice(7) };
+		return { bytesRead: value.size };
 	})).content;
 }
 /** Every new file effect publishes a manifest into the certificate owner's existing CAS transaction. */
 export function publishContent(value: ContentVersion, store: ProvenanceCertificateStore): Promise<ChunkedContentManifest> {
 	if (value instanceof ChunkedContent) return value.pool.publish(value.manifest, store).then(() => value.manifest);
-	return store.withPublication(async () => {
-		const chunks: (ArtifactReference | null)[] = [];
-		for (let offset = 0; offset < value.byteLength; offset += CONTENT_CHUNK_BYTES) {
-			const length = Math.min(CONTENT_CHUNK_BYTES, value.byteLength - offset);
-			const bytes = await readContent(value, offset, length);
-			if (bytes.equals((zeroChunk ??= Buffer.alloc(CONTENT_CHUNK_BYTES)).subarray(0, length))) chunks.push(null);
-			else chunks.push(await store.artifacts.put(bytes));
+	return store.withPublication(async () => (await captureContentBlocks(async sink => {
+		await sink(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+		return { bytesRead: value.byteLength };
+	}, bytes => store.artifacts.put(bytes), value.byteLength)).manifest);
+}
+
+/** Capture and persistence share one bounded chunker, including zero blocks and partial final blocks. */
+async function captureContentBlocks<T extends { readonly bytesRead: number }>(
+	read: (sink: (chunk: Buffer) => Promise<void>) => Promise<T>, put: (bytes: Buffer) => Promise<ArtifactReference>, maxBytes: number, signal?: AbortSignal,
+) {
+	const chunks: (ArtifactReference | null)[] = [], buffer = Buffer.allocUnsafe(CONTENT_CHUNK_BYTES), digest = createHash("sha256");
+	let offset = 0, size = 0;
+	const flush = async () => {
+		const bytes = buffer.subarray(0, offset);
+		chunks.push(bytes.equals((zeroChunk ??= Buffer.alloc(CONTENT_CHUNK_BYTES)).subarray(0, offset)) ? null : await put(bytes)); offset = 0;
+	};
+	const capture = await read(async chunk => {
+		signal?.throwIfAborted();
+		if (size + chunk.length > maxBytes) throw new Error("content logical budget exceeded");
+		size += chunk.length; digest.update(chunk);
+		for (let cursor = 0; cursor < chunk.length;) {
+			const count = Math.min(chunk.length - cursor, buffer.length - offset);
+			chunk.copy(buffer, offset, cursor, cursor + count); cursor += count; offset += count;
+			if (offset === buffer.length) await flush();
 		}
-		return parseContentManifest({ size: value.byteLength, digest: contentDigest(value), chunks });
 	});
+	if (offset) await flush();
+	signal?.throwIfAborted();
+	if (size !== capture.bytesRead) throw new Error("content capture size mismatch");
+	const hash = digest.digest("hex"), manifest = parseContentManifest({ size, digest: `sha256:${hash}`, chunks });
+	verifiedManifests.add(manifest);
+	return { capture: { ...capture, hash }, manifest };
 }
 /** Apply changed logical ranges to the existing object, keeping its aliases and open descriptions attached. */
 export async function writeContent(handle: FileHandle, after: ContentVersion, before?: ContentVersion): Promise<void> {

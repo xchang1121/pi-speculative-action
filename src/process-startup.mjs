@@ -41,7 +41,7 @@ export async function resolveLinuxExecHelper(binary) {
 export async function ensureNativeFilesystem() {
 	if (process.platform !== "linux") return undefined;
 	const qualify = () => {
-		if (!nativeFilesystem || nativeFilesystem(-11) !== 2) throw new Error("qualified native filesystem reader unavailable; rebuild the Linux backend");
+		if (!nativeFilesystem || nativeFilesystem(-11) !== 3) throw new Error("qualified native filesystem reader unavailable; rebuild the Linux backend");
 		return nativeFilesystem;
 	};
 	if (nativeFilesystem) return qualify();
@@ -85,6 +85,7 @@ if (process.argv[1] === qualification) {
 	// Group cancellation kills the probe children; this parent stays to reap them.
 	process.on("SIGTERM", () => {});
 	const binary = process.argv[2], startup = nativeProcessLibrary(binary), observerBinary = process.argv[3];
+	await ensureNativeFilesystem();
 	if (process.argv[4] === "confined" && startup(-2) !== 0) throw new Error("private startup qualification unavailable");
 	const probe = spawnSync(observerBinary, ["--probe-observation"], { stdio: "ignore" });
 	if (probe.status !== 0) process.exit(probe.status ?? 70);

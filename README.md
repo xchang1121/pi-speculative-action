@@ -48,6 +48,16 @@ pi
 Linux / WSL 2 需在扩展目录运行 `npm run setup:linux`，升级后重新运行；WSL checkout 放在 Linux 原生文件系统。Windows x64 使用随包提供的本地 NTFS 对象租约，无需另行编译。
 
 Linux 的透明子进程观察还需要合格的观察助手：通过 `PI_SPEC_HELD_EXEC_OBSERVER` 指向管理员部署、普通用户不可修改且具有 `CAP_SYS_PTRACE` 的独立 `.observer` 文件。助手核对调用者及目标进程身份，并在附着后释放该能力；工作负载本身不获得此权限。若启动环境已经设置 `no_new_privs`，助手也可在该约束下工作，但这会阻止依赖提权的 FUSE 挂载，不能用作完整验证环境的通用替代。权限不足时原工具正常执行，透明复用不可用。
+Linux 进程复用统一要求 cgroup v2、内核 BTF 与所需 eBPF tracing hooks；构建采集器还需要 Clang 和 libbpf、libelf、zlib 开发库。安装后，保留上面配置的观察助手，通过前台执行域启动 Pi：
+
+```sh
+sudo ~/.local/bin/pi-speculative-domain --user "$(id -u)" env \
+  PATH="$PATH" PI_SPEC_HELD_EXEC_OBSERVER="$PI_SPEC_HELD_EXEC_OBSERVER" "$(command -v pi)"
+```
+
+执行域负责对象版本、描述符身份、元数据观察和进程回收，Pi 与工具仍以原用户运行；进程接管、资源所有权、效果提交和计量沿用现有执行世界。仅配置旧观察助手已不足以启用 Linux 进程复用；普通启动或内核条件不足时，工具照常执行，文件输入和纯计算仍按各自能力工作。
+
+同一采集器共享已加载的观察探针，执行结束只释放其借用；最多保留 256 个探针对象，容量满时淘汰空闲对象，退出时统一关闭。执行域最多同时持有 256 个观察所有者，稀疏的内核对象表按需分配，各有 65,536 条上限；分配失败、溢出、丢失或观察中断使相关证明失效，不能以不完整证据交付资源。重新启动执行域可重新建立观察代际。
 
 ## 支持边界
 
@@ -67,7 +77,7 @@ npm test -- --maxWorkers=1 --no-file-parallelism
 npm run bench:check
 ```
 
-Windows 开发可在 WSL 中运行 `scripts/wsl-verify.sh`。它将当前提交和未提交改动复制到独立 Linux checkout，构建私有助手，并将其目录加入测试搜索路径；原工作区和用户安装保持独立。观察权限仍须按上文配置，脚本不自动授予权限。
+Windows 开发可在 WSL 中运行 `scripts/wsl-verify.sh`。它将当前提交和未提交改动复制到独立 Linux checkout，构建私有助手，再通过 `sudo` 启动该构建的前台执行域；测试仍以原用户运行。先按上文配置 `PI_SPEC_HELD_EXEC_OBSERVER`，脚本不安装持久服务或替换用户助手。
 
 扩展接口见 [Pi Host API](./src/index.ts)、[core](./src/core.ts) 和 [process-reuse](./src/process-reuse.ts)。新预测来源提交计划，新执行后端实现执行世界契约；反馈通过 `runtime.subscribe()` 接收，结束时调用 `host.dispose()`。
 

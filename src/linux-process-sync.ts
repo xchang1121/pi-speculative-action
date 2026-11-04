@@ -17,7 +17,7 @@ type SerializedDependency = Omit<TimelineDependency, "computation" | "shared"> &
 };
 export interface SynchronousProcessRequest {
 	readonly gate: number; readonly sourceRoot: string; readonly scope?: ExecutionScope;
-	readonly learn: boolean; readonly reuseEnabled?: boolean; readonly descriptors?: boolean | "inspect"; readonly skipRoot?: boolean;
+	readonly learn: boolean; readonly reuseEnabled?: boolean; readonly descriptors?: boolean; readonly skipRoot?: boolean;
 	readonly handoffs?: ProcessHandoffTransfer;
 	readonly inputs?: readonly CapturedFilesystemTransfer[];
 	readonly owners?: readonly number[];
@@ -152,8 +152,7 @@ export class SynchronousProcessObserver {
 			if (method === "borrow" && borrow) return borrow(args.key, args.excluded, context.signal, args.join);
 			throw new Error("native observation callback unavailable");
 		}));
-		const buffers = request.handoffs?.results.flatMap(result => [...result.artifacts.flatMap(artifact => "bytes" in artifact ? [artifact.bytes.buffer as ArrayBuffer] : []),
-			...(result.continuation ? [result.continuation.image.buffer as ArrayBuffer] : [])]) ?? [];
+		const buffers = request.handoffs?.results.flatMap(result => result.artifacts.flatMap(artifact => "bytes" in artifact ? [artifact.bytes.buffer as ArrayBuffer] : [])) ?? [];
 		const pending = this.rpc.request<SynchronousProcessResult>("observe", { id, request }, undefined, undefined, request.asynchronous ? [] : buffers);
 		void pending.completion.catch(() => undefined);
 		const attached = pending.receive();

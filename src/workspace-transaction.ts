@@ -1,5 +1,6 @@
 import type { ContentVersion } from "./content-chunks.ts";
 import type { WorkspaceFileMutation, WorkspaceStructureSnapshot } from "./workspace-state.ts";
+import type { FilesystemVersionSource } from "./process-observation.ts";
 
 /** Apply removals child first and creations parent first, preserving each caller's path order. */
 export function orderWorkspaceChanges<Value>(
@@ -55,7 +56,8 @@ export interface WorkspaceTransactionCapture {
 	readonly readBefore?: (relativePath: string, maxBytes: number) => Promise<Uint8Array | undefined>;
 	/** An overlapped interval is attributed only by its writer's own account; without one it fails closed. */
 	readonly finish: (ownership?: () => Promise<WorkspaceTransactionOwnership | undefined>) => Promise<WorkspaceTransactionDelta>;
-	readonly abort: () => Promise<void>;
+	/** `unchanged` is valid only when the operation never started mutating this workspace. */
+	readonly abort: (unchanged?: true) => Promise<void>;
 }
 
 /** What one interval's writer did, from its own trace, in workspace-relative paths. */
@@ -79,6 +81,7 @@ export interface WorkspaceTransactionDriver {
 /** Content-free structure view supplied by the concrete workspace storage driver. */
 export interface WorkspaceStructureDriver {
 	readonly capture: () => Promise<WorkspaceStructureSnapshot>;
+	readonly retain?: (versions: FilesystemVersionSource) => () => void;
 }
 
 /**

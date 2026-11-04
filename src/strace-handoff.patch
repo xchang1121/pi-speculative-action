@@ -1,12 +1,16 @@
 --- a/src/defs.h
 +++ b/src/defs.h
-@@ -267,6 +267,13 @@
+@@ -265,8 +265,17 @@
+
+ /* Trace Control Block */
  struct tcb {
++	bool gate_pending, notify_tagged, notify_entering, notify_child;
++	uint64_t gate_nr, gate_ip, notify_original;
  	int flags;		/* See below for TCB_ values */
  	int pid;		/* If 0, this tcb is free */
 +	void *broker_job, *exec_call, *exec_files;
 +	struct tcb_wait_data *exec_deferred;
-+	bool exec_table_busy;
++	bool exec_table_busy, broker_recording;
 +	int broker_fd;
 +	unsigned long handoff_tid;
 +	unsigned int handoff_tid_value, handoff_tid_state;
@@ -14,7 +18,7 @@
  	int qual_flg;		/* qual_flags[scno] or DEFAULT_QUAL_FLAGS + RAW */
  # if SUPPORTED_PERSONALITIES > 1
  	unsigned int currpers;	/* Personality at the time of scno update */
-@@ -857,6 +864,9 @@
+@@ -857,6 +866,9 @@
  	return getfdpath_pid(tcp->pid, fd, buf, bufsize, NULL);
  }
 
@@ -137,20 +141,30 @@
 
  #include "kill_save_errno.h"
  #include "exitkill.h"
-@@ -175,6 +181,12 @@
+@@ -175,6 +181,14 @@
  	siginfo_t si;        /**< siginfo, returned by PTRACE_GETSIGINFO */
  };
 
-+static void *(*broker_start)(pid_t, const char *, int *);
++static void *(*broker_start)(pid_t, const char *, int, int *);
 +static int (*broker_finish)(void *, int);
 +static const char *exec_context_source, *exec_context_name, *exec_context_comm;
++static bool children_only;
++#include "trace-gate.h"
 +static void (*drop_exec_files)(pid_t, void **, void **, const char *, int);
 +static int (*exec_call_ready)(void *);
 +static int (*clone_exec_files)(void **, void **, int);
  static struct tcb **tcbtab;
  static unsigned int nprocs;
  static size_t tcbtabsize;
-@@ -838,9 +850,10 @@
+@@ -589,6 +603,7 @@
+ ptrace_restart(const unsigned int op, struct tcb *const tcp, unsigned int sig)
+ {
+ 	int err;
++	if (gate_state && (unsigned)tcp->pid < GATE_PIDS) atomic_store(&gate_state[tcp->pid], op == PTRACE_SYSCALL);
+
+ 	errno = 0;
+ 	ptrace(op, tcp->pid, 0L, (unsigned long) sig);
+@@ -838,9 +853,10 @@
  	tprint_associated_info_end();
  }
 
@@ -164,7 +178,7 @@
  	/* If -ff, "previous tcb we printed" is always the same as current,
  	 * because we have per-tcb output files.
  	 */
-@@ -866,6 +879,13 @@
+@@ -866,6 +882,13 @@
  		}
  	}
 
@@ -178,7 +192,21 @@
  	printing_tcp = tcp;
  	set_current_tcp(tcp);
  	current_tcp->curcol = 0;
-@@ -1098,6 +1118,9 @@
+@@ -893,7 +916,12 @@
+
+ 	selinux_printpidcon(tcp);
+
+-	if (tflag_format) {
++	if (children_only && tflag_format) {
++        struct timespec ts, wall;
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        clock_gettime(CLOCK_REALTIME, &wall);
++        tprintf_string("%lld.%09ld@%lld.%09ld ", (long long)wall.tv_sec, wall.tv_nsec, (long long)ts.tv_sec, ts.tv_nsec);
++    } else if (tflag_format) {
+ 		struct timespec ts;
+ 		clock_gettime(CLOCK_REALTIME, &ts);
+
+@@ -1098,6 +1126,9 @@
  static void
  droptcb(struct tcb *tcp)
  {
@@ -188,12 +216,29 @@
  	if (tcp->pid == 0)
  		return;
 
-@@ -2231,6 +2254,213 @@
+@@ -1520,7 +1551,7 @@
+ {
+ 	debug_msg("seccomp filter %s",
+ 		  seccomp_filtering ? "enabled" : "disabled");
+-	if (seccomp_filtering)
++	if (seccomp_filtering && !children_only)
+ 		init_seccomp_filter();
+ }
+
+@@ -1827,7 +1858,7 @@
+ 		 */
+ 	}
+
+-	if (seccomp_filtering)
++	if (seccomp_filtering && !children_only)
+ 		tcp->flags |= TCB_SECCOMP_FILTER;
+
+ 	/*
+@@ -2231,6 +2262,215 @@
   * Don't want main() to inline us and defeat the reason
   * we have a separate function.
   */
 +static int handoff_fd = -1;
-+static bool children_only;
 +bool elide_path_data;
 +static int (*prepare_exec_call)(pid_t, void **, void **, const char *);
 +static int (*step_exec_call)(pid_t, void **, void **, int);
@@ -374,8 +419,10 @@
 +}
 +
 +static void broker_signal(int signal) { (void)signal; }
-+static bool start_exec_broker(struct tcb *tcp) {
-+    tcp->broker_job = broker_start(tcp->pid, exec_context_source, &tcp->broker_fd);
++static bool start_exec_broker(struct tcb *tcp, int status) {
++    finish_pending_output(tcp);
++    if (fflush(tcp->outf)) perror_msg_and_die("execution prefix flush");
++    tcp->broker_job = broker_start(tcp->pid, exec_context_source, status, &tcp->broker_fd);
 +    if (tcp->broker_fd == -2) error_msg_and_die("start post-exec broker for %d", tcp->pid);
 +    return tcp->broker_job != NULL;
 +}
@@ -389,6 +436,7 @@
 +        if (settle && poll(&ready, 1, 0) > 0) {
 +            int result = broker_finish(tcp->broker_job, 0); tcp->broker_job = NULL;
 +            if (result < 0) error_msg_and_die("post-exec decision for %d", tcp->pid);
++            if (result == 0) tcp->broker_recording = true;
 +            if (result > 1) {
 +                struct tcb *saved = current_tcp;
 +                printleader(tcp); tprints_string("pi_brokered_exec() = 0"); tprint_newline(); line_ended(); set_current_tcp(saved);
@@ -402,7 +450,7 @@
  static void ATTRIBUTE_NOINLINE
  init(int argc, char *argv[])
  {
-@@ -2364,6 +2594,14 @@
+@@ -2364,6 +2604,14 @@
  		{ "help",		no_argument,	   0, 'h' },
  		{ "instruction-pointer", no_argument,      0, 'i' },
  		{ "interruptible",	required_argument, 0, 'I' },
@@ -417,7 +465,7 @@
  		{ "kill-on-exit",	no_argument,	   0, GETOPT_KILL_ON_EXIT },
  		{ "stack-trace" ,	optional_argument, 0, GETOPT_STACK },
  		{ "stack-traces" ,	optional_argument, 0, GETOPT_STACK },
-@@ -2564,6 +2802,18 @@
+@@ -2564,6 +2812,18 @@
  					  "by this build of strace");
  #endif
  			break;
@@ -436,7 +484,7 @@
  		case GETOPT_KILL_ON_EXIT:
  			opt_kill_on_exit = true;
  			break;
-@@ -3007,6 +3257,9 @@
+@@ -3007,6 +3267,9 @@
 
  	debug_msg("ptrace_setoptions = %#x", ptrace_setoptions);
  	test_ptrace_seize();
@@ -446,7 +494,7 @@
  	test_ptrace_get_syscall_info();
 
  	/*
-@@ -3288,6 +3541,12 @@
+@@ -3288,6 +3551,12 @@
  maybe_allocate_tcb(const int pid, int status)
  {
  	if (!WIFSTOPPED(status)) {
@@ -459,7 +507,7 @@
  		if (detach_on_execve && pid == strace_child) {
  			/* example: strace -bexecve sh -c 'exec true' */
  			strace_child = 0;
-@@ -3304,6 +3563,11 @@
+@@ -3304,6 +3573,11 @@
  		return NULL;
  	}
  	if (followfork) {
@@ -471,7 +519,7 @@
  		/* We assume it's a fork/vfork/clone child */
  		struct tcb *tcp = alloctcb(pid);
  		after_successful_attach(tcp, post_attach_sigstop);
-@@ -3585,9 +3849,22 @@
+@@ -3585,9 +3859,23 @@
  	}
  }
 
@@ -489,12 +537,13 @@
  {
 +    static struct tcb_wait_data *resumed_exec;
 +    free(resumed_exec); resumed_exec = NULL;
++	gate_requests();
 +	size_t decisions = broker_jobs(NULL, true); bool retiring_exec = false;
 +	handoff_request();
  	if (interrupted)
  		return NULL;
 
-@@ -3619,6 +3896,16 @@
+@@ -3619,6 +3907,16 @@
  		debug_msg("dequeued extra event for pid %u", tcp->pid);
  		goto next_event_exit;
  	}
@@ -511,13 +560,13 @@
 
  	/*
  	 * Used to exit simply when nprocs hits zero, but in this testcase:
-@@ -3663,8 +3950,21 @@
+@@ -3663,8 +3961,21 @@
  	 */
  	int status;
  	struct rusage ru;
 -	int pid = wait4(-1, &status, __WALL, (cflag ? &ru : NULL));
 -	int wait_errno = errno;
-+    decisions += retiring_exec;
++    decisions += retiring_exec + (gate_socket >= 0);
 +    sigset_t previous, blocked;
 +    if (decisions) { sigemptyset(&blocked); sigaddset(&blocked, SIGCHLD); sigprocmask(SIG_BLOCK, &blocked, &previous); }
 +    int pid = wait4(-1, &status, __WALL | (decisions ? WNOHANG : 0), (cflag ? &ru : NULL));
@@ -525,7 +574,7 @@
 +    if (decisions) {
 +        if (pid == 0) {
 +            struct pollfd *polling = xcalloc(decisions, sizeof(*polling));
-+            size_t count = broker_jobs(polling, false); sigset_t waiting = previous; sigdelset(&waiting, SIGCHLD);
++            size_t count = broker_jobs(polling, false); if (gate_socket >= 0) polling[count++] = (struct pollfd){.fd = gate_socket, .events = POLLIN}; sigset_t waiting = previous; sigdelset(&waiting, SIGCHLD);
 +            struct timespec retry = {.tv_nsec = 1000000};
 +            if (ppoll(polling, count, retiring_exec ? &retry : NULL, &waiting) < 0 && errno != EINTR) perror_msg_and_die("post-exec wait");
 +            free(polling);
@@ -535,7 +584,7 @@
 
  	/*
  	 * The window of opportunity to handle expirations
-@@ -3802,6 +4102,23 @@
+@@ -3802,6 +4113,25 @@
  					wd->te = TE_RESTART;
  				}
  				break;
@@ -551,6 +600,8 @@
 +                        error_msg_and_die("read clone flags for %d", pid);
 +                    struct tcb *child = pid2tcb(wd->msg);
 +                    if (!child) child = maybe_allocate_tcb(wd->msg, status);
++                    if (child && has_seccomp_filter(tcp)) child->flags |= TCB_SECCOMP_FILTER;
++                    if (child && tcp->notify_tagged) { child->notify_tagged = true; child->notify_original = tcp->notify_original; child->notify_child = true; }
 +                    if (!child || clone_exec_files(&tcp->exec_files, &child->exec_files, (flags & 0x400) != 0) < 0)
 +                        error_msg_and_die("clone exec memory for %d", pid);
 +                }
@@ -559,7 +610,7 @@
  			case PTRACE_EVENT_EXEC:
  					/*
  					 * TODO: shouldn't we check for
-@@ -3882,6 +4199,15 @@
+@@ -3882,6 +4212,15 @@
  {
  	if (entering(tcp)) {
  		int res = syscall_entering_decode(tcp);
@@ -575,16 +626,64 @@
  		switch (res) {
  		case 0:
  			return 0;
-@@ -3913,6 +4239,8 @@
+@@ -3893,6 +4232,13 @@
+ 	} else {
+ 		struct timespec ts = {};
+ 		int res = syscall_exiting_decode(tcp, &ts);
++        /* A canceled notification must retain copy_process's unconditional restart. */
++        if (res && exec_context_source && tcp->u_error == ERESTARTSYS && tcp->s_ent &&
++            (!strcmp(tcp->s_ent->sys_name, "clone") || !strcmp(tcp->s_ent->sys_name, "clone3") ||
++             !strcmp(tcp->s_ent->sys_name, "fork") || !strcmp(tcp->s_ent->sys_name, "vfork"))) {
++            if (ptrace(PTRACE_POKEUSER, tcp->pid, offsetof(struct user_regs_struct, rax), -(long)ERESTARTNOINTR) < 0) return -1;
++            tcp->u_error = ERESTARTNOINTR;
++        }
+ 		if (res != 0) {
+ 			res = syscall_exiting_trace(tcp, &ts, res);
+ 		}
+@@ -3913,6 +4259,17 @@
  	 * around union wait fixed by glibc commit glibc-2.24~391
  	 */
  	int status = wd ? wd->status : 0;
++    if (gate_rewind(current_tcp, status)) { if (ptrace_restart(PTRACE_SYSCALL, current_tcp, 0) < 0) perror_msg_and_die("gate restart"); return true; }
++    if (current_tcp && current_tcp->notify_tagged &&
++        (current_tcp->notify_child || te == TE_SIGNAL_DELIVERY_STOP || (te == TE_SYSCALL_STOP && exiting(current_tcp)))) {
++        if (ptrace(PTRACE_POKEUSER, current_tcp->pid, offsetof(struct user_regs_struct, r9), current_tcp->notify_original) < 0) {
++            if (errno == ESRCH) return true;
++            perror_msg_and_die("restore notification argument");
++        }
++        current_tcp->notify_tagged = current_tcp->notify_child = false;
++    }
 +    if (handoff_watch_stop(current_tcp, status)) return true;
 +    if (WIFSTOPPED(status) && ((unsigned)status >> 16 == PTRACE_EVENT_STOP || WSTOPSIG(status) == syscall_trap_sig) && handoff_stop(current_tcp, false)) return true;
 
  	if (current_tcp && has_seccomp_filter(current_tcp))
  		restart_op = seccomp_filter_restart_operator(current_tcp);
-@@ -3951,7 +4279,39 @@
+@@ -3930,6 +4287,24 @@
+ 		break;
+
+ 	case TE_SECCOMP:
++        unsigned long notify_tag;
++        if (ptrace(PTRACE_GETEVENTMSG, current_tcp->pid, 0, &notify_tag) < 0) { if (errno == ESRCH) return true; perror_msg_and_die("notification trace identity"); }
++        if (notify_tag == 0x5049) {
++            current_tcp->notify_entering = entering(current_tcp);
++            if (!entering(current_tcp) && !current_tcp->notify_tagged && !current_tcp->exec_call) {
++                current_tcp->notify_original = current_tcp->u_arg[5];
++                if (ptrace(PTRACE_POKEUSER, current_tcp->pid, offsetof(struct user_regs_struct, r9), 0x5049545200000000UL) < 0) {
++                    if (errno == ESRCH) return true;
++                    perror_msg_and_die("prepare stopped notification argument");
++                }
++                current_tcp->notify_tagged = true;
++            }
++        }
++        /* An injected call already stopped at entry under PTRACE_SYSCALL. Its
++         * following seccomp event is not another entry in the native state machine. */
++        if (gate_state && !seccomp_before_sysentry && (unsigned)current_tcp->pid < GATE_PIDS && atomic_load(&gate_state[current_tcp->pid])) {
++            current_tcp->flags |= TCB_SECCOMP_FILTER; restart_op = PTRACE_SYSCALL; break;
++        }
+ 		if (!has_seccomp_filter(current_tcp)) {
+ 			/*
+ 			 * We don't know if forks/clones have a seccomp filter
+@@ -3951,7 +4326,39 @@
  		ATTRIBUTE_FALLTHROUGH;
 
  	case TE_SYSCALL_STOP:
@@ -595,7 +694,7 @@
 +        if (current_tcp->exec_call || exec_context_source) {
 +            int step = step_exec_call(current_tcp->pid, &current_tcp->exec_call, &current_tcp->exec_files, exiting(current_tcp));
 +            if (step < 0) { if (errno == ESRCH) return true; error_msg_and_die("advance exec call for %d", current_tcp->pid); }
-+            if ((step & 2) && (step & 4) && start_exec_broker(current_tcp)) return true;
++            if ((step & 2) && (step & 4) && start_exec_broker(current_tcp, -1)) return true;
 +            if (step) { restart_op = PTRACE_SYSCALL; break; }
 +        }
 +        if (handoff_fd >= 0 && entering(current_tcp)) {
@@ -625,7 +724,7 @@
  			/*
  			 * ptrace() failed in trace_syscall().
  			 * Likely a result of process disappearing mid-flight.
-@@ -3963,6 +4323,27 @@
+@@ -3963,6 +4370,38 @@
  			 * we can let this process to report its death to us
  			 * normally, via WIFEXITED or WIFSIGNALED wait status.
  			 */
@@ -643,17 +742,28 @@
 +                if (restored < 0) error_msg_and_die("restore exec context for %d", current_tcp->pid);
 +                if (restored & 1) exec_context_name = exec_context_comm = NULL;
 +                if (restored & 8) { restart_op = PTRACE_SYSCALL; break; }
-+                if ((restored & 2) && start_exec_broker(current_tcp)) return true;
++                if ((restored & 2) && start_exec_broker(current_tcp, -1)) return true;
 +            }
 +        }
 +        if (exiting(current_tcp) && handoff_stop(current_tcp, true)) return true;
++        if (current_tcp->notify_entering) {
++            current_tcp->notify_entering = false;
++            if (!current_tcp->exec_call) {
++                current_tcp->notify_original = current_tcp->u_arg[5];
++                if (ptrace(PTRACE_POKEUSER, current_tcp->pid, offsetof(struct user_regs_struct, r9), 0x5049545200000000UL) < 0) {
++                    if (errno == ESRCH) return true;
++                    perror_msg_and_die("prepare notification argument");
++                }
++                current_tcp->notify_tagged = true;
++            }
++        }
 +		/* Once the launcher has recorded the command's start, it runs untraced too. */
 +		if (children_only && current_tcp->pid == strace_child && entering(current_tcp) && started_process(current_tcp)) {
 +			detach(current_tcp);
  			return true;
  		}
  		if (has_seccomp_filter(current_tcp)) {
-@@ -4034,6 +4415,9 @@
+@@ -4034,6 +4473,9 @@
  		return true;
 
  	case TE_STOP_BEFORE_EXECVE:
@@ -663,7 +773,7 @@
  		/* The syscall succeeded, clear the flag.  */
  		current_tcp->flags &= ~TCB_CHECK_EXEC_SYSCALL;
  		/*
-@@ -4072,6 +4456,10 @@
+@@ -4072,7 +4514,18 @@
  		break;
 
  	case TE_STOP_BEFORE_EXIT:
@@ -672,12 +782,21 @@
 +        }
 +        if (drop_exec_files) drop_exec_files(current_tcp->pid, &current_tcp->exec_files, &current_tcp->exec_call, exec_context_source, 0);
  		print_event_exit(current_tcp);
++        if (current_tcp->broker_recording) {
++            unsigned long status;
++            if (ptrace(PTRACE_GETEVENTMSG, current_tcp->pid, NULL, &status) < 0) perror_msg_and_die("execution exit status");
++            current_tcp->broker_recording = false;
++            printleader(current_tcp); tprintf_string("pi_domain_exit(%lu) = 0", status); tprint_newline(); line_ended();
++            if (start_exec_broker(current_tcp, (int)status)) return true;
++        }
  		break;
  	}
-@@ -4231,6 +4619,19 @@
+
+@@ -4231,6 +4684,20 @@
  {
  	setlocale(LC_ALL, "");
  	init(argc, argv);
++	gate_open(exec_context_source);
 +	if (handoff_library) {
 +        void *library = dlopen(handoff_library, RTLD_NOW | RTLD_LOCAL);
 +        if (!library) error_msg_and_die("invalid handoff library: %s", dlerror());
@@ -685,7 +804,7 @@
 +        handoff_frontier = dlsym(library, "pi_process_image_frontier");
 +        restore_exec_context = dlsym(library, "pi_restore_exec_context");
 +        step_exec_call = dlsym(library, "pi_step_exec_call"); prepare_exec_call = dlsym(library, "pi_prepare_exec_call"); drop_exec_files = dlsym(library, "pi_drop_exec_files"); clone_exec_files = dlsym(library, "pi_clone_exec_files"); exec_call_ready = dlsym(library, "pi_exec_call_ready");
-+        broker_start = dlsym(library, "pi_broker_start");
++        broker_start = dlsym(library, "pi_broker_event");
 +        broker_finish = dlsym(library, "pi_broker_finish");
 +        set_sighandler(SIGCHLD, broker_signal, NULL);
 +        if (!exec_call_ready || !step_exec_call || !drop_exec_files || !clone_exec_files || !prepare_exec_call || !handoff_capture || !handoff_frontier || !restore_exec_context || !broker_start || !broker_finish) error_msg_and_die("incompatible capture ABI");
@@ -694,3 +813,129 @@
 
  	exit_code = !nprocs;
 
+--- a/src/filter_seccomp.c
++++ b/src/filter_seccomp.c
+@@ -255,6 +255,12 @@
+ static bool
+ traced_by_seccomp(unsigned int scno, unsigned int p)
+ {
++    /* The execution domain owns these native records; leave other personalities traced. */
++    if (elide_path_data && p == 0) {
++        const char *name = sysent_vec[p][scno].sys_name;
++        if (name && (!strcmp(name, "stat") || !strcmp(name, "lstat") || !strcmp(name, "fstat") ||
++            !strcmp(name, "newfstatat") || !strcmp(name, "statx") || !strcmp(name, "pread64") || !strcmp(name, "pwrite64"))) return false;
++    }
+ 	unsigned int always_trace_flags =
+ 		TRACE_INDIRECT_SUBCALL | TRACE_SECCOMP_DEFAULT |
+ 		(stack_trace_mode ? MEMORY_MAPPING_CHANGE : 0) |
+@@ -708,7 +714,7 @@
+ check_seccomp_filter(void)
+ {
+ 	/* Let's avoid enabling seccomp if all syscalls are traced. */
+-	seccomp_filtering = !is_complete_set_array(trace_set, nsyscall_vec,
++	seccomp_filtering = elide_path_data || !is_complete_set_array(trace_set, nsyscall_vec,
+ 						   SUPPORTED_PERSONALITIES);
+ 	if (!seccomp_filtering) {
+ 		error_msg("Seccomp filter is requested "
+@@ -722,3 +728,9 @@
+ 	if (!seccomp_filtering)
+ 		error_msg("seccomp filter is requested but unavailable");
+ }
++
++unsigned export_seccomp_filter(void *target, size_t capacity) {
++    size_t bytes = bpf_prog.len * sizeof(*bpf_prog.filter);
++    if (!bpf_prog.filter || bytes > capacity) return 0;
++    memcpy(target, bpf_prog.filter, bytes); return bpf_prog.len;
++}
+--- a/src/filter_seccomp.h
++++ b/src/filter_seccomp.h
+@@ -17,6 +17,7 @@
+
+ extern void check_seccomp_filter(void);
+ extern void init_seccomp_filter(void);
++extern unsigned export_seccomp_filter(void *, size_t);
+ extern int seccomp_filter_restart_operator(const struct tcb *);
+
+ #endif /* !STRACE_SECCOMP_FILTER_H */
+--- /dev/null
++++ b/src/trace-gate.h
+@@ -0,0 +1,79 @@
++#include <sys/mman.h>
++#include <sys/un.h>
++#include <linux/seccomp.h>
++#include <stdatomic.h>
++#include <sys/ioctl.h>
++
++#define GATE_PIDS (1U << 22)
++#define GATE_HEADER 32784
++static _Atomic uint64_t *gate_state;
++static int gate_socket = -1, gate_supervisor, gate_file = -1;
++static struct tcb *pid2tcb(const int pid);
++
++static void gate_open(const char *source) {
++    if (!seccomp_filtering || !children_only || !source) return;
++    int file = gate_file = memfd_create("pi-trace-gate", MFD_CLOEXEC | MFD_ALLOW_SEALING);
++    size_t size = GATE_HEADER + GATE_PIDS * sizeof(*gate_state);
++    if (file < 0 || ftruncate(file, size)) perror_msg_and_die("gate file");
++    void *mapped = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
++    if (mapped == MAP_FAILED) perror_msg_and_die("gate mapping");
++    uint32_t *header = mapped;
++    header[0] = 0x50494731; header[1] = getpid(); header[2] = GATE_PIDS;
++    header[3] = export_seccomp_filter((char *)mapped + 16, GATE_HEADER - 16);
++    if (!header[3]) error_msg_and_die("gate filter");
++    if (fcntl(file, F_ADD_SEALS, F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_FUTURE_WRITE)) perror_msg_and_die("gate seals");
++    gate_state = (void *)((char *)mapped + GATE_HEADER);
++    struct sockaddr_un address = {.sun_family = AF_UNIX};
++    snprintf(address.sun_path + 1, sizeof(address.sun_path) - 1, "pi-trace-gate-%d", getpid());
++    gate_socket = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++    int credentials = 1;
++    if (gate_socket < 0 || setsockopt(gate_socket, SOL_SOCKET, SO_PASSCRED, &credentials, sizeof(credentials)) ||
++        bind(gate_socket, (struct sockaddr *)&address, offsetof(struct sockaddr_un, sun_path) + 1 + strlen(address.sun_path + 1)))
++        perror_msg_and_die("gate socket");
++    gate_supervisor = strace_child;
++}
++static void gate_requests(void) {
++    if (gate_socket < 0) return;
++    for (;;) {
++        struct seccomp_notif request;
++        char ancillary[CMSG_SPACE(sizeof(int)) + CMSG_SPACE(sizeof(struct ucred))];
++        struct iovec vector = {&request, sizeof(request)};
++        struct msghdr message = {.msg_iov = &vector, .msg_iovlen = 1, .msg_control = ancillary, .msg_controllen = sizeof(ancillary)};
++        ssize_t bytes = recvmsg(gate_socket, &message, MSG_CMSG_CLOEXEC);
++        if (bytes < 0 && (errno == EAGAIN || errno == EINTR)) return;
++        int listener = -1, owner = -1;
++        for (struct cmsghdr *header = CMSG_FIRSTHDR(&message); header; header = CMSG_NXTHDR(&message, header)) {
++            if (header->cmsg_level != SOL_SOCKET) continue;
++            if (header->cmsg_type == SCM_RIGHTS && header->cmsg_len == CMSG_LEN(sizeof(int))) memcpy(&listener, CMSG_DATA(header), sizeof(listener));
++            if (header->cmsg_type == SCM_CREDENTIALS && header->cmsg_len == CMSG_LEN(sizeof(struct ucred))) {
++                struct ucred peer; memcpy(&peer, CMSG_DATA(header), sizeof(peer)); owner = peer.pid;
++            }
++        }
++        if (bytes != sizeof(request) || message.msg_flags & (MSG_CTRUNC | MSG_TRUNC) || owner != gate_supervisor || listener < 0)
++            error_msg_and_die("invalid gate sender");
++        if (ioctl(listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &request.id) == 0) {
++            struct tcb *tcp = pid2tcb(request.pid);
++            if (!tcp || request.pid >= GATE_PIDS || tcp->gate_pending || atomic_load(&gate_state[request.pid])) error_msg_and_die("invalid gate target");
++            if (ptrace(PTRACE_INTERRUPT, request.pid, 0, 0) < 0) {
++                if (errno == ESRCH) { close(listener); continue; }
++                perror_msg_and_die("gate interrupt");
++            }
++            tcp->gate_pending = true; tcp->gate_nr = request.data.nr; tcp->gate_ip = request.data.instruction_pointer;
++            struct seccomp_notif_resp response = {.id = request.id, .error = -ENOSYS};
++            if (ioctl(listener, SECCOMP_IOCTL_NOTIF_SEND, &response) < 0 && errno != ENOENT) perror_msg_and_die("gate notification");
++        }
++        close(listener);
++    }
++}
++static int gate_rewind(struct tcb *tcp, int status) {
++    if (!tcp || !tcp->gate_pending || !WIFSTOPPED(status) || (unsigned)status >> 16 != PTRACE_EVENT_STOP) return 0;
++    struct user_regs_struct regs;
++    if (ptrace(PTRACE_GETREGS, tcp->pid, 0, &regs) || regs.orig_rax != tcp->gate_nr || regs.rip != tcp->gate_ip ||
++        (long)regs.rax != -ENOSYS || regs.rip < 2 || !entering(tcp))
++        error_msg_and_die("gate boundary changed pid=%d nr=%llu expected=%llu result=%lld same_ip=%d entering=%d", tcp->pid,
++            (unsigned long long)regs.orig_rax, (unsigned long long)tcp->gate_nr, (long long)regs.rax, regs.rip == tcp->gate_ip, entering(tcp));
++    regs.rip -= 2; regs.rax = regs.orig_rax; regs.orig_rax = (unsigned long)-1;
++    if (ptrace(PTRACE_SETREGS, tcp->pid, 0, &regs)) perror_msg_and_die("gate rewind");
++    tcp->gate_pending = false;
++    return 1;
++}

@@ -242,9 +242,12 @@ export function processStrongKey(weakKey: Sha256Digest, certificate: DynamicDepe
 	return digestObject({ weakKey, dependencies: normalizeDependencies(certificate.dependencies) });
 }
 
-export function sealProcessCertificate(input: Pick<ProcessProvenanceCertificate, "prototype" | "producer" | "dependencyCertificate" | "result"> & {
+export type ProcessCertificateInput = Pick<ProcessProvenanceCertificate, "prototype" | "producer" | "dependencyCertificate" | "result"> & {
 	readonly createdAt?: number;
-}): ProcessProvenanceCertificate {
+};
+
+export function sealProcessCertificate(input: ProcessCertificateInput): ProcessProvenanceCertificate {
+	if (normalizedCertificates.has(input)) return input as ProcessProvenanceCertificate;
 	const prototype = normalizePrototype(input.prototype);
 	const producer = normalizeProducerProof(input.producer);
 	const evidence = input.dependencyCertificate;
@@ -259,11 +262,13 @@ export function sealProcessCertificate(input: Pick<ProcessProvenanceCertificate,
 	const strongKey = digestObject({ weakKey, dependencies: dependencyCertificate.dependencies });
 	const createdAt = finiteTimestamp(input.createdAt ?? Date.now());
 	const body = { weakKey, strongKey, prototype, producer, dependencyCertificate, result, createdAt };
-	return deepFreeze({ ...body, id: certificateContentKey(body) });
+	const sealed = deepFreeze({ ...body, id: certificateContentKey(body) });
+	normalizedCertificates.add(sealed); return sealed;
 }
 
 export function parseProcessCertificate(value: unknown): ProcessProvenanceCertificate | undefined {
 	if (!isRecord(value)) return undefined;
+	if (normalizedCertificates.has(value)) return value as unknown as ProcessProvenanceCertificate;
 	const candidate = value as Partial<ProcessProvenanceCertificate>;
 	if (!isSha256Digest(candidate.id) || !candidate.prototype || !candidate.producer || !candidate.dependencyCertificate || !candidate.result) return undefined;
 	try {
@@ -284,8 +289,10 @@ function certificateContentKey(
 	return digestObject({ ...content, result: semanticResult });
 }
 
-export function referencedArtifacts(certificate: ProcessProvenanceCertificate): readonly ArtifactReference[] {
+export function referencedArtifacts(certificate: Pick<ProcessCertificateInput, "result">): readonly ArtifactReference[] {
 	const unique = new Map<Sha256Digest, ArtifactReference>();
+	const image = certificate.result.continuation;
+	if (image) unique.set(image.imageDigest, { digest: image.imageDigest, size: image.imageBytes });
 	for (const event of certificate.result.journal) {
 		if (event.kind === "output") unique.set(event.data.digest, event.data);
 		else for (const state of [event.before, event.after]) {
@@ -303,7 +310,7 @@ export function referencedArtifacts(certificate: ProcessProvenanceCertificate): 
 export const ONE_SHOT_TAINTS: readonly ProvenanceTaint[] = ["clock", "random", "pid_observation", "descriptor_observation"];
 
 export function certificateReplayable(
-	certificate: ProcessProvenanceCertificate,
+	certificate: Pick<ProcessCertificateInput, "prototype" | "dependencyCertificate" | "result">,
 	acceptedTaints: readonly ProvenanceTaint[] = [],
 ): boolean {
 	const input = certificate.prototype.inheritedFDs.find(({ fd }) => fd === 0);
@@ -322,6 +329,7 @@ export function certificateReplayable(
 }
 
 // Only this module's owned, validated records may skip capture, never arbitrary frozen inputs.
+const normalizedCertificates = new WeakSet<object>();
 const normalizedPrototypes = new WeakSet<ExecPrototype>();
 
 function normalizePrototype(input: ExecPrototype): ExecPrototype {
@@ -517,6 +525,7 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 	const descriptors = prototype.inheritedFDs.filter(({ alias }) => alias !== undefined);
 	const resources = result.resources ? cloneSharedData(result.resources) : undefined;
 	const artifactSizes = new Map<Sha256Digest, number>();
+	if (result.continuation) artifactSizes.set(result.continuation.imageDigest, result.continuation.imageBytes);
 	if (!resources && descriptors.length) throw new Error("missing inherited OFD resource effects");
 	if (resources) {
 		const descriptions = descriptors.filter(fd => fd.alias === fd.fd), objects = descriptors.filter(fd => fd.object === fd.fd);

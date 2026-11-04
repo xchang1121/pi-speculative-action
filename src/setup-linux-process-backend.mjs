@@ -44,18 +44,19 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) await setup();
 async function setup() {
 	await mkdir(localBin, { recursive: true });
 	const helper = await optional("Native execution helper", installHeldExec);
+	const collector = await optional("cgroup/eBPF execution domain", installExecutionDomain);
 	const held = helper && await optional("Actor child handoff", () => qualifyNativeStartup(heldExec));
 	const tracing = helper && await optional("Running process handoff tracer", installStrace);
 	const missing = await missingExecutables([...(tracing ? [] : ["strace"]), "git"]);
 	let producer = false;
-	if (!helper)
-		console.warn("Speculative Bash producer unavailable because its transparent exec boundary is unavailable.");
+	if (!helper || !collector)
+		console.warn("Linux process reuse unavailable because its execution domain or native helper is unavailable; tools execute normally.");
 	else if (missing.length)
-		console.warn(`Speculative Bash producer unavailable (missing ${missing.join(", ")}); cached Actor replay remains usable.`);
+		console.warn(`Linux process reuse unavailable (missing ${missing.join(", ")}); tools execute normally.`);
 	else producer = await optional("Speculative Bash producer", installSandlock);
 	const overlay = await optional("OverlayFS workspace optimization", installFuseOverlayfs);
 	console.log(
-		`Linux reuse setup complete: cached command replay ready; child handoff ${held ? "ready" : "unavailable"}; running process capture ${tracing ? "ready" : "unavailable"}; speculative producer ${producer ? "ready" : "unavailable"}; OverlayFS ${overlay ? "ready" : "unavailable"}.`,
+		`Linux backend setup complete: cgroup/eBPF collector ${collector ? "built" : "unavailable"}; child handoff ${held ? "ready" : "unavailable"}; running process capture ${tracing ? "ready" : "unavailable"}; speculative producer ${producer ? "ready" : "unavailable"}; OverlayFS ${overlay ? "ready" : "unavailable"}. Process reuse requires an active execution domain.`,
 	);
 }
 
@@ -122,7 +123,7 @@ async function qualifySandlock(binary) {
 export async function installHeldExec(target = heldExec) {
 	const source = fileURLToPath(new URL("./linux-held-exec.c", import.meta.url));
 	const sqlite = fileURLToPath(new URL("./sqlite-read-vfs.c", import.meta.url));
-	return installNative(target, sha256("static-pthread+shared-image+native-startup+authority-observer+sqlite-read", JSON.stringify(SQLITE_HEADERS), await readFile(source), await readFile(sqlite)), qualifyHeldExec, async (root, temporary) => {
+	return installNative(target, sha256("static-pthread+shared-image+native-startup+authority-observer+sqlite-read", JSON.stringify(SQLITE_HEADERS), await readFile(source), await readFile(new URL("./linux-execution-domain.h", import.meta.url)), await readFile(sqlite)), qualifyHeldExec, async (root, temporary) => {
 		const compiler = await executable(["cc", "gcc", "clang"]);
 		for (const [suffix, flags] of [["", ["-static"]], [".observer", ["-static", "-DPI_SPEC_AUTHORITY_ONLY=1"]], [".so", ["-shared", "-fPIC"]]])
 			await run(compiler, [...flags, "-pthread", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", source, "-o", temporary + suffix]);
@@ -131,6 +132,17 @@ export async function installHeldExec(target = heldExec) {
 			await writeFile(path.join(root, name), await downloadPinned(`https://raw.githubusercontent.com/nodejs/node/v24.20.0/deps/sqlite/${name}`, digest));
 		await run(compiler, ["-shared", "-fPIC", "-pthread", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-I", root, sqlite, "-o", `${temporary}.sqlite`]);
 	}, [".so", ".node", ".sqlite", ".observer", ""]);
+}
+
+export async function installExecutionDomain(target = path.join(localBin, "pi-speculative-domain")) {
+	if (process.arch !== "x64") throw new Error("kernel collection requires x86-64 Linux");
+	const source = fileURLToPath(new URL("./linux-execution-domain.c", import.meta.url));
+	const digest = sha256(await readFile(source), await readFile(new URL("./linux-execution-domain.h", import.meta.url)));
+	return installNative(target, digest, binary => run(binary, ["--version"]), async (_root, temporary) => {
+		const compiler = await executable(["cc", "gcc"]), clang = await executable(["clang"]);
+		await run(clang, ["-target", "bpf", "-DPI_BPF_OBJECT", "-g", "-O2", "-I/usr/include/x86_64-linux-gnu", "-c", source, "-o", `${temporary}.bpf.o`]);
+		await run(compiler, ["-O2", "-Wall", "-Wextra", "-Werror", `-DPI_DOMAIN_BUILD="${digest}"`, source, "-lbpf", "-lelf", "-lz", "-o", temporary]);
+	}, [".bpf.o", ""]);
 }
 
 async function qualifyHeldExec(binary) {

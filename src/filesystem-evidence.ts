@@ -59,6 +59,17 @@ export async function openAnonymousFilesystemFile(root: string): Promise<FileHan
 	}, handle => handle.close());
 }
 
+/** Kernel-sealed content versions are independent of both mutable names and their producers. */
+export async function openArtifactImage(): Promise<FileHandle> {
+	const reader = await ensureNativeFilesystem(), fd = reader!(-13, Buffer.alloc(0), native => adoptFilesystemDescriptor(native, constants.O_RDWR));
+	if (!Number.isInteger(fd) || fd < 0) throw new Error("immutable artifact images unavailable; rebuild the Linux backend");
+	try { return await fs.open(`/proc/self/fd/${fd}`, "r+"); } finally { closeSync(fd); }
+}
+export function sealArtifactImage(fd: number, seal = false): boolean {
+	const request = Buffer.alloc(8); request.writeInt32LE(fd); request.writeInt32LE(Number(seal), 4);
+	return nativeFilesystem?.(-14, request) === 1;
+}
+
 /** Resolve a proposed destination through its existing ancestors without creating any names. */
 export async function resolveFilesystemDestination(target: string, view: FilesystemReadView): Promise<{ path: string; ancestor: string }> {
 	target = path.resolve(target); let ancestor = target;
@@ -107,17 +118,23 @@ export class FilesystemReadView {
 		const view = new FilesystemReadView(descriptor, mounts, reader);
 		try { await view.verify(); return view; } catch (error) { await view.close(); throw error; }
 	}
-	/** Caller owns the returned raw descriptor. Only use while this view is open. */
-	open(target: string, flags: number): number {
+	/** Without a synchronous observer, Node adopts and owns the returned descriptor. */
+	open(target: string, flags: number, observe = (fd: number) => adoptFilesystemDescriptor(fd, flags)): number {
 		if (this.closed || this.descriptor === undefined || !this.reader) throw new Error("read-only filesystem view is closed or unavailable");
 		const absolute = path.isAbsolute(target) ? target : `${process.cwd()}/${target}`;
 		if (absolute.includes("\0")) throw new Error("invalid filesystem pathname");
 		this.observed.add(absolute);
-		const descriptor = openFilesystemDescriptor(this.reader, this.descriptor, absolute, flags);
-		try {
-			this.observed.add(readlinkSync(`/proc/self/fd/${descriptor}`));
-			return descriptor;
-		} catch (error) { closeSync(descriptor); throw error; }
+		const request = Buffer.alloc(9 + Buffer.byteLength(absolute));
+		request.writeInt32LE(this.descriptor); request.writeUInt32LE(flags, 4); request.write(absolute, 8);
+		const descriptor = this.reader(-6, request, fd => { this.observed.add(readlinkSync(`/proc/self/fd/${fd}`)); return observe(fd); });
+		if (!Number.isInteger(descriptor)) throw new Error("native filesystem open unavailable");
+		if (descriptor < 0) throw filesystemReadError(`filesystem open failed: ${target} (flags=${flags})`, descriptor);
+		return descriptor;
+	}
+	private observe<Value>(target: string, follow: boolean, read: (fd: number) => Value): Value {
+		let value!: Value;
+		this.open(target, 0x200000 | (follow ? 0 : constants.O_NOFOLLOW), fd => { value = read(fd); return 0; });
+		return value;
 	}
 	async pin(target: string, follow = false): Promise<FilesystemObjectHandle> {
 		if (this.closed) throw new Error("read-only filesystem view is closed");
@@ -128,22 +145,19 @@ export class FilesystemReadView {
 	async stat(target: string, follow = false): Promise<BigIntStats> {
 		if (this.closed) throw new Error("read-only filesystem view is closed");
 		if (this.descriptor === undefined) return (follow ? fs.stat : fs.lstat)(target, { bigint: true });
-		const handle = await this.pin(target, follow);
-		try { return await handle.stat({ bigint: true }); } finally { await handle.close(); }
+		return this.observe(target, follow, fd => fstatSync(fd, { bigint: true }));
 	}
 	async realpath(target: string): Promise<string> {
 		if (this.closed) throw new Error("read-only filesystem view is closed");
 		if (this.descriptor === undefined) return fs.realpath(target);
-		const handle = await this.pin(target, true);
-		try { return readlinkSync(`/proc/self/fd/${handle.fd}`); } finally { await handle.close(); }
+		return this.observe(target, true, fd => readlinkSync(`/proc/self/fd/${fd}`));
 	}
 	async readlink(target: string): Promise<string> {
 		if (this.closed) throw new Error("read-only filesystem view is closed");
 		if (this.descriptor === undefined) return fs.readlink(target);
-		const handle = await this.pin(target);
-		try {
+		return this.observe(target, false, fd => {
 			for (let capacity = 4096; capacity <= 512 * 1024; capacity *= 2) {
-				const buffer = Buffer.allocUnsafe(capacity + 4); buffer.writeInt32LE(handle.fd);
+				const buffer = Buffer.allocUnsafe(capacity + 4); buffer.writeInt32LE(fd);
 				const count = this.reader!(-7, buffer);
 				if (!Number.isInteger(count) || count > capacity) throw new Error("native read-only filesystem readlink unavailable");
 				if (count < 0) throw filesystemReadError("read-only filesystem readlink failed", count);
@@ -154,7 +168,7 @@ export class FilesystemReadView {
 				}
 			}
 			throw new Error("filesystem symlink target is too large");
-		} finally { await handle.close(); }
+		});
 	}
 	async readDirectory(target: string): Promise<FileHandle> {
 		if (this.closed) throw new Error("read-only filesystem view is closed");
@@ -169,9 +183,11 @@ export class FilesystemReadView {
 	async verify(targets?: Iterable<string>): Promise<void> {
 		if (this.closed) throw new Error("read-only filesystem view is closed");
 		if (this.descriptor === undefined) return;
+		const current = await fs.readFile("/proc/self/mountinfo", "utf8");
+		if (current === this.mounts) return;
 		const paths = [...(targets ?? this.observed)].map(target => path.resolve(target));
 		const relevant = (image: string) => filesystemMountTopology(image, paths, targets !== undefined);
-		if (relevant(this.mounts) !== relevant(await fs.readFile("/proc/self/mountinfo", "utf8"))) throw new Error("filesystem mount topology changed during capture");
+		if (relevant(this.mounts) !== relevant(current)) throw new Error("filesystem mount topology changed during capture");
 	}
 	async close(): Promise<void> { if (!this.closed) { this.closed = true; if (this.descriptor !== undefined) closeSync(this.descriptor); this.descriptor = undefined; } }
 	[Symbol.asyncDispose](): Promise<void> { return this.close(); }
@@ -194,15 +210,6 @@ function filesystemDescriptorHandle(fd: number, readable = false): FilesystemObj
 	}, read: readable ? (buffer, offset, length, position) => new Promise((resolve, reject) => {
 		assertOpen(); read(fd, buffer, offset, length, position, (error, bytesRead) => error ? reject(error) : resolve({ bytesRead }));
 	}) : undefined, close: async () => { if (!closed) { closed = true; closeSync(fd); } } };
-}
-
-function openFilesystemDescriptor(reader: NonNullable<typeof nativeFilesystem>, root: number, target: string, flags: number): number {
-	const request = Buffer.alloc(9 + Buffer.byteLength(target));
-	request.writeInt32LE(root); request.writeUInt32LE(flags, 4); request.write(target, 8);
-	const descriptor = reader(-6, request, fd => adoptFilesystemDescriptor(fd, flags));
-	if (!Number.isInteger(descriptor)) throw new Error("native filesystem open unavailable");
-	if (descriptor < 0) throw filesystemReadError(`filesystem open failed: ${target} (flags=${flags})`, descriptor);
-	return descriptor;
 }
 
 /** Node owns the adopted descriptor, including worker teardown. The native callback closes its
@@ -278,18 +285,22 @@ export interface FilesystemObjectTransfer {
 /** Kernel-object ownership is independent of content and observation proofs. Loans only cross this process's thread boundary. */
 export class FilesystemObjectLease {
 	private readonly lifetime = new RuntimeLifecycleLane();
+	private readonly available = new Int32Array(new SharedArrayBuffer(4));
 	readonly handle: FilesystemObjectHandle;
 	private readonly identity: Readonly<Pick<BigIntStats, "dev" | "ino">>;
 	private readonly readable: boolean;
 	constructor(handle: FilesystemObjectHandle, identity: Readonly<Pick<BigIntStats, "dev" | "ino">>, readable = false) {
 		this.handle = handle; this.identity = identity; this.readable = readable;
+		Atomics.store(this.available, 0, 1);
 	}
 	borrow<T>(consume: (handle: FilesystemObjectHandle) => Promise<T>): Promise<T> { return this.lifetime.admit(() => consume(this.handle)); }
-	lend(): { readonly transfer: FilesystemObjectTransfer; readonly release: () => void } | undefined {
+	/** A catalog describes without retention; receive acquires its own descriptor only while this owner is available. */
+	lend(retain = true): { readonly transfer: FilesystemObjectTransfer; readonly release: () => void } | undefined {
 		if (this.lifetime.sealed || process.platform !== "linux") return;
-		const active = new Int32Array(new SharedArrayBuffer(4)); Atomics.store(active, 0, 1);
+		const active = retain ? new Int32Array(new SharedArrayBuffer(4)) : this.available; Atomics.store(active, 0, 1);
 		const transfer = { fd: this.handle.fd, active: active.buffer, process: process.pid, readable: this.readable,
 			identity: { dev: this.identity.dev, ino: this.identity.ino } };
+		if (!retain) return { transfer, release: () => {} };
 		const { promise, resolve } = Promise.withResolvers<void>(); this.lifetime.track(promise);
 		return { transfer, release: () => { Atomics.store(active, 0, 0); resolve(); } };
 	}
@@ -306,7 +317,7 @@ export class FilesystemObjectLease {
 			return { stat, handle: filesystemDescriptorHandle(owned, readable) };
 		} catch { return undefined; } finally { if (fd !== undefined) closeSync(fd); }
 	}
-	dispose(): Promise<void> { return this.lifetime.dispose(() => this.handle.close()); }
+	dispose(): Promise<void> { Atomics.store(this.available, 0, 0); return this.lifetime.dispose(() => this.handle.close()); }
 }
 
 /** A source observation owns a kernel-object lease; the observation alone never grants borrowing authority. */
@@ -597,7 +608,7 @@ export async function captureFilesystemEntry(target: string, read?: "directory" 
 	return { info, link, entries: undefined, computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())) };
 }
 
-/** Resolve link targets component by component, retaining each stable namespace observation. */
+/** Resolve link targets within the caller's view; its owner verifies the completed capture. */
 export async function* walkFilesystemPath(target: string, options: { readonly start?: string; readonly followFinal?: boolean; readonly capture?: typeof captureFilesystemEntry; readonly view?: FilesystemReadView } = {}) {
 	await using owned = options.view ? undefined : FilesystemReadView.ambient();
 	const view = options.view ?? owned!;
@@ -616,7 +627,6 @@ export async function* walkFilesystemPath(target: string, options: { readonly st
 			});
 			if (info ? !actual || !sameFilesystemIdentity(info, actual) : actual) throw new Error("filesystem_link_resolution_changed");
 		}
-		await view.verify();
 		yield { path: current, info, link, terminal };
 		if (!info || terminal) return;
 		if (link !== undefined) {
