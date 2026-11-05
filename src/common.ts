@@ -33,7 +33,6 @@ export const DEFAULTS = {
 	resourceCacheMaxEntries: 512,
 	resourceCacheMaxBytes: 256 * 1024 * 1024,
 	predictionTimeoutMs: 300_000,
-	thinkThreadTimeoutMs: 120_000,
 };
 
 export const clampCandidateLimit = positiveCount;

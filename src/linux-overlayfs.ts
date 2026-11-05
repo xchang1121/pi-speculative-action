@@ -97,23 +97,14 @@ export class LinuxOverlayfsCapabilityRegistry {
 	}
 }
 
-const defaultCapabilityRegistry = new LinuxOverlayfsCapabilityRegistry();
-
-/** Probe the complete mount/read/copy-up/whiteout/unmount lifecycle; version output alone is insufficient. */
-export function linuxOverlayfsCapability(
-	options: LinuxOverlayfsOptions = {},
-): Promise<LinuxOverlayfsCapability> {
-	return defaultCapabilityRegistry.capability(options);
-}
-
 /** Mount a private copy-on-write view in the caller's mount namespace. */
 export async function mountLinuxOverlayfs(input: {
 	readonly lowerRoot: string;
 	readonly privateRoot: string;
 	readonly options?: LinuxOverlayfsOptions;
-	readonly capabilityRegistry?: LinuxOverlayfsCapabilityRegistry;
+	readonly capabilityRegistry: LinuxOverlayfsCapabilityRegistry;
 }): Promise<LinuxOverlayfsMount> {
-	const capabilityRegistry = input.capabilityRegistry ?? defaultCapabilityRegistry;
+	const { capabilityRegistry } = input;
 	const capability = await capabilityRegistry.capability(input.options);
 	if (!capability.available) throw new Error(capability.detail);
 	return startLinuxOverlayfs({ ...capability, ...input, onDegraded: detail => capabilityRegistry.markDegraded(capability, detail) });

@@ -42,7 +42,7 @@ try {
 	}
 	console.log(JSON.stringify({ platform: process.platform, node: process.version, profile: worker.profile,
 		cancellation, pi, extension,
-		admission: "Captured find plus available qualified grep through the production TUI route; no extra dependency/download. Not native-default equivalence, macOS or ThinkThread Runtime qualification." }, null, 2));
+		admission: "Captured find plus available qualified grep through the production TUI route; no extra dependency/download. Not native-default equivalence, macOS or external runtime qualification." }, null, 2));
 } finally { await worker.dispose(); }
 
 async function prepareWorker(qualification = false) {

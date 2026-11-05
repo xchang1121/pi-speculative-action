@@ -232,11 +232,6 @@ export function buildActionKey(input: Pick<ActionKey, "tool" | "resources" | "in
 	});
 }
 
-/** Build K(a) from the default Pi action semantics registry. */
-export function buildPiActionKey(tool: string, input: unknown, cwd: string, schemaHash = ""): ActionKey | undefined {
-	return PI_ACTION_SEMANTICS.buildKey(tool, input, cwd, schemaHash);
-}
-
 export function actionKeyMatches(speculative: ActionKey, actor: ActionKey, projectors: readonly ActionKeyProjector[] = []): boolean {
 	return actionKeyMatch(speculative, actor, projectors) !== undefined;
 }

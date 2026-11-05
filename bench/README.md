@@ -11,7 +11,7 @@ npm run bench:exec-boundary -- --reporter=json --outputFile=/tmp/exec-boundary.j
 npm run bench:overlay-probe
 ```
 
-前两项使用当前完整构建、合格的本地 Pi rg 和共享 Host 流程，验证原版 find、显式 captured grep 的输出、编码、排序、链接、输入变化、增量重算、取消及回收；grep 支持 `--case=<名称>`。这些结果不外推到 Native Pi 搜索、其他架构或 ThinkThread。
+前两项使用当前完整构建、合格的本地 Pi rg 和共享 Host 流程，验证原版 find、显式 captured grep 的输出、编码、排序、链接、输入变化、增量重算、取消及回收；grep 支持 `--case=<名称>`。这些结果不外推到 Native Pi 搜索、其他架构或外部运行时。
 
 Linux 进程资格在原生文件系统的 checkout 运行。Windows 可用 `wsl.exe -e bash -lc 'bash "$(wslpath "<checkout>")/scripts/wsl-verify.sh" [vitest 参数]'` 同步当前代码、构建助手并执行测试；`PI_SPEC_WSL_WORK/CHECKOUT/HOME` 调整隔离目录。已验证的 binary 可通过 `PI_SPEC_SANDLOCK`、`PI_SPEC_HELD_EXEC`、`PI_SPEC_STRACE` 指定，观察器资格见[使用说明](../README.md#使用)。
 

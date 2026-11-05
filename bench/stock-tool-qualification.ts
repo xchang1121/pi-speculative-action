@@ -11,9 +11,6 @@ import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
 import { slash } from "../src/path-utils.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { stableValueHash } from "../src/stable-value-hash.ts";
-import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
-import { decodeThinkThreadToolRunnerResponse, encodeThinkThreadToolRunnerResponse,
-	type ThinkThreadToolName } from "../src/thinkthread/tool-runner-protocol.ts";
 import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 import { toolErrorSettlement, type ToolSettlement } from "../src/tool-settlement.ts";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
@@ -27,9 +24,9 @@ export const STOCK_TOOL_CASES = [
 	["edit", { path: "notes.txt", edits: [{ oldText: "beta", newText: "gamma" }] }],
 ] as const;
 
-/** Compare the local wire runner and applicable fallback at the same cwd/path. */
+/** Compare the applicable fallback with stock Pi at the same cwd/path. */
 export async function qualifyStockTool(
-	name: ThinkThreadToolName,
+	name: (typeof STOCK_TOOL_CASES)[number][0],
 	input: (typeof STOCK_TOOL_CASES)[number][1],
 ) {
 	const fixtureParent = path.resolve(os.tmpdir());
@@ -75,7 +72,7 @@ export async function qualifyStockTool(
 		await reset();
 		const initial = await workspaceState(root);
 		const actorOutput = await actor();
-		const baseline = wire(actorOutput);
+		const baseline = observable(actorOutput);
 		assert.equal(baseline.isError, false, `${name}: Actor baseline failed`);
 		const expected = await workspaceState(root);
 		const executeRoute = async () => {
@@ -96,17 +93,10 @@ export async function qualifyStockTool(
 					output = await branch.commit();
 				} finally { await branch.dispose(); }
 			}
-			assert.deepEqual(wire(output), baseline, `${name}: output differs`);
+			assert.deepEqual(observable(output), baseline, `${name}: output differs`);
 			assert.deepEqual(await workspaceState(root), expected, `${name}: adopted file effects differ`);
 		};
 		await executeRoute();
-		await reset();
-		const output = wire(await runThinkThreadTool({
-			tool: name, args, callID: context.callID, autoResizeImages: true, modelSupportsImages: true,
-		}, cwd));
-		assert.deepEqual(output, baseline, `${name}: local wire runner output differs`);
-		assert.deepEqual(await workspaceState(root), expected, `${name}: local wire runner effects differ`);
-		return { evidence: "Local wire runner only" };
 	} catch (error) {
 		poisoned = isPoisonedEffectCommit(error);
 		if (poisoned) console.error(`Indeterminate adoption: retain fixture without further writes at ${root}`);
@@ -117,10 +107,9 @@ export async function qualifyStockTool(
 	}
 }
 
-function wire(output: ToolSettlement): ToolSettlement {
-	const decoded = decodeThinkThreadToolRunnerResponse(Buffer.from(encodeThinkThreadToolRunnerResponse(output)));
-	// Stock Pi may omit details; the extension's in-memory Symbol leaves {} after wire encoding.
-	return { ...decoded, result: { ...decoded.result, details: decoded.result.details ?? {} } };
+function observable(output: ToolSettlement): ToolSettlement {
+	// Compare public results without the extension's in-memory Symbol bookkeeping.
+	return JSON.parse(JSON.stringify({ ...output, result: { ...output.result, details: output.result.details ?? {} } }));
 }
 
 async function workspaceState(root: string, relative = ""): Promise<unknown[]> {

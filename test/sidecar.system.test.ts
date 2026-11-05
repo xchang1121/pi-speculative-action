@@ -1,19 +1,20 @@
 import { createServer } from "node:http";
 import { afterEach, expect, test, vi } from "vitest";
 import { createActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
-import { SelfSpeculationCoordinator, SELF_SPECULATION_DEFAULTS } from "../src/self-speculation.ts";
+import { SelfSpeculationCoordinator, normalizeSelfSpeculationSettings } from "../src/self-speculation.ts";
 import { testModel } from "./model.ts";
 
 afterEach(() => vi.unstubAllEnvs());
 
 test.each(["valid", "low confidence", "HTTP failure"])("runs a sidecar fork over HTTP and drains the request (%s)", async mode => {
+	const defaults = normalizeSelfSpeculationSettings({});
 	const requests: { path: string; auth: string | undefined; body: Record<string, unknown> }[] = [];
 	const server = createServer(async (request, response) => {
 		const parts: Buffer[] = []; for await (const part of request) parts.push(Buffer.from(part));
 		const bytes = Buffer.concat(parts).toString();
 		requests.push({ path: request.url!, auth: request.headers.authorization, body: bytes ? JSON.parse(bytes) : {} });
 		response.setHeader("content-type", "application/json");
-		const fork = request.url === SELF_SPECULATION_DEFAULTS.forkPath;
+		const fork = request.url === defaults.forkPath;
 		if (fork && mode === "HTTP failure") { response.writeHead(503); response.end('{}'); return; }
 		response.end(JSON.stringify(fork ? { details: { bundle: { candidates: [{
 			sources: ["self-speculation"],
@@ -25,7 +26,7 @@ test.each(["valid", "low confidence", "HTTP failure"])("runs a sidecar fork over
 	const address = server.address(); if (!address || typeof address === "string") throw new Error("missing HTTP address");
 	vi.stubEnv("PI_TEST_SIDECAR_TOKEN", "test-only-token");
 	const source = createActorForkPlanSource({ maxAttempts: 1 });
-	const settings = { ...SELF_SPECULATION_DEFAULTS, enabled: true, forkTransport: "sidecar" as const, forkMaxAttempts: 1,
+	const settings = { ...defaults, enabled: true, forkTransport: "sidecar" as const, forkMaxAttempts: 1,
 		endpoint: `http://127.0.0.1:${address.port}`, apiKeyEnv: "PI_TEST_SIDECAR_TOKEN" };
 	const coordinator = new SelfSpeculationCoordinator({ settings: () => settings, actorForkPlanSource: source, requestID: () => "actor-request" });
 	try {

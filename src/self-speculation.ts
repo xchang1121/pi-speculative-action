@@ -59,8 +59,6 @@ const { defaults: selfSpeculationDefaults, parse: parseSettings } = settingsPars
 	requireLogprobs: [false, booleanOr],
 });
 
-export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze(selfSpeculationDefaults);
-
 export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculationSettings {
 	const input = isRecord(value) ? value : {};
 	const result = parseSettings(input);

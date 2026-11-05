@@ -13,7 +13,6 @@ import { createSpeculativeActionHost, normalizeSpeculativeAgentSettings, type Ac
 import { DrafterTaskBudget } from "./drafter-budget.ts";
 import { toolSpeedup } from "./task-timing.ts";
 import { forceToolChoice } from "./drafter-plan-source.ts";
-import { DEFAULTS } from "./common.ts";
 import { PATTERN_AWARE_PRESETS, patternAwarePersistenceFile, type PatternAwareSettings } from "./pattern-aware.ts";
 import { createClosedSearchProfile, createPiToolDefinitions, PI_CLOSED_SEARCH_TOOLS, resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import { checkLinuxEnvironment, installLinuxDependencies } from "./linux-setup.ts";
@@ -27,7 +26,7 @@ import { DEFAULT_PROVENANCE_STORE_LIMITS, ProvenanceCertificateStore } from "./r
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { millisecondsInput, nonEmptyTextInput, nonNegativeIntegerInput, nonNegativeNumberInput, optionalTextInput,
-	positiveIntegerInput, positiveInteger, positiveMilliseconds, probabilityInput, settingInput, type SettingInputDescriptor } from "./setting-input.ts";
+	positiveIntegerInput, positiveInteger, probabilityInput, settingInput, type SettingInputDescriptor } from "./setting-input.ts";
 import { errorMessage } from "./error-utils.ts";
 import { asRecord } from "./stable-json.ts";
 import { httpEndpoint, httpPath, SelfSpeculationCoordinator, type SelfSpeculationCoordinatorSnapshot, type SelfSpeculationSettings } from "./self-speculation.ts";
@@ -57,7 +56,6 @@ const ROOT_SETTING_INPUTS = {
 	executionStoreMaxEntries: positiveIntegerInput("Reusable command history entries"),
 	executionStoreMaxBytes: mebibyteInput("Reusable command history memory"),
 	predictionTimeoutMs: millisecondsInput("Prediction wait limit (ms)"),
-	thinkThreadTimeoutMs: millisecondsInput("ThinkThread execution timeout (ms)"),
 	drafterMaxTokens: positiveIntegerInput("Maximum Drafter output tokens"),
 	drafterTaskMaxRequests: positiveIntegerInput("Maximum Drafter requests per task"),
 	drafterTaskMaxTokens: positiveIntegerInput("Maximum Drafter input/output tokens per task"),
@@ -164,7 +162,6 @@ export function normalizeSpeculativeActionSettings(
 	return {
 		...normalizeSpeculativeAgentSettings(input),
 		searchExecution: input?.searchExecution === "captured" ? "captured" : "native",
-		thinkThreadTimeoutMs: positiveMilliseconds(input?.thinkThreadTimeoutMs, DEFAULTS.thinkThreadTimeoutMs),
 		...(typeof input?.draftModel === "string" && input.draftModel.trim() ? { draftModel: input.draftModel.trim() } : {}),
 		executionStoreMaxEntries: positiveInteger(input?.executionStoreMaxEntries, DEFAULT_PROVENANCE_STORE_LIMITS.maxCertificates),
 		executionStoreMaxBytes: positiveInteger(input?.executionStoreMaxBytes, DEFAULT_PROVENANCE_STORE_LIMITS.maxBytes),
@@ -872,7 +869,6 @@ function openSchedulingAndCache(ctx: ExtensionContext, controller: SpeculativeAc
 			["Scheduler policy › sampling, failure recovery", () => openSchedulingPolicy(ctx, controller)],
 			["Resource estimates › process/tree and file snapshots", () => openSchedulingPolicy(ctx, controller, true)],
 			input("predictionTimeoutMs", "Prediction wait limit", formatDuration),
-			input("thinkThreadTimeoutMs", "ThinkThread execution timeout", formatDuration),
 			input("resourceCacheMaxEntries"),
 			input("resourceCacheMaxBytes", "Live result memory", formatBytes),
 			input("executionStoreMaxEntries"),

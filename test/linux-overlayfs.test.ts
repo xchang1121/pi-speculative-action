@@ -5,13 +5,15 @@ import { chmod, link, mkdir, mkdtemp, open, rename, rm, writeFile } from "node:f
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { linuxOverlayfsCapability, mountLinuxOverlayfs } from "../src/linux-overlayfs.ts";
+import { LinuxOverlayfsCapabilityRegistry, mountLinuxOverlayfs } from "../src/linux-overlayfs.ts";
 
 const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 
 describe("Linux OverlayFS workspace substrate", () => {
 	it.for(["normal", "recovered"])("proves copy-on-write isolation and namespace visibility through %s unmount", async (mode, { skip }) => {
-		const capability = await linuxOverlayfsCapability();
+		const capabilityRegistry = new LinuxOverlayfsCapabilityRegistry();
+		await using _registry = onExit(async () => capabilityRegistry.dispose());
+		const capability = await capabilityRegistry.capability();
 		if (!capability.available) return skip(capability.detail);
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-overlayfs-test-"));
 		const lowerRoot = path.join(root, "lower");
@@ -32,10 +34,10 @@ describe("Linux OverlayFS workspace substrate", () => {
 				"utf8",
 			);
 			await chmod(wrapper, 0o755);
-			const probed = await linuxOverlayfsCapability(options);
+			const probed = await capabilityRegistry.capability(options);
 			expect(probed.available).toBe(true);
 		}
-		const mounted = await mountLinuxOverlayfs({ lowerRoot, privateRoot, options });
+		const mounted = await mountLinuxOverlayfs({ lowerRoot, privateRoot, options, capabilityRegistry });
 		await using _mounted = onExit(async () => { await mounted.close(); await rm(root, { recursive: true, force: true }); });
 		const held = await open(path.join(mounted.root, "value.txt"));
 		try {
@@ -58,7 +60,7 @@ describe("Linux OverlayFS workspace substrate", () => {
 		} finally { await held.close(); }
 		await mounted.close();
 		if (mode === "recovered") {
-			const demoted = await linuxOverlayfsCapability(options);
+			const demoted = await capabilityRegistry.capability(options);
 			expect(demoted.available).toBe(false);
 			expect(demoted.detail).toMatch(/unmount/i);
 			expect(await readText(lowerRoot, "value.txt")).toBe("lower\n");

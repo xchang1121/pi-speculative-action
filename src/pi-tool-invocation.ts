@@ -62,7 +62,6 @@ export function resolvePiToolInvocation(
 		const cwd = options.cwd;
 		const autoResizeImages = options.autoResizeImages ?? true;
 		const modelSupportsImages = options.modelSupportsImages ?? true;
-		// Shared with the ThinkThread runner's binding check.
 		const executor = "pi.filesystem.local";
 		const requested = tool === "read" ? asRecord(input)?.path : undefined;
 		const invocation: ToolInvocation = {
