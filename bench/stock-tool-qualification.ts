@@ -2,18 +2,16 @@ import assert from "node:assert/strict";
 import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { createEditToolDefinition, createFindToolDefinition, createGrepToolDefinition,
-	createLsToolDefinition, createReadToolDefinition, createWriteToolDefinition } from "@earendil-works/pi-coding-agent";
-import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import { createResourceSnapshotExecutionWorld, type SpeculativeToolExecutionContext } from "../src/agent-execution-world.ts";
+	createLsToolDefinition, createReadToolDefinition, createWriteToolDefinition, createAgentSession, DefaultResourceLoader,
+	ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { createSpeculativeActionHost } from "../src/agent-integration.ts";
+import { createSpeculativeActionExtension } from "../src/extension.ts";
 import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
 import { slash } from "../src/path-utils.ts";
-import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
-import { stableValueHash } from "../src/stable-value-hash.ts";
-import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
+import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { toolErrorSettlement, type ToolSettlement } from "../src/tool-settlement.ts";
-import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 
 export const STOCK_TOOL_CASES = [
 	["read", { path: "notes.txt" }],
@@ -24,86 +22,90 @@ export const STOCK_TOOL_CASES = [
 	["edit", { path: "notes.txt", edits: [{ oldText: "beta", newText: "gamma" }] }],
 ] as const;
 
-/** Compare the applicable fallback with stock Pi at the same cwd/path. */
+/** Compare the default extension route with stock Pi, including search adoption and speculative effects. */
 export async function qualifyStockTool(
 	name: (typeof STOCK_TOOL_CASES)[number][0],
 	input: (typeof STOCK_TOOL_CASES)[number][1],
+	searchExecution?: "native",
 ) {
 	const fixtureParent = path.resolve(os.tmpdir());
 	const root = await mkdtemp(path.join(fixtureParent, "pi-tool-qualification-"));
 	assert.equal(path.dirname(root), fixtureParent);
-	const cwd = root;
-	const args = { ...input, path: slash(path.join(path.relative(cwd, root), input.path)) };
-	const invocation = resolvePiToolInvocation(name, args, { cwd, environment: {} });
-	const action = PI_ACTION_SEMANTICS.buildKey(name, args, cwd, "", invocation
-		? { fingerprint: stableValueHash(invocation.identity), context: invocation } : undefined);
-	assert.ok(action);
-	const semantics = PI_ACTION_SEMANTICS.definition(name)!;
+	const cwd = path.join(root, "workspace"), agentDir = path.join(root, "agent");
+	await mkdir(agentDir);
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = agentDir;
+	const args = { ...input };
 	const tools = [
 		createReadToolDefinition(cwd), createGrepToolDefinition(cwd), createFindToolDefinition(cwd),
 		createLsToolDefinition(cwd), createWriteToolDefinition(cwd), createEditToolDefinition(cwd),
 	];
 	const definition = tools.find((tool) => tool.name === name)!;
-	const tool: AgentTool = {
-		...definition,
-		execute: (callID, value, signal, onUpdate) =>
-			definition.execute(callID, value as never, signal, onUpdate as never, undefined as never),
-	};
-	const context = { cwd, tool, toolName: name, args, action, callID: `qualify-${name}`, signal: new AbortController().signal,
-		executionScope: { sessionID: root, turnID: name } };
-	const operation = { tool: name, input: args, action, callID: context.callID };
-	const workspaceSandbox = new WorkspaceSandboxService(), fallback = workspaceSandbox.createExecutionWorld({ driver: "git" });
-	const resources = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 1024 * 1024 });
-	const gateway = new ToolExecutionGateway<SpeculativeToolExecutionContext, ToolSettlement>([fallback, resources]);
 	const actor = async (): Promise<ToolSettlement> => {
 		try {
-			return { result: await tool.execute(context.callID, args), isError: false };
+			return { result: await definition.execute("oracle", args as never, undefined, undefined, undefined as never), isError: false };
 		} catch (error) { return toolErrorSettlement(error); }
 	};
 	const reset = async () => {
 		// Only this mkdtemp-owned fixture is reset, never the caller's cwd.
-		await rm(root, { recursive: true, force: true });
-		await mkdir(path.join(root, "nested"), { recursive: true });
-		await writeFile(path.join(root, "notes.txt"), "alpha\nbeta\n");
-		await writeFile(path.join(root, "nested", "todo.txt"), "beta\n");
+		assert.equal(path.dirname(cwd), root); await rm(cwd, { recursive: true, force: true });
+		await mkdir(path.join(cwd, "nested"), { recursive: true });
+		await writeFile(path.join(cwd, "notes.txt"), "alpha\nbeta\n");
+		await writeFile(path.join(cwd, "nested", "todo.txt"), "beta\n");
 	};
-	let poisoned = false;
+	let poisoned = false, session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
 	try {
 		await reset();
-		const initial = await workspaceState(root);
+		const initial = await workspaceState(cwd);
 		const actorOutput = await actor();
 		const baseline = observable(actorOutput);
 		assert.equal(baseline.isError, false, `${name}: Actor baseline failed`);
-		const expected = await workspaceState(root);
-		const executeRoute = async () => {
-			await reset();
-			const route = await gateway.resolve({ ...operation, effect: semantics.effect, requirements: semantics.requirements }, { cwd });
-			assert.equal(route?.backend, semantics.effect === "workspace_mutation" ? fallback.id : invocation?.filesystem ? resources.id : undefined,
-				`${name}: native route differs from its stock fallback`);
-			let output: ToolSettlement;
-			if (!route) {
-				output = await actor();
-			} else {
-				const branch = await gateway.executeSpeculative(operation, route, {
-					...context, action: { ...action, executionFingerprint: route.fingerprint },
-				});
-				try {
-					assert.deepEqual(await workspaceState(root), initial, `${name}: speculative effects leaked before adoption`);
-					assert.equal((await branch.validate()).status, "valid", `${name}: fresh candidate rejected`);
-					output = await branch.commit();
-				} finally { await branch.dispose(); }
-			}
-			assert.deepEqual(observable(output), baseline, `${name}: output differs`);
-			assert.deepEqual(await workspaceState(root), expected, `${name}: adopted file effects differ`);
-		};
-		await executeRoute();
+		const expected = await workspaceState(cwd); await reset();
+		await writeFile(path.join(agentDir, "speculative-action.json"), JSON.stringify({ enabled: true, drafterEnabled: false,
+			prepareObservedOperations: false, patternAware: { enabled: false }, searchExecution }));
+		const events: SpeculativeActionEvent<string>[] = [];
+		let host!: ReturnType<typeof createSpeculativeActionHost>, turn!: Parameters<typeof host.startTurn>[0];
+		const extension = createSpeculativeActionExtension({ createHost: (id, options) => {
+			host = createSpeculativeActionHost(id, { ...options, resources: { initial: { cpuCount: 2, idleCpuCount: 2 }, sample: () => new Promise(() => {}) },
+				onEvent: event => { events.push(event); return options.onEvent?.(event); } });
+			return { ...host, startTurn: (input, signal) => { turn = input; return host.startTurn(input, signal); } };
+		} });
+		const settingsManager = SettingsManager.inMemory({}, { projectTrusted: true });
+		const resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noExtensions: true, extensionFactories: [extension] });
+		await resourceLoader.reload();
+		const provider = fauxProvider({ provider: "stock-qualification", models: [{ id: "actor" }], tokensPerSecond: 4000 });
+		const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, refreshOnCreate: false });
+		modelRuntime.registerNativeProvider(provider.provider);
+		({ session } = await createAgentSession({ cwd, agentDir, model: provider.getModel(), modelRuntime, settingsManager, resourceLoader,
+			sessionManager: SessionManager.inMemory(cwd), tools: [name] }));
+		await session.bindExtensions({ mode: "print", onError: error => { throw error; } });
+		let failure: unknown;
+		provider.setResponses([async () => {
+			try {
+				await host.previewActorCall({ turnID: turn.turnID, tool: name, args, id: "stock", tools: turn.tools });
+				const deadline = performance.now() + 10000;
+				while (!searchExecution && !events.some(event => event.type === "candidate" && event.state.status === "succeeded")) {
+					assert.ok(performance.now() < deadline, JSON.stringify(events)); await new Promise(resolve => setTimeout(resolve, 10));
+				}
+				assert.deepEqual(await workspaceState(cwd), initial, `${name}: speculative effects leaked before adoption`);
+			} catch (error) { failure = error; throw error; }
+			return fauxAssistantMessage(fauxToolCall(name, args, { id: "stock" }), { stopReason: "toolUse" });
+		}, fauxAssistantMessage("done")]);
+		await session.prompt(`Run ${name}.`); if (failure) throw failure;
+		const result = session.messages.find(message => message.role === "toolResult")!;
+		assert.ok(result, JSON.stringify(session.messages));
+		assert.deepEqual(observable({ result: { content: result.content, details: result.details }, isError: result.isError }), baseline, `${name}: output differs`);
+		assert.deepEqual(await workspaceState(cwd), expected, `${name}: adopted file effects differ`);
+		assert.equal(events.some(event => event.type === "actor_action" && (event.computation?.hiddenComputeMs ?? 0) > 0), !searchExecution, `${name}: adoption differs`);
 	} catch (error) {
 		poisoned = isPoisonedEffectCommit(error);
 		if (poisoned) console.error(`Indeterminate adoption: retain fixture without further writes at ${root}`);
 		throw error;
 	} finally {
-		try { try { await gateway.dispose(); } finally { await workspaceSandbox.dispose(); } }
-		finally { if (!poisoned) await rm(root, { recursive: true, force: true }); }
+		try { if (session) { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); } }
+		finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			if (!poisoned) await rm(root, { recursive: true, force: true });
+		}
 	}
 }
 

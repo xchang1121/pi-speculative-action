@@ -5,40 +5,22 @@ import { UNRESTRICTED_PROCESS_EFFECTS } from "./effect-model.ts";
 import { LinuxProcessReuseBackend, type LinuxProcessSession, type LinuxProcessBackendOptions } from "./linux-process-backend.ts";
 import { ProcessExecutionCoordinator } from "./process-execution.ts";
 import type { ProcessExecutionBinding } from "./process-handoff.ts";
-import type { ExecutionOperationBinding } from "./execution-world.ts";
+import { registerExecutionWorld, type ExecutionOperationBinding } from "./execution-world.ts";
 import { toolErrorSettlement, type ToolInvocation } from "./tool-settlement.ts";
 import { WorkspaceSandboxService, type WorkspaceSandboxOptions } from "./workspace-sandbox.ts";
 import { isRecord } from "./stable-json.ts";
 
-const hostWorlds = new WeakMap<object, boolean>();
-export const isCompletedProcessExecutionWorld = (world: object) => hostWorlds.get(world) === true;
-export const isRestorableProcessExecutionWorld = (world: object) => hostWorlds.get(world) === false;
 type HostProcessWorldOptions = Pick<LinuxProcessExecutionWorldOptions,
 	"coordinator" | "tools" | "storeRoot" | "store" | "sandlockBinary" | "straceBinary" | "heldExecBinary" | "deniedPaths">;
 
 /** Public Host route for finished, validated branches; it cannot observe or restore Actor processes. */
 export function createCompletedProcessExecutionWorld(options: HostProcessWorldOptions): SpeculativeAgentExecutionWorld {
-	return createHostProcessWorld(options, true);
+	return createLinuxProcessExecutionWorld({ ...options, driver: "git", completedOnly: true });
 }
 
 /** Native operations are admitted only through owned bindings and revalidated effects, inputs and handles. */
 export function createRestorableProcessExecutionWorld(options: HostProcessWorldOptions) {
-	return createHostProcessWorld(options, false);
-}
-
-function createHostProcessWorld(options: HostProcessWorldOptions, completedOnly: boolean) {
-	const { coordinator, tools, storeRoot, store, sandlockBinary, straceBinary, heldExecBinary, deniedPaths } = options;
-	const configuration = { storeRoot, store,
-		...(sandlockBinary ? { sandlockBinary } : {}), ...(straceBinary ? { straceBinary } : {}), ...(heldExecBinary ? { heldExecBinary } : {}),
-		deniedPaths: deniedPaths && Object.freeze([...deniedPaths]), completedOnly };
-	const backend = new LinuxProcessReuseBackend(configuration);
-	const implementation = createLinuxProcessExecutionWorld({ ...configuration, coordinator, backend, tools: Object.freeze([...tools]), driver: "git" });
-	const world = Object.freeze({ ...implementation, id: completedOnly ? "linux_completed_process" : implementation.id,
-		observeOperations: completedOnly ? undefined : implementation.observeOperations,
-		nativeDiagnostics: (enabled?: boolean) => backend.nativeDiagnostics(enabled),
-		speculation: Object.freeze({ ...implementation.speculation, tools: completedOnly ? Object.freeze([...tools]) : undefined }) });
-	hostWorlds.set(world, completedOnly);
-	return world;
+	return createLinuxProcessExecutionWorld({ ...options, driver: "git", completedOnly: false });
 }
 
 export interface LinuxProcessExecutionWorldOptions extends LinuxProcessBackendOptions, WorkspaceSandboxOptions {
@@ -53,7 +35,9 @@ export interface LinuxProcessExecutionWorldOptions extends LinuxProcessBackendOp
 /** Generic process world; eligibility follows action semantics and a structured process invocation. */
 export function createLinuxProcessExecutionWorld(
 	options: LinuxProcessExecutionWorldOptions,
-): SpeculativeAgentExecutionWorld {
+) {
+	options = Object.freeze({ ...options, tools: Object.freeze([...options.tools]),
+		deniedPaths: options.deniedPaths && Object.freeze([...options.deniedPaths]) });
 	const { coordinator, backend: suppliedBackend, workspaceSandbox: suppliedWorkspace, ...configuration } = options;
 	const backend = suppliedBackend ?? new LinuxProcessReuseBackend(configuration);
 	const workspaceSandbox = suppliedWorkspace ?? new WorkspaceSandboxService();
@@ -88,16 +72,18 @@ export function createLinuxProcessExecutionWorld(
 		qualifiedDrivers.set(root, selected);
 		return selected;
 	};
-	return {
-		id: "linux_process_reuse",
+	return registerExecutionWorld({
+		id: options.completedOnly ? "linux_completed_process" : "linux_process_reuse",
 		scope: "runtime",
 		isolation: "runtime_sandbox",
 		storage: backend.storage,
-		observeOperations: ({ action, scope, learn, inputs, cwd, signal, enabled, reuseEnabled }, execute, observe) => backend.observeBindings(scope,
+		nativeDiagnostics: (enabled?: boolean) => backend.nativeDiagnostics(enabled),
+		observeOperations: options.completedOnly ? undefined : ({ action, scope, learn, inputs, cwd, signal, enabled, reuseEnabled }, execute, observe) => backend.observeBindings(scope,
 			() => enabled && cwd ? backend.observeNative(cwd, scope, signal, execute) : execute(), (bindings, computations) => {
 			observe(action ? bindings.map(binding => describeOperation(binding, action)) : [], computations);
 		}, learn, inputs, reuseEnabled),
 		speculation: {
+			tools: options.completedOnly ? options.tools : undefined,
 			capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
 			acceptsCheckpoint: (checkpoint, cwd) => workspaceSandbox.acceptsCheckpoint(checkpoint, cwd),
 			fingerprint: async (request) => {
@@ -190,7 +176,15 @@ export function createLinuxProcessExecutionWorld(
 				if (ownsWorkspaceSandbox) await workspaceSandbox.dispose();
 			}
 		},
-	};
+	} satisfies SpeculativeAgentExecutionWorld & { nativeDiagnostics: (enabled?: boolean) => ReturnType<LinuxProcessReuseBackend["nativeDiagnostics"]> }, {
+		operations: options.completedOnly ? ["speculation"] : ["speculation", "observeOperations"],
+		verify: async ({ cwd, refresh }) => {
+			backendChecked = true;
+			const status = await backend.check(refresh, cwd);
+			if (status.state !== "ready") throw new Error(status.detail);
+			return { fingerprint: status.fingerprint!, externalEffects: "excluded" };
+		},
+	});
 }
 
 function processInvocation(value: unknown): ToolInvocation["process"] | undefined {

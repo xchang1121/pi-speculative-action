@@ -161,7 +161,7 @@ export function normalizeSpeculativeActionSettings(
 ) {
 	return {
 		...normalizeSpeculativeAgentSettings(input),
-		searchExecution: input?.searchExecution === "captured" ? "captured" : "native",
+		searchExecution: input?.searchExecution === "native" ? "native" : "captured",
 		...(typeof input?.draftModel === "string" && input.draftModel.trim() ? { draftModel: input.draftModel.trim() } : {}),
 		executionStoreMaxEntries: positiveInteger(input?.executionStoreMaxEntries, DEFAULT_PROVENANCE_STORE_LIMITS.maxCertificates),
 		executionStoreMaxBytes: positiveInteger(input?.executionStoreMaxBytes, DEFAULT_PROVENANCE_STORE_LIMITS.maxBytes),
@@ -363,20 +363,21 @@ async function installController(
 	const processCoordinator = new ProcessExecutionCoordinator({ execute: request => LinuxHeldExecBoundary.command(() => rawProcessExecutor.execute(request)) });
 	const processWorld = createRestorableProcessExecutionWorld({ coordinator: processCoordinator, tools: ["bash"], storeRoot, store: { reservedRoot: true } });
 	const workspaceSandbox = dependencies.createWorkspaceSandboxService?.() ?? new WorkspaceSandboxService();
+	const resourceWorld = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => currentSettings.resourceCacheMaxBytes,
+		persistentInputs: { store: inputStore, internalCache: true } });
 	const executionWorlds = [
 		...new Set([
 			...primaryExecutionWorlds,
 			processWorld,
 			workspaceSandbox.createExecutionWorld(),
-			{ ...createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => currentSettings.resourceCacheMaxBytes,
-				persistentInputs: { store: inputStore, internalCache: true } }),
+			{ ...resourceWorld,
 				storage: {
 					configure: ({ maxEntries, maxBytes }: { maxEntries: number; maxBytes: number }) => inputStore.configure({ maxCertificates: maxEntries, maxBytes }),
 					maintain: async (operation: "gc" | "clear") => {
 						const result = await (operation === "gc" ? inputStore.gc() : inputStore.clear());
 						return { removedEntries: result.removedCertificates + result.removedInputVersions, removedArtifacts: result.removedArtifacts, removedBytes: result.removedBytes };
 					},
-				}, dispose: () => inputStore.dispose() },
+				}, dispose: async () => { try { await resourceWorld.dispose?.(); } finally { await inputStore.dispose(); } } },
 		]),
 	];
 	const primaryExecutionWorldIDs = new Set(primaryExecutionWorlds.map((world) => world.id));

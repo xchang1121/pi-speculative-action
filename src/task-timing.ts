@@ -44,6 +44,12 @@ const collecting = new AsyncLocalStorage<{ inputs?: Map<TimelineInterval, Receip
 const calculating = new AsyncLocalStorage<CalculationClock | undefined>();
 const identityNamespace = randomUUID();
 let nextIdentity = 0;
+function computationCollection(producer = collecting.getStore()?.producer) {
+	const scope = { inputs: new Map<TimelineInterval, Receipt>() as Map<TimelineInterval, Receipt> | undefined, producer: producer && Object.freeze({ ...producer }) };
+	return { scope, complete: <Value>(output: Value) => ({ output,
+		dependencies: Object.freeze([...scope.inputs!].map(([computation, receipt]) => ({ computation, ...receipt, shared: [computation] }))) }),
+		close: () => { scope.inputs = undefined; } };
+}
 
 export type ComputationProducer = NonNullable<SerializedTimelineNode["producer"]>;
 export interface ModeComputationTiming { readonly source: string; readonly mode: string; readonly hiddenComputeMs: number; }
@@ -85,11 +91,17 @@ export class TimelineInterval {
 
 	/** Record provenance before publication; failed evaluations never transfer borrowed work to the caller. */
 	static async collect<T>(execute: () => T | Promise<T>, producer = collecting.getStore()?.producer) {
-		const scope = { inputs: new Map<TimelineInterval, Receipt>() as Map<TimelineInterval, Receipt> | undefined, producer: producer && Object.freeze({ ...producer }) };
+		const collection = computationCollection(producer);
+		try { return collection.complete(await collecting.run(collection.scope, execute)); } finally { collection.close(); }
+	}
+
+	/** Synchronous language operations use the same producer graph and active calculation clock. */
+	static measureSync<T>(execute: () => T) {
+		const collection = computationCollection(), startedAt = performance.now(), clock = new CalculationClock(startedAt, calculating.getStore());
 		try {
-			const output = await collecting.run(scope, execute);
-			return { output, dependencies: Object.freeze([...scope.inputs!].map(([computation, receipt]) => ({ computation, ...receipt, shared: [computation] }))) };
-		} finally { scope.inputs = undefined; }
+			const evaluation = collection.complete(calculating.run(clock, () => collecting.run(collection.scope, execute)));
+			return { ...evaluation, computation: new TimelineInterval(startedAt, clock.finish(), evaluation.dependencies, clock.spans, collection.scope.producer) };
+		} finally { clock.finish(); collection.close(); }
 	}
 
 	static use(computation: TimelineInterval | undefined): void {
@@ -141,6 +153,12 @@ export class TimelineInterval {
 		for (let current: CalculationClock | undefined = clock; current; current = current.parent) current.pause();
 		try { return await calculating.run(undefined, execute); }
 		finally { for (let current: CalculationClock | undefined = clock; current; current = current.parent) current.resume(); }
+	}
+	static outsideSync<T>(execute: () => T): T {
+		const clock = calculating.getStore();
+		for (let current = clock; current; current = current.parent) current.pause();
+		try { return calculating.run(undefined, execute); }
+		finally { for (let current = clock; current; current = current.parent) current.resume(); }
 	}
 
 	/** Freeze the active calculation up to an observed native execution boundary. */

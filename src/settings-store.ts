@@ -13,7 +13,7 @@ export interface SpeculativeActionPackageSettings extends SpeculativeAgentSettin
 	readonly executionStoreMaxEntries?: number;
 	readonly executionStoreMaxBytes?: number;
 	readonly executionRouting?: ExecutionRoutingSettings;
-	/** Explicit Actor and speculative search semantics; native Pi remains the default. */
+	/** Captured searches share a qualified Actor/producer contract by default; native opts out. */
 	readonly searchExecution?: "native" | "captured";
 }
 

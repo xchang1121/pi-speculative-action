@@ -2,6 +2,7 @@ import { isSafeCount } from "./number-utils.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hash } from "node:crypto";
 import { types } from "node:util";
+import { serialize } from "node:v8";
 import { type BigIntStats, type FSWatcher, watch, closeSync, constants, fstatSync, readlinkSync } from "node:fs";
 import { ensureNativeFilesystem, nativeFilesystem } from "./process-startup.mjs";
 import path from "node:path";
@@ -159,7 +160,7 @@ export function createSerializablePreparationBinding(implementation: unknown, ac
 }
 
 /** Own a bounded, lossless JSON tree without invoking getters or flattening opaque resources. */
-function snapshotPreparation(value: unknown): { readonly value: unknown; readonly data: Buffer } | undefined {
+function snapshotPreparation(value: unknown, references?: { readonly collect?: WeakSet<object>; readonly exclude?: WeakSet<object> }): { readonly value: unknown; readonly data: Buffer } | undefined {
 	let remaining = MAX_PREPARATION_DATA_BYTES, nodes = 0;
 	const seen = new WeakSet<object>(), budget = Symbol(), invalid = () => { throw new Error("resource_preparation_data_invalid"); };
 	const charge = (value: string) => { if (value.length > remaining || (remaining -= Buffer.byteLength(value)) < 0) throw budget; };
@@ -167,8 +168,10 @@ function snapshotPreparation(value: unknown): { readonly value: unknown; readonl
 		if (++nodes > 65536 || depth > 64) throw budget;
 		if (item === null || typeof item === "boolean" || typeof item === "number" && Number.isFinite(item) && !Object.is(item, -0)) { charge(JSON.stringify(item)); return item; }
 		if (typeof item === "string") { if (item.length > remaining) throw budget; charge(JSON.stringify(item)); return item; }
-		if (!item || typeof item !== "object" || types.isProxy(item) || seen.has(item)) return invalid();
+		if (!item || typeof item !== "object" || types.isProxy(item) || seen.has(item) || references?.exclude?.has(item)) return invalid();
+		references?.collect?.add(item);
 		const array = Array.isArray(item), keys = Reflect.ownKeys(item);
+		if (array && references?.collect && !Object.getOwnPropertyDescriptor(item, "length")!.writable) return invalid();
 		if (Object.getPrototypeOf(item) !== (array ? Array.prototype : Object.prototype) ||
 			array && (keys.length !== item.length + 1 || keys.some((key, index) => key !== (index === item.length ? "length" : String(index))))) return invalid();
 		seen.add(item); charge(array ? "[]" : "{}");
@@ -177,6 +180,7 @@ function snapshotPreparation(value: unknown): { readonly value: unknown; readonl
 			if (array && key === "length") continue;
 			const property = Object.getOwnPropertyDescriptor(item, key)!;
 			if (typeof key !== "string" || !property.enumerable || !("value" in property)) return invalid();
+			if (references?.collect && (!property.writable || !property.configurable)) return invalid();
 			if (key.length > remaining) throw budget;
 			charge(array ? "," : JSON.stringify(key) + ":,");
 			Object.defineProperty(owned, key, { value: copy(property.value, depth + 1), enumerable: true });
@@ -248,6 +252,7 @@ type PreparedResource = {
 	dependencies?: ReadonlySet<string>; readonly boundary?: { readonly root: string; readonly physicalRoot: string };
 	readonly origin: ResourceReadView; destination: ResourceReadView; ready?: Promise<void>; readonly declined: Promise<void>; readonly composed?: Promise<void>;
 	borrowers: number; revoked?: boolean; retained?: boolean; shareable?: boolean; proofs?: ResourceVersionToken[];
+	readonly synchronous?: true;
 };
 
 function preparationWaitsFor(resource: PreparedResource, target: PreparedResource): boolean {
@@ -470,6 +475,37 @@ export class ResourceReadView {
 		return true;
 	}
 	access = async (target: string): Promise<void> => { await this.readFile(target, 0); };
+	/** Compiler-proven synchronous work: all dependencies are argument/capture values, never ambient state.
+	 * It shares the existing preparation table, byte budget, input leases and retirement path. */
+	compute<Value>(binding: object, inputs: unknown, build: () => Value, sources: () => Iterable<ResourceReadView>): Value {
+		let owner: ResourceReadView = this; while (owner.owner) owner = owner.owner;
+		let key: string | undefined, reused: { readonly value: Value } | undefined;
+		const references = new WeakSet<object>();
+		try { TimelineInterval.outsideSync(() => {
+			if (!owner.retained) return;
+			const input = snapshotPreparation(inputs, { collect: references }); if (!input) return;
+			// V8's encoding preserves property order, unlike the persistent JSON canonicalization.
+			key = hash("sha256", serialize(input.value));
+			for (let source of [owner, ...sources()]) {
+				while (source.owner) source = source.owner;
+				const cached = source.prepared?.bindings.get(binding)?.get(key);
+				if (!source.retained || !cached?.synchronous || !cached.retained || cached.revoked) continue;
+				reused = { value: structuredClone(cached.value) as Value }; TimelineInterval.use(cached.computation); break;
+			}
+		}); } catch { key = undefined; }
+		if (reused) return reused.value;
+		if (!key) return build();
+		const evaluation = TimelineInterval.measureSync(build); TimelineInterval.own(evaluation.computation);
+		try { TimelineInterval.outsideSync(() => {
+			if (!owner.retained || owner.sealed) return;
+			const output = snapshotPreparation(evaluation.output, { exclude: references }); if (!output) return;
+			const bytes = preparationDataBytes(output.data.length) + preparationMetadataBytes(key!, undefined, []) + 32;
+			if (bytes > owner.remainingBytes || owner.prepared?.bindings.get(binding)?.has(key!)) return;
+			owner.capturedBytes += bytes;
+			owner.retainPreparation(binding, key!, output, bytes, { dependencies: new Set(), synchronous: true, computation: evaluation.computation });
+		}); } catch { /* Optional retention never changes a completed calculation. */ }
+		return evaluation.output;
+	}
 	/** Retain preparations only while capturing, so the sealed branch accounts for every owned byte. */
 	prepare: NonNullable<ToolFilesystemOperations["prepare"]> = (binding, key, build, consume, target, signal) => TimelineInterval.outside(() => {
 		signal?.throwIfAborted();
@@ -710,13 +746,7 @@ export class ResourceReadView {
 			const snapshot = snapshotPreparation(JSON.parse(data.toString("utf8")));
 			if (!snapshot || !snapshot.data.equals(data)) throw new Error("resource_preparation_data_invalid");
 			if (!this.reserve(0)) this.assertComplete();
-			const prepared = this.preparations();
-			let entries = prepared.bindings.get(binding); if (!entries) prepared.bindings.set(binding, entries = new Map());
-			const restored: PreparedResource = { resource, dependencies: new Set(dependencies), boundary: this.boundary,
-				origin: this, destination: this, borrowers: 0, retained: true, shareable: true, cancellation: new SharedAbortScope(), waiting: new Set(),
-				ready: Promise.resolve(), declined: Promise.resolve(), value: snapshot.value, data: snapshot.data,
-				dispose: () => { if (entries!.get(key) === restored) entries!.delete(key); this.capturedBytes -= bytes; restored.value = undefined; restored.data = undefined; } };
-			entries.set(key, prepared.lifetime.own(restored));
+			this.retainPreparation(binding, key, snapshot, bytes, { resource, dependencies: new Set(dependencies), boundary: this.boundary });
 		}
 	}
 	seal(): void { if (this.pending) this.failure ??= new Error("resource_snapshot_capture_pending"); this.assertComplete(); this.sealed = true; }
@@ -737,6 +767,15 @@ export class ResourceReadView {
 		if (entry.object) void this.preparations().lifetime.release(entry.object);
 	}
 	private preparations() { return this.prepared ??= { lifetime: new RuntimeLifecycleLane(), bindings: new Map() }; }
+	private retainPreparation(binding: object | Sha256Digest, key: string, snapshot: NonNullable<ReturnType<typeof snapshotPreparation>>, bytes: number,
+		metadata: Pick<PreparedResource, "resource" | "dependencies" | "boundary" | "synchronous" | "computation">) {
+		const prepared = this.preparations();
+		let entries = prepared.bindings.get(binding); if (!entries) prepared.bindings.set(binding, entries = new Map());
+		const retained: PreparedResource = { ...metadata, origin: this, destination: this, borrowers: 0, retained: true, shareable: true,
+			cancellation: new SharedAbortScope(), waiting: new Set(), ready: Promise.resolve(), declined: Promise.resolve(), ...snapshot,
+			dispose: () => { if (entries!.get(key) === retained) entries!.delete(key); this.capturedBytes -= bytes; retained.value = undefined; retained.data = undefined; } };
+		entries.set(key, prepared.lifetime.own(retained));
+	}
 	private async get(target: string, scope: ResourceDependency["scope"]): Promise<CapturedResource> {
 		this.assertComplete();
 		if (this.owner && this.boundary && !containsFilesystemPath(this.boundary.root, target)) this.unproven(target);

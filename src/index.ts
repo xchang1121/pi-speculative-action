@@ -18,4 +18,5 @@ export { WorkspaceSandboxService, type WorkspaceSandboxOptions } from "./workspa
 export { type PiToolInvocationOptions, resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 export { EXACT_TOOL_OBSERVATION, type ToolObservationContract, type ToolInvocation, type ToolProcessInvocation, type ToolSettlement } from "./tool-settlement.ts";
 export type { ToolFilesystemOperations } from "./resource-version.ts";
+export { registerExecutionWorld, type ExecutionWorldQualification, type ExecutionWorldEntry } from "./execution-world.ts";
 export type { AgentRuntime, AgentRuntimeEvents } from "./agent-runtime-types.ts";

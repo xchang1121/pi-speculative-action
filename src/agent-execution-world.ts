@@ -1,4 +1,3 @@
-import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { containsFilesystemPath, relativeFilesystemPath } from "./path-utils.ts";
@@ -15,6 +14,7 @@ import { captureResourceVersion, collectResourceComputation, invalidateResourceI
 import { cause } from "./settlement.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import { TimelineInterval } from "./task-timing.ts";
+import { resourceComputationCompiler, resourceOperationContext } from "./resource-computation.ts";
 
 /** Host tool call supplied to any OS sandbox or safe local substitute. */
 export type SpeculativeToolExecutionContext = Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0] & ExecutionResourceContext & {
@@ -60,6 +60,8 @@ export function createResourceSnapshotExecutionWorld(
 	operations: { readonly maxBytes: () => number; readonly persistentInputs?: ResourceInputPersistence } = { maxBytes: () => DEFAULTS.resourceCacheMaxBytes },
 ): AgentExecutionWorld {
 	const persistence = process.platform === "linux" ? operations.persistentInputs : undefined;
+	const computations = resourceComputationCompiler(), captures = new Map<string, ResourceReadView>();
+	const captureKey = (scope: ExecutionScope | undefined, call: string) => JSON.stringify([scope?.sessionID, scope?.turnID, call]);
 	const route = {
 		capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
 		fingerprint: () => "resource-version",
@@ -70,8 +72,14 @@ export function createResourceSnapshotExecutionWorld(
 	};
 	return {
 		id: "resource_version",
-		observeOperations: ({ inputs, reuseEnabled }, execute) => actorResourceInputs.run(reuseEnabled !== false
-			? { inputs, maxBytes: operations.maxBytes, persistentInputs: persistence } : undefined, execute),
+		observeOperations: ({ inputs, reuseEnabled, scope, signal }, execute) => {
+			const view = scope.callID && captures.get(captureKey(scope, scope.callID));
+			return resourceOperationContext.run(reuseEnabled !== false ? { inputs, maxBytes: operations.maxBytes, persistentInputs: persistence,
+				computation: view ? { view, signal, sources: function* () {
+					for (const source of inputs?.() ?? []) for (const token of resourceVersions.get(source)?.() ?? []) if (token.view) yield token.view;
+				} } : undefined } : undefined, execute);
+		},
+		dispose: () => computations.dispose(),
 		scope: "fallback",
 		isolation: "resource_snapshot",
 		observation: { ...route, inputsOnly: () => true,
@@ -83,7 +91,11 @@ export function createResourceSnapshotExecutionWorld(
 					const root = invocation?.filesystemRoot ?? context.cwd, budget = operations.maxBytes();
 					const version = session ? await session.capture(undefined, root, actionSemantics, budget)
 						: await captureResourceVersion(undefined, root, actionSemantics, budget);
-					return resourceCapture([version], context.action, actionSemantics, true, undefined, undefined, undefined, session);
+					const key = captureKey(context.executionScope, context.callID);
+					if (version.view) { await computations.prepare(invocation?.callback ?? context.tool.execute); captures.set(key, version.view); }
+					return resourceCapture([version], context.action, actionSemantics, true, undefined, () => {
+						if (captures.get(key) === version.view) captures.delete(key);
+					}, undefined, session);
 				} catch (error) { await session?.dispose(); throw error; }
 			} },
 		speculation: {
@@ -116,7 +128,6 @@ function readonlyResourceInvocation(action: ActionKey, semantics: ActionSemantic
 
 const resourceVersions = new WeakMap<object, () => readonly ResourceVersionToken[]>();
 const inputBytes = (versions: readonly ResourceVersionToken[]) => versions.reduce((bytes, token) => bytes + (token.view?.bytes ?? 0), 0);
-const actorResourceInputs = new AsyncLocalStorage<{ inputs?: (path?: string) => Iterable<object>; maxBytes: () => number; persistentInputs?: ResourceInputPersistence } | undefined>();
 
 /** Native inputs use the same owners and exact object validation on either side of a thread boundary. */
 export class ResourceObjectInputs {
@@ -379,7 +390,7 @@ export function bindResourceOperation(execute: NonNullable<ToolInvocation["files
 			output ? result => !owned.incomplete && !!result && !result.isError : undefined);
 		},
 		authoritative: async request => {
-			const owned = active.get(request.callID)?.started ? undefined : active.get(request.callID), scope = actorResourceInputs.getStore();
+			const owned = active.get(request.callID)?.started ? undefined : active.get(request.callID), scope = resourceOperationContext.getStore();
 			if (!owned && !scope && native) return native(request);
 			if (owned) owned.started = true;
 			const unproven = () => { if (owned) owned.incomplete = true; };

@@ -51,7 +51,7 @@ export function sdkCallbackTool(tool: AgentTool): AgentTool {
 	if (!entry || entry.execute !== tool.execute) {
 		// The SDK already prepared Actor arguments. An arbitrary preparation callback cannot run ahead on the host.
 		entry = { execute: tool.execute, tool: { ...tool, prepareArguments: undefined, execute: tool.execute.bind(tool) },
-			invocation: { executor: "pi.sdk.callback", identity: { callback: randomUUID() }, semantics: {
+			invocation: { executor: "pi.sdk.callback", callback: broker.tools.get(tool)?.execute ?? tool.execute, identity: { callback: randomUUID() }, semantics: {
 				tool: tool.name, epoch: "pi.sdk.callback:1", effect: "unbounded",
 				requirements: { capabilities: ["invocation.host_function", ...UNRESTRICTED_PROCESS_EFFECTS.capabilities] },
 				canonicalize: input => { const record = asRecord(input); return record && { input: record, resources: [] }; },

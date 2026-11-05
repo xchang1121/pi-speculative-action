@@ -8,7 +8,7 @@ import {
 	type AgentConsumeInput, type AgentStartInput, type AgentStateData, type AgentRuntime, type DrafterModelOptions, definitionSchemaHashes,
 } from "./agent-runtime-types.ts";
 import type { ActorForkPlanSource } from "./actor-fork-plan-source.ts";
-import type { ExecutionWorldDiagnosticSnapshot, ExecutionOperationBinding, SpeculativeExecutionRoute, WorldCheckpoint } from "./execution-world.ts";
+import { isRegisteredExecutionWorld, type ExecutionWorldDiagnosticSnapshot, type ExecutionOperationBinding, type SpeculativeExecutionRoute, type WorldCheckpoint } from "./execution-world.ts";
 import { createDrafterPlanSource, type DrafterPlanSnapshot } from "./drafter-plan-source.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, type PatternAwareStore, patternAwareSettings } from "./pattern-aware.ts";
 import { createPatternPlanSource } from "./pattern-plan-source.ts";
@@ -28,7 +28,6 @@ import { type ToolInvocation, type ToolSettlement, toolObservationKey } from "./
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
 import { createSystemResourceMonitor, type ExecutionResourceMonitor } from "./system-resources.ts";
 import { UNRESTRICTED_PROCESS_EFFECTS } from "./effect-model.ts";
-import { isCompletedProcessExecutionWorld, isRestorableProcessExecutionWorld } from "./linux-process-world.ts";
 
 const ACTOR_OPERATION = Symbol("actor-operation");
 const RAW_ACTOR_CALL = Symbol("raw-actor-call");
@@ -138,9 +137,8 @@ export { patternPlanActionID } from "./pattern-plan-source.ts";
  */
 export function createSpeculativeActionHost(sessionID: string, options: CreateSpeculativeActionHostOptions): SpeculativeActionHost {
 	return createAgentExecutionHost(sessionID, options, (world, operation) => world.isolation === "resource_snapshot" ||
-		isRestorableProcessExecutionWorld(world) && operation !== "observation" &&
-			(operation === "speculation" || options.speculativeExecutionWorldEnabled?.(world.id) !== false) || operation === "speculation" &&
-		(world.isolation === "workspace_branch" || isCompletedProcessExecutionWorld(world))
+		isRegisteredExecutionWorld(world, operation) && (operation === "speculation" || options.speculativeExecutionWorldEnabled?.(world.id) !== false) ||
+		operation === "speculation" && world.isolation === "workspace_branch"
 		? undefined : "Outside the supported resource closure; the Actor executes this operation");
 }
 

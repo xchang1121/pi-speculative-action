@@ -349,8 +349,56 @@ export type ExecutionWorld<Context, Output, ObservationContext = Context> = Exec
 		  }
 	);
 
+export type ExecutionWorldEntry = "speculation" | "observation" | "observeOperations";
+
+/** Trusted backend integration. Qualification tests the concrete isolation provider, not a tool name.
+ * Every entry is rechecked; result freshness, effect transactions and ownership remain separate proofs. */
+export interface ExecutionWorldQualification {
+	readonly operations: readonly ExecutionWorldEntry[];
+	readonly verify: (input: ExecutionWorldDiagnosticsContext & { readonly operation: ExecutionWorldEntry }) => Promise<{
+		readonly fingerprint: string;
+		/** External service state and effects must be denied or excluded from speculative work. */
+		readonly externalEffects: "excluded";
+	}>;
+}
+const qualifiedWorlds = new WeakMap<object, ExecutionWorldQualification & { active: boolean }>();
+
+/** Register an immutable implementation with an actual, repeatable provider qualification probe.
+ * A copy is a different implementation and must be registered separately. Registration itself grants no result authority. */
+export function registerExecutionWorld<World extends ExecutionWorld<any, any, any>>(world: World, qualification: ExecutionWorldQualification): World {
+	const operations = Object.freeze([...new Set(qualification.operations)]);
+	if (!operations.length || operations.some(operation => !["speculation", "observation", "observeOperations"].includes(operation) || !world[operation]) ||
+		typeof qualification.verify !== "function") throw new Error("execution world qualification requires concrete entries and a provider probe");
+	const entry = { operations, verify: qualification.verify.bind(qualification), active: true }, close = world.dispose?.bind(world);
+	const snapshot = (operation: ExecutionWorldOperation | undefined) => operation && Object.freeze({ ...operation,
+		capabilities: operation.capabilities === "all" ? "all" as const : Object.freeze([...operation.capabilities]),
+		...(operation.tools ? { tools: Object.freeze([...operation.tools]) } : {}) });
+	let disposed: Promise<void> | undefined;
+	const registered = Object.freeze({ ...world, speculation: snapshot(world.speculation), observation: snapshot(world.observation),
+		dispose: () => { entry.active = false; return disposed ??= Promise.resolve().then(close); } }) as unknown as World;
+	qualifiedWorlds.set(registered, entry);
+	return registered;
+}
+
+export function isRegisteredExecutionWorld(world: object, operation: ExecutionWorldEntry): boolean {
+	const entry = qualifiedWorlds.get(world);
+	return !!entry?.active && entry.operations.includes(operation);
+}
+
+async function qualifyExecutionWorld(world: object, operation: ExecutionWorldEntry, input: ExecutionWorldDiagnosticsContext): Promise<string | undefined> {
+	const entry = qualifiedWorlds.get(world);
+	if (!entry) return;
+	if (!isRegisteredExecutionWorld(world, operation)) throw new Error("execution world entry is not registered or has been retired");
+	input.signal?.throwIfAborted();
+	const evidence = await entry.verify({ ...input, operation });
+	input.signal?.throwIfAborted();
+	if (!entry.active || evidence.externalEffects !== "excluded" || typeof evidence.fingerprint !== "string" || !evidence.fingerprint.trim())
+		throw new Error("execution world qualification failed");
+	return evidence.fingerprint;
+}
+
 type ExecutionWorldAdmission<Context, Output, ObservationContext> = (world: ExecutionWorld<Context, Output, ObservationContext>,
-	operation: "speculation" | "observation" | "observeOperations") => string | undefined;
+	operation: ExecutionWorldEntry) => string | undefined;
 
 /** The only authority allowed to resolve, prepare, fork, and dispose speculative tool execution. */
 export class ExecutionWorldRouter<Context, Output, ObservationContext = Context> {
@@ -359,6 +407,7 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 	private readonly admission?: ExecutionWorldAdmission<Context, Output, ObservationContext>;
 	private readonly worldsByID = new Map<string, ExecutionWorld<Context, Output, ObservationContext>>();
 	private readonly routeObservations = new Map<string, ExecutionWorldDiagnosticReport & { readonly cwd: string }>();
+	private readonly qualifications = new WeakMap<SpeculativeExecutionRoute, { readonly cwd: string; readonly fingerprint: string }>();
 
 	constructor(worlds: readonly ExecutionWorld<Context, Output, ObservationContext>[], speculationEnabled: (backend: string) => boolean = () => true,
 		lifecycle = new RuntimeLifecycleLane(), admission?: ExecutionWorldAdmission<Context, Output, ObservationContext>) {
@@ -389,7 +438,12 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 		if (rejected) throw new Error(rejected);
 		if (!this.speculationEnabled(world.id)) throw new Error(`Execution world ${world.id} is disabled by routing policy`);
 		if (!world.speculation) throw new Error(`Execution world ${world.id} does not provide speculative execution`);
-		return this.lifecycle.admit(() => world.speculation!.execute(context));
+		return this.lifecycle.admit(async () => {
+			const qualified = this.qualifications.get(route);
+			if (qualifiedWorlds.has(world) && (!qualified || await qualifyExecutionWorld(world, "speculation", qualified) !== qualified.fingerprint))
+				throw new Error("execution world qualification changed before execution");
+			return world.speculation!.execute(context);
+		});
 	}
 
 	observeOperations<Value>(action: ActionKey | undefined, scope: ExecutionScope, execute: () => Promise<Value>,
@@ -398,7 +452,11 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 		for (const world of this.worldsByID.values()) {
 			if (!world.observeOperations || this.admission?.(world, "observeOperations")) continue;
 			const next = execute;
-			execute = () => world.observeOperations!({ action, scope, learn, inputs, enabled: true, ...context }, next, observe);
+			execute = async () => {
+				try { await qualifyExecutionWorld(world, "observeOperations", { cwd: context?.cwd ?? "", signal: context?.signal }); }
+				catch { return next(); }
+				return world.observeOperations!({ action, scope, learn, inputs, enabled: true, ...context }, next, observe);
+			};
 		}
 		return execute();
 	}
@@ -435,21 +493,9 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 	async diagnostics(input: ExecutionWorldDiagnosticsContext): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
 		return this.lifecycle.admit(() => Promise.all(
 			[...this.worldsByID.values()].map(async (world) => {
-				const rejected = this.admission?.(world, "speculation");
-				if (rejected) return Object.freeze({ id: world.id, scope: world.scope, isolation: world.isolation,
-					capabilities: Object.freeze([]), state: "unavailable" as const, detail: rejected });
-				const speculation = world.speculation
-					? this.speculationEnabled(world.id)
-						? await this.diagnose(world.id, "speculation", world.speculation, input)
-						: {
-								capabilities: world.speculation.capabilities,
-								...(world.speculation.tools ? { tools: world.speculation.tools } : {}),
-								state: "unavailable" as const,
-								detail: "Pre-execution disabled by routing policy",
-							}
-					: { capabilities: Object.freeze([]), state: "unavailable" as const, detail: "Speculative execution is not provided" };
-				const observation = world.observation && !this.admission?.(world, "observation") ? await this.diagnose(world.id, "observation", world.observation, input) : undefined;
-				return Object.freeze({ id: world.id, scope: world.scope, isolation: world.isolation, ...speculation, ...(observation ? { observation } : {}) });
+				const speculation = await this.diagnose(world, "speculation", input), observation = await this.diagnose(world, "observation", input);
+				const primary = (speculation ?? observation ?? await this.diagnose(world, "observeOperations", input))!;
+				return Object.freeze({ id: world.id, scope: world.scope, isolation: world.isolation, ...primary, ...(observation ? { observation } : {}) });
 			}),
 		));
 	}
@@ -475,7 +521,9 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 					if (request.parentCheckpoint && (!acceptsCheckpoint || !acceptsCheckpoint(request.parentCheckpoint, preparation.cwd))) continue;
 					if (!effectCapabilitiesCover(operation.capabilities, request.requirements) &&
 						!(kind === "observation" && world.observation?.inputsOnly?.(request))) continue;
-					const fingerprint = (await operation.fingerprint?.(request)) ?? `${world.id}:${world.isolation}`;
+					const qualified = await qualifyExecutionWorld(world, kind, preparation);
+					const identity = (await operation.fingerprint?.(request)) ?? `${world.id}:${world.isolation}`;
+					const fingerprint = qualified === undefined ? identity : JSON.stringify([qualified, identity]);
 					await operation.prepare?.(preparation);
 					this.observeRoute(world.id, kind, preparation.cwd, "ready", "Route prepared successfully");
 					const cwd = preparation.cwd;
@@ -498,6 +546,7 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 						Object.defineProperty(route, "dependsOn", { value: (parent: ActionKey) => dependsOn(action, parent) });
 					}
 					Object.freeze(route);
+					if (qualified !== undefined) this.qualifications.set(route, { cwd: preparation.cwd, fingerprint: qualified });
 					const selected = await select(world, route);
 					if (selected !== undefined) return selected;
 				} catch (error) {
@@ -511,16 +560,21 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 	}
 
 	private async diagnose(
-		id: string,
-		kind: "speculation" | "observation",
-		operation: ExecutionWorldOperation,
+		world: ExecutionWorld<Context, Output, ObservationContext>,
+		kind: ExecutionWorldEntry,
 		input: ExecutionWorldDiagnosticsContext,
-	): Promise<ExecutionWorldOperationDiagnostic> {
-		const key = `${id}:${kind}`;
+	): Promise<ExecutionWorldOperationDiagnostic | undefined> {
+		const operation: ExecutionWorldOperation | undefined = kind === "observeOperations"
+			? world.observeOperations && { capabilities: [] } : world[kind];
+		if (!operation) return;
+		const rejected = this.admission?.(world, kind) ?? (kind === "speculation" && !this.speculationEnabled(world.id) ? "Pre-execution disabled by routing policy" : undefined);
+		if (rejected) return Object.freeze({ capabilities: Object.freeze([]), state: "unavailable", detail: rejected });
+		const key = `${world.id}:${kind}`;
 		if (input.refresh) this.routeObservations.delete(key);
 		let report: ExecutionWorldDiagnosticReport | undefined;
 		try {
-			report = await operation.diagnostics?.(input);
+			const qualified = input.refresh ? await qualifyExecutionWorld(world, kind, input) : undefined;
+			report = await operation.diagnostics?.(input) ?? (qualified !== undefined ? { state: "ready", detail: "Provider qualification succeeded" } : undefined);
 			if (!report && input.refresh && operation.prepare) {
 				await operation.prepare(input);
 				report = { state: "ready", detail: "Route prepared successfully" };

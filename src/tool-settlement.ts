@@ -55,6 +55,8 @@ export interface ToolProcessInvocation {
 /** Identity of the concrete tool executor. */
 export interface ToolInvocation {
 	readonly executor: string;
+	/** Original Actor callback; automatic data calculations never authorize its outer effects. */
+	readonly callback?: Function;
 	readonly observation?: ToolObservationContract;
 	/** Internal execution uses the current enclosing action for permission and an opaque backend binding. */
 	readonly operation?: { readonly binding: ExecutionOperationBinding; readonly permission: ActionKey };

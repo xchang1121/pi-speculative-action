@@ -43,6 +43,8 @@ pi
 
 两个开关都保留实际调用的观察与模式学习。`tools` 和各预测来源开关只筛选提前生产，不限制其他工具复用合格成果。
 
+`grep/find` 默认采用通过版本检查的 Captured 搜索契约，让 Actor 和提前执行共享同一搜索实现；资格不足时仍由原工具执行。保存 `searchExecution: "native"` 可显式选择 Native Pi。这个选择决定搜索语义，开启投机与否不会切换 Actor 的实现。
+
 全局配置位于 `<agent-dir>/speculative-action.json`，项目配置位于 `.pi/speculative-action.json`。安装准备阶段使用随依赖保留的 TypeScript 编译器生成入口，兼容 Pi 默认省略开发依赖的 Git 安装；类型检查在开发验证阶段单独运行。Pi 加载已编译入口；本地修改源码后运行 `npm run build`，再用 `pi -e /absolute/path/to/pi-speculative-action` 加载。
 
 Linux / WSL 2 需在扩展目录运行 `npm run setup:linux`，升级后重新运行；WSL checkout 放在 Linux 原生文件系统。Windows x64 使用随包提供的本地 NTFS 对象租约，无需另行编译。
@@ -66,16 +68,19 @@ sudo ~/.local/bin/pi-speculative-domain --user "$(id -u)" env \
 | 能力 | 成立条件与不满足时的行为 | 公开入口验收 |
 | --- | --- | --- |
 | 共享输入、纯子计算 | 实际操作绑定、有效依赖证明；可跨工具消费，缺少绑定或证明时正常执行。 | `agent.system`、`persistent-inputs` |
+| 普通工具内部计算 | 自动接入同一已加载 JS 模块内可证明的同步数据函数和原生 `JSON.parse`；以当前代码、完整参数、闭包数据和内建实现核验，外层工具继续执行。未知调用、访问器、代理、别名、预算不足或取消时正常执行。 | `resource-computation`，真实 Pi 注册工具与独立调用计数 |
 | 工作区效果 | 私有工作区隔离、验新、事务提交及所有权释放；提交前失效可回退，已产生效果且恢复不明时终止。 | `process-reuse.system`、`host-closure`、`linux-overlayfs` |
 | Linux 完成成果与进程接管 | 已验证 x86-64、同一 ext4 挂载、合格 Bash 分支、已观察子操作及可封存的单线程进程；需要当前构建的执行域、观察助手和通过行为探测的后端。缺少执行域时进程复用不可用。 | `extension.system`、`linux-reuse-chain`、`held-exec` |
 | 检查点跨进程恢复 | 另限同一次系统启动、同一 Pi 会话、工作区和原缓存位置；身份、输入、所有权或镜像不符时拒绝恢复。 | `process-reuse.system` |
 | Windows | 本地 NTFS 文件资源与私有工作区；没有 Linux 同等进程接管能力。 | `filesystem-lease`、`host-closure` |
 
+普通工具内部计算通过进程内 V8 LiveEdit 接入，不打开调试端口。当前自动证明限于普通有限 JSON 数据和已审查的内建操作，不覆盖任意导入库、异步计算或函数源码反射；含已识别源码反射的模块不接入，外部调试器仍可能看到临时包装。代码、闭包数据或文件内容改变不会沿用旧计算，返回的数据副本允许调用者独立修改。结果继续使用现有资源视图、预算、消费计时和回收链，仅保留在当前会话；显式绑定的持久化接口保持原有契约。它不会提前运行不透明工具的外层副作用，也不保证每个小计算都有净耗时收益。
+
 进程观察根允许空格、反斜杠和 UTF-8 字符；须为规范化后的绝对目录、归调用者所有且组/其他用户不可写。路径须小于 Linux `PATH_MAX`（4,096 字节），每条祖先链最多 64 项（包括根自身和 `/`），同一观察所有者最多 4 个根、64 个去重父目录。限额耗尽或权限不符会给出具体拒绝原因。`linux-environment` 验证诊断与真实准入一致，`extension.system` 验证这些路径下的实际消费。
 
 菜单中的 **Check Linux environment** 使用运行时同一执行域握手、工作区准入及观察助手探测，分别列出构建条件、当前缺口和未验证事项；**Refresh and show capabilities** 显示已启用后端的实际资格。构建工具或库存在并不等于操作已获复用资格。升级后须重新 `setup:linux` 并重启前台执行域；仅保留旧观察助手不能恢复进程复用。
 
-任意原生程序、多线程续接、任意外部副作用、宿主中断工具批次的透明恢复及外部 runtime world 尚不支持。Linux 实测环境为 WSL 2 / Ubuntu 24.04、x86-64 和原生 ext4，不外推其他内核、文件系统或架构。上表用例位于 `test/`，平台专属跳过不计为支持证据。
+任意原生程序、多线程续接、Windows 原生进程续接及宿主中断工具批次的透明恢复尚不支持；保持当前纯扩展部署，不引入检查点服务或虚拟机来扩大这一边界。外部服务状态与副作用不属于投机范围。Linux 实测环境为 WSL 2 / Ubuntu 24.04、x86-64 和原生 ext4，不外推其他内核、文件系统或架构。上表用例位于 `test/`，平台专属跳过不计为支持证据。
 
 验新不提供任意外部并发写入的隔离保证。证明不足时沿原路径执行；若提交已产生副作用且无法证明恢复，则报错终止，避免重复执行。
 
@@ -92,5 +97,7 @@ npm run bench:check
 Windows 开发可在 WSL 中运行 `scripts/wsl-verify.sh`。它将当前提交和未提交改动复制到独立 Linux checkout，构建私有助手，再通过 `sudo` 启动该构建的前台执行域；测试仍以原用户运行。先按上文配置 `PI_SPEC_HELD_EXEC_OBSERVER`，脚本不安装持久服务或替换用户助手。
 
 扩展接口见 [Pi Host API](./src/index.ts)、[core](./src/core.ts) 和 [process-reuse](./src/process-reuse.ts)。新预测来源提交计划，新执行后端实现执行世界契约；反馈通过 `runtime.subscribe()` 接收，结束时调用 `host.dispose()`。
+
+公共 Host 接纳通过 `registerExecutionWorld(implementation, qualification)` 注册的运行时后端，通用 Linux 工厂也走此入口。注册声明具体入口并提供 `verify({ cwd, operation, signal, refresh })` 行为探测，返回当前隔离实现的 fingerprint 及 `externalEffects: "excluded"`；这是受信任后端对实际隔离、观察与回收能力的证明接口，不能用常量替代探测。执行前重新检查资格和版本，失败时回到可用路径；逐成果验新、效果事务和所有权仍由原流程检查。复制或修改后的实现须重新注册，关闭即撤销资格。
 
 [验证与收益口径](./bench/README.md) · [变更记录](./CHANGELOG.md)
