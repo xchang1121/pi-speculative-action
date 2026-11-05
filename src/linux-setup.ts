@@ -13,7 +13,7 @@ export async function checkLinuxEnvironment(ctx: ExtensionContext, refresh: () =
 		return;
 	}
 	if (!ctx.isIdle()) { ctx.ui.notify("Wait for the current task to finish before checking the Linux environment.", "warning"); return; }
-	const report = await inspectLinuxEnvironment();
+	const report = await inspectLinuxEnvironment(ctx.cwd);
 	ctx.ui.notify(report.text, report.warnings ? "warning" : "info");
 	if (!ctx.isIdle()) { ctx.ui.notify("The task is now running. Refresh execution diagnostics after it finishes.", "warning"); return; }
 	await refresh();
@@ -29,11 +29,11 @@ export async function installLinuxDependencies(ctx: ExtensionContext, refresh: (
 		ctx.ui.notify("Wait for the current task to finish before installing Linux dependencies.", "warning");
 		return;
 	}
-	const report = await inspectLinuxEnvironment();
+	const report = await inspectLinuxEnvironment(ctx.cwd);
 	if (!ctx.isIdle()) { ctx.ui.notify("The task is now running. Retry installation after it finishes.", "warning"); return; }
 	if (!await ctx.ui.confirm("Install / update Linux dependencies?",
 		`${report.summary}\n\nDownload and build the packaged Sandlock, process helpers and strace, plus optional fuse-overlayfs, in ~/.local/bin. ` +
-		"Requires Git, C/Rust toolchains, make, tar and xz; FUSE also needs fusermount and access to /dev/fuse. " +
+		"Requires Git, C/Rust toolchains, Clang, libbpf/libelf/zlib development files, make, tar and xz; FUSE needs fusermount and /dev/fuse. " +
 		"Missing prerequisites may leave individual components unavailable. System packages and permissions are not changed. Building may take several minutes.")) return;
 	if (!ctx.isIdle()) { ctx.ui.notify("The task is now running. Retry installation after it finishes.", "warning"); return; }
 	const script = fileURLToPath(new URL("../src/setup-linux-process-backend.mjs", import.meta.url));

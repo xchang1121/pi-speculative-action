@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { execFileSync, spawn } from "node:child_process";
@@ -29,9 +29,13 @@ const adoptions = (settlement: PredictionSettlement) => settlement.observation =
 const directories = temporaryDirectories("pi-extension-system-");
 afterEach(async () => { vi.unstubAllEnvs(); vi.restoreAllMocks(); await directories.dispose(); });
 
-test.skipIf(process.platform !== "linux").each(["reuse", "stale", "environment", "outside-mount", "disabled", "routing-off", "no-domain", "lost-domain", "retired-domain"])(
+test.skipIf(process.platform !== "linux").each(["reuse", "space-root", "backslash-root", "deep-root", "long-root", "shared-root", "stale", "environment", "outside-mount", "disabled", "routing-off", "no-domain", "lost-domain", "retired-domain"])(
 	"consumes finished Bash through the default Pi extension (%s)", { timeout: 60_000 }, async mode => {
-	const cwd = await directories.create(os.homedir()), agentDir = await directories.create(os.homedir());
+	const roots: Record<string, string> = { "space-root": "with space 中", "backslash-root": "with\\backslash", "deep-root": "d/".repeat(18) + "leaf", "long-root": "long/" + "x".repeat(240) };
+	const cwd = path.join(await directories.create(os.homedir()), roots[mode] ?? ""), agentDir = await directories.create(os.homedir());
+	await mkdir(cwd, { recursive: true });
+	if (mode === "shared-root") await chmod(cwd, 0o775);
+	const reusable = mode === "reuse" || mode in roots;
 	vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
 	vi.stubEnv("PWD", mode === "outside-mount" ? "/proc" : cwd);
 	vi.stubEnv("BASH_TEST_VERSION", "first");
@@ -66,9 +70,12 @@ test.skipIf(process.platform !== "linux").each(["reuse", "stale", "environment",
 	let retiredSocket: string | undefined;
 	await using _collector = onExit(async () => { if (retiredSocket) await rename(`${retiredSocket}.retired`, retiredSocket); });
 	await session.bindExtensions({ mode: "print", onError: error => { throw error; } });
+	if (mode === "shared-root") expect(await host.executionWorldDiagnostics(true)).toEqual(expect.arrayContaining([
+		expect.objectContaining({ state: "unavailable", detail: expect.stringContaining("root_permissions") }),
+	]));
 	actor.setResponses([async () => {
 		await host.previewActorCall({ turnID: turn.turnID, id: "bash-default", tool: "bash", args: { command }, tools: turn.tools });
-		if (!["disabled", "routing-off", "no-domain", "lost-domain"].includes(mode)) await expect.poll(() => events.some(event => event.type === "candidate" && event.state.status === "succeeded"), { timeout: 30_000 }).toBe(true);
+		if (!["disabled", "routing-off", "no-domain", "lost-domain", "shared-root"].includes(mode)) await expect.poll(() => events.some(event => event.type === "candidate" && event.state.status === "succeeded"), { timeout: 30_000 }).toBe(true);
 		if (mode === "stale") await writeFile(path.join(cwd, "value"), "two\n");
 		if (mode === "environment") vi.stubEnv("BASH_TEST_VERSION", "second");
 		if (mode === "retired-domain") { retiredSocket = process.env.PI_SPEC_DOMAIN_SOCKET!; await rename(retiredSocket, `${retiredSocket}.retired`); }
@@ -78,11 +85,11 @@ test.skipIf(process.platform !== "linux").each(["reuse", "stale", "environment",
 	const result = session.messages.find(message => message.role === "toolResult");
 	expect(result, JSON.stringify(events)).toMatchObject({ isError: false, content: [fauxText(`built:42\n${mode === "stale" ? "two" : "one"}\n${mode === "environment" ? "second" : "first"}\n`)] });
 	const settled = events.filter(event => event.type === "actor_action").at(-1)!;
-	expect(fallbacks, JSON.stringify(events)).toEqual(mode === "reuse" ? [] : ["bash"]);
+	expect(fallbacks, JSON.stringify(events)).toEqual(reusable ? [] : ["bash"]);
 	// A rejected whole branch can still consume unchanged, independently validated child work.
-	if (["reuse", "environment", "disabled", "routing-off", "no-domain", "lost-domain", "retired-domain"].includes(mode))
-		expect((settled.computation?.hiddenComputeMs ?? 0) > 0).toBe(mode === "reuse");
-	if (mode === "reuse") expect(settled.settlement.provider).toMatchObject({ kind: "actor", origin: "preview" });
+	if (reusable || ["environment", "disabled", "routing-off", "no-domain", "lost-domain", "retired-domain", "shared-root"].includes(mode))
+		expect((settled.computation?.hiddenComputeMs ?? 0) > 0).toBe(reusable);
+	if (reusable) expect(settled.settlement.provider).toMatchObject({ kind: "actor", origin: "preview" });
 	for (const entry of forbidden) expect(entry).not.toHaveBeenCalled();
 });
 

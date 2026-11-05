@@ -6,6 +6,7 @@ import { on, once } from "node:events";
 import { AsyncResource } from "node:async_hooks";
 import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
+import { getSystemErrorName } from "node:util";
 import { chmod, mkdir, open, readFile, readdir, readlink, rm, stat } from "node:fs/promises";
 import { captureProcessContext, processLaunchOptions, validProcessContext, type ProcessExecutionContext, type ProcessLaunchOptions } from "./process-context.mjs";
 import net from "node:net";
@@ -21,7 +22,7 @@ import { containsFilesystemPath } from "./path-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 import { immutableSnapshot } from "./stable-json.ts";
 import { captureWorkspaceFileAliases } from "./process-observation.ts";
-import { nativeFilesystem, qualifyNativeStartup, resolveLinuxExecHelper, startupScope } from "./process-startup.mjs";
+import { nativeFilesystem, nativeProcessLibrary, qualifyNativeStartup, resolveLinuxExecHelper, startupScope } from "./process-startup.mjs";
 export { resolveLinuxExecHelper } from "./process-startup.mjs";
 
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024 + 32768;
@@ -31,7 +32,8 @@ const MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
 /** Kernel collection shares the execution owner's lifetime, not its privileges. */
 export async function executionDomainCollector(binary: string) {
 	const socket = process.env.PI_SPEC_DOMAIN_SOCKET;
-	if (!socket) throw new Error("Linux process reuse requires an active cgroup/eBPF execution domain");
+	if (!socket) throw new Error("execution_domain_missing: start Pi through pi-speculative-domain --user <uid>; cgroup v2, kernel BTF and eBPF hooks are required");
+	if (!nativeFilesystem) nativeProcessLibrary(binary);
 	const request = (operation: number, domain = 0n, values: readonly (number | bigint)[] | Buffer = []) => {
 		const count = Buffer.isBuffer(values) ? Math.ceil(values.length / 8) : values.length;
 		if (count > 4096) throw new Error("execution domain query exceeds its batch limit");
@@ -40,18 +42,28 @@ export async function executionDomainCollector(binary: string) {
 		if (Buffer.isBuffer(values)) values.copy(packet, 16);
 		else for (const [index, value] of values.entries()) packet.writeBigUInt64LE(BigInt(value), 16 + index * 8);
 		const status = nativeFilesystem?.(-15, packet);
-		if (status !== 0) throw new Error(`execution domain collector unavailable: ${status}`);
+		if (status !== 0) {
+			const code = typeof status === "number" && status < 0 ? getSystemErrorName(status) : "EPROTO";
+			const reason = operation === 5 && ({ EACCES: "root_permissions: root must be caller-owned and not group/other writable",
+				E2BIG: "root_depth_limit: at most 64 levels per root and 64 distinct parent directories", ENOSPC: "root_count_limit: at most 4 roots",
+				ENAMETOOLONG: "root_path_limit: path must fit PATH_MAX", EINVAL: "root_not_canonical: use the resolved absolute directory" } as Record<string, string>)[code];
+			throw new Error(reason || `execution_domain_unavailable:${code}`);
+		}
 		return packet;
 	};
 	const fingerprint = sha256Digest(Buffer.concat(await Promise.all(["c", "h"].map(extension =>
 		readFile(new URL(`../src/linux-execution-domain.${extension}`, import.meta.url))))));
-	const check = () => {
+	const check = (root?: string): void => {
 		const hello = request(0);
-		if (hello.readBigUInt64LE(8) !== 15n || hello.readUInt32LE(4) !== 8 || hello.toString("ascii", 16, 80) !== fingerprint.slice(7))
+		if (hello.readBigUInt64LE(8) !== 16n || hello.readUInt32LE(4) !== 8 || hello.toString("ascii", 16, 80) !== fingerprint.slice(7))
 			throw new Error("execution domain collector changed; rebuild the Linux backend");
+		if (root !== undefined) {
+			const domain = collector.open();
+			try { const reason = domain.watch([root]); if (reason || domain.version() === undefined) throw new Error(reason || "observer_unavailable"); }
+			finally { domain.close(); }
+		}
 	};
-	check();
-	return { fingerprint, check, open: () => {
+	const collector = { fingerprint, check, open: () => {
 		const id = request(1).readBigUInt64LE(8); let closed = false, watching = false, descriptor: number | undefined;
 		return {
 			trace: (broker: string) => {
@@ -71,7 +83,7 @@ export async function executionDomainCollector(binary: string) {
 			launch: (command: readonly [string, ...string[]]): readonly [string, ...string[]] => [binary, "--execution-domain", String(id), socket, ...command],
 			watch: (roots: readonly string[]) => {
 				try { request(5, id, Buffer.from(`${roots.join("\0")}\0`)); watching = true; }
-				catch { watching = false; }
+				catch (error) { watching = false; return (error as Error).message; }
 			},
 			admit: (objects: readonly { readonly dev: bigint; readonly ino: bigint; readonly path: string }[]) => {
 				if (closed || !watching) return false;
@@ -116,15 +128,17 @@ export async function executionDomainCollector(binary: string) {
 			close: () => { if (!closed) { closed = true; try { request(4, id); } finally { if (descriptor !== undefined) closeSync(descriptor); descriptor = undefined; } } },
 		};
 	} };
+	check(); return collector;
 }
 
 /** Bind a lookup to the collector's continuous history. The final check runs only
  * after the native consumer has staged its immutable bytes and before it is armed. */
 export function executionDomainProof(collector: Awaited<ReturnType<typeof executionDomainCollector>>, root: string) {
+	const namespace = statSync("/proc/self/ns/mnt", { bigint: true });
 	const domain = collector.open();
-	domain.watch([root]);
-	const since = domain.version(), namespace = statSync("/proc/self/ns/mnt", { bigint: true });
-	let closed = false, reason = since === undefined ? "observer_unavailable" : "";
+	let closed = false, reason = domain.watch([root]) ?? "";
+	const since = domain.version();
+	if (since === undefined) reason ||= "observer_unavailable";
 	return {
 		get reason() { return reason; },
 		seal(dependencies: readonly DynamicDependency[], resolve: (target: string) => string | undefined): () => boolean {

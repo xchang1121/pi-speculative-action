@@ -2,13 +2,12 @@
 #define PI_EXECUTION_DOMAIN_H
 
 /* The collector owns observations; the application receives only read views. */
-#define PI_DOMAIN_ABI 15
+#define PI_DOMAIN_ABI 16
 #define PI_DOMAIN_VALUES 4096
 #define PI_DOMAIN_LIMIT 256
 #define PI_DOMAIN_RECORDS 65536
 #define PI_DOMAIN_ROOTS 4
-#define PI_DOMAIN_PATH 256
-#define PI_DOMAIN_ANCESTORS 16
+#define PI_DOMAIN_ANCESTORS 64
 enum pi_domain_operation { PI_DOMAIN_HELLO, PI_DOMAIN_OPEN, PI_DOMAIN_JOIN, PI_DOMAIN_CLOSE = 4, PI_DOMAIN_WATCH, PI_DOMAIN_VERSION, PI_DOMAIN_CHANGES,
 	PI_DOMAIN_TRACK, PI_DOMAIN_FILE, PI_DOMAIN_QUEUES, PI_DOMAIN_TRACE, PI_DOMAIN_EVENTS, PI_DOMAIN_ADMIT };
 struct pi_domain_packet {
@@ -31,9 +30,8 @@ struct pi_domain_state {
 	unsigned long long namespace_device, namespace_inode, mount_namespace, uncertain;
 	unsigned long long descriptor_lost, descriptor_active, descriptor_escaped;
 	unsigned long long metadata_device, metadata_inode, metadata_lost, metadata_records;
-	unsigned int root_count;
-	char roots[PI_DOMAIN_ROOTS][PI_DOMAIN_PATH];
-	struct pi_domain_inode ancestors[PI_DOMAIN_ROOTS][PI_DOMAIN_ANCESTORS];
+	unsigned int root_count, ancestor_count;
+	struct pi_domain_inode roots[PI_DOMAIN_ROOTS], ancestors[PI_DOMAIN_ANCESTORS];
 };
 struct pi_domain_event {
 	unsigned long long owner, task, time, id, kind;

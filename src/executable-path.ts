@@ -12,20 +12,13 @@ export async function resolveHostExecutable(
 	name: string,
 	fallbacks: readonly string[] = [],
 	alternateNames: readonly string[] = [],
+	preserveSymlink = false,
 ): Promise<string> {
-	for (const candidate of [explicit, ...fallbacks]) if (candidate && await executable(candidate)) return realpath(candidate);
-	for (const executableName of [name, ...alternateNames]) {
-		for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
-			if (!directory) continue;
-			const candidate = path.join(directory, executableName);
-			if (await executable(candidate)) return realpath(candidate);
-		}
-	}
+	const directories = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
+	for (const candidate of [explicit, ...fallbacks, ...[name, ...alternateNames].flatMap(name => directories.map(directory => path.join(directory, name)))])
+		if (candidate && await access(candidate, fsConstants.X_OK).then(() => true, () => false))
+			return preserveSymlink ? path.resolve(candidate) : realpath(candidate);
 	throw new Error(`Executable not found: ${[name, ...alternateNames].join(" or ")}`);
-}
-
-async function executable(candidate: string): Promise<boolean> {
-	return access(candidate, fsConstants.X_OK).then(() => true, () => false);
 }
 
 /** Run a host utility with bounded output; callers retain their timeout and environment policy. */

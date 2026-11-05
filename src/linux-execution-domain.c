@@ -1,6 +1,9 @@
 #define _GNU_SOURCE
 #include "linux-execution-domain.h"
 
+#define PI_ENTRY_OPERATIONS(X) X(mkdir) X(mknod) X(rmdir) X(unlink) X(symlink)
+#define PI_INODE_OPERATIONS(X) X(setattr) X(setxattr) X(removexattr) X(set_acl) X(remove_acl)
+
 #ifdef PI_BPF_OBJECT
 #include <linux/bpf.h>
 #include <linux/fs.h>
@@ -434,38 +437,45 @@ static int ioctl_watch(unsigned long long *args) {
 }
 SEC("fentry/security_file_ioctl") int ioctl_file(unsigned long long *args) { return ioctl_watch(args); }
 SEC("fentry/security_file_ioctl_compat") int ioctl_compat(unsigned long long *args) { return ioctl_watch(args); }
-SEC("fentry/security_mmap_file") int map_file3(unsigned long long *args) { return (args[1] & 2) && (args[2] & 1) ? file_watch((void *)args[0], 4) : 0; }
-SEC("fentry/security_mmap_file") int map_file4(unsigned long long *args) { return (args[2] & 2) && (args[3] & 1) ? file_watch((void *)args[0], 4) : 0; }
+SEC("fentry/security_mmap_file") int map_file(unsigned long long *args) {
+	unsigned count = bpf_get_func_arg_cnt(args); __u64 protection = 0, flags = 0;
+	if ((count != 3 && count != 4) || bpf_get_func_arg(args, count - 2, &protection) || bpf_get_func_arg(args, count - 1, &flags)) {
+		struct pi_version_clock *clock = version_clock(); if (clock) __sync_fetch_and_or(&clock->lost, 256); return 0;
+	}
+	return (protection & 2) && (flags & 1) ? file_watch((void *)args[0], 4) : 0;
+}
 SEC("fentry/security_file_mprotect") int protect_file(unsigned long long *args) { return (args[2] & 2) && (BPF_CORE_READ((struct vm_area_struct *)args[0], vm_flags) & 8) ? file_watch(BPF_CORE_READ((struct vm_area_struct *)args[0], vm_file), 4) : 0; }
 /* The preliminary atime predicate can succeed on a read-only mount; the
  * update path runs only after the kernel has acquired mount write access. */
 SEC("fentry/inode_update_timestamps") int access_time(unsigned long long *args) { return inode_watch((void *)args[0], 0); }
-#define ENTRY_WATCH(name) SEC("fentry/security_path_" #name) int path_##name(unsigned long long *args) { path_watch((void *)args[0]); return watch((void *)args[1], 0); }
-ENTRY_WATCH(mkdir) ENTRY_WATCH(mknod) ENTRY_WATCH(rmdir) ENTRY_WATCH(unlink) ENTRY_WATCH(symlink)
+SEC("kprobe") int entries_watch(struct pt_regs *args) { path_watch((void *)BPF_CORE_READ(args, di)); return watch((void *)BPF_CORE_READ(args, si), 0); }
 SEC("fentry/security_path_truncate") int path_truncate(unsigned long long *args) { return path_watch((void *)args[0]); }
 SEC("fentry/security_path_chmod") int path_chmod(unsigned long long *args) { return watch(BPF_CORE_READ((struct path *)args[0], dentry), 8); }
 SEC("fentry/security_path_chown") int path_chown(unsigned long long *args) { return watch(BPF_CORE_READ((struct path *)args[0], dentry), 8); }
 /* Imported names may predate observation and already have a mapped writer. */
 SEC("fentry/security_path_rename") int path_rename(unsigned long long *args) { path_watch((void *)args[0]); watch((void *)args[1], 32 | 8); path_watch((void *)args[2]); return watch((void *)args[3], 8); }
 SEC("fentry/security_path_link") int path_link(unsigned long long *args) { watch((void *)args[0], 32); return path_watch((void *)args[1]); }
-#define INODE_WATCH(name) SEC("fentry/security_inode_" #name) int inode_##name(unsigned long long *args) { return watch((void *)args[1], 8); }
-INODE_WATCH(setattr) INODE_WATCH(setxattr) INODE_WATCH(removexattr) INODE_WATCH(set_acl) INODE_WATCH(remove_acl)
+SEC("kprobe") int inodes_watch(struct pt_regs *args) { return watch((void *)BPF_CORE_READ(args, si), 8); }
 struct mount_change { struct pi_domain_inode nodes[64]; __u64 namespace; unsigned count, unknown; };
 struct { __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); __uint(max_entries, 1); __type(key, __u32); __type(value, struct mount_change); } mounts SEC(".maps");
+struct mount_match { struct pi_domain_state *state; struct mount_change *change; };
+static long match_mount(unsigned long index, struct mount_match *match) {
+	struct pi_domain_state *state = match->state; struct mount_change *change = match->change;
+	if (index >= 64 || (index >= change->count && index >= state->ancestor_count)) return 1;
+	unsigned matched = 0;
+	for (unsigned root = 0; root < PI_DOMAIN_ROOTS; root++) {
+		if (root >= state->root_count) break;
+		if (index < change->count && state->roots[root].device == change->nodes[index].device && state->roots[root].inode == change->nodes[index].inode) matched = 1;
+	}
+	if (index < state->ancestor_count && change->count && state->ancestors[index].device == change->nodes[0].device && state->ancestors[index].inode == change->nodes[0].inode) matched = 1;
+	if (matched) __sync_fetch_and_or(&state->uncertain, 128);
+	return matched;
+}
 static long invalidate_mount(void *map, __u64 *id, struct pi_domain_state *state, void *context) {
 	__u32 zero = 0; struct mount_change *change = bpf_map_lookup_elem(&mounts, &zero);
 	if (!change || state->mount_namespace != change->namespace) return 0;
-	unsigned matched = change->unknown;
-	for (unsigned root = 0; root < PI_DOMAIN_ROOTS; root++) {
-		if (root >= state->root_count) break;
-		for (unsigned index = 0; index < 64; index++) {
-			if (index >= change->count) break;
-			if (state->ancestors[root][0].device == change->nodes[index].device && state->ancestors[root][0].inode == change->nodes[index].inode) matched = 1;
-		}
-		for (unsigned index = 0; index < PI_DOMAIN_ANCESTORS; index++)
-			if (change->count && state->ancestors[root][index].device == change->nodes[0].device && state->ancestors[root][index].inode == change->nodes[0].inode) matched = 1;
-	}
-	if (matched) __sync_fetch_and_or(&state->uncertain, 128);
+	if (change->unknown) __sync_fetch_and_or(&state->uncertain, 128);
+	else { struct mount_match match = {state, change}; bpf_loop(64, match_mount, &match, 0); }
 	return 0;
 }
 static void mount_binding(struct dentry *entry) {
@@ -567,7 +577,6 @@ char LICENSE[] SEC("license") = "GPL";
 
 #else
 #include <bpf/bpf.h>
-#include <bpf/btf.h>
 #include <bpf/libbpf.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -917,17 +926,29 @@ static int respond(struct pi_domain_packet *message, const struct ucred *peer, p
 	unsigned zero = 0; struct pi_version_clock clock;
 	if (bpf_map_lookup_elem(clock_map, &zero, &clock)) return errno;
 	if (message->operation == PI_DOMAIN_WATCH) {
-		if (state.root_count || !message->count || message->count > PI_DOMAIN_ROOTS * PI_DOMAIN_PATH / sizeof(*message->values)) return EINVAL;
+		if (state.root_count || !message->count) return EINVAL;
 		const char *input = (const char *)message->values; size_t bytes = message->count * sizeof(*message->values), offset = 0;
 		while (offset < bytes && input[offset]) {
 			size_t length = strnlen(input + offset, bytes - offset); char resolved[PATH_MAX]; struct stat info;
-			if (length >= PI_DOMAIN_PATH || state.root_count >= PI_DOMAIN_ROOTS || !realpath(input + offset, resolved) ||
-				strcmp(input + offset, resolved) || stat(resolved, &info) || !S_ISDIR(info.st_mode) || info.st_uid != peer->uid || (info.st_mode & 0022)) return EINVAL;
-			for (size_t index = 0; index < length; index++) if ((unsigned char)resolved[index] <= ' ' || resolved[index] == '\\') return EINVAL;
-			memcpy(state.roots[state.root_count], resolved, length + 1); offset += length + 1;
+			if (length == bytes - offset) return EINVAL;
+			if (length >= PATH_MAX) return ENAMETOOLONG;
+			if (state.root_count >= PI_DOMAIN_ROOTS) return ENOSPC;
+			if (!realpath(input + offset, resolved) || stat(resolved, &info)) return errno;
+			if (strcmp(input + offset, resolved)) return EINVAL;
+			if (!S_ISDIR(info.st_mode)) return ENOTDIR;
+			if (info.st_uid != peer->uid || (info.st_mode & 0022)) return EACCES;
+			offset += length + 1;
 			for (unsigned depth = 0;; depth++) {
-				if (depth >= PI_DOMAIN_ANCESTORS || stat(resolved, &info)) return EINVAL;
-				state.ancestors[state.root_count][depth] = (struct pi_domain_inode){((uint64_t)major(info.st_dev) << 20) | minor(info.st_dev), info.st_ino};
+				if (depth >= PI_DOMAIN_ANCESTORS) return E2BIG;
+				if (stat(resolved, &info)) return errno;
+				struct pi_domain_inode node = {((uint64_t)major(info.st_dev) << 20) | minor(info.st_dev), info.st_ino};
+				if (!depth) state.roots[state.root_count] = node;
+				else {
+					unsigned index = 0;
+					while (index < state.ancestor_count && (state.ancestors[index].device != node.device || state.ancestors[index].inode != node.inode)) index++;
+					if (index == PI_DOMAIN_ANCESTORS) return E2BIG;
+					if (index == state.ancestor_count) state.ancestors[state.ancestor_count++] = node;
+				}
 				if (!strcmp(resolved, "/")) break;
 				char *slash = strrchr(resolved, '/'); if (!slash) return EINVAL; if (slash == resolved) slash++; *slash = 0;
 			}
@@ -965,9 +986,8 @@ static int respond(struct pi_domain_packet *message, const struct ucred *peer, p
 		message->count = 0; return 0;
 	}
 	if (message->operation == PI_DOMAIN_VERSION || message->operation == PI_DOMAIN_CHANGES) {
-		for (unsigned root = 0; root < state.root_count; root++) for (unsigned depth = 1; depth < PI_DOMAIN_ANCESTORS; depth++) {
-			struct pi_domain_inode ancestor = state.ancestors[root][depth]; struct pi_object_version observed;
-			if (!ancestor.inode) break;
+		for (unsigned index = 0; index < state.ancestor_count; index++) {
+			struct pi_domain_inode ancestor = state.ancestors[index]; struct pi_object_version observed;
 			struct pi_domain_record key = {1, ancestor.device, ancestor.inode};
 			if (!bpf_map_lookup_elem(version_map, &key, &observed)) { if (observed.binding > group->watched) state.uncertain |= 8; }
 			else if (errno != ENOENT) return errno;
@@ -1033,14 +1053,6 @@ int main(int argc, char **argv) {
 	memcpy(binary + size, ".bpf.o", 7);
 	object = bpf_object__open_file(binary, NULL);
 	if (libbpf_get_error(object)) { object = NULL; goto done; }
-	struct btf *kernel = btf__load_vmlinux_btf();
-	if (libbpf_get_error(kernel)) goto done;
-	int mmap_id = btf__find_by_name_kind(kernel, "security_mmap_file", BTF_KIND_FUNC);
-	unsigned mmap_args = mmap_id < 0 ? 0 : btf_vlen(btf__type_by_id(kernel, btf__type_by_id(kernel, mmap_id)->type));
-	btf__free(kernel);
-	if (mmap_args != 3 && mmap_args != 4) goto done;
-	bpf_program__set_autoload(bpf_object__find_program_by_name(object, "map_file3"), mmap_args == 3);
-	bpf_program__set_autoload(bpf_object__find_program_by_name(object, "map_file4"), mmap_args == 4);
 	if (bpf_object__load(object)) goto done;
 	domain_map = bpf_object__find_map_fd_by_name(object, "domains");
 	membership_map = bpf_object__find_map_fd_by_name(object, "membership");
@@ -1052,13 +1064,21 @@ int main(int argc, char **argv) {
 	metadata_call_map = bpf_object__find_map_fd_by_name(object, "metadata_calls");
 	metadata_notification_map = bpf_object__find_map_fd_by_name(object, "metadata_notifications");
 	broker_query = bpf_object__find_program_by_name(object, "metadata_broker");
+#define ENTRY_SYMBOL(name) "security_path_" #name,
+#define INODE_SYMBOL(name) "security_inode_" #name,
+	const char *entry_symbols[] = {PI_ENTRY_OPERATIONS(ENTRY_SYMBOL)}, *inode_symbols[] = {PI_INODE_OPERATIONS(INODE_SYMBOL)};
 	struct bpf_program *program;
 	bpf_object__for_each_program(program, object) {
 		if (!bpf_program__autoload(program) || program == file_query || program == input_query || program == broker_query) continue;
-		if (link_count == sizeof(links) / sizeof(*links)) goto done;
-		struct bpf_link *link = bpf_program__attach(program);
-		if (libbpf_get_error(link)) goto done;
-		links[link_count++] = link;
+		const char **symbols = NULL; unsigned count = 1;
+		if (!strcmp(bpf_program__name(program), "entries_watch")) { symbols = entry_symbols; count = sizeof(entry_symbols) / sizeof(*entry_symbols); }
+		if (!strcmp(bpf_program__name(program), "inodes_watch")) { symbols = inode_symbols; count = sizeof(inode_symbols) / sizeof(*inode_symbols); }
+		for (unsigned index = 0; index < count; index++) {
+			if (link_count == sizeof(links) / sizeof(*links)) goto done;
+			struct bpf_link *link = symbols ? bpf_program__attach_kprobe(program, false, symbols[index]) : bpf_program__attach(program);
+			if (libbpf_get_error(link)) goto done;
+			links[link_count++] = link;
+		}
 	}
 	events = ring_buffer__new(bpf_object__find_map_fd_by_name(object, "metadata_events"), metadata_record, NULL, NULL);
 	if (!events) goto done;

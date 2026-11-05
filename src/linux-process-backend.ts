@@ -276,11 +276,12 @@ export class LinuxProcessReuseBackend {
 		};
 	}
 
-	async check(refresh = false): Promise<LinuxProcessBackendStatus> {
+	async check(refresh = false, sourceRoot?: string): Promise<LinuxProcessBackendStatus> {
 		if (process.platform !== "linux") return { state: "unavailable", detail: "Linux host required" };
 		if (refresh) this.ready = undefined;
 		try {
 			const ready = await this.resolveReady();
+			ready.collector.check(sourceRoot);
 			return {
 				state: "ready",
 				detail: this.options.completedOnly ? "Finished command branches ready; live process capture disabled" : `Landlock/seccomp virtual filesystem + strace provenance ready; ${ready.imageLibrary
@@ -815,7 +816,6 @@ export class LinuxProcessReuseBackend {
 
 	private async probe() {
 		if (process.platform !== "linux") throw new Error("Linux host required");
-		if (!process.env.PI_SPEC_DOMAIN_SOCKET) throw new Error("Linux process reuse requires an active cgroup/eBPF execution domain");
 		if (!this.options.store?.reservedRoot) await mkdir(this.options.storeRoot, { recursive: true, mode: 0o700 });
 		await chmod(this.options.storeRoot, 0o700);
 		const [sandlock, strace, dispatcher] = await Promise.all([

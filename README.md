@@ -48,7 +48,7 @@ pi
 Linux / WSL 2 需在扩展目录运行 `npm run setup:linux`，升级后重新运行；WSL checkout 放在 Linux 原生文件系统。Windows x64 使用随包提供的本地 NTFS 对象租约，无需另行编译。
 
 Linux 的透明子进程观察还需要合格的观察助手：通过 `PI_SPEC_HELD_EXEC_OBSERVER` 指向管理员部署、普通用户不可修改且具有 `CAP_SYS_PTRACE` 的独立 `.observer` 文件。助手核对调用者及目标进程身份，并在附着后释放该能力；工作负载本身不获得此权限。若启动环境已经设置 `no_new_privs`，助手也可在该约束下工作，但这会阻止依赖提权的 FUSE 挂载，不能用作完整验证环境的通用替代。权限不足时原工具正常执行，透明复用不可用。
-Linux 进程复用统一要求 cgroup v2、内核 BTF 与所需 eBPF tracing hooks；构建采集器还需要 Clang 和 libbpf、libelf、zlib 开发库。安装后，保留上面配置的观察助手，通过前台执行域启动 Pi：
+Linux 进程复用统一要求 cgroup v2、内核 BTF 与所需 eBPF tracing/kprobe hooks、`bpf_loop`；构建采集器还需要 Clang 和 libbpf、libelf、zlib 开发库。安装后，保留上面配置的观察助手，通过前台执行域启动 Pi：
 
 ```sh
 sudo ~/.local/bin/pi-speculative-domain --user "$(id -u)" env \
@@ -61,9 +61,21 @@ sudo ~/.local/bin/pi-speculative-domain --user "$(id -u)" env \
 
 ## 支持边界
 
-- **文件与计算**：通过显式操作绑定共享输入和纯子计算；仅声明工具“只读”不能授权缓存其完整结果。写入通过工作区事务隔离、验新并提交。
-- **Linux 进程**：已验证范围为 x86-64、同一 ext4 挂载和 UTF-8 路径，支持合格 Bash 分支、已观察子操作及可封存的单线程进程。检查点跨进程恢复还要求同一次系统启动、同一 Pi 会话、工作区和原缓存位置。
-- **平台范围**：Windows 支持本地 NTFS 文件资源与私有工作区。任意进程、多线程续接、宿主中断工具批次的透明恢复及外部 runtime world 尚不支持。
+资格由实际操作、依赖、效果和所有权决定。下表描述可验收的能力；某个工具名称或“只读”声明不会授权缓存其完整结果。
+
+| 能力 | 成立条件与不满足时的行为 | 公开入口验收 |
+| --- | --- | --- |
+| 共享输入、纯子计算 | 实际操作绑定、有效依赖证明；可跨工具消费，缺少绑定或证明时正常执行。 | `agent.system`、`persistent-inputs` |
+| 工作区效果 | 私有工作区隔离、验新、事务提交及所有权释放；提交前失效可回退，已产生效果且恢复不明时终止。 | `process-reuse.system`、`host-closure`、`linux-overlayfs` |
+| Linux 完成成果与进程接管 | 已验证 x86-64、同一 ext4 挂载、合格 Bash 分支、已观察子操作及可封存的单线程进程；需要当前构建的执行域、观察助手和通过行为探测的后端。缺少执行域时进程复用不可用。 | `extension.system`、`linux-reuse-chain`、`held-exec` |
+| 检查点跨进程恢复 | 另限同一次系统启动、同一 Pi 会话、工作区和原缓存位置；身份、输入、所有权或镜像不符时拒绝恢复。 | `process-reuse.system` |
+| Windows | 本地 NTFS 文件资源与私有工作区；没有 Linux 同等进程接管能力。 | `filesystem-lease`、`host-closure` |
+
+进程观察根允许空格、反斜杠和 UTF-8 字符；须为规范化后的绝对目录、归调用者所有且组/其他用户不可写。路径须小于 Linux `PATH_MAX`（4,096 字节），每条祖先链最多 64 项（包括根自身和 `/`），同一观察所有者最多 4 个根、64 个去重父目录。限额耗尽或权限不符会给出具体拒绝原因。`linux-environment` 验证诊断与真实准入一致，`extension.system` 验证这些路径下的实际消费。
+
+菜单中的 **Check Linux environment** 使用运行时同一执行域握手、工作区准入及观察助手探测，分别列出构建条件、当前缺口和未验证事项；**Refresh and show capabilities** 显示已启用后端的实际资格。构建工具或库存在并不等于操作已获复用资格。升级后须重新 `setup:linux` 并重启前台执行域；仅保留旧观察助手不能恢复进程复用。
+
+任意原生程序、多线程续接、任意外部副作用、宿主中断工具批次的透明恢复及外部 runtime world 尚不支持。Linux 实测环境为 WSL 2 / Ubuntu 24.04、x86-64 和原生 ext4，不外推其他内核、文件系统或架构。上表用例位于 `test/`，平台专属跳过不计为支持证据。
 
 验新不提供任意外部并发写入的隔离保证。证明不足时沿原路径执行；若提交已产生副作用且无法证明恢复，则报错终止，避免重复执行。
 

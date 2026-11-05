@@ -116,7 +116,7 @@ export function createLinuxProcessExecutionWorld(
 			diagnostics: async ({ cwd, refresh }) => {
 				if (!refresh && !backendChecked) return { state: "registered" as const, detail: "Checked on first process fork" };
 				backendChecked = true;
-				const [status, store] = await Promise.all([backend.check(refresh), backend.store.stats(refresh)]);
+				const [status, store] = await Promise.all([backend.check(refresh, cwd), backend.store.stats(refresh)]);
 				const storage = {
 					entries: store.certificates,
 					maxEntries: backend.store.limits.maxCertificates,
@@ -137,7 +137,7 @@ export function createLinuxProcessExecutionWorld(
 			},
 			prepare: async ({ cwd, signal }) => {
 				backendChecked = true;
-				const status = await backend.check();
+				const status = await backend.check(false, cwd);
 				if (status.state !== "ready") throw new Error(status.detail);
 				const selected = await qualify(cwd);
 				const prepared = await workspaceSandbox.prepare(cwd, { ...workspaceOptions, driver: selected.driver, signal });
