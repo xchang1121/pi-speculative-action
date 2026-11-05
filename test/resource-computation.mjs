@@ -21,20 +21,20 @@ registerHooks({ load(url, context, next) {
   }).outputText } : loaded;
 } });
 const [{ createSpeculativeActionHost }, { createSpeculativeActionExtension }, { ResourceReadView },
-  { resourceComputationCompiler, resourceOperationContext }, { TimelineInterval },
-  { tool, indexRows, impure, alias, counts, setFactor, cases, replace, reviverCalls, rename }] = await Promise.all([
+  { resourceComputationCompiler, resourceOperationContext }, { TimelineInterval, TaskTimeline },
+  { tool, indexRows, groupRows, fullRows, impure, alias, counts, setFactor, cases, replace, reviverCalls, rename }] = await Promise.all([
     import('../src/agent-integration.ts'), import('../src/extension.ts'), import('../src/resource-version.ts'),
     import('../src/resource-computation.ts'), import('../src/task-timing.ts'), import('./resource-computation-tool.mjs'),
   ]);
 
-async function observeCalls() {
-  globalThis.__piComputationTest = { indexRows, impure, alias };
+async function observeCalls(functions = { indexRows, impure, alias }) {
+  globalThis.__piComputationTest = functions;
   const worker = new Worker(`
-    const { parentPort } = require('node:worker_threads'), { Session } = require('node:inspector');
+    const { parentPort, workerData } = require('node:worker_threads'), { Session } = require('node:inspector');
     const session = new Session(); session.connectToMainThread();
     const post = (method, params = {}) => new Promise((resolve, reject) => session.post(method, params,
       (error, result) => error ? reject(error) : resolve(result)));
-    const counts = { indexRows: 0, impure: 0, alias: 0 }, breakpoints = new Map();
+    const counts = Object.fromEntries(workerData.map(name => [name, 0])), breakpoints = new Map();
     session.on('Debugger.paused', ({ params }) => {
       for (const id of params.hitBreakpoints ?? []) { const name = breakpoints.get(id); if (name) counts[name]++; }
       session.post('Debugger.resume');
@@ -54,7 +54,7 @@ async function observeCalls() {
       }
       parentPort.postMessage('ready');
     })().catch(error => { throw error; });
-  `, { eval: true });
+  `, { eval: true, workerData: Object.keys(functions) });
   await once(worker, 'message');
   return { count: async () => { const reply = once(worker, 'message'); worker.postMessage('count'); return (await reply)[0]; },
     stop: async () => { const reply = once(worker, 'message'); worker.postMessage('stop'); await reply;
@@ -113,8 +113,8 @@ const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, '
 modelRuntime.registerNativeProvider(provider.provider);
 const { session } = await createAgentSession({ cwd: directory, agentDir, model: provider.getModel(), modelRuntime, settingsManager,
   resourceLoader, sessionManager: SessionManager.inMemory(directory), tools: tools.map(tool => tool.name) });
-const execute = async (tool, id) => {
-  provider.setResponses([fauxAssistantMessage(fauxToolCall(tool.name, {}, { id }), { stopReason: 'toolUse' }), fauxAssistantMessage('done')]);
+const execute = async (tool, id, args = {}) => {
+  provider.setResponses([fauxAssistantMessage(fauxToolCall(tool.name, args, { id }), { stopReason: 'toolUse' }), fauxAssistantMessage('done')]);
   await session.prompt(`Execute ${tool.name}.`);
   const result = session.messages.find(message => message.role === 'toolResult' && message.toolCallId === id);
   assert.ok(result && !result.isError, JSON.stringify(result)); return result;
@@ -156,6 +156,38 @@ try {
   assert.equal(events.at(-1).computation?.hiddenComputeMs ?? 0, 0);
   assert.deepEqual(counts(), { renders: 6, reads: 6, effects: 6 });
   await observer.stop(); observer = undefined;
+  reuseEnabled = true;
+  observer = await observeCalls({ indexRows, groupRows, fullRows });
+  const hierarchy = [];
+  const levelCounts = async (indexRows, groupRows, fullRows) => {
+    const actual = await observer.count(); hierarchy.push(actual);
+    assert.deepEqual(actual, { indexRows, groupRows, fullRows });
+  };
+  await writeFile(file, '[{"value":9}]');
+  const firstArgs = { label: 'first', footer: 'first' }, secondArgs = { label: 'second', footer: 'second' };
+  const grouped = await execute(tools[0], 'group-first', firstArgs); await levelCounts(1, 1, 1);
+  assert.deepEqual((await execute(tools[1], 'group-hit', firstArgs)).details.result, grouped.details.result);
+  await levelCounts(0, 0, 0);
+  const changedFooter = await execute(tools[1], 'group-outer', { ...firstArgs, footer: 'second' });
+  assert.deepEqual(changedFooter.details.result, { ...grouped.details.result, footer: 'second' }); await levelCounts(0, 0, 1);
+  const changedLabel = await execute(tools[1], 'group-partial', secondArgs);
+  assert.deepEqual(changedLabel.details.result, { footer: 'second', group: { ...grouped.details.result.group, label: 'second' } });
+  await levelCounts(0, 1, 1);
+  await writeFile(file, '[{"value":11}]');
+  const changedRows = await execute(tools[1], 'group-stale', secondArgs);
+  assert.notDeepEqual(changedRows.details.result.group.values, changedLabel.details.result.group.values); await levelCounts(1, 1, 1);
+  setFactor(4);
+  const changedCapture = await execute(tools[1], 'group-capture', secondArgs);
+  assert.notDeepEqual(changedCapture.details.result.group.values, changedRows.details.result.group.values); await levelCounts(1, 1, 1);
+  assert.deepEqual((await execute(tools[0], 'group-refreshed', secondArgs)).details.result, changedCapture.details.result);
+  await levelCounts(0, 0, 0);
+  reuseEnabled = false;
+  assert.deepEqual((await execute(tools[0], 'group-disabled', secondArgs)).details.result, changedCapture.details.result);
+  await levelCounts(1, 1, 1);
+  assert.equal(events.at(-1).computation?.hiddenComputeMs ?? 0, 0);
+  assert.deepEqual(counts(), { renders: 14, reads: 14, effects: 14 });
+  automatic.hierarchy = hierarchy; reuseEnabled = true; setFactor(3);
+  await observer.stop(); observer = undefined;
   const view = new ResourceReadView(8 * 1024 * 1024);
   await compiler.prepare(cases); compilerAttached = true;
   const context = { view, sources: () => [] };
@@ -171,8 +203,30 @@ try {
     const borrowed = await evaluate('copy', data); assert.ok(used(borrowed));
     assert.notEqual(fresh, borrowed.output); borrowed.output.n = 100;
     assert.deepEqual((await evaluate('copy', data)).output, { n: 1 });
+    assert.ok(used(await evaluate('copy', data, undefined, { view, sources: function* () { throw new Error('unused source discovery'); } })));
+    const consumer = new ResourceReadView(8 * 1024 * 1024);
+    try { assert.ok(used(await evaluate('copy', data, undefined, { view: consumer,
+      sources: function* () { yield view; throw new Error('later source discovery'); } }))); }
+    finally { await consumer.dispose(); }
+    const combined = await evaluate('copy-group', data);
+    assert.deepEqual(combined.output, { copied: { n: 1 } });
+    assert.deepEqual((await evaluate('copy-group', data)).output, combined.output);
+    const issuedAt = performance.now();
+    const overlapping = await TimelineInterval.measure(() => resourceOperationContext.run({ computation: context, maxBytes: () => 8 * 1024 * 1024 },
+      () => [cases('copy-group', data), cases('copy', data)]));
+    assert.equal(overlapping.dependencies.filter(item => item.reused).length, 2);
+    assert.equal(new TaskTimeline().recordTool(overlapping.computation, issuedAt, false).hiddenComputeMs,
+      new TaskTimeline().recordCall([overlapping.dependencies[0]], issuedAt, performance.now()).hiddenComputeMs);
+    const priorEffects = counts().effects;
+    await evaluate('impure-group', [1]); await evaluate('impure-group', [1]); assert.equal(counts().effects, priorEffects + 2);
     assert.equal((await evaluate('capture')).output.factor, 3); setFactor(4);
     assert.equal((await evaluate('capture')).output.factor, 4);
+    assert.deepEqual((await evaluate('shadowed', 9)).output, { local: 9, global: { nested: { factor: 4 } } });
+    assert.ok(used(await evaluate('shadowed', 9))); setFactor(5);
+    assert.deepEqual((await evaluate('shadowed', 9)).output, { local: 9, global: { nested: { factor: 5 } } });
+    for (let i = 0; i < 2; i++) {
+      const recursive = await evaluate('recursive', 2); assert.deepEqual(recursive.output, { n: 0 }); assert.equal(used(recursive), false);
+    }
     for (const mode of ['change', 'alias-change']) {
       const mutable = { n: 0 };
       assert.equal((await evaluate(mode, mutable)).output, 1);
@@ -210,6 +264,7 @@ try {
     await assert.rejects(evaluate('inherited', inherited), TypeError);
     await withChangedCalculation(async () => {
       const changed = await evaluate('copy', data); assert.equal(changed.output.n, 11); assert.equal(used(changed), false);
+      const parent = await evaluate('copy-group', data); assert.equal(parent.output.copied.n, 11); assert.equal(used(parent), false);
     });
     assert.equal((await evaluate('copy', data)).output.n, 1);
     const source = 'export function reflected(value) { return { data: JSON.parse(value), source: reflected.toString() }; }';

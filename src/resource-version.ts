@@ -481,12 +481,13 @@ export class ResourceReadView {
 		let owner: ResourceReadView = this; while (owner.owner) owner = owner.owner;
 		let key: string | undefined, reused: { readonly value: Value } | undefined;
 		const references = new WeakSet<object>();
+		function* candidates() { yield owner; yield* sources(); }
 		try { TimelineInterval.outsideSync(() => {
 			if (!owner.retained) return;
 			const input = snapshotPreparation(inputs, { collect: references }); if (!input) return;
 			// V8's encoding preserves property order, unlike the persistent JSON canonicalization.
 			key = hash("sha256", serialize(input.value));
-			for (let source of [owner, ...sources()]) {
+			for (let source of candidates()) {
 				while (source.owner) source = source.owner;
 				const cached = source.prepared?.bindings.get(binding)?.get(key);
 				if (!source.retained || !cached?.synchronous || !cached.retained || cached.revoked) continue;

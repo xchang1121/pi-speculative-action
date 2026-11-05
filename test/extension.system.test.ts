@@ -29,7 +29,7 @@ const adoptions = (settlement: PredictionSettlement) => settlement.observation =
 const directories = temporaryDirectories("pi-extension-system-");
 afterEach(async () => { vi.unstubAllEnvs(); vi.restoreAllMocks(); await directories.dispose(); });
 
-test.skipIf(process.platform !== "linux").each(["reuse", "space-root", "backslash-root", "deep-root", "long-root", "shared-root", "stale", "environment", "outside-mount", "disabled", "routing-off", "no-domain", "lost-domain", "retired-domain"])(
+test.skipIf(process.platform !== "linux").each(["reuse", "space-root", "backslash-root", "deep-root", "long-root", "shared-root", "stale", "stale-inputs", "environment", "outside-mount", "disabled", "routing-off", "no-domain", "lost-domain", "retired-domain"])(
 	"consumes finished Bash through the default Pi extension (%s)", { timeout: 60_000 }, async mode => {
 	const roots: Record<string, string> = { "space-root": "with space 中", "backslash-root": "with\\backslash", "deep-root": "d/".repeat(18) + "leaf", "long-root": "long/" + "x".repeat(240) };
 	const cwd = path.join(await directories.create(os.homedir()), roots[mode] ?? ""), agentDir = await directories.create(os.homedir());
@@ -47,11 +47,32 @@ test.skipIf(process.platform !== "linux").each(["reuse", "space-root", "backslas
 	await writeFile(path.join(cwd, "main.c"), '#include <stdio.h>\nint main(void){puts("built:42");return 0;}\n');
 	await writeFile(path.join(cwd, "check.py"), 'print(open("value").read(), end="")\n');
 	await writeFile(path.join(cwd, "value"), "one\n");
-	const command = 'cc main.c -o app && ./app && python3 -B check.py; printf "%s\\n" "$BASH_TEST_VERSION"';
+	const command = 'cc main.c -o app && ./app && python3 -B check.py; printf "%s\\n" "$BASH_TEST_VERSION"; printf once >> marker';
 	expect(execFileSync("/bin/bash", ["-c", command], { cwd, encoding: "utf8" })).toBe("built:42\none\nfirst\n");
+	await writeFile(path.join(cwd, "marker"), "");
 	const nativeEntries = ["completedReplayExecutor", "refreshNativeObservation"] as const;
 	const forbidden = nativeEntries.map(entry => vi.spyOn(LinuxProcessReuseBackend.prototype, entry).mockImplementation(() => { throw new Error(`unsupported entry: ${entry}`); }));
 	const events: SpeculativeActionEvent<string>[] = [], fallbacks: string[] = [];
+	let inspection: ReturnType<typeof inspectProcessOwner> | undefined;
+	const nativeAdoptions: Promise<unknown>[] = [];
+	const ownerPrototype = LinuxProcessReuseBackend.prototype as unknown as { processOwner(): SynchronousProcessObserver };
+	const processOwner = ownerPrototype.processOwner;
+	vi.spyOn(ownerPrototype, "processOwner").mockImplementation(function (this: LinuxProcessReuseBackend) {
+		if (!inspection) {
+			inspection = inspectProcessOwner(() => processOwner.call(this));
+			nativeAdoptions.push(inspection.inOwner(async state => {
+				const Backend = (await state.load("../dist/linux-process-backend.js")).LinuxProcessReuseBackend, decide = Backend.prototype.decideHeldExec;
+				state.adopted = [];
+				state.method(Backend.prototype, "decideHeldExec", async function (this: unknown, ...args: any[]) {
+					const executable = await state.fs.readlink(`/proc/${args[0].pid}/exe`), decision = await decide.apply(this, args);
+					return decision.kind !== "replay" ? decision : { ...decision, adopted: () => {
+						decision.adopted?.(); state.adopted.push(executable);
+					} };
+				});
+			}));
+		}
+		return processOwner.call(this);
+	});
 	let host!: ReturnType<typeof createSpeculativeActionHost>, turn!: Parameters<typeof host.startTurn>[0];
 	const extension = createSpeculativeActionExtension({ createHost: (id, options) => {
 		host = createSpeculativeActionHost(id, { ...options, resources: idleResources(2), onEvent: event => { events.push(event); return options.onEvent?.(event); } });
@@ -66,7 +87,8 @@ test.skipIf(process.platform !== "linux").each(["reuse", "space-root", "backslas
 	modelRuntime.registerNativeProvider(actor.provider);
 	const { session } = await createAgentSession({ cwd, agentDir, model: actor.getModel(), modelRuntime, settingsManager, resourceLoader: loader,
 		sessionManager: SessionManager.inMemory(cwd), tools: ["bash"] });
-	await using _session = onExit(async () => { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); });
+	await using _session = onExit(async () => { try { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); }
+		finally { inspection?.dispose(); } });
 	let retiredSocket: string | undefined;
 	await using _collector = onExit(async () => { if (retiredSocket) await rename(`${retiredSocket}.retired`, retiredSocket); });
 	await session.bindExtensions({ mode: "print", onError: error => { throw error; } });
@@ -76,20 +98,32 @@ test.skipIf(process.platform !== "linux").each(["reuse", "space-root", "backslas
 	actor.setResponses([async () => {
 		await host.previewActorCall({ turnID: turn.turnID, id: "bash-default", tool: "bash", args: { command }, tools: turn.tools });
 		if (!["disabled", "routing-off", "no-domain", "lost-domain", "shared-root"].includes(mode)) await expect.poll(() => events.some(event => event.type === "candidate" && event.state.status === "succeeded"), { timeout: 30_000 }).toBe(true);
-		if (mode === "stale") await writeFile(path.join(cwd, "value"), "two\n");
+		expect(await readText(cwd, "marker")).toBe("");
+		if (mode.startsWith("stale")) await writeFile(path.join(cwd, "value"), "two\n");
+		if (mode === "stale-inputs") await writeFile(path.join(cwd, "main.c"), '#include <stdio.h>\nint main(void){puts("built:43");return 0;}\n');
 		if (mode === "environment") vi.stubEnv("BASH_TEST_VERSION", "second");
 		if (mode === "retired-domain") { retiredSocket = process.env.PI_SPEC_DOMAIN_SOCKET!; await rename(retiredSocket, `${retiredSocket}.retired`); }
 		return response("bash", { command }, { id: "bash-default" });
 	}, fauxAssistantMessage("done")]);
 	await session.prompt("Build the program and run the Python check.");
 	const result = session.messages.find(message => message.role === "toolResult");
-	expect(result, JSON.stringify(events)).toMatchObject({ isError: false, content: [fauxText(`built:42\n${mode === "stale" ? "two" : "one"}\n${mode === "environment" ? "second" : "first"}\n`)] });
+	expect(result, JSON.stringify(events)).toMatchObject({ isError: false, content: [fauxText(`built:${mode === "stale-inputs" ? 43 : 42}\n${mode.startsWith("stale") ? "two" : "one"}\n${mode === "environment" ? "second" : "first"}\n`)] });
+	expect(await readText(cwd, "marker")).toBe("once");
 	const settled = events.filter(event => event.type === "actor_action").at(-1)!;
 	expect(fallbacks, JSON.stringify(events)).toEqual(reusable ? [] : ["bash"]);
 	// A rejected whole branch can still consume unchanged, independently validated child work.
 	if (reusable || ["environment", "disabled", "routing-off", "no-domain", "lost-domain", "retired-domain", "shared-root"].includes(mode))
 		expect((settled.computation?.hiddenComputeMs ?? 0) > 0).toBe(reusable);
 	if (reusable) expect(settled.settlement.provider).toMatchObject({ kind: "actor", origin: "preview" });
+	await Promise.all(nativeAdoptions);
+	const adopted = inspection ? await inspection.inOwner(state => state.adopted as string[]) : [];
+	if (reusable) expect(adopted).toEqual([]);
+	if (mode === "stale") {
+		expect(adopted, JSON.stringify({ adopted, events })).toContainEqual(expect.stringMatching(/\/(?:cc|gcc|cc1|app)$/));
+		expect(settled.computation!.hiddenComputeMs).toBeGreaterThan(0);
+	}
+	if (mode.startsWith("stale")) expect(adopted).not.toContainEqual(expect.stringMatching(/\/python[^/]*$/));
+	if (mode === "stale-inputs") expect(adopted).not.toContainEqual(expect.stringMatching(/\/(?:cc|gcc|cc1|app)$/));
 	for (const entry of forbidden) expect(entry).not.toHaveBeenCalled();
 });
 

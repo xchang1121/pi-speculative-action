@@ -11,7 +11,9 @@ type Context = { readonly view: ResourceReadView; readonly sources: () => Iterab
 type ResourceOperationScope = { readonly inputs?: (path?: string) => Iterable<object>; readonly maxBytes: () => number;
 	readonly persistentInputs?: ResourceInputPersistence; readonly computation?: Context };
 type FunctionNode = ts.FunctionDeclaration | ts.FunctionExpression | ts.ArrowFunction | ts.MethodDeclaration;
-type Proof = { readonly binding: object; readonly globals: readonly unknown[]; readonly source: string };
+type Proof = { readonly binding: object; readonly globals: readonly unknown[]; readonly sources: readonly string[] };
+type FunctionProof = { readonly captures: string[]; readonly globals: string[]; readonly bindings: Map<string, ts.Symbol | undefined>;
+	readonly helpers: Map<string, FunctionNode> };
 const namespace = "pi-speculative-action.computation/", key = namespace + randomUUID(), access = `globalThis[${JSON.stringify(key)}]`;
 const globals: Record<string, unknown> = { Math, JSON, Object, Array, Number, String, Boolean };
 const staticCalls: Record<string, ReadonlySet<string>> = {
@@ -76,13 +78,14 @@ function createBroker() {
 	const contexts = new AsyncLocalStorage<ResourceOperationScope | undefined>(), proofs = new Map<string, Proof>();
 	const parse = JSON.parse, parsing = Object.freeze({});
 	return { contexts, proofs, target: undefined as Function | undefined,
-		wrap(id: string, original: (...args: unknown[]) => unknown, environment: () => [unknown[], unknown[]]) {
+		wrap(id: string, original: (...args: unknown[]) => unknown, environment: () => [unknown[], unknown[], Function[]]) {
 			return (...args: unknown[]) => {
 				const context = contexts.getStore()?.computation, proof = proofs.get(id), execute = () => apply(original, undefined, args);
 				if (!context || context.signal?.aborted || !proof) return execute();
 				const values = TimelineInterval.outsideSync(() => {
-					try { if (intact() && apply(standard.source, original, []) === proof.source) { const [values, actualGlobals] = environment();
-						if (actualGlobals.every((value, index) => value === proof.globals[index])) return values;
+					try { if (intact()) { const [values, actualGlobals, helpers] = environment();
+						if (actualGlobals.every((value, index) => value === proof.globals[index]) &&
+							[original, ...helpers].every((value, index) => apply(standard.source, value, []) === proof.sources[index])) return values;
 					} } catch { /* A conditional read or unavailable closure keeps its native evaluation order. */ }
 				});
 				return values ? context.view.compute(proof.binding, [args, values], execute, context.sources) : execute();
@@ -117,14 +120,19 @@ const reference = (node: ts.Identifier) => {
 
 /** A deliberately closed language: synchronous data calculations and audited intrinsics.
  * Unknown calls, ambient state, input mutation and escaping aliases keep their original execution. */
-function prove(fn: FunctionNode, checker: ts.TypeChecker): { captures: string[]; globals: string[]; bindings: Map<string, ts.Symbol | undefined> } | undefined {
+function prove(fn: FunctionNode, checker: ts.TypeChecker,
+	resolve: (call: ts.Identifier) => { readonly fn: FunctionNode; readonly proof: FunctionProof } | undefined): FunctionProof | undefined {
 	if (!fn.body || fn.asteriskToken || fn.modifiers?.some(value => value.kind === ts.SyntaxKind.AsyncKeyword) ||
 		fn.parameters.some(param => !ts.isIdentifier(param.name) || param.initializer || param.dotDotDotToken)) return;
 	const locals = new Set<ts.Symbol>(), owned = new Set<ts.Symbol>(), assigned = new Set<ts.Symbol>();
 	const captures = new Set<string>(), usedGlobals = new Set<string>();
-	const bindings = new Map<string, ts.Symbol | undefined>();
+	const bindings = new Map<string, ts.Symbol | undefined>(), helpers = new Map<string, FunctionNode>();
 	let valid = true;
 	const symbol = (node: ts.Node) => bindingAt(checker, node);
+	const bind = (name: string, binding: ts.Symbol | undefined) => {
+		if (bindings.has(name) && bindings.get(name) !== binding) valid = false;
+		else bindings.set(name, binding);
+	};
 	const write = (node: ts.Node) => {
 		if (ts.isIdentifier(node)) { const binding = symbol(node); if (!binding || !locals.has(binding)) valid = false; else assigned.add(binding); }
 		else if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
@@ -154,10 +162,11 @@ function prove(fn: FunctionNode, checker: ts.TypeChecker): { captures: string[];
 			if (["arguments", "eval", "Function", "globalThis", "Symbol"].includes(node.text)) { valid = false; return; }
 			const binding = symbol(node), local = binding?.declarations?.some(declaration => contains(fn, declaration));
 			if (local && binding && !locals.has(binding)) { valid = false; return; }
-			if (!local && (node.text !== "undefined" || binding)) {
+			if (!local && (node.text !== "undefined" || binding) &&
+				!(helpers.has(node.text) && ts.isCallExpression(node.parent) && node.parent.expression === node)) {
 				if (Object.hasOwn(globals, node.text)) usedGlobals.add(node.text);
 				else if (!binding) { valid = false; return; } else captures.add(node.text);
-				bindings.set(node.text, binding);
+				bind(node.text, binding);
 			}
 		}
 		if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) write(node.left);
@@ -166,8 +175,15 @@ function prove(fn: FunctionNode, checker: ts.TypeChecker): { captures: string[];
 		if (ts.isCallExpression(node)) {
 			const call = node.expression;
 			if (ts.isIdentifier(call)) {
-				if (!["Number", "String", "Boolean"].includes(call.text)) { valid = false; return; }
-				usedGlobals.add(call.text);
+				if (["Number", "String", "Boolean"].includes(call.text)) usedGlobals.add(call.text);
+				else {
+					const helper = resolve(call); if (!helper) { valid = false; return; }
+					helpers.set(call.text, helper.fn); bind(call.text, symbol(call));
+					for (const [name, fn] of helper.proof.helpers) helpers.set(name, fn);
+					for (const [name, binding] of helper.proof.bindings) bind(name, binding);
+					for (const name of helper.proof.captures) captures.add(name);
+					for (const name of helper.proof.globals) usedGlobals.add(name);
+				}
 			} else if (ts.isPropertyAccessExpression(call)) {
 				const receiver = call.expression, method = call.name.text;
 				if (ts.isIdentifier(receiver) && Object.hasOwn(staticCalls, receiver.text)) {
@@ -185,7 +201,7 @@ function prove(fn: FunctionNode, checker: ts.TypeChecker): { captures: string[];
 	if ([...owned].some(binding => assigned.has(binding))) valid = false;
 	// A global spelling shadowed by any local declaration is not the intrinsic passed at entry.
 	if ([...locals].some(binding => usedGlobals.has(binding.name))) valid = false;
-	return valid ? { captures: [...captures], globals: [...usedGlobals], bindings } : undefined;
+	return valid ? { captures: [...captures], globals: [...usedGlobals], bindings, helpers } : undefined;
 }
 
 type Edit = { readonly start: number; readonly end: number; readonly text: string };
@@ -217,25 +233,32 @@ function compile(source: string, id: string) {
 		ts.forEachChild(node, walk);
 	}; walk(file);
 	if (dynamic) return;
-	const pure = new Map<FunctionNode, { identity: string; proof: NonNullable<ReturnType<typeof prove>> }>();
-	for (const fn of functions) {
-		if (!ts.isExternalModule(file) && !functions.some(parent => parent !== fn && contains(parent, fn))) continue;
-		const proof = prove(fn, checker); if (!proof) continue;
-		pure.set(fn, { identity: `${id}:${fn.pos}`, proof });
-	}
+	const pure = new Map<FunctionNode, FunctionProof | undefined>();
+	const definition = (call: ts.Identifier) => {
+		const binding = bindingAt(checker, call), declaration = binding?.declarations?.[0];
+		return !binding || writes.has(binding) || !declaration ? undefined : isFunction(declaration) ? declaration :
+			ts.isVariableDeclaration(declaration) && declaration.initializer && isFunction(declaration.initializer) ? declaration.initializer : undefined;
+	};
+	const proofFor = (fn: FunctionNode): FunctionProof | undefined => {
+		if (!pure.has(fn)) {
+			pure.set(fn, undefined); // Cycles retain ordinary execution; descendants can still be reused independently.
+			if (ts.isExternalModule(file) || functions.some(parent => parent !== fn && contains(parent, fn)))
+				pure.set(fn, prove(fn, checker, call => { const child = definition(call), proof = child && proofFor(child);
+					return proof ? { fn: child!, proof } : undefined; }));
+		}
+		return pure.get(fn);
+	};
 	const parse = (node: ts.Node, inside = false) => {
 		inside ||= isFunction(node);
 		if (inside && ts.isCallExpression(node) && !(node.flags & ts.NodeFlags.OptionalChain) && ts.isPropertyAccessExpression(node.expression) && ts.isIdentifier(node.expression.expression) &&
 			node.expression.expression.text === "JSON" && node.expression.name.text === "parse") {
 			edits.push({ start: node.expression.getStart(file), end: node.expression.end, text: `${access}.call(JSON,"parse")` });
 		} else if (inside && ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
-			const binding = bindingAt(checker, node.expression), declaration = binding?.declarations?.[0];
-			const fn = declaration && (isFunction(declaration) ? declaration : ts.isVariableDeclaration(declaration) && declaration.initializer && isFunction(declaration.initializer) ? declaration.initializer : undefined);
-			const operation = fn && pure.get(fn);
-			if (operation && binding && !writes.has(binding) && [...operation.proof.bindings].every(([name, symbol]) => checker.resolveName(name, node, ts.SymbolFlags.Value, false) === symbol)) {
-				const { identity, proof } = operation;
+			const fn = definition(node.expression), proof = fn && proofFor(fn);
+			if (proof && [...proof.bindings].every(([name, symbol]) => checker.resolveName(name, node, ts.SymbolFlags.Value, false) === symbol)) {
+				const identity = `${id}:${fn!.pos}`;
 				edits.push({ start: node.expression.getStart(file), end: node.expression.end,
-					text: `${access}.wrap(${JSON.stringify(identity)},${node.expression.text},()=>[[${proof.captures.join(",")}],[${proof.globals.join(",")}]] )` });
+					text: `${access}.wrap(${JSON.stringify(identity)},${node.expression.text},()=>[[${proof.captures.join(",")}],[${proof.globals.join(",")}],[${[...proof.helpers.keys()].join(",")}]] )` });
 				registered.set(identity, fn!);
 			}
 		}
@@ -250,8 +273,12 @@ function compile(source: string, id: string) {
 		return result;
 	};
 	for (const [identity, fn] of registered) {
-		const start = ts.isFunctionDeclaration(fn) ? fn.getChildren(file).find(node => node.kind === ts.SyntaxKind.FunctionKeyword)!.getStart(file) : fn.getStart(file);
-		broker.proofs.set(identity, { binding: Object.freeze({}), globals: pure.get(fn)!.proof.globals.map(name => globals[name]), source: edited(start, fn.end) });
+		const proof = pure.get(fn)!;
+		broker.proofs.set(identity, { binding: Object.freeze({}), globals: proof.globals.map(name => globals[name]),
+			sources: [fn, ...proof.helpers.values()].map(fn => {
+				const start = ts.isFunctionDeclaration(fn) ? fn.getChildren(file).find(node => node.kind === ts.SyntaxKind.FunctionKeyword)!.getStart(file) : fn.getStart(file);
+				return edited(start, fn.end);
+			}) });
 	}
 	return { source: edited(0, source.length), registered: [...registered.keys()] };
 }
