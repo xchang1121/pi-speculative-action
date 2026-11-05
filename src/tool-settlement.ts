@@ -57,6 +57,8 @@ export interface ToolInvocation {
 	readonly executor: string;
 	/** Original Actor callback; automatic data calculations never authorize its outer effects. */
 	readonly callback?: Function;
+	/** The enclosing host callback may run only for an actual call; independently proven child operations remain eligible. */
+	readonly authoritativeOnly?: true;
 	readonly observation?: ToolObservationContract;
 	/** Internal execution uses the current enclosing action for permission and an opaque backend binding. */
 	readonly operation?: { readonly binding: ExecutionOperationBinding; readonly permission: ActionKey };

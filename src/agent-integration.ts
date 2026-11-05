@@ -157,6 +157,8 @@ export function createAgentExecutionHost(sessionID: string, options: CreateSpecu
 	const inClosure = (world: AgentExecutionWorld) => !admission?.(world, "speculation");
 	const executionGateway = new ToolExecutionGateway(executionWorlds, options.speculativeExecutionWorldEnabled, undefined, admission);
 	const resolveExecutionRoute = (tool: string, signal?: AbortSignal, action?: ActionKey, parentCheckpoint?: WorldCheckpoint) => {
+		const invocation = action?.executionContext as ToolInvocation | undefined;
+		if (invocation?.authoritativeOnly && !invocation.operation) return undefined;
 		const definition = actionSemantics.definition(action ?? tool);
 		return definition && executionGateway.resolve({ tool, action, parentCheckpoint,
 			backend: (action?.executionContext as ToolInvocation | undefined)?.operation?.binding.backend,

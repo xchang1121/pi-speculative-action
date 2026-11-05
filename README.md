@@ -29,6 +29,8 @@ flowchart LR
 
 ## 使用
 
+自定义工具可使用[通用投机工具接入模板](./docs/speculative-tool-template.md)：以 `defineSpeculativeStep` 声明可共享的同步或异步计算，以 `defineSpeculativeTool` 声明效果边界，再照常 `pi.registerTool`。附带[可运行的三层报表示例](./examples/speculative-tool.ts)，展示跨工具共享、局部失效及工作区写入；所有步骤共用现有缓存和生命周期。
+
 需要 Node.js ≥ 22.19；使用未修改的 Pi，当前兼容验证基线为 `0.84.1`。
 
 ```sh

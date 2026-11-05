@@ -160,7 +160,7 @@ export function createSerializablePreparationBinding(implementation: unknown, ac
 }
 
 /** Own a bounded, lossless JSON tree without invoking getters or flattening opaque resources. */
-function snapshotPreparation(value: unknown, references?: { readonly collect?: WeakSet<object>; readonly exclude?: WeakSet<object> }): { readonly value: unknown; readonly data: Buffer } | undefined {
+export function snapshotPreparation(value: unknown, references?: { readonly collect?: WeakSet<object>; readonly exclude?: WeakSet<object> }): { readonly value: unknown; readonly data: Buffer } | undefined {
 	let remaining = MAX_PREPARATION_DATA_BYTES, nodes = 0;
 	const seen = new WeakSet<object>(), budget = Symbol(), invalid = () => { throw new Error("resource_preparation_data_invalid"); };
 	const charge = (value: string) => { if (value.length > remaining || (remaining -= Buffer.byteLength(value)) < 0) throw budget; };
@@ -192,7 +192,7 @@ function snapshotPreparation(value: unknown, references?: { readonly collect?: W
 }
 
 // Includes the decoded tree, encoded bytes and transient decoding copies, not just the CAS payload.
-const preparationDataBytes = (size: number) => size * 64 + 512;
+export const preparationDataBytes = (size: number) => size * 64 + 512;
 const preparationMetadataBytes = (key: string, resource: string | undefined, dependencies: Iterable<string>) =>
 	(key.length + (resource?.length ?? 0)) * 2 + 192 + [...dependencies].reduce((sum, name) => sum + name.length * 2 + 64, 0);
 
@@ -539,7 +539,10 @@ export class ResourceReadView {
 					if (registration && !registration.accepts(cached.value)) throw new Error("resource_preparation_data_invalid");
 					const dependencies = cached.origin === owner && cached.dependencies && this.dependencies ? new Set([...this.dependencies, ...cached.dependencies]) : undefined;
 					const sourceDependencies = source && cached.origin.entries === source.view.entries ? cached.dependencies : undefined;
-					const proofs = [...source?.observed(sourceDependencies, false) ?? [], ...cached.proofs ?? []];
+					// Relocated preparations retain their own input proofs; their new owner may also contain unrelated effects.
+					const independent = source && cached.origin.entries !== source.view.entries && cached.dependencies &&
+						[...cached.dependencies].every(key => cached.proofs?.some(proof => proof.observations.has(key)));
+					const proofs = [...(!independent ? source?.observed(sourceDependencies, false) ?? [] : []), ...cached.proofs ?? []];
 					return await cached.destination.prepared!.lifetime.admit(async () => {
 						this.assertComplete(); cached.destination.assertComplete();
 						await this.validateInputs?.([...(this.observed?.(dependencies, false) ?? []), ...proofs]);

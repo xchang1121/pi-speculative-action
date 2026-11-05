@@ -409,7 +409,7 @@ async function installController(
 	const toolCapabilities = () => resolveToolCapabilities(
 		new Map(sdk.tools().map(selectTool).map(tool => [tool.name, agentTools.get(tool.name) === tool
 			? (closedSearchEnabled() ? search?.profile?.invocations.get(tool.name)?.semantics : undefined)?.requirements ?? PI_ACTION_SEMANTICS.requirements(tool.name)
-			: sdkToolInvocation(tool).semantics?.requirements])), executionRoutes(),
+			: sdkToolInvocation(tool, latestContext.cwd).semantics?.requirements])), executionRoutes(),
 	);
 	const runtimeSettings = () => currentSettings;
 	const visibleMetrics = (): SpeculativeActionMetrics => ({ ...currentMetrics, actorProcessReuse: emptyWorldReuseMetrics() });
@@ -426,7 +426,7 @@ async function installController(
 		preflight: ({ toolName }) =>
 			latestContext.isProjectTrusted() && pi.getActiveTools().includes(toolName),
 		resolveInvocation: async (tool, input, definition) => {
-			if (!definition || agentTools.get(tool) !== definition) return definition && sdkToolInvocation(definition);
+			if (!definition || agentTools.get(tool) !== definition) return definition && sdkToolInvocation(definition, latestContext.cwd);
 			if (closedSearchEnabled() && PI_CLOSED_SEARCH_TOOLS.includes(tool)) {
 				const invocation = (await prepareSearch())?.invocations.get(tool);
 				if (invocation) return invocation; // Qualification precedes identity binding; never switch an admitted call.

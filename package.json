@@ -37,6 +37,8 @@
 		"dist",
 		"src",
 		"vendor",
+		"examples",
+		"docs",
 		"README.md",
 		"CHANGELOG.md",
 		"LICENSE"

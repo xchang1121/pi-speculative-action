@@ -16,6 +16,10 @@
 		"inlineSources": true,
 		"inlineSourceMap": false,
 		"moduleResolution": "Node16",
+		"paths": {
+			"@earendil-works/pi-speculative-action": ["./src/index.ts"],
+			"@earendil-works/pi-speculative-action/extension": ["./src/extension.ts"]
+		},
 		"resolveJsonModule": true,
 		"allowImportingTsExtensions": true,
 		"allowJs": true,
@@ -26,6 +30,6 @@
 		"types": ["node"],
 		"noEmit": true
 	},
-	"include": ["src/**/*.ts", "src/process-context.mjs", "test/**/*.ts", "vitest.config.ts"],
+	"include": ["src/**/*.ts", "src/process-context.mjs", "test/**/*.ts", "examples/**/*.ts", "vitest.config.ts"],
 	"exclude": ["node_modules", "dist"]
 }

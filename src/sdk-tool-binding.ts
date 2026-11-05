@@ -6,6 +6,7 @@ import { stableValueHash } from "./stable-value-hash.ts";
 import { asRecord } from "./stable-json.ts";
 import { UNRESTRICTED_PROCESS_EFFECTS } from "./effect-model.ts";
 import type { ToolInvocation } from "./tool-settlement.ts";
+import { speculativeToolInvocation } from "./speculative-tool.ts";
 
 type Execute = (tool: AgentTool, args: Parameters<AgentTool["execute"]>) => ReturnType<AgentTool["execute"]>;
 type Turn = { readonly tools: readonly AgentTool[]; execute?: Execute; closed?: boolean };
@@ -45,13 +46,13 @@ function createBroker() {
 }
 
 /** Keep opaque callbacks available for child-operation learning, never for executing a host function ahead. */
-const callbackTools = new WeakMap<AgentTool, { readonly execute: AgentTool["execute"]; readonly tool: AgentTool; readonly invocation: ToolInvocation }>();
+const callbackTools = new WeakMap<AgentTool, { readonly source: AgentTool; readonly execute: AgentTool["execute"]; readonly tool: AgentTool; readonly invocation: ToolInvocation }>();
 export function sdkCallbackTool(tool: AgentTool): AgentTool {
 	let entry = callbackTools.get(tool);
 	if (!entry || entry.execute !== tool.execute) {
 		// The SDK already prepared Actor arguments. An arbitrary preparation callback cannot run ahead on the host.
-		entry = { execute: tool.execute, tool: { ...tool, prepareArguments: undefined, execute: tool.execute.bind(tool) },
-			invocation: { executor: "pi.sdk.callback", callback: broker.tools.get(tool)?.execute ?? tool.execute, identity: { callback: randomUUID() }, semantics: {
+		entry = { source: tool, execute: tool.execute, tool: { ...tool, prepareArguments: undefined, execute: tool.execute.bind(tool) },
+			invocation: { executor: "pi.sdk.callback", callback: currentDefinition(tool)?.execute ?? tool.execute, identity: { callback: randomUUID() }, semantics: {
 				tool: tool.name, epoch: "pi.sdk.callback:1", effect: "unbounded",
 				requirements: { capabilities: ["invocation.host_function", ...UNRESTRICTED_PROCESS_EFFECTS.capabilities] },
 				canonicalize: input => { const record = asRecord(input); return record && { input: record, resources: [] }; },
@@ -61,16 +62,20 @@ export function sdkCallbackTool(tool: AgentTool): AgentTool {
 	}
 	return entry.tool;
 }
-export function sdkToolInvocation(tool: AgentTool): ToolInvocation {
-	return callbackTools.get(tool)?.invocation ?? sdkToolInvocation(sdkCallbackTool(tool));
+export function sdkToolInvocation(tool: AgentTool, cwd?: string): ToolInvocation {
+	const entry = callbackTools.get(tool);
+	if (!entry) return sdkToolInvocation(sdkCallbackTool(tool), cwd);
+	const callback = currentDefinition(entry.source)?.execute;
+	return cwd && callback && speculativeToolInvocation(callback, cwd) || entry.invocation;
 }
 
-export function isStockSdkTool(tool: AgentTool): boolean {
+function currentDefinition(tool: AgentTool): Registered | undefined {
 	const binding = broker.tools.get(tool), definition = binding?.definition;
-	return !!binding?.stock && definition?.execute === binding.execute && tool.execute === binding.executeTool &&
+	return binding && definition?.execute === binding.execute && tool.execute === binding.executeTool &&
 		tool.prepareArguments === binding.prepare && definition.prepareArguments === binding.prepare &&
-		stableValueHash(tool.parameters) === binding.schema && stableValueHash(definition.parameters) === binding.schema;
+		stableValueHash(tool.parameters) === binding.schema && stableValueHash(definition.parameters) === binding.schema ? binding : undefined;
 }
+export const isStockSdkTool = (tool: AgentTool): boolean => !!currentDefinition(tool)?.stock;
 
 export function currentSdkTurn(context: ExtensionContext): Turn | undefined {
 	const run = broker.runs.getStore();
