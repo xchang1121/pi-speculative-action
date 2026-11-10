@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
 import { AgentSession, VERSION, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { stableValueHash } from "./stable-value-hash.ts";
 import { asRecord } from "./stable-json.ts";
@@ -82,17 +82,30 @@ export function currentSdkTurn(context: ExtensionContext): Turn | undefined {
 	return run?.session.sessionManager === context.sessionManager && run.session.agent.signal === context.signal ? run.turn : undefined;
 }
 
-export function attachSdkTools(context: ExtensionContext) {
+export function attachSdkTools(context: ExtensionContext, options: {
+	readonly wrapStream?: (stream: StreamFn) => StreamFn;
+	readonly onDiagnostic?: (diagnostic: { readonly code: string; readonly detail?: string }) => void;
+} = {}) {
 	const session = broker.sessions.getStore();
-	if (!session || session.sessionManager !== context.sessionManager) return { tools: (): readonly AgentTool[] => [], dispose: () => {} };
+	if (!session || session.sessionManager !== context.sessionManager) {
+		options.onDiagnostic?.({ code: "sdk_binding_unavailable", detail: "No matching SDK session; check duplicate SDK module instances and extension binding lifetime" });
+		return { attached: false, tools: (): readonly AgentTool[] => [], dispose: () => {} };
+	}
 	const agent = session.agent, restores: (() => void)[] = [];
+	if (options.wrapStream) {
+		const original = agent.streamFunction, wrapped = options.wrapStream(original);
+		agent.streamFunction = wrapped;
+		restores.push(() => { if (agent.streamFunction === wrapped) agent.streamFunction = original; });
+	}
 	let attached = true;
 	for (const name of ["prompt", "continue"] as const) {
 		const descriptor = Object.getOwnPropertyDescriptor(agent, name), original = agent[name];
 		const wrapped = async function (this: typeof agent, ...args: never[]) {
 			if (!attached || this !== agent || agent.signal) return Reflect.apply(original, this, args);
 			const state = agent.state, property = Object.getOwnPropertyDescriptor(state, "tools");
-			if (!property?.configurable || !property.get || !property.set) return Reflect.apply(original, this, args);
+			if (!property?.configurable || !property.get || !property.set) {
+				options.onDiagnostic?.({ code: "sdk_tools_accessor_unavailable" }); return Reflect.apply(original, this, args);
+			}
 			const run: Run = { session };
 			const wrap = (tools: AgentTool[]) => {
 				if (run.turn) run.turn.closed = true;
@@ -127,5 +140,5 @@ export function attachSdkTools(context: ExtensionContext) {
 		Object.defineProperty(agent, name, { configurable: true, writable: true, value: wrapped });
 		restores.push(() => { if (agent[name] === wrapped) { if (descriptor) Object.defineProperty(agent, name, descriptor); else delete (agent as Partial<typeof agent>)[name]; } });
 	}
-	return { tools: () => agent.state.tools, dispose: () => { attached = false; for (const restore of restores) restore(); } };
+	return { attached: true, tools: () => agent.state.tools, dispose: () => { attached = false; for (const restore of restores) restore(); } };
 }

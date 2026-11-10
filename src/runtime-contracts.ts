@@ -27,7 +27,10 @@ export interface SpeculativeActionSettings {
 	readonly maxConcurrentActions?: number;
 	readonly resourceCacheMaxEntries: number;
 	readonly resourceCacheMaxBytes?: number;
-	readonly predictionTimeoutMs: number;
+	/** null disables the prediction deadline; turn cancellation still applies. */
+	readonly predictionTimeoutMs: number | null;
+	/** Total formal-call wait for reusable work, before direct authoritative execution. */
+	readonly reuseLookupTimeoutMs?: number;
 	readonly scheduling?: Partial<import("./scheduling-settings.ts").SchedulingSettings>;
 	/** Source-owned configuration. The runtime treats every value as opaque. */
 	readonly sourceConfig?: Readonly<Record<string, unknown>>;

@@ -25,7 +25,7 @@ import { adaptProcessToolOperations, definedProcessEnvironment, ProcessExecution
 import { DEFAULT_PROVENANCE_STORE_LIMITS, ProvenanceCertificateStore } from "./reuse-store.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
-import { millisecondsInput, nonEmptyTextInput, nonNegativeIntegerInput, nonNegativeNumberInput, optionalTextInput,
+import { millisecondsInput, nonEmptyTextInput, nonNegativeIntegerInput, nonNegativeNumberInput, optionalLimitInput, optionalTextInput,
 	positiveIntegerInput, positiveInteger, probabilityInput, settingInput, type SettingInputDescriptor } from "./setting-input.ts";
 import { errorMessage } from "./error-utils.ts";
 import { asRecord } from "./stable-json.ts";
@@ -36,6 +36,8 @@ import { emptySpeculativeTraceSummary, reduceSpeculativeTrace, type SpeculativeT
 import { resolvePatternWorkspaceIdentity } from "./workspace-identity.ts";
 import { WorkspaceSandboxService } from "./workspace-sandbox.ts";
 import { attachSdkTools, currentSdkTurn, isStockSdkTool, sdkCallbackTool, sdkToolInvocation } from "./sdk-tool-binding.ts";
+import { modelRequestContext, modelRequestDomain, modelResponseRequestIDs, sharedModelRequestScheduler, type ModelRequestEvent } from "./model-request.ts";
+import { assistantCompletion, scheduledModelStream } from "./model-request-adapter.ts";
 
 const STATUS_KEY = "speculative-action";
 const CLOSE = "Close";
@@ -55,10 +57,10 @@ const ROOT_SETTING_INPUTS = {
 	resourceCacheMaxBytes: mebibyteInput("Live result memory"),
 	executionStoreMaxEntries: positiveIntegerInput("Reusable command history entries"),
 	executionStoreMaxBytes: mebibyteInput("Reusable command history memory"),
-	predictionTimeoutMs: millisecondsInput("Prediction wait limit (ms)"),
-	drafterMaxTokens: positiveIntegerInput("Maximum Drafter output tokens"),
-	drafterTaskMaxRequests: positiveIntegerInput("Maximum Drafter requests per task"),
-	drafterTaskMaxTokens: positiveIntegerInput("Maximum Drafter input/output tokens per task"),
+	predictionTimeoutMs: optionalLimitInput(millisecondsInput("Prediction wait limit (ms)")),
+	drafterMaxTokens: optionalLimitInput(positiveIntegerInput("Maximum Drafter output tokens")),
+	drafterTaskMaxRequests: optionalLimitInput(positiveIntegerInput("Maximum Drafter requests per task")),
+	drafterTaskMaxTokens: optionalLimitInput(positiveIntegerInput("Maximum Drafter input/output tokens per task")),
 	drafterMaxDepth: nonNegativeIntegerInput("Drafter out-of-order follow-up batches"),
 	drafterDeterministicCandidates: nonNegativeIntegerInput("Temperature-0 Drafter candidates"),
 } satisfies Partial<SettingInputDescriptors<EffectiveSpeculativeActionSettings, keyof EffectiveSpeculativeActionSettings>>;
@@ -78,7 +80,7 @@ const SELF_SPECULATION_INPUTS = {
 	actorProfile: nonEmptyTextInput("Actor tool-call Profile ('auto' to derive)"),
 	draftFormat: nonEmptyTextInput("Target tool-call format"),
 	draftBoundary: nonEmptyTextInput("Target tool-call boundary override ('auto' to derive)"),
-	forkMaxTokens: positiveIntegerInput("Actor probe output-token limit"),
+	forkMaxTokens: optionalLimitInput(positiveIntegerInput("Actor probe output-token limit")),
 	timeoutMs: millisecondsInput("Control request timeout (ms)"),
 	forkTemperature: nonNegativeNumberInput("Actor probe temperature"),
 	forkMaxAttempts: positiveIntegerInput("Maximum probes per Actor decision"),
@@ -141,6 +143,11 @@ export type SpeculativeSettingsStore = Pick<SpeculativeActionSettingsStore,
 type SpeculativeActionController = Readonly<Awaited<ReturnType<typeof installController>>>;
 
 export interface SpeculativeActionExtensionDependencies {
+	/** A host may retain one budget across internal completion recovery prompts with withTask(). */
+	readonly drafterBudget?: DrafterTaskBudget;
+	readonly onModelRequest?: (event: ModelRequestEvent) => void;
+	readonly onDiagnostic?: (diagnostic: { readonly code: string; readonly detail?: string; readonly turnID?: string }) => void;
+	readonly onCapabilities?: (capabilities: readonly ExecutionWorldDiagnosticSnapshot[]) => void;
 	readonly createExecutionWorlds?: (
 		context: SpeculativeActionExecutionWorldContext,
 	) => readonly AgentExecutionWorld[];
@@ -181,7 +188,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Model Drafter: ${settings.drafterEnabled ? "On" : "Off"}`,
 		`Drafter model: ${settings.draftModel ?? "active model"}`,
 		`Candidate requests per Actor decision: ${settings.candidateLimit}`,
-		`Model Drafter policy: ${settings.drafterMaxDepth} out-of-order follow-up batches; ${settings.drafterMaxTokens} output tokens per request; ${settings.drafterTaskMaxRequests} requests / ${settings.drafterTaskMaxTokens} input+output tokens per task; ${settings.drafterDeterministicCandidates} temperature-0 candidates; sampling ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
+		`Model Drafter policy: ${settings.drafterMaxDepth} out-of-order follow-up batches; ${settings.drafterMaxTokens ?? "provider-managed"} output tokens per request; ${settings.drafterTaskMaxRequests ?? "unlimited"} requests / ${settings.drafterTaskMaxTokens ?? "unlimited"} input+output tokens per task; ${settings.drafterDeterministicCandidates} temperature-0 candidates; sampling ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
 		`Speculative resource units per session: ${settings.maxConcurrentActions}`,
 		`Scheduler: sampling ${formatDuration(settings.scheduling.resourcePollIntervalMs)}; failure circuit ${settings.scheduling.failureThreshold} failures / ${settings.scheduling.failureRetryDecisions} eligible decisions`,
 		`Storage policy: ${settings.resourceCacheMaxEntries} live results/${formatBytes(settings.resourceCacheMaxBytes)}; ${settings.executionStoreMaxEntries} reusable commands/${formatBytes(settings.executionStoreMaxBytes)}`,
@@ -243,7 +250,11 @@ export function createSpeculativeActionExtension(
 				}
 			}
 		});
-		pi.on("message_end", (event) => { if (event.message.role === "assistant") controller?.finishActorOutput(); });
+		pi.on("message_end", (event) => { if (event.message.role === "assistant") {
+			controller?.finishActorOutput();
+			const completion = assistantCompletion(event.message);
+			if (completion === "reasoning-only" || completion === "empty") controller?.diagnostic({ code: "actor_output_incomplete", detail: completion });
+		} });
 		pi.on("turn_end", async () => { await controller?.finishTurn(false); });
 		pi.on("agent_settled", async () => { await controller?.finishTurn(true); });
 		pi.on("session_shutdown", (_event, ctx) => sessions.run(async () => {
@@ -275,6 +286,9 @@ async function installController(
 	let latestContext = context;
 	let currentTurnID: string | undefined, unavailableDraftModel: string | undefined;
 	const sessionID = context.sessionManager.getSessionId();
+	let taskSequence = 0, taskActive = false, requestTaskID = sessionID;
+	const requestTasks = new Set<string>();
+	let lastCapabilities = "";
 	let lastTurnID: string | undefined;
 	let turnSequence = 0;
 	let turnTools: readonly AgentTool[] = [];
@@ -286,7 +300,15 @@ async function installController(
 		cacheCapacity: currentSettings.resourceCacheMaxEntries, cacheByteCapacity: currentSettings.resourceCacheMaxBytes,
 	});
 	const settings = () => currentSettings;
-	const drafterBudget = new DrafterTaskBudget();
+	const drafterBudget = dependencies.drafterBudget ?? new DrafterTaskBudget();
+	const requests = sharedModelRequestScheduler;
+	const requestPolicy = () => ({ maxConcurrent: settings().modelRequestMaxConcurrent, actorReserve: settings().modelRequestActorReserve });
+	const diagnostic = (value: { readonly code: string; readonly detail?: string; readonly turnID?: string }) => {
+		try { dependencies.onDiagnostic?.(value); } catch { /* Diagnostics cannot affect execution. */ }
+		recentEvents.push(`${value.code}${value.detail ? `: ${value.detail}` : ""}`);
+		if (recentEvents.length > RECENT_EVENT_LIMIT) recentEvents.shift();
+		try { ui?.notify(`Speculative action: ${value.code}`, "warning"); } catch { /* Optional UI. */ }
+	};
 	const lifecycle = new RuntimeLifecycleLane();
 	type SearchProfile = Awaited<ReturnType<typeof createClosedSearchProfile>>;
 	type SearchRoute = { ready: Promise<SearchProfile | undefined>; profile?: SearchProfile };
@@ -295,7 +317,7 @@ async function installController(
 	const prepareSearch = (): Promise<SearchProfile | undefined> => {
 		if (search) return search.ready;
 		const entry: SearchRoute = { ready: createClosedSearchProfile(context.cwd).then(
-				(profile) => (entry.profile = profile), () => undefined) };
+				(profile) => (entry.profile = profile), () => { diagnostic({ code: "captured_search_unavailable" }); return undefined; }) };
 		search = entry; return entry.ready;
 	};
 	const resetSearch = async () => {
@@ -307,7 +329,15 @@ async function installController(
 		const registry = latestContext.modelRegistry, provider = registry.getProvider(model.provider), auth = await registry.getApiKeyAndHeaders(model);
 		if (!provider || !auth.ok) throw new Error(auth.ok ? `Unknown provider: ${model.provider}` : auth.error);
 		let request: Parameters<NonNullable<SpeculativeActionExtensionDependencies["onDrafterResponse"]>>[2];
-		const message = await provider.streamSimple({ ...model, baseUrl: auth.baseUrl ?? model.baseUrl }, llmContext, { ...options, apiKey: options?.apiKey ?? auth.apiKey,
+		let responseStatus: number | undefined, providerRequestID: string | undefined, requestID: string | undefined;
+		const message = await requests.run({ domain: modelRequestDomain(auth.baseUrl ?? model.baseUrl), role: "drafter",
+			context: { ...modelRequestContext.getStore(), taskID: modelRequestContext.getStore()?.taskID || requestTaskID, turnID: modelRequestContext.getStore()?.turnID ?? currentTurnID },
+			policy: requestPolicy(), signal: options?.signal, onEvent: dependencies.onModelRequest,
+			execute: transport => { requestID = transport.id; return provider.streamSimple({ ...model, baseUrl: auth.baseUrl ?? model.baseUrl }, llmContext, { ...options, signal: transport.signal, apiKey: options?.apiKey ?? auth.apiKey,
+			maxRetries: options?.maxRetries ?? 0,
+			onResponse: async (response, currentModel) => { responseStatus = response.status;
+				providerRequestID = response.headers["x-request-id"] ?? response.headers["request-id"];
+				await options?.onResponse?.(response, currentModel); },
 			onPayload: dependencies.onDrafterResponse ? async (payload, model) => {
 				const next = await options?.onPayload?.(payload, model);
 				try {
@@ -320,7 +350,10 @@ async function installController(
 				} catch { /* Diagnostics cannot change the provider payload. */ }
 				return next;
 			} : options?.onPayload,
-			headers: { ...auth.headers, ...options?.headers }, env: { ...auth.env, ...options?.env } }).result();
+			headers: { ...auth.headers, ...options?.headers, "X-Pi-Request-Id": transport.id, "X-Pi-Request-Role": "drafter" }, env: { ...auth.env, ...options?.env } }).result(); },
+			settled: message => ({ remoteFinished: !["error", "aborted"].includes(message.stopReason) || (responseStatus ?? 0) >= 400, usage: message.usage, providerRequestID }),
+		});
+		if (requestID) modelResponseRequestIDs.set(message, requestID);
 		try { dependencies.onDrafterResponse?.(message, options?.sessionId, request); } catch { /* Reporting cannot change inference. */ }
 		return message;
 	});
@@ -338,9 +371,9 @@ async function installController(
 		...(dependencies.selfSpeculationFetch ? { fetch: dependencies.selfSpeculationFetch } : {}),
 		// Without reasoning, the Drafter must answer with the calls the Actor's own reasoning is heading for.
 		draftFork: async ({ model, context: actorContext, reasoning, content, signal, maxTokens, temperature }) => {
-			const message = await drafterBudget.run({ model: draftModelFor(model), context: { ...actorContext, messages: [...actorContext.messages, { role: "user", timestamp: Date.now(),
+			const message = await modelRequestContext.run({ taskID: requestTaskID, turnID: currentTurnID, source: "self-speculation", purpose: "actor-reasoning-probe" }, () => drafterBudget.run({ model: draftModelFor(model), context: { ...actorContext, messages: [...actorContext.messages, { role: "user", timestamp: Date.now(),
 				content: `The assistant has begun its next reply. Its reasoning so far:\n<reasoning>\n${reasoning}\n</reasoning>${content ? `\nIts reply so far:\n${content}` : ""}\nCall exactly the tool or tools it is about to call next, with the arguments it will use.` }] },
-				options: { signal, maxTokens, temperature, onPayload: forceToolChoice(undefined) }, policy: settings(), complete: completeDraft });
+				options: { signal, maxTokens, temperature, onPayload: forceToolChoice(undefined) }, policy: settings(), complete: completeDraft }));
 			return message?.content.flatMap((item) => item.type === "toolCall" ? [{ tool: item.name, input: item.arguments }] : []) ?? [];
 		},
 	});
@@ -422,6 +455,7 @@ async function installController(
 		getSettings: runtimeSettings,
 		complete: completeDraft,
 		drafterBudget,
+		onDiagnostic: diagnostic,
 		draftModel: draftModelFor,
 		preflight: ({ toolName }) =>
 			latestContext.isProjectTrusted() && pi.getActiveTools().includes(toolName),
@@ -470,11 +504,14 @@ async function installController(
 		// A failed provider cannot detach preparation from refresh or shutdown ownership.
 		const [, diagnostics] = await Promise.all(preparations).finally(() => Promise.allSettled(preparations));
 		executionDiagnostics = diagnostics;
+		const capabilities = JSON.stringify(diagnostics);
+		if (capabilities !== lastCapabilities) { lastCapabilities = capabilities; try { dependencies.onCapabilities?.(diagnostics); } catch { /* Observational only. */ } }
 		await recoverSpeculation(() => host.runtime.settingsChanged());
 		renderFooter();
 	});
 
 	const controller = {
+		diagnostic,
 		settings,
 		editableSettings: () => normalizeSpeculativeActionSettings(settingsStore.editable()),
 		settingsScope: () => settingsStore.scope,
@@ -520,10 +557,13 @@ async function installController(
 		startTurn: async (messages: AgentMessage[], nextContext: ExtensionContext) => {
 			latestContext = nextContext;
 			const model = nextContext.model, turn = currentSdkTurn(nextContext);
-			if (!model || !turn) return;
+			if (!model) return;
+			if (!turn) { diagnostic({ code: "sdk_turn_unavailable" }); return; }
 			try {
 				if (currentTurnID) await host.finishTurn(currentTurnID);
 				const turnID = currentTurnID = `turn_${++turnSequence}`;
+				if (!taskActive) { requestTaskID = `${sessionID}:task:${++taskSequence}`; requestTasks.add(requestTaskID); taskActive = true; }
+				drafterBudget.beginTurn(turnID);
 				const tools = turnTools = turn.tools.map(selectTool);
 				turn.execute = (tool, args) => {
 					const [callID, input, signal] = args, selected = selectTool(tool);
@@ -534,18 +574,19 @@ async function installController(
 						})).result : selected.execute(...args));
 				};
 				const actorContext = { systemPrompt: nextContext.getSystemPrompt(), messages: convertToLlm(messages), tools: [...turnTools] };
-				await host.startTurn(
+				await modelRequestContext.run({ taskID: requestTaskID, turnID }, () => host.startTurn(
 					{
-						turnID: currentTurnID,
+						turnID,
 						actorModel: model,
 						context: actorContext,
 						actorOptions: nextContext.signal ? { signal: nextContext.signal } : undefined,
 						tools: turnTools,
 					},
 					nextContext.signal,
-				);
+				));
 				void recoverSpeculation(() => refreshExecutionDiagnostics());
 			} catch {
+				diagnostic({ code: "turn_speculation_unavailable", turnID: currentTurnID });
 				// Speculation is optional; the actor request remains authoritative.
 			}
 		},
@@ -570,7 +611,7 @@ async function installController(
 			await recoverSpeculation(() => host.finishTurn(turnID, terminal));
 			if (terminal) selfSpeculation.reset();
 			else selfSpeculation.endTurn();
-			if (terminal) lastTurnID = undefined;
+			if (terminal) { lastTurnID = undefined; taskActive = false; }
 		},
 		statusText: () => {
 			const effective = settings();
@@ -592,13 +633,21 @@ async function installController(
 				.finally(disconnectProbe)
 					.finally(() => workspaceSandbox.dispose())
 				.finally(() => selfSpeculation.dispose())
+					.finally(async () => {
+						const pending = (await Promise.all([...requestTasks].map(taskID => requests.drain(taskID, settings().modelRequestDrainTimeoutMs ?? undefined)))).flat();
+						if (pending.length) diagnostic({ code: "model_requests_unsettled", detail: JSON.stringify(pending.map(request => ({ id: request.id, phase: request.phase }))) });
+						for (const taskID of requestTasks) requests.retire(taskID);
+						await Promise.all([...requestTasks].map(taskID => requests.drain(taskID, 1000)));
+					})
 				.finally(resetSearch).finally(() => {
 					try { dependencies.onMetrics?.(visibleMetrics(), routes); } catch { /* Reporting cannot change cleanup. */ }
 				});
 			});
 		},
 	} as const;
-	const sdk = attachSdkTools(context);
+	const sdk = attachSdkTools(context, { onDiagnostic: diagnostic,
+		wrapStream: original => scheduledModelStream(original, requests, { role: "actor", context: () => ({ taskID: requestTaskID, turnID: currentTurnID, purpose: "actor" }),
+			policy: requestPolicy, onEvent: dependencies.onModelRequest }) });
 	await recoverSpeculation(() => refreshExecutionDiagnostics());
 	return controller;
 }
@@ -795,7 +844,7 @@ function openActorForkSettings(ctx: ExtensionContext, controller: SpeculativeAct
 		}
 		if (menu === "advanced") return [
 			link(`Integration and authentication › ${FORK_TRANSPORT_LABELS[self.forkTransport]}`, "integration"),
-			link(`Fork decoding › ${self.forkMaxTokens} tokens, ${self.forkMaxAttempts} probes`, "fork"),
+			link(`Fork decoding › ${self.forkMaxTokens ?? "provider-managed"} tokens, ${self.forkMaxAttempts} probes`, "fork"),
 			...(remote ? [link(`Target verification › ${self.maxCandidates} candidates × ${self.maxDraftTokens} tokens`, "target")] : []),
 		];
 		if (menu === "integration") {
@@ -1132,7 +1181,7 @@ function syntaxSettingLabel(value: string): string {
 
 function formatDrafterBudgetStatus(snapshot: ActionDrafterBudgetSnapshot): string {
 	const { budget, observations } = snapshot;
-	return `Action Drafter task budget: ${budget.requests} requests, ${budget.reportedTokens} reported + ${budget.unreportedTokens} estimated without usage + ${budget.reservedTokens} reserved tokens, ${budget.skippedRequests} requests skipped\nPrivate observations: ${observations.forecasted} forecasted, ${observations.matched}/${observations.compared} exact matches against completed speculative results`;
+	return `Action Drafter task budget: ${budget.requests} requests, ${budget.reportedTokens} reported + ${budget.unreportedTokens} estimated without usage (${budget.unreportedRequests} requests unknown) + ${budget.reservedTokens} reserved tokens, ${budget.skippedRequests} requests skipped\nPrivate observations: ${observations.forecasted} forecasted, ${observations.matched}/${observations.compared} exact matches against completed speculative results`;
 }
 
 const FORK_TRANSPORT_LABELS: Readonly<Record<SelfSpeculationSettings["forkTransport"], string>> = { provider: "Provider-integrated", sidecar: "Sidecar service", drafter: "Drafter reads Actor reasoning" };
@@ -1309,7 +1358,8 @@ function formatSpeedup(timing: TimingSummary): string {
 	return `Tool SpeedUp ${ratio === null ? !timing.hiddenComputeIncomplete && Number.isFinite(timing.toolComputeMs) && timing.toolComputeMs === timing.hiddenComputeMs && timing.hiddenComputeMs > 0 ? "fully hidden" : "n/a" : `${ratio.toFixed(2)}x`}`;
 }
 
-function formatDuration(ms: number): string {
+function formatDuration(ms: number | null): string {
+	if (ms === null) return "unlimited";
 	if (!Number.isFinite(ms)) return "n/a";
 	const value = Math.max(0, ms);
 	if (value > 0 && value < 1) return "<1ms";

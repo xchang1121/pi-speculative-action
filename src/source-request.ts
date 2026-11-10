@@ -5,6 +5,8 @@ import {
 	type ResolutionCause, type SettledSourceRequest, type SourceRequestIdentity, type SourceRequestSettlement, cause,
 } from "./settlement.ts";
 import { waitForCompletion } from "./runtime-lifecycle.ts";
+import { randomUUID } from "node:crypto";
+import { modelRequestContext } from "./model-request.ts";
 
 /** A deliberate source admission decision; it produced no proposal and is not a provider failure. */
 export class SourceRequestSuppressed extends Error {
@@ -47,8 +49,9 @@ export async function runSourceRequest<Value>(input: {
 	readonly count: (value: Value) => number;
 }): Promise<SettledSourceRequest & { readonly value?: Value }> {
 	const startedAt = performance.now();
+	const request = { ...input.request, id: randomUUID() };
 	const finish = (settlement: SourceRequestSettlement): SettledSourceRequest => Object.freeze({
-		request: Object.freeze({ ...input.request }), durationMs: Math.max(0, performance.now() - startedAt), settlement: Object.freeze(settlement),
+		request: Object.freeze(request), durationMs: Math.max(0, performance.now() - startedAt), settlement: Object.freeze(settlement),
 	});
 	const aborted = () => finish({ status: "aborted", cause: cause("source",
 		input.generation.expiration?.code ?? "generation_expired", input.generation.expiration?.detail) });
@@ -59,7 +62,8 @@ export async function runSourceRequest<Value>(input: {
 	// Produced proposals can leave preparation in flight until their generation closes.
 	const signal = AbortSignal.any([input.generation.signal, controller.signal]);
 	const producer = Promise.resolve()
-		.then(() => { signal.throwIfAborted(); return input.produce(signal); })
+		.then(() => { signal.throwIfAborted(); return modelRequestContext.run({ taskID: "", ...modelRequestContext.getStore(), turnID: request.turnID,
+			source: request.source, sourceRequestID: request.id }, () => input.produce(signal)); })
 		.then((value) => ({ kind: "produced" as const, value }), (error) => ({ kind: "error" as const, error }));
 
 	const waited = await waitForCompletion(producer, input.generation.signal, nonNegativeNumber(input.timeoutMs, undefined));

@@ -2,28 +2,50 @@ import { calculateContextTokens, estimateContextTokens } from "@earendil-works/p
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import type { DrafterRequestSettings } from "./common.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
+import { ModelRequestNotSent } from "./model-request.ts";
 
-type BudgetPolicy = Pick<DrafterRequestSettings, "drafterTaskMaxRequests" | "drafterTaskMaxTokens">;
+type BudgetPolicy = Pick<DrafterRequestSettings, "drafterTaskMaxRequests" | "drafterTaskMaxTokens"> & Partial<Pick<DrafterRequestSettings, "drafterBudgetHorizonTurns" | "drafterBudgetInitialFraction">>;
 export interface DrafterBudgetSnapshot {
 	readonly requests: number;
 	readonly reportedTokens: number;
 	readonly unreportedTokens: number;
+	/** Usage is unknown for these requests; an uncapped output has no finite reservation estimate. */
+	readonly unreportedRequests: number;
 	readonly reservedTokens: number;
 	readonly skippedRequests: number;
 }
-type Suppression = "drafter_request_limit" | "drafter_token_limit" | "drafter_context_limit";
+type Suppression = "drafter_request_limit" | "drafter_token_limit" | "drafter_context_limit" | "drafter_progress_reserve";
 type OnSkipped = (reason: Suppression, detail?: string) => void;
 
 /** One user task shares reservations across concurrent roots, continuations and Drafter probes. */
 export class DrafterTaskBudget {
 	private state = this.empty();
 	private finished = false;
+	private taskScopes = 0;
+	private turns = new Set<string>();
+	/** Keep one host task's allowance across internal SDK completion/recovery boundaries. */
+	async withTask<Value>(run: () => Promise<Value>): Promise<Value> {
+		this.resetFinished(); this.taskScopes++;
+		try { return await run(); }
+		finally { if (--this.taskScopes === 0) this.finished = true; }
+	}
+	beginTurn(turnID: string): void { this.resetFinished(); this.turns.add(turnID); }
+	private resetFinished() { if (this.finished) { this.state = this.empty(); this.turns.clear(); this.finished = false; } }
+	private allowance(policy: BudgetPolicy) {
+		const initial = policy.drafterBudgetInitialFraction ?? 1, horizon = policy.drafterBudgetHorizonTurns ?? 1;
+		return Math.min(1, initial + (1 - initial) * Math.max(0, this.turns.size - 1) / Math.max(1, horizon - 1));
+	}
 
 	available(policy: BudgetPolicy, onSkipped?: OnSkipped): boolean {
-		if (this.finished) { this.state = this.empty(); this.finished = false; }
+		this.resetFinished();
 		const state = this.state;
-		if (state.requests < policy.drafterTaskMaxRequests && this.spent() < policy.drafterTaskMaxTokens) return true;
-		this.skip(state.requests >= policy.drafterTaskMaxRequests ? "drafter_request_limit" : "drafter_token_limit", onSkipped);
+		const requests = policy.drafterTaskMaxRequests ?? Infinity, tokens = policy.drafterTaskMaxTokens ?? Infinity;
+		if (state.requests < requests && this.spent() < tokens) {
+			if ((policy.drafterTaskMaxRequests === null || state.requests < Math.ceil(requests * this.allowance(policy))) &&
+				(policy.drafterTaskMaxTokens === null || this.spent() < tokens * this.allowance(policy))) return true;
+			this.skip("drafter_progress_reserve", onSkipped); return false;
+		}
+		this.skip(state.requests >= requests ? "drafter_request_limit" : "drafter_token_limit", onSkipped);
 		return false;
 	}
 
@@ -40,15 +62,19 @@ export class DrafterTaskBudget {
 		input.options?.signal?.throwIfAborted();
 		if (!this.available(input.policy, input.onSkipped)) return undefined;
 		const state = this.state, prompt = Math.max(drafterInputTokens(input.context), input.inputTokens ?? 0);
-		const remaining = input.policy.drafterTaskMaxTokens - this.spent();
-		const output = Math.min(input.options?.maxTokens ?? input.model.maxTokens, input.model.maxTokens, input.model.contextWindow - prompt);
-		const maxTokens = Math.floor(Math.min(output, remaining - prompt));
-		if (!(maxTokens > 0)) return this.skip(prompt >= input.model.contextWindow ? "drafter_context_limit" : "drafter_token_limit", input.onSkipped,
+		const remaining = input.policy.drafterTaskMaxTokens === null ? Infinity : input.policy.drafterTaskMaxTokens * this.allowance(input.policy) - this.spent();
+		const contextRemaining = input.model.contextWindow > 0 ? input.model.contextWindow - prompt : Infinity;
+		const requested = input.options?.maxTokens;
+		const output = requested === undefined ? Infinity : Math.min(requested, input.model.maxTokens > 0 ? input.model.maxTokens : Infinity);
+		// Without an explicit output or task cap, leave the request length to the provider.
+		const cap = Math.floor(Math.min(output, remaining - prompt, requested === undefined ? Infinity : contextRemaining));
+		if (!(cap > 0) || !(contextRemaining > 0)) return this.skip(contextRemaining <= 0 ? "drafter_context_limit" : "drafter_token_limit", input.onSkipped,
 			JSON.stringify({ promptTokens: prompt, remainingTokens: remaining, contextWindow: input.model.contextWindow }));
-		const reservation = prompt + maxTokens;
+		const maxTokens = Number.isFinite(cap) ? cap : undefined;
+		const reservation = prompt + (maxTokens ?? 0);
 		state.requests++;
 		state.reservedTokens += reservation;
-		let reported = false;
+		let reported = false, notSent = false;
 		try {
 			const message = await input.complete(input.model, input.context, { ...input.options, maxTokens });
 			const tokens = calculateContextTokens(message.usage);
@@ -56,18 +82,21 @@ export class DrafterTaskBudget {
 				state.reportedTokens += tokens; reported = true;
 			}
 			return message;
+		} catch (error) {
+			if (error instanceof ModelRequestNotSent) { notSent = true; state.requests--; }
+			throw error;
 		} finally {
 			state.reservedTokens -= reservation;
 			// Missing usage can still be billable; keep the reservation charged, including aborts and failures.
-			if (!reported) state.unreportedTokens += reservation;
+			if (!reported && !notSent) { state.unreportedTokens += reservation; state.unreportedRequests++; }
 		}
 	}
 
-	finishTask(): void { this.finished = true; }
+	finishTask(): void { if (!this.taskScopes) this.finished = true; }
 	snapshot(): DrafterBudgetSnapshot { return { ...this.state }; }
 	private skip(reason: Suppression, onSkipped?: OnSkipped, detail?: string): undefined { this.state.skippedRequests++; onSkipped?.(reason, detail); return undefined; }
 	private spent() { return this.state.reportedTokens + this.state.unreportedTokens + this.state.reservedTokens; }
-	private empty() { return { requests: 0, reportedTokens: 0, unreportedTokens: 0, reservedTokens: 0, skippedRequests: 0 }; }
+	private empty() { return { requests: 0, reportedTokens: 0, unreportedTokens: 0, unreportedRequests: 0, reservedTokens: 0, skippedRequests: 0 }; }
 }
 
 /** Probability calibration follows actual tool context and workflow shape, never argument churn. */

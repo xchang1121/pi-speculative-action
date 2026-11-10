@@ -197,6 +197,7 @@ async function evaluateResourceQuery<Output>(
 	const versions = inputs ?? [initial!], version = versions[0]!, view = version.view!;
 	const retained: ResourceVersionToken[] = [];
 	let missing: Promise<ResourceVersionToken> | undefined, captured: ResourceVersionToken | undefined, sealed: ResourceVersionToken[] | undefined;
+	let closing = false;
 	const inputSource = publish && Object.freeze({});
 	// Keep the initiating view first: it owns the query's root resolution, even when another source answers first.
 	const proofs = new Map<ResourceVersionToken, Map<string, ResourceObservation>>([[version, new Map()]]);
@@ -223,10 +224,13 @@ async function evaluateResourceQuery<Output>(
 				for (const tokens of owners) for (const token of tokens) if (token.view) yield { view: token.view.readOnly(),
 					observed: (dependencies, commit) => dependencies ? [observe(token, dependencies, commit)] : observeOwner(tokens, undefined, commit) };
 			}, async () => {
+				if (closing) throw new Error("resource_query_closed");
 				const token = await (missing ??= capture().then(token => captured = token));
+				if (closing) throw new Error("resource_query_closed");
 				if (!token.view) throw new Error("resource_snapshot_budget_exceeded");
 				return { view: token.view, observed: (dependencies, commit) => [observe(token, dependencies, commit)] };
 			}, inputs => inputs.map(input => {
+				if (closing) throw new Error("resource_query_closed");
 				const proof = session ? session.retain(input) : input.manager.retain(input); retained.push(proof); observe(proof, undefined); return proof;
 			}), async proofs => { await validateResourceInputs(proofs, true); }, session?.memory); completed = true;
 		} finally { await TimelineInterval.outside(async () => {
@@ -255,7 +259,11 @@ async function evaluateResourceQuery<Output>(
 		return sealed && { output, versions: sealed, inputSource };
 	}, branch => branch !== undefined); }
 	finally { await TimelineInterval.outside(async () => {
+		closing = true;
 		if (inputSource && !sealed) resourceVersions.delete(inputSource);
+		// An aborted preparation can outlive its waiter and still be acquiring an input lease.
+		// Settle that acquisition before taking the release list, and reject later borrowers.
+		await missing?.catch(() => undefined);
 		await Promise.allSettled([...retained, captured, initial].map(releaseResourceVersion));
 	}); }
 }

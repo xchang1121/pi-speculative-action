@@ -22,6 +22,38 @@ const toolReply = (...args: Parameters<typeof fauxToolCall>) => fauxAssistantMes
 const directories = temporaryDirectories("pi-agent-system-");
 afterEach(directories.dispose);
 
+test("one formal-call deadline skips slow reconstruction, retains its lease, and falls back once", async () => {
+	const cwd = await directories.create(), world = resourceWorld(), release = deferred();
+	await writeText(cwd, "input.txt", "one\ntwo\nthree\n");
+	let reconstructions = 0;
+	const f = systemHost(cwd, [createReadTool(cwd)], {
+		complete: async () => toolUse("read", { path: "input.txt", offset: 1, limit: 1 }),
+		executionWorlds: [{ ...world, speculation: { ...world.speculation!, execute: async context => {
+			const branch = await world.speculation!.execute(context);
+			return { ...branch, reconstruct: async request => { reconstructions++; await release.promise;
+				request.signal.throwIfAborted(); return branch.reconstruct!(request); } };
+		} } }],
+	}, { drafterEnabled: true, drafterMaxDepth: 0, reuseLookupTimeoutMs: 25 });
+	await using _cleanup = onExit(async () => { release.resolve(); await f.dispose(); });
+	await f.start(); await f.ready();
+	const started = performance.now();
+	const result = await f.execute("read", { path: "input.txt", offset: 2, limit: 1 });
+	expect(performance.now() - started).toBeLessThan(2000);
+	expect(textOutput(result)).toContain("two"); expect(f.fallbacks).toEqual(["read"]);
+	expect(reconstructions).toBe(1);
+	release.resolve(); await nextTurn();
+	await expect.poll(() => JSON.stringify(f.actors.at(-1))).toContain("reuse_lookup_deadline");
+	// The old input owner cannot repeatedly consume the next call's deadline.
+	expect(textOutput(await f.execute("read", { path: "input.txt", offset: 3, limit: 1 }))).toContain("three");
+	expect(reconstructions).toBe(1);
+	expect(f.fallbacks).toEqual(["read", "read"]);
+	await expect.poll(() => JSON.stringify(f.actors.at(-1))).toContain("recent_reconstruction_timeout");
+	// The owner's original result still has a valid proof and needs no reconstruction.
+	expect(textOutput(await f.execute("read", { path: "input.txt", offset: 1, limit: 1 }))).toContain("one");
+	expect(f.fallbacks).toEqual(["read", "read"]);
+	expect(reconstructions).toBe(1);
+});
+
 test.for(["producer", "borrower", "both"])("cancels a preparation waiter without waiting for shared computation (%s)", async cancelled => {
 	const view = new ResourceReadView(4096), binding = {}, gate = gated(), controllers = [new AbortController(), new AbortController()];
 	const results = ["pending", "pending"], pending: Promise<unknown>[] = [];

@@ -25,6 +25,7 @@ export interface DrafterModelOptions {
 	readonly complete: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
 	/** Share reservations with other model requests in the same user task. */
 	readonly drafterBudget?: DrafterTaskBudget;
+	readonly onDiagnostic?: (diagnostic: { readonly code: string; readonly detail?: string; readonly turnID?: string }) => void;
 }
 
 export interface AgentStartInput extends Pick<DraftOptionsContext, "actorModel" | "actorOptions">, Omit<TurnInput<string>, "terminal"> {
