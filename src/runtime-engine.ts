@@ -956,11 +956,10 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	/** Coalesce plan and producer dispatch behind current Actor events; a concrete Actor intent stays immediate. */
-	const startQueuedCandidates = (session: Session, preferred?: Candidate | Preparation): void => {
+	const startQueuedCandidates = (session: Session, preferred?: Candidate | Preparation) => {
 		if (session.lifecycle.sealed) return;
 		if (preferred) return launchCandidateBatch(session, preferred);
-		if (pendingLaunch) return;
-		pendingLaunch = session.lifecycle.track(new Promise<void>(setImmediate).then(() => {
+		return pendingLaunch ??= session.lifecycle.track(new Promise<void>(setImmediate).then(() => {
 			pendingLaunch = undefined;
 			launchCandidateBatch();
 		}));
@@ -1738,9 +1737,8 @@ export function makeSpeculativeActionRuntime<
 		if (context && source?.continuationBatch && trigger === "execution_succeeded") {
 			try { queuePeerContinuations(session, current, context, source); } catch { /* Producer feedback is advisory. */ }
 		}
-		if (!context || !source?.continue) return;
-		if (source.multiStepEnabled?.(context.settings, context.draft.feedback) === false) return;
-		if (context.continuationTriggers.has(trigger)) return;
+		if (!context || !source?.continue || source.multiStepEnabled?.(context.settings, context.draft.feedback) === false ||
+			context.continuationTriggers.has(trigger)) return;
 		context.continuationTriggers.add(trigger);
 		let continuations: readonly PlanContinuation[], scoped = false;
 		try {
@@ -1762,7 +1760,7 @@ export function makeSpeculativeActionRuntime<
 				return identity ? session.actionContexts.get(identity) : undefined;
 			});
 			if (!parents.length || new Set(continuation.actionIDs).size !== parents.length || parents.some(parent => !parent)) continue;
-			const pending = Promise.all(scoped ? [] : parents.map(parent => continuationTails.get(parent!)))
+			const pending = Promise.all([startQueuedCandidates(session), ...scoped ? [] : parents.map(parent => continuationTails.get(parent!))])
 			.then(() => requestContinuation(session, source, parents as typeof context[], targetDecisionSequence, (signal, reportDraftTokens) => {
 				const revision = session.plan.reserveRevision(node.proposalID);
 				if (revision === undefined) return undefined;
