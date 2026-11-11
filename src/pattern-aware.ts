@@ -424,7 +424,7 @@ export class PatternAwareStore {
 		parentConfirmed = false,
 		predictionSettings: PatternAwareSettings = this.settings,
 	) {
-		if (!predictionSettings.enabled) return [];
+		if (!predictionSettings.enabled || continuation.visitedPatternIDs.length >= predictionSettings.maxPredictionDepth) return [];
 		const event: PatternAwareEvent = { ...input, sequence: (continuation.history.at(-1)?.sequence ?? this.clock) + 1, learnTarget: false };
 		const history = structuredClone([...continuation.history, event]);
 		this.trimSessionHistory(history);

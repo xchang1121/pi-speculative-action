@@ -179,9 +179,8 @@ export function createPatternPlanSource({
 			return { id, source: "pattern_aware", revision: 0, actions: planActions(candidates, store, dependencies) };
 		}),
 		continue: ({ startInput, data, settings, candidate, adoptedAction, proposalID, actionID, revision, feedback, output, trigger, signal }) => admit(settings, async (patternSettings) => {
-			if (signal.aborted || output === undefined) return undefined;
 			const context = feedbacks.get(feedback as object)?.context;
-			if (!context) return undefined;
+			if (!context || signal.aborted || output === undefined || context.continuation.visitedPatternIDs.length >= patternSettings.maxPredictionDepth) return undefined;
 			const next = await predict(() => context.store.continue(context.continuation, predictedEvent(startInput, adoptedAction ?? candidate, output, nonNegativeFinite(candidate.executionMs)),
 				data.schemaHashes, trigger === "actor_adopted", patternSettings));
 			if (!next.length) return undefined;

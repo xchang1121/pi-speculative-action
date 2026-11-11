@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { Session } from "node:inspector";
+import { Session, type Runtime } from "node:inspector";
 import { hash, randomUUID } from "node:crypto";
-import { types } from "node:util";
+import { promisify, types } from "node:util";
 import { runInNewContext } from "node:vm";
 import ts from "typescript";
 import type { ResourceReadView, ResourceInputPersistence } from "./resource-version.ts";
@@ -44,33 +44,25 @@ const matches = (actual: unknown, expected: unknown): boolean => {
 	if (!expected || typeof expected !== "object") return sameValue(actual, expected);
 	const index = standard.values.indexOf(expected);
 	if (index >= 0) return actual === intrinsics[index];
-	return matches(standard.prototype(actual), standard.prototype(expected)) && matchesDescriptors(actual, expected);
+	return matches(standard.prototype(actual), standard.prototype(expected)) && matchesDescriptors(standard.descriptors(actual), standard.descriptors(expected));
 };
-function matchesDescriptors(actual: unknown, expected: unknown): boolean {
-	const left = standard.descriptors(actual), right = standard.descriptors(expected), keys = ownKeys(right);
-	return ownKeys(left).length === keys.length && keys.every(key => left[key] &&
-		["value", "get", "set", "enumerable", "configurable", "writable"].every(field => matches(left[key][field], right[key][field])));
+function matchesDescriptors(actual: PropertyDescriptorMap, expected: PropertyDescriptorMap, equal = matches): boolean {
+	const keys = ownKeys(expected);
+	return ownKeys(actual).length === keys.length && keys.every(key => {
+		const left = actual[key as string], right = expected[key as string]!;
+		return left && equal(left.value, right.value) && equal(left.get, right.get) && equal(left.set, right.set) &&
+			left.enumerable === right.enumerable && left.configurable === right.configurable && left.writable === right.writable;
+	});
 }
 const pristine = intrinsics.every((value, index) => matches(value, standard.values[index]) &&
-	matches(prototypes[index], standard.prototype(standard.values[index])) && matchesDescriptors(value, standard.values[index]));
-const globalDescriptors = Object.entries(globals).map(([name, value]) => ({ name, value }));
+	matches(prototypes[index], standard.prototype(standard.values[index])) && matchesDescriptors(standard.descriptors(value), standard.descriptors(standard.values[index])));
+const globalBindings = Object.entries(globals);
 function intact(): boolean {
-	if (!pristine) return false;
-	for (let i = 0; i < globalDescriptors.length; i++) {
-		const { name, value } = globalDescriptors[i]!, current = getOwnPropertyDescriptor(globalThis, name);
-		if (!current || !("value" in current) || current.value !== value) return false;
-	}
-	for (let i = 0; i < intrinsics.length; i++) {
-		if (standard.prototype(intrinsics[i]) !== prototypes[i]) return false;
-		const current = getOwnPropertyDescriptors(intrinsics[i]), original = descriptors[i]!, keys = ownKeys(original);
-		if (ownKeys(current).length !== keys.length) return false;
-		for (let j = 0; j < keys.length; j++) {
-			const key = keys[j]!, left = current[key as string], right = original[key as string]!;
-			if (!left || !sameValue(left.value, right.value) || left.get !== right.get || left.set !== right.set ||
-				left.writable !== right.writable || left.configurable !== right.configurable || left.enumerable !== right.enumerable) return false;
-		}
-	}
-	return true;
+	return pristine && globalBindings.every(([name, value]) => {
+		const current = getOwnPropertyDescriptor(globalThis, name);
+		return current && "value" in current && current.value === value;
+	}) && intrinsics.every((value, index) => standard.prototype(value) === prototypes[index] &&
+		matchesDescriptors(getOwnPropertyDescriptors(value), descriptors[index]!, sameValue));
 }
 
 /** Code/proof metadata only. Values, ownership, byte budgets and receipts stay in ResourceReadView. */
@@ -106,7 +98,7 @@ Object.defineProperty(globalThis, key, { value: broker });
 export const resourceOperationContext = broker.contexts;
 
 const isFunction = (node: ts.Node): node is FunctionNode => ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node) || ts.isMethodDeclaration(node);
-const contains = (outer: ts.Node, inner: ts.Node) => inner.pos >= outer.pos && inner.end <= outer.end;
+const contains = (outer: ts.TextRange, inner: ts.TextRange) => inner.pos >= outer.pos && inner.end <= outer.end;
 const bindingAt = (checker: ts.TypeChecker, node: ts.Node) => ts.isIdentifier(node) && ts.isShorthandPropertyAssignment(node.parent)
 	? checker.getShorthandAssignmentValueSymbol(node.parent) : checker.getSymbolAtLocation(node);
 const reference = (node: ts.Identifier) => {
@@ -204,12 +196,12 @@ function prove(fn: FunctionNode, checker: ts.TypeChecker,
 	return valid ? { captures: [...captures], globals: [...usedGlobals], bindings, helpers } : undefined;
 }
 
-type Edit = { readonly start: number; readonly end: number; readonly text: string };
-function compile(source: string, id: string) {
+type Edit = { readonly pos: number; readonly end: number; readonly text: string };
+function compile(source: string, id: string, location: { lineNumber: number; columnNumber: number }) {
 	const file = ts.createSourceFile("resource-operation.js", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-	const host = ts.createCompilerHost({ allowJs: true, noLib: true, noResolve: true });
+	const options = { allowJs: true, noLib: true, noResolve: true }, host = ts.createCompilerHost(options);
 	host.getSourceFile = name => name === file.fileName ? file : undefined;
-	const checker = ts.createProgram([file.fileName], { allowJs: true, noLib: true, noResolve: true }, host).getTypeChecker();
+	const checker = ts.createProgram([file.fileName], options, host).getTypeChecker();
 	const functions: FunctionNode[] = [], edits: Edit[] = [], registered = new Map<string, FunctionNode>(), writes = new Set<ts.Symbol>();
 	let dynamic = false;
 	const assigned = (node: ts.Node) => {
@@ -239,6 +231,14 @@ function compile(source: string, id: string) {
 		return !binding || writes.has(binding) || !declaration ? undefined : isFunction(declaration) ? declaration :
 			ts.isVariableDeclaration(declaration) && declaration.initializer && isFunction(declaration.initializer) ? declaration.initializer : undefined;
 	};
+	const offset = file.getPositionOfLineAndCharacter(location.lineNumber, location.columnNumber);
+	const root = functions.filter(fn => fn.pos <= offset && offset < fn.end).pop();
+	if (!root) return;
+	const reachable = new Set<ts.Node>([root]);
+	const reach = (node: ts.Node) => {
+		if (ts.isIdentifier(node)) { const target = bindingAt(checker, node)?.valueDeclaration; if (target && !reachable.has(target)) { reachable.add(target); reach(target); } }
+		ts.forEachChild(node, reach);
+	}; reach(root);
 	const proofFor = (fn: FunctionNode): FunctionProof | undefined => {
 		if (!pure.has(fn)) {
 			pure.set(fn, undefined); // Cycles retain ordinary execution; descendants can still be reused independently.
@@ -252,24 +252,24 @@ function compile(source: string, id: string) {
 		inside ||= isFunction(node);
 		if (inside && ts.isCallExpression(node) && !(node.flags & ts.NodeFlags.OptionalChain) && ts.isPropertyAccessExpression(node.expression) && ts.isIdentifier(node.expression.expression) &&
 			node.expression.expression.text === "JSON" && node.expression.name.text === "parse") {
-			edits.push({ start: node.expression.getStart(file), end: node.expression.end, text: `${access}.call(JSON,"parse")` });
+			edits.push({ pos: node.expression.getStart(file), end: node.expression.end, text: `${access}.call(JSON,"parse")` });
 		} else if (inside && ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
 			const fn = definition(node.expression), proof = fn && proofFor(fn);
 			if (proof && [...proof.bindings].every(([name, symbol]) => checker.resolveName(name, node, ts.SymbolFlags.Value, false) === symbol)) {
 				const identity = `${id}:${fn!.pos}`;
-				edits.push({ start: node.expression.getStart(file), end: node.expression.end,
+				edits.push({ pos: node.expression.getStart(file), end: node.expression.end,
 					text: `${access}.wrap(${JSON.stringify(identity)},${node.expression.text},()=>[[${proof.captures.join(",")}],[${proof.globals.join(",")}],[${[...proof.helpers.keys()].join(",")}]] )` });
 				registered.set(identity, fn!);
 			}
 		}
 		ts.forEachChild(node, child => parse(child, inside));
 	}; parse(file);
-	if (!edits.length) return;
-	edits.sort((a, b) => b.start - a.start);
+	if (![...reachable].some(fn => edits.some(edit => contains(fn, edit)))) return;
+	edits.sort((a, b) => b.pos - a.pos);
 	const edited = (start: number, end: number) => {
 		let result = source.slice(start, end);
-		for (const edit of edits) if (edit.start >= start && edit.end <= end)
-			result = result.slice(0, edit.start - start) + edit.text + result.slice(edit.end - start);
+		for (const edit of edits) if (edit.pos >= start && edit.end <= end)
+			result = result.slice(0, edit.pos - start) + edit.text + result.slice(edit.end - start);
 		return result;
 	};
 	for (const [identity, fn] of registered) {
@@ -280,10 +280,11 @@ function compile(source: string, id: string) {
 				return edited(start, fn.end);
 			}) });
 	}
-	return { source: edited(0, source.length), registered: [...registered.keys()] };
+	return { compiled: edited(0, source.length), registered: [...registered.keys()] };
 }
 
-type Script = { readonly source: string; readonly compiled: string; readonly registered: readonly string[]; readonly owners: Set<object> };
+type Post = <Result>(method: string, params?: object) => Promise<Result>;
+type Script = NonNullable<ReturnType<typeof compile>> & { readonly source: string; readonly owners: Set<object> };
 const scripts = new Map<string, Script>();
 let lane = Promise.resolve();
 const serial = <Value>(execute: () => Promise<Value>): Promise<Value> => { const result = lane.then(execute); lane = result.then(() => {}, () => {}); return result; };
@@ -291,36 +292,34 @@ const serial = <Value>(execute: () => Promise<Value>): Promise<Value> => { const
 /** Attach to the existing function's script without copying its closure or executing its outer tool ahead. */
 export function resourceComputationCompiler() {
 	const owner = {}, seen = new WeakSet<Function>(); let closed = false;
-	const inspect = async <Value>(execute: (post: <Result>(method: string, params?: object) => Promise<Result>) => Promise<Value>) => {
+	const inspect = async <Value>(execute: (post: Post) => Promise<Value>) => {
 		const session = new Session(); session.connect();
-		const post = <Result>(method: string, params: object = {}) => new Promise<Result>((resolve, reject) =>
-			session.post(method, params, (error, result) => error ? reject(error) : resolve(result as Result)));
+		const post = promisify(session.post.bind(session)) as Post;
 		try { await post("Debugger.enable"); return await execute(post); }
 		finally { broker.target = undefined; await post("Debugger.disable").catch(() => {}); session.disconnect(); }
 	};
 	return {
 		prepare: (callback: Function) => serial(async () => {
 			if (closed || seen.has(callback) || !intact()) return;
-			try { await inspect(async post => {
+			try { if (await inspect(async post => {
 				broker.target = callback;
 				const group = randomUUID();
 				try {
-					const value = await post<{ result: { objectId?: string } }>("Runtime.evaluate", { expression: `${access}.target`, objectGroup: group });
-					if (!value.result.objectId) { seen.add(callback); return; }
-					const details = await post<{ internalProperties?: { name: string; value?: { value?: { scriptId: string; lineNumber: number; columnNumber: number } } }[] }>("Runtime.getProperties", { objectId: value.result.objectId, ownProperties: true });
+					const value = await post<Runtime.EvaluateReturnType>("Runtime.evaluate", { expression: `${access}.target`, objectGroup: group });
+					if (!value.result.objectId) return;
+					const details = await post<Runtime.GetPropertiesReturnType>("Runtime.getProperties", { objectId: value.result.objectId, ownProperties: true });
 					const location = details.internalProperties?.find(property => property.name === "[[FunctionLocation]]")?.value?.value;
-					if (!location) { seen.add(callback); return; }
+					if (!location) return;
 					const previous = scripts.get(location.scriptId);
-					if (previous) { previous.owners.add(owner); seen.add(callback); return; }
+					if (previous) { previous.owners.add(owner); return; }
 					const { scriptSource: source } = await post<{ scriptSource: string }>("Debugger.getScriptSource", { scriptId: location.scriptId });
-					if (source.length > 2 * 1024 * 1024 || source.includes(namespace)) { seen.add(callback); return; }
-					const compiled = compile(source, `${hash("sha256", source)}:${location.scriptId}`); if (!compiled) { seen.add(callback); return; }
-					const edited = await post<{ status?: string; exceptionDetails?: unknown }>("Debugger.setScriptSource", { scriptId: location.scriptId, scriptSource: compiled.source });
-					if (edited.exceptionDetails || edited.status && edited.status !== "Ok") { for (const id of compiled.registered) broker.proofs.delete(id); return; }
-					scripts.set(location.scriptId, { source, compiled: compiled.source, registered: compiled.registered, owners: new Set([owner]) });
-					seen.add(callback);
+					if (source.length > 2 * 1024 * 1024 || source.includes(namespace)) return;
+					const compiled = compile(source, `${hash("sha256", source)}:${location.scriptId}`, location); if (!compiled) return;
+					const edited = await post<{ status?: string; exceptionDetails?: unknown }>("Debugger.setScriptSource", { scriptId: location.scriptId, scriptSource: compiled.compiled });
+					if (edited.exceptionDetails || edited.status && edited.status !== "Ok") { for (const id of compiled.registered) broker.proofs.delete(id); return false; }
+					scripts.set(location.scriptId, { source, ...compiled, owners: new Set([owner]) });
 				} finally { await post("Runtime.releaseObjectGroup", { objectGroup: group }); }
-			}); } catch { /* Unsupported live editing retains the original Actor behavior. */ }
+			}) !== false) seen.add(callback); } catch { /* Unsupported live editing retains the original Actor behavior. */ }
 		}),
 		dispose: () => serial(async () => {
 			closed = true;

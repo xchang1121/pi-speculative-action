@@ -1456,7 +1456,7 @@ export async function validateResourceVersion(token: unknown): Promise<ResourceV
 				group.observations.set(key, entry);
 			}
 		}
-		for (const group of groups.values()) { const result = await group.manager.validate(group); checked.push(result); }
+		await withFilesystemReadView(undefined, async () => { for (const group of groups.values()) checked.push(await group.manager.validate(group)); });
 		const expired = checked.find(result => result.expired);
 		if (expired) return { ...validation(expired.reason, "exact", checked), changed: [...new Set(checked.flatMap(result => result.changed ?? []))] };
 		for (const source of token as ResourceVersionToken[]) source.view?.assertComplete(true);

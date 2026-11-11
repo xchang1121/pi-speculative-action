@@ -124,6 +124,7 @@ let compilerAttached = false;
 const countsByCall = [];
 const executed = async () => { countsByCall.push(await observer.count()); };
 try {
+  await compiler.prepare(counts); assert.equal(cases.toString(), originalCases);
   await session.bindExtensions({ mode: 'print', onError: error => { throw error; } });
   const first = await execute(tools[0], 'first');
   assert.notEqual(cases.toString(), originalCases);
