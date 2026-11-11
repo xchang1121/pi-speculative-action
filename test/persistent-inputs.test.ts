@@ -9,7 +9,7 @@ import type { ArtifactReference } from "../src/artifact-reference.ts";
 import type { Sha256Digest } from "../src/stable-value-hash.ts";
 import { CONTENT_CHUNK_BYTES } from "../src/content-chunks.ts";
 import { FILESYSTEM_METADATA_FIELDS } from "../src/filesystem-evidence.ts";
-import { ResourceVersionManager, type ResourceVersionToken } from "../src/resource-version.ts";
+import { ResourceInputSession, ResourceVersionManager, type ResourceVersionToken } from "../src/resource-version.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
 import { storePeer } from "./process-fixture.ts";
 
@@ -31,6 +31,33 @@ async function fixture() {
 }
 const searchFixture = async (f: Awaited<ReturnType<typeof fixture>>, mode: string, id = "") => JSON.parse((await promisify(execFile)(process.execPath,
 	[fileURLToPath(new URL("./persistent-preparation-fixture.ts", import.meta.url)), mode, f.root, f.cache, id])).stdout);
+
+linux("stops persistent recovery after a consumed input and releases its lease", async () => {
+	const f = await fixture(), session = new ResourceInputSession({ store: f.store }, memoryBudget);
+	try {
+		for (const name of ["first", "second"]) {
+			const file = path.join(f.root, name); await writeFile(file, name);
+			const token = await f.manager.capture([{ path: file, scope: "content" }], memoryBudget); f.tokens.push(token);
+			await f.manager.persist(token);
+		}
+		const restore = vi.spyOn(ResourceVersionManager.prototype, "restore");
+		await session.run(async () => {
+			for await (const token of session.recover(f.root, new AbortController().signal)) {
+				expect((await token.manager.validate(token)).expired).toBe(false); break;
+			}
+		});
+		expect(restore).toHaveBeenCalledTimes(1);
+		restore.mockClear();
+		for await (const token of session.recover(f.root, new AbortController().signal, path.join(f.root, "first"))) {
+			expect((await token.view!.readFile(path.join(f.root, "first"))).toString()).toBe("first");
+		}
+		expect(restore).toHaveBeenCalledTimes(1);
+		restore.mockClear();
+		for await (const _token of session.recover(f.root, new AbortController().signal, undefined, true)) throw new Error("no prepared values were stored");
+		expect(restore).not.toHaveBeenCalled();
+	} finally { await session.dispose(); await f.close(); }
+	expect(session.contents.closed).toBe(true); expect(session.contents.openChunks).toBe(0);
+});
 
 linux("rejects incomplete, corrupt, over-budget and stale persistent preparation closures", async () => {
 	const f = await fixture(), file = path.join(f.root, "input");

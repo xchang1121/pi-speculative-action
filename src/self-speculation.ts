@@ -8,7 +8,7 @@ import type { ActorActionSettlement } from "./settlement.ts";
 import { EvidenceLedger } from "./self-speculation-evidence.ts";
 import { asRecord as record, isRecord, stableStringify } from "./stable-json.ts";
 import { isFiniteNumber, isSafeCount, finiteNumber, nonNegativeFinite, nonNegativeCount } from "./number-utils.ts";
-import { booleanOr, nonNegativeNumber, optionalPositiveInteger, positiveInteger, positiveMilliseconds, probability, settingsParser } from "./setting-input.ts";
+import { booleanOr, nonNegativeNumber, positiveInteger, positiveMilliseconds, probability, settingsParser } from "./setting-input.ts";
 import { PendingTasks } from "./runtime-lifecycle.ts";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 
@@ -48,7 +48,6 @@ const { defaults: selfSpeculationDefaults, parse: parseSettings } = settingsPars
 	/** Minimum SPORK selected-token top-1 probability required for action execution. */
 	forkActionMinConfidence: [0.9, probability],
 	forkTransport: ["provider" as SelfSpeculationForkTransport, (value) => value === "sidecar" || value === "drafter" ? value : "provider"],
-	forkMaxTokens: [128 as number | null, optionalPositiveInteger],
 	forkTemperature: [0, nonNegativeNumber],
 	forkMaxAttempts: [ACTOR_PROBE_SCHEDULE.maxAttempts, positiveInteger],
 	forkRetryStreamUpdates: [ACTOR_PROBE_SCHEDULE.retryStreamUpdates, positiveInteger],
@@ -76,7 +75,7 @@ export interface SelfSpeculationCoordinatorOptions {
 	readonly requestID?: () => string;
 	readonly actorForkPlanSource?: ActorForkPlanSource;
 	readonly draftFork?: (input: { readonly model: Model<Api>; readonly context: Context; readonly reasoning: string; readonly content: string;
-		readonly signal: AbortSignal; readonly maxTokens: number | undefined; readonly temperature: number }) => Promise<readonly Pick<ActorForkActionCall, "tool" | "input">[]>;
+		readonly signal: AbortSignal; readonly temperature: number }) => Promise<readonly Pick<ActorForkActionCall, "tool" | "input">[]>;
 }
 
 interface TurnState {
@@ -372,7 +371,7 @@ export class SelfSpeculationCoordinator {
 	private async draftedFork(state: TurnState, probe: ActorProbeSnapshot, signal?: AbortSignal): Promise<ForkReceiptOutcome> {
 		if (!this.draftFork) throw new Error("self-speculation Drafter fork is not configured");
 		const calls = await this.draftFork({ model: state.model, context: state.actorContext, reasoning: probe.reasoning, content: probe.content,
-			maxTokens: state.settings.forkMaxTokens ?? undefined, temperature: state.settings.forkTemperature, signal: signal ?? AbortSignal.any([]) });
+			temperature: state.settings.forkTemperature, signal: signal ?? AbortSignal.any([]) });
 		this.counters.forkCompletions++;
 		const batches = calls.length ? [{ id: sidecarActionBatchID(stableStringify(calls)), calls: calls.map((call, index) => ({ id: `${index}:fork`, index, ...call })) }] : [];
 		return { committed: batches.length > 0, batches };
@@ -663,7 +662,7 @@ function providerPayload(
 	if (!isRecord(payload)) return payload;
 	const identified = { ...payload, [settings.requestIDField]: requestID };
 	if (settings.forkTransport === "sidecar") return identified;
-	const { max_tokens, temperature, decoder, forced_prefix, ...fork } = forkPayload(settings);
+	const { temperature, decoder, forced_prefix, ...fork } = forkPayload(settings);
 	return {
 		...identified,
 		self_speculation: {
@@ -671,7 +670,6 @@ function providerPayload(
 			fork: settings.forkEnabled,
 			fork_transport: settings.forkTransport,
 			...fork,
-			fork_max_tokens: max_tokens,
 			fork_temperature: temperature,
 			fork_decoder: decoder,
 			...(forced_prefix === undefined ? {} : { fork_forced_prefix: forced_prefix }),
@@ -689,7 +687,6 @@ function forkPayload(settings: SelfSpeculationSettings) {
 	return {
 		actor_profile: settings.actorProfile,
 		...(settings.draftFormat === "auto" ? {} : { draft_format: settings.draftFormat }),
-		...(settings.forkMaxTokens === null ? {} : { max_tokens: settings.forkMaxTokens }),
 		temperature: settings.forkTemperature,
 		decoder: settings.forkDecoder,
 		...(settings.forkForcedPrefix === "auto" ? {} : { forced_prefix: settings.forkForcedPrefix }),

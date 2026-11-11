@@ -34,7 +34,6 @@ import { runSourceRequest, SourceGeneration } from "./source-request.ts";
 import { TaskTimeline, TimelineInterval } from "./task-timing.ts";
 import type { HardwareResources } from "./system-resources.ts";
 import { normalizeSchedulingSettings, SCHEDULING_DEFAULTS } from "./scheduling-settings.ts";
-import { ProjectionFailureMemory, ReuseDeadline } from "./reuse-deadline.ts";
 
 class CandidateFailure extends Error {
 	readonly failure: ResolutionCause;
@@ -133,8 +132,7 @@ function captureCoverage<Output>(action: ActionKey, output: Output, rules: reado
 
 async function projectOutput<Output>(candidate: CandidateRecord<Output>, actor: ActionKey, match: ActionKeyMatch,
 	rules: readonly ActionProjectionRule<Output>[],
-	request: Parameters<NonNullable<WorldBranch<Output>["reconstruct"]>>[0], mode: "cached" | "output" | "inputs" = "cached",
-	beforeReconstruct?: () => ResolutionCause | undefined): Promise<ProjectionResult<Output>> {
+	request: Parameters<NonNullable<WorldBranch<Output>["reconstruct"]>>[0], mode: "cached" | "output" | "inputs" = "cached"): Promise<ProjectionResult<Output>> {
 	const branch = candidateBranch(candidate)!;
 	if (branch.inputsOnly && match.kind !== "inputs") return { ok: false, cause: cause("projection", "input_only_branch") };
 	const retained = mode === "cached" && candidate.resultViews?.get(actor.key);
@@ -155,10 +153,7 @@ async function projectOutput<Output>(candidate: CandidateRecord<Output>, actor: 
 			const projected: Output | undefined = !branch.inputsOnly && candidate.key && match.kind === "projected" && coverage && rule?.projectOutput ? cloneSharedData(await rule.projectOutput({
 				speculative: candidate.key, actor, output: branch.output, coverage: cloneSharedData(coverage.value), keyMatch: match,
 			})) : undefined;
-			if (projected !== undefined || !reconstruct) return projected;
-			const blocked = beforeReconstruct?.();
-			if (blocked) throw new CandidateFailure(blocked);
-			return (rebuilt = await reconstruct(request))?.output;
+			return projected !== undefined ? projected : (rebuilt = await reconstruct?.(request))?.output;
 		});
 		if ((rebuilt?.requiresQueryValidation || mode === "inputs") && !rebuilt?.validate) return { ok: false, cause: cause("projection", "query_proof_missing") };
 		if (projected === undefined) return { ok: false, cause: cause("projection", "view_not_covered") };
@@ -167,7 +162,7 @@ async function projectOutput<Output>(candidate: CandidateRecord<Output>, actor: 
 		return { ok: true, output: projected, execution, inputs: !!rebuilt, compatibility: rebuilt?.compatibility,
 			validate: rebuilt?.validate, capturedBytes: rebuilt?.capturedBytes, requiresQueryValidation: rebuilt?.requiresQueryValidation, resource };
 	} catch (error) {
-		return { ok: false, cause: error instanceof CandidateFailure ? error.failure : cause("projection", "reconstruction_failed", errorDetail(error)) };
+		return { ok: false, cause: cause("projection", "reconstruction_failed", errorDetail(error)) };
 	} finally { if (!transferred) await Promise.resolve().then(() => rebuilt?.dispose?.()).catch(() => {}); }
 }
 
@@ -1254,7 +1249,7 @@ export function makeSpeculativeActionRuntime<
 
 	/** Preparation proves the current query; every later adoption repeats this proof before committing. */
 	const prepareCandidateOutput = async (state: Turn, candidate: Candidate, action: ActionKey, match: ActionKeyMatch,
-		call: ActualToolCall, signal: AbortSignal, beforeReconstruct?: () => ResolutionCause | undefined): Promise<ProjectionResult<Output>> => {
+		call: ActualToolCall, signal: AbortSignal): Promise<ProjectionResult<Output>> => {
 		const branch = candidateBranch(candidate)!;
 		const sourceCompatibility = branch.reconstructionScope === "current_action" && match.kind !== "exact" ? undefined
 			: scheduler.assessCompatibility(branch.compatibility, action.executionFingerprint);
@@ -1266,7 +1261,7 @@ export function makeSpeculativeActionRuntime<
 				if ((match.kind !== "exact" || mode === "inputs") && branch.inputSource && (mode !== "cached" || !candidate.resultViews?.has(action.key)))
 					inputs ??= borrowResourceInputs(state.session, candidate, `inputs:query:${callKey(state.turnID, call.id ?? action.hash)}`);
 				const projection = await projectOutput(candidate, action, mode === "inputs" ? { kind: "inputs", distance: match.distance } : match,
-					projectionRules, { action, args: call.input, callID: call.id ?? action.hash, signal, inputs: inputs?.lookup }, mode, beforeReconstruct);
+					projectionRules, { action, args: call.input, callID: call.id ?? action.hash, signal, inputs: inputs?.lookup }, mode);
 				if (!projection.ok) return projection;
 				const compatibility = sourceCompatibility ?? scheduler.assessCompatibility(projection.compatibility ?? branch.compatibility, action.executionFingerprint);
 				const validation = compatibility.compatible
@@ -1285,17 +1280,13 @@ export function makeSpeculativeActionRuntime<
 		} finally { inputs?.dispose(); }
 	};
 
-	const projectionFailures = new ProjectionFailureMemory();
 	const selectActorCandidate = async (input: ActorSelectionInput): Promise<void> => {
 		const { state, actualCall, actualKey, actorAction, pending, preview } = input;
-		const deadline = new ReuseDeadline(state.settings.reuseLookupTimeoutMs ?? DEFAULTS.reuseLookupTimeoutMs,
-			input.signal ? AbortSignal.any([input.signal, state.generation.signal]) : state.generation.signal);
-		const signal = deadline.signal;
-		const expiration = () => cause("control", deadline.expired && !input.signal?.aborted && !state.generation.signal.aborted ? "reuse_lookup_deadline" : "actor_aborted");
+		const signal = input.signal ? AbortSignal.any([input.signal, state.generation.signal]) : state.generation.signal;
 		const attempted = new Set<Candidate>();
 		const stopCandidate = (candidate: Candidate): boolean => {
 			const failure = signal?.aborted
-				? expiration()
+				? cause("control", "actor_aborted")
 				: !actorTurnActive(state) ? cause("control", "disabled")
 				: state.settings.reuseEnabled === false ? cause("control", "reuse_disabled") : undefined;
 			if (!failure) return false;
@@ -1303,8 +1294,7 @@ export function makeSpeculativeActionRuntime<
 			return true;
 		};
 
-		try { for (;;) {
-			if (signal.aborted) { actorAction.setFallback(expiration()); break; }
+		for (;;) {
 			const observation = candidateStore.observe(state.sessionID);
 			const stop = AbortSignal.any([signal, observation.signal]);
 			try {
@@ -1317,29 +1307,22 @@ export function makeSpeculativeActionRuntime<
 				if (!choice) {
 					if (!pending.size && !ranked.length) break;
 					await waitForCompletion(Promise.race(pending), stop);
-					if (signal.aborted) { actorAction.setFallback(expiration()); break; }
+					if (signal.aborted) { actorAction.setFallback(cause("control", "actor_aborted")); break; }
 					continue;
 				}
 				const candidate = choice.candidate;
 				attempted.add(candidate);
-				// Output projection and input discovery may reach the same backend reconstruction.
-				// Scope failures to that owner/executor/tool, while still allowing already available outputs.
-				const projector = JSON.stringify([actualKey.executionFingerprint, actualKey.tool]);
-				let reconstructed = false;
 				const reservation = acquireCandidate(state.session, candidate, `actor:${actorAction.identity.sequence}`);
 				if (!reservation) { actorAction.rejectCandidate(candidate.id, choice.match, cause("matching", "candidate_reserved")); continue; }
 				(candidate.actorConsumers ??= new Set()).add(actorAction);
 				let projection: ProjectionResult<Output> | undefined;
-				let detached = false;
 				try {
 					if (candidate.work.execution.status === "queued") {
 						preemptForActor(state.session, ranked.map(({ candidate }) => candidate));
 						startQueuedCandidates(state.session, candidate);
 					}
-					const authorizationWait = await waitForCompletion(authorize(input, candidate, signal), signal);
+					const authorization = await authorize(input, candidate, signal);
 					if (stopCandidate(candidate)) break;
-					if (authorizationWait.status !== "completed") break;
-					const authorization = authorizationWait.value;
 					if (authorization) { actorAction.rejectCandidate(candidate.id, choice.match, authorization); continue; }
 					const waiting = await waitForCompletion(Promise.race([candidate.work.completion, ...pending]), stop);
 					if (stopCandidate(candidate)) break;
@@ -1351,27 +1334,9 @@ export function makeSpeculativeActionRuntime<
 					if (preview?.state.status === "candidate" && preview.state.candidateID === candidate.id &&
 						preview.actionKey?.key === actualKey.key) await waitForCompletion(preview.task, signal);
 					if (stopCandidate(candidate)) break;
-					const preparation = prepareCandidateOutput(state, candidate, actualKey, choice.match, actualCall, signal, () => {
-						if (projectionFailures.blocked(candidate, projector)) return cause("projection", "recent_reconstruction_timeout");
-						reconstructed = true;
-						return undefined;
-					});
-					const projected = await waitForCompletion(preparation, signal);
-					// A cooperative backend can settle in the same microtask as cancellation; remember both outcomes.
-					if (deadline.expired && reconstructed) projectionFailures.remember(candidate, projector, 30_000);
-					if (projected.status !== "completed") {
-						detached = true;
-						// The timed-out query retains its lease until borrowed input work and late output cleanup settle.
-						state.session.lifecycle.track(preparation.then(late => { if (late.ok) releaseProjectionResource(state.sessionID, late.resource); })
-							.catch(() => {}).finally(() => reservation.release()));
-						actorAction.setFallback(expiration(), candidate.id); break;
-					}
-					projection = projected.value;
+					projection = await prepareCandidateOutput(state, candidate, actualKey, choice.match, actualCall, signal);
 					if (stopCandidate(candidate)) break;
-					if (!projection.ok) {
-						if (reconstructed && projection.cause.code === "reconstruction_failed" && /deadline|timeout/i.test(projection.cause.detail ?? "")) projectionFailures.remember(candidate, projector, 30_000);
-						actorAction.rejectCandidate(candidate.id, choice.match, projection.cause); continue;
-					}
+					if (!projection.ok) { actorAction.rejectCandidate(candidate.id, choice.match, projection.cause); continue; }
 					let output = projection.output;
 					try {
 						if (!projection.validate) { const committed = await branch.commit(); if (choice.match.kind === "exact") output = committed; }
@@ -1414,7 +1379,7 @@ export function makeSpeculativeActionRuntime<
 				} finally {
 					if (projection?.ok) releaseProjectionResource(state.sessionID, projection.resource);
 					candidate.actorConsumers?.delete(actorAction);
-					if (!detached) reservation.release();
+					reservation.release();
 					retireUndemandedCandidate(state.session, candidate, cause("retention", "actor_released"));
 					scheduler.refresh(candidate, forecastsForCandidate(state.session, candidate));
 				}
@@ -1422,7 +1387,7 @@ export function makeSpeculativeActionRuntime<
 				observation.dispose();
 				if (observation.changed) attempted.clear();
 			}
-		} } finally { deadline.dispose(); }
+		}
 	};
 
 	const prepareActorCall = async (input: ConsumeInput, signal?: AbortSignal, actorArrivedAt = performance.now()): Promise<PreparedActorCall<Output> | undefined> => {
@@ -1543,16 +1508,9 @@ export function makeSpeculativeActionRuntime<
 				state.session.effects.enqueue(() => dispatchReady(state.session));
 				try {
 					const concrete = asConcreteInput(actualCall.input), captureSignal = signal ?? state.generation.signal;
-					const remaining = (state.settings.reuseLookupTimeoutMs ?? DEFAULTS.reuseLookupTimeoutMs) - (performance.now() - actorArrivedAt);
-					if (remaining > 0 && state.settings.reuseEnabled !== false && adapter.captureAuthoritativeResult && concrete && !captureSignal.aborted && state.actorActions.has(actorAction)) {
-						const cancellation = new AbortController();
-						const captureTask = Promise.resolve(adapter.captureAuthoritativeResult({ ...turnContext(state), consumeInput: input,
-							tool: actualCall.tool, concrete, action: actualKey, callID: actualCall.id ?? callKey(state.turnID, actualCall.tool), signal: AbortSignal.any([captureSignal, cancellation.signal]) }));
-						const waited = await waitForCompletion(captureTask, captureSignal, remaining);
-						if (waited.status !== "completed") {
-							cancellation.abort(); state.session.lifecycle.track(captureTask.then(late => late && state.session.lifecycle.release(late)).catch(() => {}));
-						}
-						const capture = waited.status === "completed" ? waited.value : undefined;
+					if (state.settings.reuseEnabled !== false && adapter.captureAuthoritativeResult && concrete && !captureSignal.aborted && state.actorActions.has(actorAction)) {
+						const capture = await adapter.captureAuthoritativeResult({ ...turnContext(state), consumeInput: input,
+							tool: actualCall.tool, concrete, action: actualKey, callID: actualCall.id ?? callKey(state.turnID, actualCall.tool), signal: captureSignal });
 						if (capture) {
 							if (!(state.session.settings.reuseEnabled !== false && (actualKey || capture.inputsOnly) && capture.route.reuse === "shared_result" && !captureSignal.aborted && actorTurnActive(state) &&
 								state.actorActions.has(actorAction) && actorAction.capture(capture))) state.session.lifecycle.release(capture);

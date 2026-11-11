@@ -269,7 +269,6 @@ export async function createClosedSearchProfile(cwd: string) {
 								const file = prepared.files.find(file => file.path === target); assert.ok(file, "unselected grep context input");
 								return view!.readFile(file.source);
 							}
-							if (prepared) { assert.equal(target, prepared.target, "unselected grep metadata input"); return { directory: prepared.directory }; }
 							return operation === "stat" ? { directory: (await fs.stat(target as string)).isDirectory() } : fs.readFile(target as string, { signal });
 						},
 					});
@@ -284,10 +283,10 @@ export async function createClosedSearchProfile(cwd: string) {
 						try {
 							const prepared = await prepareCapturedGrep(inputs, cwd, root, { ...query, path: target }, signal,
 								(directory, args, signal, emit) => engine.execute("selection", directory, args, signal, emit));
-							return { value: prepared.index, bytes: prepared.bytes, dispose: () => {} };
-						} finally { await dispose(); }
+							return { value: { root, ...prepared }, bytes: prepared.bytes, dispose };
+						} catch (error) { await dispose(); throw error; }
 					};
-					if (view.prepare) return await view.prepare(engine.indexBinding, JSON.stringify([cwd, target, query.glob]), build, run, target, signal);
+					if (view.prepare) return await view.prepare(engine, JSON.stringify([target, query.glob]), build, run, target, signal);
 					const prepared = await build(view, signal);
 					try { return await run(prepared.value); } finally { await prepared.dispose(); }
 				} finally { await capture?.release(); }
@@ -321,9 +320,7 @@ async function prepareGrepEngine(home: string, profile: { readonly versions: Rea
 		const identity = Object.freeze({ sha256: binary.hash, platform: process.platform, arch: process.arch, environment, flags });
 		const matchesBinding: object = createSerializablePreparationBinding({ engine: identity, node: process.version,
 			loaded: [matchCapturedGrep, runCapturedSearchProcess, prepareGrepEngine].map(fn => Function.prototype.toString.call(fn)) }, acceptsGrepMatches);
-		const indexBinding: object = createSerializablePreparationBinding({ engine: identity, node: process.version,
-			loaded: [prepareCapturedGrep, acceptsCapturedSearchIndex, runCapturedSearchProcess].map(fn => Function.prototype.toString.call(fn)) }, acceptsCapturedSearchIndex);
-		return { root: owned, identity, matchesBinding, indexBinding,
+		return { root: owned, identity, matchesBinding,
 			execute: (stage: "actor" | "selection" | "producer", cwd: string, args: readonly string[], signal: AbortSignal, emit: (output: SearchOutput) => void) =>
 				runCapturedSearchProcess(executable, [...flags, ...(stage === "actor" ? [] : ["--no-ignore-parent"]), ...(stage === "producer" ? ["--no-ignore"] : []), ...args], cwd, environment, signal, emit),
 			release: async () => { assert.equal(path.dirname(owned), path.resolve(os.tmpdir())); await fs.rm(owned, { recursive: true, force: true }); },
@@ -403,17 +400,8 @@ export async function readClosedSearchInput(source: ToolFilesystemOperations, ro
 type GrepInput = Parameters<ReturnType<typeof createGrepToolDefinition>["execute"]>[1];
 type SearchOutput = { readonly fd: 1 | 2; readonly data: Buffer };
 type SearchSelection = (cwd: string, args: readonly string[], signal: AbortSignal, emit: (output: SearchOutput) => void) => Promise<{ readonly code: number | null }>;
-/** Immutable file selection, reusable across regex/formatting requests under the retained namespace proofs. */
-export type CapturedSearchIndex = { readonly root: string; readonly cwd: string; readonly path: string; readonly target: string; readonly directory: boolean;
+type PreparedGrep = { readonly root: string; readonly cwd: string; readonly path: string;
 	readonly files: readonly { readonly source: string; readonly path: string }[] };
-type PreparedGrep = CapturedSearchIndex;
-
-function acceptsCapturedSearchIndex(value: unknown): value is CapturedSearchIndex {
-	const index = value as CapturedSearchIndex | undefined;
-	return !!index && typeof index === "object" && Object.keys(index).length === 6 &&
-		[index.root, index.cwd, index.path, index.target].every(value => typeof value === "string") && typeof index.directory === "boolean" &&
-		Array.isArray(index.files) && index.files.every(file => !!file && Object.keys(file).length === 2 && typeof file.source === "string" && typeof file.path === "string");
-}
 
 function acceptsGrepMatches(value: unknown): boolean {
 	return Array.isArray(value) && value.every(match => match && typeof match === "object" && Object.keys(match).length === 2 &&
@@ -655,13 +643,10 @@ async function prepareCapturedGrep(view: ToolFilesystemOperations, cwd: string, 
 		else { assert.ok(relativeFilesystemPath(privateVolume, file) !== undefined); await fs.unlink(file); }
 	}
 	selectedInputs.sort((left, right) => Buffer.compare(Buffer.from(left.path), Buffer.from(right.path)));
-	// Only namespace decisions survive selection. The temporary skeleton is deleted before matching;
-	// stat and context reads are serviced from this immutable index and the same captured input view.
-	const virtualRoot = path.join(path.parse(cwd).root, "__pi_captured_search__");
-	const virtual = (file: string) => { const relative = relativeFilesystemPath(destination, file); assert.ok(relative !== undefined); return path.join(virtualRoot, relative); };
-	const index: CapturedSearchIndex = { root: virtualRoot, cwd: virtual(privateCwd), target: virtual(logicalTarget), path: pathToFileURL(virtual(logicalTarget)).href,
-		directory, files: selectedInputs.map(file => ({ source: file.source, path: virtual(file.path) })) };
-	return { index, bytes: JSON.stringify(index).length * 2 };
+	return { cwd: privateCwd, path: pathToFileURL(logicalTarget).href,
+		files: selectedInputs,
+		bytes: inputBytes + [...files.keys(), ...parents, privateCwd, logicalTarget, destination].reduce((sum, name) => sum + name.length * 2 + 128, 0) +
+			selectedInputs.reduce((sum, file) => sum + (file.source.length + file.path.length) * 2 + 64, 0) };
 }
 import assert from "node:assert/strict";
 import path from "node:path";

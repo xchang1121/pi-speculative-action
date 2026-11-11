@@ -4,24 +4,15 @@ export function positiveInteger<F extends number | undefined>(value: unknown, fa
 	return typeof value === "number" && Number.isSafeInteger(Math.floor(value)) && value >= 1 ? Math.floor(value) : fallback;
 }
 
-/** Explicit null disables a caller-owned limit; missing/invalid values retain the default. */
-export function optionalPositiveInteger(value: unknown, fallback: number | null): number | null {
-	return value === null ? null : positiveInteger(value, fallback ?? undefined) ?? fallback;
-}
-
-export function optionalPositiveMilliseconds(value: unknown, fallback: number | null): number | null {
-	return value === null ? null : positiveMilliseconds(value, fallback ?? 0) || fallback;
-}
-
 export function nonNegativeInteger(value: unknown, fallback: number): number {
 	return typeof value === "number" && Number.isSafeInteger(Math.floor(value)) && value >= 0 ? Math.floor(value) : fallback;
 }
 
 /** Node timers otherwise turn an overflowing delay into a 1 ms timeout. */
-export function milliseconds(value: unknown, fallback: number): number {
+export function milliseconds<F extends number | undefined>(value: unknown, fallback: F): number | F {
 	return isSafeCount(value, 0, 2_147_483_647) ? value : fallback;
 }
-export const positiveMilliseconds = (value: unknown, fallback: number): number => milliseconds(value, fallback) || fallback;
+export const positiveMilliseconds = <F extends number | undefined>(value: unknown, fallback: F): number | F => milliseconds(value, fallback) || fallback;
 
 export function nonNegativeNumber<F extends number | undefined>(value: unknown, fallback: F): number | F {
 	return isFiniteNumber(value) && value >= 0 ? value : fallback;
@@ -92,11 +83,6 @@ export function nonNegativeIntegerInput(title: string): SettingInputDescriptor<n
 
 export function millisecondsInput(title: string): SettingInputDescriptor<number> {
 	return numericInput(title, value => milliseconds(value, -1) >= 1, `${title} must be an integer from 1 to 2147483647.`);
-}
-
-export function optionalLimitInput(input: SettingInputDescriptor<number>): SettingInputDescriptor<number | null> {
-	return settingInput(input.title, value => value === null ? "unlimited" : input.format(value), value =>
-		["null", "unlimited"].includes(value.trim().toLowerCase()) ? { ok: true, value: null } : input.parse(value));
 }
 
 export function nonNegativeNumberInput(title: string): SettingInputDescriptor<number> {

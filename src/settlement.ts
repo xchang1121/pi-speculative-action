@@ -88,7 +88,6 @@ export type SourceRequestSettlement =
 export type SourceRequestKind = "proposal" | "continuation" | "observation";
 
 export interface SourceRequestIdentity {
-	readonly id?: string;
 	readonly source: string;
 	readonly turnID: string;
 	readonly index: number;

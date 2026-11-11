@@ -15,7 +15,7 @@ export { createLinuxProcessExecutionWorld, createCompletedProcessExecutionWorld,
 export { LinuxProcessReuseBackend, type LinuxProcessBackendOptions, type LinuxProcessBackendStatus, type LinuxProcessSession } from "./linux-process-backend.ts";
 export { adaptProcessToolOperations, ProcessExecutionCoordinator, type ProcessExecutionRequest, type ProcessExecutionResult, type ProcessExecutor, type ProcessToolOperations } from "./process-execution.ts";
 export { WorkspaceSandboxService, type WorkspaceSandboxOptions } from "./workspace-sandbox.ts";
-export { type PiToolInvocationOptions, resolvePiToolInvocation, createClosedSearchProfile, type CapturedSearchIndex } from "./pi-tool-invocation.ts";
+export { type PiToolInvocationOptions, resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 export { EXACT_TOOL_OBSERVATION, type ToolObservationContract, type ToolInvocation, type ToolProcessInvocation, type ToolSettlement } from "./tool-settlement.ts";
 export type { ToolFilesystemOperations } from "./resource-version.ts";
 export { defineSpeculativeStep, defineSpeculativeTool, type SpeculativeStep, type SpeculativeStepContext,

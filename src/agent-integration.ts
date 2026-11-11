@@ -21,7 +21,7 @@ import {
 } from "./runtime.ts";
 import { normalizeSelfSpeculationSettings, type SelfSpeculationSettingsInput } from "./self-speculation.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
-import { booleanOr, optionalPositiveMilliseconds, positiveInteger, positiveMilliseconds } from "./setting-input.ts";
+import { booleanOr, positiveInteger, positiveMilliseconds } from "./setting-input.ts";
 import { normalizeSchedulingSettings } from "./scheduling-settings.ts";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 import { type ToolInvocation, type ToolSettlement, toolObservationKey } from "./tool-settlement.ts";
@@ -52,8 +52,7 @@ export function normalizeSpeculativeAgentSettings(input: SpeculativeAgentSetting
 		maxConcurrentActions: positiveInteger(input.maxConcurrentActions, DEFAULTS.maxConcurrentActions),
 		resourceCacheMaxEntries: positiveInteger(input.resourceCacheMaxEntries, DEFAULTS.resourceCacheMaxEntries),
 		resourceCacheMaxBytes: positiveInteger(input.resourceCacheMaxBytes, DEFAULTS.resourceCacheMaxBytes),
-		predictionTimeoutMs: optionalPositiveMilliseconds(input.predictionTimeoutMs, DEFAULTS.predictionTimeoutMs),
-		reuseLookupTimeoutMs: positiveMilliseconds(input.reuseLookupTimeoutMs, DEFAULTS.reuseLookupTimeoutMs),
+		predictionTimeoutMs: positiveMilliseconds(input.predictionTimeoutMs, undefined),
 		scheduling: normalizeSchedulingSettings(input.scheduling),
 		patternAware: patternAwareSettings(input.patternAware ?? PATTERN_AWARE_DEFAULTS),
 		selfSpeculation: normalizeSelfSpeculationSettings(input.selfSpeculation),
@@ -166,16 +165,14 @@ export function createAgentExecutionHost(sessionID: string, options: CreateSpecu
 			effect: definition.effect, requirements: definition.requirements }, { cwd: options.cwd, signal });
 	};
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
-		const { patternAware, selfSpeculation, drafterMaxDepth, drafterMaxTokens, drafterTaskMaxRequests, drafterTaskMaxTokens,
-			drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax, drafterPatternHints,
-			drafterPatternHintsTimeoutMs, drafterBudgetHorizonTurns, drafterBudgetInitialFraction, modelRequestMaxConcurrent, modelRequestActorReserve, ...policy } =
+		const { patternAware, selfSpeculation, drafterMaxDepth,
+			drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax, drafterPatternHints, ...policy } =
 			normalizeSpeculativeAgentSettings(await options.getSettings?.());
 		inputMaxBytes = policy.resourceCacheMaxBytes;
 		return {
 			...policy,
 			sourceConfig: {
-				drafterPatternHintsTimeoutMs, drafterBudgetHorizonTurns, drafterBudgetInitialFraction, modelRequestMaxConcurrent, modelRequestActorReserve,
-				drafterMaxDepth, drafterMaxTokens, drafterTaskMaxRequests, drafterTaskMaxTokens, drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax, drafterPatternHints,
+				drafterMaxDepth, drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax, drafterPatternHints,
 				patternAware,
 				actorForkActionEnabled:
 					options.actorForkPlanSource !== undefined &&
@@ -192,7 +189,6 @@ export function createAgentExecutionHost(sessionID: string, options: CreateSpecu
 		getDraftOptions: options.getDraftOptions,
 		complete: options.complete,
 		drafterBudget: options.drafterBudget,
-		onDiagnostic: options.onDiagnostic,
 		patternHints: (hint) => patternPlans.hints(hint),
 	});
 	const patternPlans = createPatternPlanSource({

@@ -49,8 +49,6 @@ pi
 
 `grep/find` 默认采用通过版本检查的 Captured 搜索契约，让 Actor 和提前执行共享同一搜索实现；资格不足时仍由原工具执行。保存 `searchExecution: "native"` 可显式选择 Native Pi。这个选择决定搜索语义，开启投机与否不会切换 Actor 的实现。
 
-模型请求按服务地址共享容量并为 Actor 预留槽位；本地取消后继续跟踪已经发送的请求。正式调用的复用查找默认最多等待5秒，随后执行原工具。请求关联、后段预测预算、可选提示、搜索索引和完成检查的配置与限制见[请求与复用生命周期](./docs/request-lifecycle.md)。
-
 全局配置位于 `<agent-dir>/speculative-action.json`，项目配置位于 `.pi/speculative-action.json`。安装准备阶段使用随依赖保留的 TypeScript 编译器生成入口，兼容 Pi 默认省略开发依赖的 Git 安装；类型检查在开发验证阶段单独运行。Pi 加载已编译入口；本地修改源码后运行 `npm run build`，再用 `pi -e /absolute/path/to/pi-speculative-action` 加载。
 
 Linux / WSL 2 需在扩展目录运行 `npm run setup:linux`，升级后重新运行；WSL checkout 放在 Linux 原生文件系统。Windows x64 使用随包提供的本地 NTFS 对象租约，无需另行编译。

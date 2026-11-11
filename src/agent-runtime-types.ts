@@ -23,9 +23,8 @@ export interface DrafterModelOptions {
 	/** Resolve request options, including credentials for a different provider. */
 	readonly getDraftOptions?: (context: DraftOptionsContext) => SimpleStreamOptions | Promise<SimpleStreamOptions>;
 	readonly complete: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
-	/** Share reservations with other model requests in the same user task. */
+	/** Share usage accounting with other model requests in the same user task. */
 	readonly drafterBudget?: DrafterTaskBudget;
-	readonly onDiagnostic?: (diagnostic: { readonly code: string; readonly detail?: string; readonly turnID?: string }) => void;
 }
 
 export interface AgentStartInput extends Pick<DraftOptionsContext, "actorModel" | "actorOptions">, Omit<TurnInput<string>, "terminal"> {

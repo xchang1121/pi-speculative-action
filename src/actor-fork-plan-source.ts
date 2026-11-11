@@ -63,7 +63,7 @@ export class ActorForkPlanSource {
 	readonly source: AgentPlanSource = {
 		id: "self-speculation",
 		enabled: (settings) => settings.sourceConfig?.actorForkActionEnabled === true,
-		timeoutMs: (settings) => settings.predictionTimeoutMs ?? undefined,
+		timeoutMs: (settings) => settings.predictionTimeoutMs,
 		requestLifetime: "actor_decision",
 		// A forked batch is one decision, as a Drafter batch is: peers such as PatternAware continue from all of it.
 		continuationBatch: ({ feedback }) => {

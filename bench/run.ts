@@ -45,7 +45,6 @@ interface CommandResult { readonly stdout: string; readonly stderr: string; }
 
 const numericSettings = {
 	drafterMaxDepth: "non-negative integer", candidateLimit: "positive integer",
-	drafterTaskMaxRequests: "positive integer", drafterTaskMaxTokens: "positive integer",
 	drafterDeterministicCandidates: "non-negative integer", drafterTemperatureMin: "non-negative number",
 	drafterTemperatureMax: "non-negative number", maxConcurrentActions: "positive integer",
 } as const;
@@ -62,7 +61,6 @@ const { values } = parseArgs({
 		drafter: { type: "string", default: "deepseek/deepseek-v4-flash" },
 		// Every model request goes through this endpoint instead (a pi-llm-tape recorder or replayer).
 		"model-base-url": { type: "string" },
-		"drafter-max-tokens": { type: "string" },
 		"max-turns": { type: "string", default: "128" },
 		"timeout-ms": { type: "string", default: "900000" },
 		"repo-cache": { type: "string" },
@@ -93,7 +91,6 @@ const options = {
 	label: values.label ?? "baseline",
 	actor: model(values.actor ?? "deepseek/deepseek-v4-pro"),
 	drafter: model(values.drafter ?? "deepseek/deepseek-v4-flash"),
-	...(values["drafter-max-tokens"] !== undefined ? { drafterMaxTokens: numberOption("drafter-max-tokens") } : {}),
 	maxTurns: numberOption("max-turns"),
 	timeoutMs: numberOption("timeout-ms"),
 	repoCache,
@@ -179,7 +176,6 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	await writeFile(path.join(agentDir, "speculative-action.json"), JSON.stringify({
 		...Object.fromEntries(numericNames.map(name => [name, input[name]])),
 		enabled: input.speculationEnabled, drafterEnabled: input.drafterEnabled, drafterPatternHints: input.drafterPatternHints,
-		...(input.drafterMaxTokens !== undefined ? { drafterMaxTokens: input.drafterMaxTokens } : {}),
 		predictionTimeoutMs: input.timeoutMs, patternAware: { enabled: input.patternAware,
 			...(input.patternPresets !== undefined ? { presets: input.patternPresets } : {}) },
 		...(input.selfSpeculation ? { selfSpeculation: { enabled: true, forkTransport: "drafter" } } : {}), draftModel: `${input.drafter.provider}/${input.drafter.id}`,

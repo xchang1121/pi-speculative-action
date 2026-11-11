@@ -242,7 +242,7 @@ function parsePersistentResourcePayload(value: unknown, root: string): Persisten
 	}
 	return { root, physicalRoot: payload.physicalRoot, observations: payload.observations, entries, preparations };
 }
-type ResourceInputLookup = (target?: string) => Iterable<ResourceInputSource>;
+type ResourceInputLookup = (target?: string, preparationsOnly?: boolean) => Iterable<ResourceInputSource> | AsyncIterable<ResourceInputSource>;
 type PreparedResource = {
 	readonly cancellation: SharedAbortScope;
 	readonly waiting: Set<PreparedResource>;
@@ -575,7 +575,7 @@ export class ResourceReadView {
 			};
 			const reused = cached && compatible(cached) && await use(cached);
 			if (reused) return reused.value;
-			for (const source of this.lookup?.() ?? []) {
+			for await (const source of this.lookup?.(target, true) ?? []) {
 				const cached = source.view.prepared?.bindings.get(identity)?.get(key);
 				if (source.view.entries === this.entries || !source.view.retained || !source.view.sealed ||
 					!cached || !compatible(cached)) continue;
@@ -814,7 +814,7 @@ export class ResourceReadView {
 			return entry!;
 		}
 		// The local alias proof owns this translation; the source owns the resolved resource.
-		for (const query of resolved === filesystemPathKey(target) ? [target] : [resolved, target]) for (const source of this.lookup?.(query) ?? []) {
+		for (const query of resolved === filesystemPathKey(target) ? [target] : [resolved, target]) for await (const source of this.lookup?.(query) ?? []) {
 			if (source.view.entries === this.entries || !source.view.retained) continue;
 			try {
 				source.view.assertComplete(true);
@@ -1118,7 +1118,7 @@ export class ResourceVersionManager {
 	}
 
 	/** Discover existing input closures without a separate ID index. The caller owns every yielded token. */
-	async *recover(retainBytes: number | (() => number), options: { readonly maxCandidates?: number; readonly signal?: AbortSignal } = {}):
+	async *recover(retainBytes: number | (() => number), options: { readonly maxCandidates?: number; readonly signal?: AbortSignal; readonly target?: string; readonly preparationsOnly?: boolean } = {}):
 		AsyncGenerator<{ readonly id: Sha256Digest; readonly token: ResourceVersionToken }> {
 		if (!this.open || !this.persistentInputs || this.snapshotExcludes.size) throw new Error("persistent input owner changed");
 		const budget = () => {
@@ -1128,11 +1128,19 @@ export class ResourceVersionManager {
 		};
 		budget();
 		const { store } = this.persistentInputs, { signal } = options;
+		const target = options.target === undefined ? undefined : filesystemPathKey(path.resolve(this.root, options.target));
 		signal?.throwIfAborted(); await this.assertPersistentStore();
 		for await (const record of store.candidatesInputVersions(options.maxCandidates ?? Math.min(store.limits.maxCertificates, 4096), signal)) {
 			signal?.throwIfAborted(); store.signal.throwIfAborted();
 			if (!this.open) throw new Error("persistent input owner changed");
-			if ((record.payload as Partial<PersistentResourcePayload> | null)?.root !== this.root) continue;
+			const payload = record.payload as Partial<PersistentResourcePayload> | null;
+			if (payload?.root !== this.root) continue;
+			if (options.preparationsOnly && Array.isArray(payload.preparations) && !payload.preparations.length) continue;
+			if (target !== undefined && Array.isArray(payload.entries) && Array.isArray(payload.preparations) &&
+				!payload.entries.some(entry => Array.isArray(entry) && typeof entry[0] === "string" &&
+					(entry[0] === target || entry[1]?.type === "alias" && containsFilesystemPath(entry[0], target))) &&
+				!payload.preparations.some(preparation => !preparation || typeof preparation.resource !== "string" ||
+					containsFilesystemPath(preparation.resource, target))) continue;
 			let token: ResourceVersionToken | undefined;
 			try {
 				token = await this.restore(record.id, budget(), signal);
@@ -1346,7 +1354,7 @@ const persistentManagers = new WeakMap<ResourceInputPersistence, Map<string, Res
 /** One call's finite input leases; records, proof checks and publication stay with the existing manager/store. */
 export class ResourceInputSession {
 	private readonly lifecycle = new RuntimeLifecycleLane();
-	private readonly roots = new Map<string, { readonly manager: ResourceVersionManager; recovered?: Promise<readonly ResourceVersionToken[]> }>();
+	private readonly roots = new Map<string, ResourceVersionManager>();
 	private readonly published = new WeakSet<ResourceVersionToken>();
 	private readonly persistence: ResourceInputPersistence;
 	readonly memory: ResourceInputMemory;
@@ -1368,27 +1376,22 @@ export class ResourceInputSession {
 	private root(root: string) {
 		if (this.lifecycle.sealed) throw new Error("resource_input_session_closed");
 		const key = path.resolve(root);
-		let entry = this.roots.get(key);
-		if (!entry) {
-			const manager = resourceManager(key, this.persistence);
-			this.lifecycle.own({ dispose: manager.acquire() }); this.roots.set(key, entry = { manager });
+		let manager = this.roots.get(key);
+		if (!manager) {
+			manager = resourceManager(key, this.persistence);
+			this.lifecycle.own({ dispose: manager.acquire() }); this.roots.set(key, manager);
 		}
-		return entry;
+		return manager;
 	}
 	async capture(action: ActionKey | undefined, root: string, semantics: ActionSemanticsRegistry, maxBytes: number,
 		providedInputs?: ReadonlyMap<string, ResourceInput>): Promise<ResourceVersionToken> {
 		this.root(root);
 		return captureResourceVersion(action, root, semantics, Math.min(maxBytes, this.remainingBytes), providedInputs, this.persistence);
 	}
-	async recover(root: string, signal: AbortSignal): Promise<readonly ResourceVersionToken[]> {
-		const entry = this.root(root);
-		return entry.recovered ??= this.lifecycle.track((async () => {
-			const tokens: ResourceVersionToken[] = [];
-			for await (const { token } of entry.manager.recover(() => this.remainingBytes, { signal })) {
-				this.lifecycle.own({ dispose: token.release }); tokens.push(token);
-			}
-			return tokens;
-		})());
+	async *recover(root: string, signal: AbortSignal, target?: string, preparationsOnly?: boolean): AsyncGenerator<ResourceVersionToken> {
+		for await (const { token } of this.root(root).recover(() => this.remainingBytes, { signal, target, preparationsOnly })) {
+			this.lifecycle.own({ dispose: token.release }); yield token;
+		}
 	}
 	async publish(token: ResourceVersionToken, signal?: AbortSignal, inputs: readonly ResourceVersionToken[] = []): Promise<void> {
 		if (signal?.aborted || this.lifecycle.sealed || this.published.has(token) || this.bytes > this.maxBytes ||

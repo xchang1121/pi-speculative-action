@@ -29,7 +29,7 @@ npm run bench:suite -- --suite swe_smoke --paired --repeats 1 --max-turns 32 --t
 
 先准备数据集和 checkout，在返回的工作区安装依赖，再传入其上一级运行目录。源码必须保持数据集基线且工作区干净，一个准备目录只运行一次任务。套件定义见 `suite.json`，默认产物写入系统临时目录，`--output-root` 可改位置；使用后清理工作区、录制及报告，只保留必要结论和失败的最小证据。运行通过 SDK 加载已安装扩展，Linux 路线需在 WSL/Linux 中提供合格后端。
 
-`--speculation-disabled` 运行关闭提前生产的基线，保留直接执行的缓存、复用、观察和学习；`--drafter-disabled` 只关闭模型预测。`--drafter-max-depth 0` 关闭乱序续推，正数限制后继批次数。`--pattern-aware --pattern-state <目录>` 跨运行保留学习状态，`--drafter-pattern-hints` 添加模式提示，`--self-speculation` 让 Drafter 根据 Actor 推理进行探测。动作预测、观测预测和探测共用 `--drafter-task-max-requests` / `--drafter-task-max-tokens`，观测预测不免费增加深度。完整 Drafter usage 与费用包含所有已收到的响应，`drafterBudget` 另列尚无 usage 的预留；账单以提供商记录为准。
+`--speculation-disabled` 运行关闭提前生产的基线，保留直接执行的缓存、复用、观察和学习；`--drafter-disabled` 只关闭模型预测。`--drafter-max-depth 0` 关闭乱序续推，正数限制后继批次数。`--pattern-aware --pattern-state <目录>` 跨运行保留学习状态，`--drafter-pattern-hints` 添加模式提示，`--self-speculation` 让 Drafter 根据 Actor 推理进行探测。插件不再预设请求数或输出 token 上限；`drafterBudget` 只统计请求数、已报告 token 和尚无 usage 的请求数。
 
 `--paired` 对各实例和重复交替运行开/关两臂，报告 `pairedToolWaitRatio`（关 / 开的工具等待总时长，允许小于 1）。用 `swe_diverse` 与 `--repeats` 扩大评估；默认最多 128 轮。单个 `swe_smoke` 任务只用于检查流程，多实例、多次重复才支持自然任务收益结论。
 

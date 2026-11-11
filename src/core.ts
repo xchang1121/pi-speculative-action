@@ -1,7 +1,4 @@
 /** Host-neutral speculative runtime surface. Pi adapters live in the root and extension entries. */
-export * from "./model-request.ts";
-export { DrafterTaskBudget, type DrafterBudgetSnapshot } from "./drafter-budget.ts";
-export { assistantCompletion, recoverAssistantCompletion, sdkRejectedToolAttempt } from "./model-request-adapter.ts";
 export {
 	type ActionProjectionCoverage, type ActionProjectionRule,
 	READ_RANGE_ACTION_KEY_PROJECTOR, readRangesShareInFlight,

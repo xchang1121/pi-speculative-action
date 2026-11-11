@@ -5,22 +5,18 @@ import {
 	type SimpleStreamOptions, type ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import { clampCandidateLimit, DEFAULTS, drafterRequestTemperature, normalizeDrafterRequestSettings, type DrafterRequestSettings } from "./common.ts";
-import { DrafterTaskBudget, drafterInputTokens, drafterOpportunityKey, type DrafterBudgetSnapshot } from "./drafter-budget.ts";
+import { DrafterTaskBudget, drafterOpportunityKey, type DrafterBudgetSnapshot } from "./drafter-budget.ts";
 import { agentBatchKey, type AgentPlanSource, type AgentRuntime, type DrafterModelOptions } from "./agent-runtime-types.ts";
 import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
 import type { SpeculativeActionSettings } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import { immutableSnapshot } from "./stable-json.ts";
-import { SourceRequestSuppressed } from "./source-request.ts";
-import { cause, predictionLearning } from "./settlement.ts";
+import { predictionLearning } from "./settlement.ts";
 import { canonicalToolObservation, toolObservationContract, toolObservationKey, type ToolSettlement } from "./tool-settlement.ts";
 import type { ActionKey } from "./action-semantics.ts";
 import { SharedAbortScope, waitForCompletion } from "./runtime-lifecycle.ts";
-import { modelRequestContext, modelResponseRequestIDs } from "./model-request.ts";
 
 interface DrafterBatch {
-	readonly requestParentID?: string;
-	readonly requestProposalID?: string;
 	readonly model: Model<Api>;
 	readonly context: Context;
 	readonly options: SimpleStreamOptions;
@@ -32,10 +28,7 @@ interface DrafterPlanFeedback extends DrafterBatch {
 	readonly message: AssistantMessage;
 	readonly depth: number;
 	readonly calls: ReadonlyMap<string, DrafterCall>;
-	continuations: readonly { readonly actionIDs: readonly string[]; readonly feedback: DrafterContinuation }[];
-	scopeReady?: Promise<void>;
-	scopeResolved?: boolean;
-	readonly scopeGates: Map<string, DrafterContinuation>;
+	readonly continuations: readonly { readonly actionIDs: readonly string[]; readonly feedback: DrafterContinuation }[];
 }
 interface DrafterContinuation {
 	readonly forecasts: Map<string, DrafterObservation>;
@@ -75,17 +68,11 @@ export function createDrafterPlanSource(input: DrafterModelOptions & {
 	const completeRequest = async (batch: DrafterBatch, context: Context, signal: AbortSignal,
 		report: ((tokens: number) => void) | undefined, force?: true | string) => {
 		signal.throwIfAborted();
-		const options = { ...batch.options, maxTokens: batch.budgetPolicy.drafterMaxTokens ?? undefined, deferred: false,
+		const options = { ...batch.options, deferred: false,
 			sessionId: batch.options.sessionId ?? input.sessionID, cacheRetention: batch.options.cacheRetention ?? "short" as const };
-		const inputTokens = drafterInputTokens({ ...context, tools: batch.context.tools }) + Math.max(0,
-			Math.ceil((JSON.stringify(context.tools ?? []).length - JSON.stringify(batch.context.tools ?? []).length) / 4));
-		if (!drafterContextFits(batch.model, context, options.maxTokens, inputTokens)) suppress("drafter_context_limit");
 		const forced = !options.reasoning && force ? { onPayload: forceToolChoice(options.onPayload, force === true ? undefined : force) } : {};
-		const parent = modelRequestContext.getStore();
-		const purpose = force === CONTINUATION_TOOL ? "scope" : force === OBSERVATION_TOOL ? "observation" : force === true ? "root" : "continuation";
-		const response = await waitForCompletion(modelRequestContext.run({ ...parent, taskID: parent?.taskID || input.sessionID, purpose,
-			parentID: batch.requestParentID ?? parent?.parentID, proposalID: batch.requestProposalID ?? parent?.proposalID }, () => budget.run({ model: batch.model, context, inputTokens, options: { ...options, ...forced, signal },
-			policy: batch.budgetPolicy, complete: input.complete, onSkipped: suppress })).then(message => {
+		const response = await waitForCompletion(budget.run({ model: batch.model, context, options: { ...options, ...forced, signal },
+			complete: input.complete }).then(message => {
 			if (!message) return undefined;
 			report?.(calculateContextTokens(message.usage));
 			if (message.stopReason === "error" || message.stopReason === "aborted")
@@ -100,27 +87,22 @@ export function createDrafterPlanSource(input: DrafterModelOptions & {
 		if (!message) return undefined;
 		const calls = message.content.filter((item): item is AgentToolCall => item.type === "toolCall");
 		if (!calls.length || new Set(calls.map(call => call.id)).size !== calls.length) return undefined;
+		let scopes = [calls.map(call => call.id)];
+		if (calls.length > 1 && depth < batch.budgetPolicy.drafterMaxDepth) {
+			// Decide visibility before any observations exist; post-hoc dependency labels could hide inputs already read.
+			const context = scopeContext(batch, message, calls);
+			try {
+				const args = privateToolArguments(await completeRequest(batch, context, signal, report, CONTINUATION_TOOL), context);
+				if (args) scopes = args.scopes as string[][];
+			} catch { /* An unavailable or invalid scope selection conservatively reads the full batch. */ }
+		}
 		if (signal.aborted) return undefined;
-		const feedback: DrafterPlanFeedback = { ...batch, requestParentID: modelResponseRequestIDs.get(message) ?? batch.requestParentID, depth, message,
+		const unique = new Map(scopes.map(scope => { const ids = calls.flatMap((call, index) => scope.includes(call.id) ? [`${prefix}:${index}`] : []); return [JSON.stringify(ids), ids]; }));
+		const feedback: DrafterPlanFeedback = { ...batch, depth, message,
 			calls: new Map(calls.map((call, member) => [`${prefix}:${member}`, { call }])),
-			scopeGates: new Map(),
-			continuations: [{ actionIDs: calls.map((_, index) => `${prefix}:${index}`), feedback: { forecasts: new Map() } }] };
+			continuations: [...unique.values()].map(actionIDs => ({ actionIDs, feedback: { forecasts: new Map() } })) };
 		feedbacks.set(feedback, feedback);
 		for (const continuation of feedback.continuations) feedbacks.set(continuation.feedback, feedback);
-		if (calls.length > 1 && depth < batch.budgetPolicy.drafterMaxDepth) {
-			// Freeze a context with no observations. Roots publish immediately; only successors await scope selection.
-			const context = scopeContext(batch, message, calls);
-			feedback.scopeReady = Promise.resolve().then(async () => {
-				try {
-					const args = privateToolArguments(await completeRequest(feedback, context, signal, report, CONTINUATION_TOOL), context);
-					if (!args || signal.aborted) return;
-					const unique = new Map((args.scopes as string[][]).map(scope => { const ids = calls.flatMap((call, index) => scope.includes(call.id) ? [`${prefix}:${index}`] : []); return [JSON.stringify(ids), ids]; }));
-					feedback.continuations = [...unique.values()].map(actionIDs => ({ actionIDs, feedback: { forecasts: new Map() } }));
-					for (const continuation of feedback.continuations) feedbacks.set(continuation.feedback, feedback);
-				} catch { /* Conservative full-batch dependencies remain valid when optional scope selection fails. */ }
-				finally { feedback.scopeResolved = true; }
-			});
-		}
 		return { actions: [...feedback.calls].map(([id, { call }]): PlanAction => {
 			const samples = calibration.get(calibrationKey(batch, call.name));
 			return { id, type: "tool_call", tool: call.name, input: call.arguments, depth, feedback, dependsOn,
@@ -130,7 +112,7 @@ export function createDrafterPlanSource(input: DrafterModelOptions & {
 	const source: AgentPlanSource = {
 		id: "drafter",
 		enabled: (settings) => (settings.drafterEnabled ?? DEFAULTS.drafterEnabled) && settings.tools?.length !== 0,
-		timeoutMs: (settings) => settings.predictionTimeoutMs ?? undefined,
+		timeoutMs: (settings) => settings.predictionTimeoutMs,
 		requestLifetime: "turn",
 		continuationBatch: ({ feedback }) => {
 			const batch = feedbacks.get(feedback as object);
@@ -149,12 +131,6 @@ export function createDrafterPlanSource(input: DrafterModelOptions & {
 			const result = output && privateObservation(member.call, output, action);
 			if (result) member.result = result;
 			member.action ??= action;
-			if (previous.scopeReady && !previous.scopeResolved) {
-				if (previous.scopeGates.has(actionID)) return [];
-				const gate = { forecasts: new Map<string, DrafterObservation>() };
-				previous.scopeGates.set(actionID, gate); feedbacks.set(gate, previous);
-				return [{ actionIDs: [actionID], feedback: gate }];
-			}
 			return previous.continuations.filter(({ actionIDs, feedback: continuation }) => {
 				if (!actionIDs.includes(actionID)) return false;
 				const forecast = continuation.forecasts.get(actionID);
@@ -176,8 +152,6 @@ export function createDrafterPlanSource(input: DrafterModelOptions & {
 		propose: async ({ startInput, data, proposalIndex, proposalCount, signal, settings, reportDraftTokens }): Promise<PlanProposal | undefined> => {
 			if (signal.aborted) return undefined;
 			const drafter = normalizeDrafterRequestSettings(settings.sourceConfig);
-			budget.beginTurn(startInput.turnID);
-			if (!budget.available(drafter, suppress)) return undefined;
 			const batchKey = agentBatchKey(startInput.sessionID, startInput.turnID);
 			let batch = batches.get(batchKey);
 			if (!batch) {
@@ -186,14 +160,7 @@ export function createDrafterPlanSource(input: DrafterModelOptions & {
 					if (signal.aborted) return undefined;
 					const { draftModel, getDraftOptions } = input, { actorModel, actorOptions } = startInput;
 					// Optional pattern hints follow the Actor history to preserve its prefix.
-					let hints: Awaited<ReturnType<NonNullable<typeof input.patternHints>>> | undefined;
-					if (drafter.drafterPatternHints && input.patternHints) {
-						try {
-							const result = await waitForCompletion(Promise.resolve().then(() => input.patternHints!({ sessionID: startInput.sessionID, schemaHashes: data.schemaHashes, settings })), signal, drafter.drafterPatternHintsTimeoutMs);
-							if (result.status === "completed") hints = result.value;
-							else if (result.status === "deadline") input.onDiagnostic?.({ code: "pattern_hints_timeout", turnID: startInput.turnID });
-						} catch { try { input.onDiagnostic?.({ code: "pattern_hints_failed", turnID: startInput.turnID }); } catch { /* Optional diagnostics. */ } }
-					}
+					const hints = await input.patternHints?.({ sessionID: startInput.sessionID, schemaHashes: data.schemaHashes, settings });
 					const selected: Context = settings.tools ? { ...startInput.context, tools: startInput.context.tools?.filter(tool => settings.tools!.includes(tool.name)) } : startInput.context;
 					const context: Context = drafter.drafterPatternHints && hints?.length ? { ...selected, messages: [...selected.messages, { role: "user", timestamp: Date.now(),
 						content: `(Speculation hint, not from the user.) Calls that followed similar steps in this workspace:\n${hints.map((hint) => `- ${hint.tool} ${JSON.stringify(hint.input)}${hint.horizon === undefined ? "" : `; expected after ${hint.horizon} batches`}`).join("\n")}` }] }
@@ -201,11 +168,9 @@ export function createDrafterPlanSource(input: DrafterModelOptions & {
 					const model = (typeof draftModel === "function" ? await draftModel(actorModel) : draftModel) ?? actorModel;
 					if (signal.aborted) return undefined;
 					const key = drafterOpportunityKey(model, startInput.context, data.schemaHashes, hints);
-					if (!drafterContextFits(model, context, drafter.drafterMaxTokens ?? undefined)) suppress("drafter_context_limit");
 					const configuredDraftOptions = getDraftOptions ? await getDraftOptions({ actorModel, draftModel: model, actorOptions, signal }) : actorOptions;
 					if (signal.aborted) return undefined;
-					// Inherit transport options, while the Drafter owns its reasoning and output budget.
-					const { maxTokens: _actorMaxTokens, reasoning: requestedReasoning, ...requestOptions } = configuredDraftOptions ?? {};
+					const { reasoning: requestedReasoning, ...requestOptions } = configuredDraftOptions ?? {};
 					const reasoning = clampThinkingLevel(model, getDraftOptions ? requestedReasoning ?? "off" : "off");
 					return { model, context, options: { ...requestOptions, reasoning: reasoning === "off" ? undefined : reasoning }, key, budgetPolicy: drafter };
 				}) };
@@ -217,24 +182,13 @@ export function createDrafterPlanSource(input: DrafterModelOptions & {
 			try {
 				const prepared = await batch.ready;
 				if (!prepared || signal.aborted) return undefined;
-				draft = await completeDraft({ ...prepared, requestProposalID: `drafter:${startInput.turnID}:${proposalIndex}`, options: { ...prepared.options, temperature: drafterRequestTemperature(proposalIndex, proposalCount, drafter) } },
+				draft = await completeDraft({ ...prepared, options: { ...prepared.options, temperature: drafterRequestTemperature(proposalIndex, proposalCount, drafter) } },
 					signal, reportDraftTokens, String(proposalIndex));
 				return draft && { id: `drafter:${startInput.turnID}:${proposalIndex}`, source: "drafter", revision: 0, ...draft };
 			} finally { if (!draft) release(); }
 		},
-		continue: async (requestInput) => {
-			const { proposalID, revision, reserveRevision, feedback, signal: originalSignal, reportDraftTokens, settings } = requestInput;
-			let signal = originalSignal;
+		continue: async ({ proposalID, revision, reserveRevision, feedback, signal, reportDraftTokens, settings }) => {
 			const previous = feedbacks.get(feedback as object);
-			if (previous?.scopeReady) {
-				const ready = await waitForCompletion(previous.scopeReady, signal);
-				if (ready.status !== "completed") return undefined;
-				if ([...previous.scopeGates.values()].includes(feedback as DrafterContinuation)) {
-					const readyBranches = previous.continuations.filter(branch => branch.actionIDs.includes(requestInput.actionID) && branch.actionIDs.every(id => previous.calls.get(id)!.action));
-					const updates = await Promise.all(readyBranches.map(branch => source.continue!({ ...requestInput, feedback: branch.feedback })));
-					return updates.flatMap(update => update ? Array.isArray(update) ? update : [update] : []);
-				}
-			}
 			const branch = previous?.continuations.find(branch => branch.feedback === feedback);
 			if (!previous || !branch || signal.aborted) return undefined;
 			const continuation = branch.feedback;
@@ -357,15 +311,7 @@ function privateToolArguments(message: AssistantMessage | undefined, context: Co
 	return stableValueHash(args) === stableValueHash(calls[0]!.arguments) ? args : undefined;
 }
 
-function suppress(reason: string, detail?: string): never { throw new SourceRequestSuppressed(cause("source", reason, detail)); }
 
 function continuationContext(context: Context, message: AssistantMessage, results: ToolResultMessage[]): Context {
 	return { ...context, messages: [...context.messages, message, ...results] };
-}
-
-/** Preserve the Actor-visible history whole; a shorter Drafter skips instead of compacting it. */
-function drafterContextFits(model: Model<Api>, context: Context, maxTokens: number | undefined, inputTokens = drafterInputTokens(context)): boolean {
-	if (!(model.contextWindow > 0)) return true;
-	const output = maxTokens === undefined ? 0 : Math.min(maxTokens, model.maxTokens > 0 ? model.maxTokens : Infinity);
-	return inputTokens + output <= model.contextWindow;
 }
