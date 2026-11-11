@@ -435,7 +435,7 @@ export function makeSpeculativeActionRuntime<
 		changed: () => wakeResourceWaiters() });
 	const scopeFor = (session: Session) => ({ owner: session, limit: concurrentLimit(session.settings), scheduling: session.settings.scheduling });
 	const wakeResourceWaiters = (): void => {
-		for (const session of sessionStates.values()) { preemptForActor(session); dispatchReady(session); }
+		for (const session of sessionStates.values()) { preemptForActor(session); startQueuedCandidates(session); }
 		scheduler.watch();
 	};
 
@@ -599,7 +599,7 @@ export function makeSpeculativeActionRuntime<
 			scheduler.watch(0);
 			await reconcileStores(state);
 			await subscriptions.publish("turn_started", { ...turnContext(state), decisionSequence: state.decisionSequence, definitions, signal });
-			dispatchReady(session);
+			startQueuedCandidates(session);
 			setTimeout(() => { if (state.lifecycle === "active" && state.actorArrivedAt === undefined && !state.generation.signal.aborted) launchSourceRequests(state); }, 0);
 		});
 	};
@@ -785,10 +785,10 @@ export function makeSpeculativeActionRuntime<
 			session.effects.enqueue(() => subscriptions.publish("prediction_admitted", {
 				source: node.source, proposalID: node.identity.proposalID, actionID: node.identity.actionID, feedback: action.feedback, issued,
 			}));
-			if (issued) materializations.push(materializeAction(session, node).finally(() => dispatchReady(session)));
+			if (issued) materializations.push(materializeAction(session, node).finally(() => startQueuedCandidates(session)));
 		}
 		await Promise.allSettled(materializations);
-		if (!materializations.length) dispatchReady(session);
+		if (!materializations.length) startQueuedCandidates(session);
 	};
 
 	const executionRouteFor = async (input: Omit<Parameters<typeof adapter.preflightCandidate>[0], "route"> & { readonly parentWorld?: WorldBranch<Output> }): Promise<
@@ -855,6 +855,7 @@ export function makeSpeculativeActionRuntime<
 		}
 		if (session.settings.reuseEnabled === false) session.plan.finishPreparation(node.identity, cause("control", "reuse_disabled"));
 		else await prepareNodeRoute(session, node, context, predictedAction, executionInput);
+		if (context.executionRoute) void launchNode(session, node);
 	};
 
 	const prepareNodeRoute = (session: Session, node: PlanRuntimeNode, context: PlanActionContext<StartInput, StateData>,
@@ -910,16 +911,6 @@ export function makeSpeculativeActionRuntime<
 	const pendingActorTurn = (session: Session): Turn | undefined =>
 		[...session.turns.values()].find((turn) => turn.lifecycle === "active" && turn.actorArrivedAt === undefined && turn.decisionSequence === session.decisionSequence + 1);
 
-	const dispatchReady = (session: Session): void => {
-		if (session.lifecycle.sealed) return;
-		settleBlockedPlanActions(session);
-		for (const node of session.plan.launchable()) {
-			if (!node.actionKey || !session.actionContexts.get(node.identity.id)?.executionRoute) continue;
-			void launchNode(session, node);
-		}
-		startQueuedCandidates(session);
-	};
-
 	const launchNode = (session: Session, node: PlanRuntimeNode): Promise<void> => {
 		const context = session.actionContexts.get(node.identity.id);
 		if (!context) return Promise.resolve();
@@ -964,12 +955,11 @@ export function makeSpeculativeActionRuntime<
 		if (execution.status === "queued") startQueuedCandidates(session);
 	};
 
-	/** Coalesce producer requests behind the current Actor events; a concrete Actor intent stays immediate. */
+	/** Coalesce plan and producer dispatch behind current Actor events; a concrete Actor intent stays immediate. */
 	const startQueuedCandidates = (session: Session, preferred?: Candidate | Preparation): void => {
 		if (session.lifecycle.sealed) return;
 		if (preferred) return launchCandidateBatch(session, preferred);
-		if (pendingLaunch || !candidateStore.pending(session.id).some((candidate) => candidate.work.execution.status === "queued") &&
-			![...preparations.values()].some(entry => entry.session === session && !entry.active)) return;
+		if (pendingLaunch) return;
 		pendingLaunch = session.lifecycle.track(new Promise<void>(setImmediate).then(() => {
 			pendingLaunch = undefined;
 			launchCandidateBatch();
@@ -980,6 +970,12 @@ export function makeSpeculativeActionRuntime<
 		const queued: { job: Candidate | Preparation; session: Session; forecasts: readonly PredictionForecast[]; work: ScheduledWork }[] = [];
 		for (const session of preferred ? [owner!] : sessionStates.values()) {
 			if (session.lifecycle.sealed) continue;
+			if (!preferred) {
+				settleBlockedPlanActions(session);
+				for (const node of session.plan.launchable()) {
+					if (node.actionKey && session.actionContexts.get(node.identity.id)?.executionRoute) void launchNode(session, node);
+				}
+			}
 			for (const { job } of scheduler.snapshot(session)) {
 				if ("work" in job) scheduler.refresh(job, forecastsForCandidate(session, job));
 				else if ("run" in job) scheduler.refresh(job, [job.forecast()]);
@@ -1486,7 +1482,7 @@ export function makeSpeculativeActionRuntime<
 				actorAction.settleSelection(previewed ? "preview" : "speculative");
 				state.actorActions.delete(actorAction);
 				queueActorSettlement(state, input, actualCall, actorAction, selected.output, selected, undefined, matchingPredictions);
-				state.session.effects.enqueue(() => dispatchReady(state.session));
+				state.session.effects.enqueue(() => startQueuedCandidates(state.session));
 				prepared.output = selected.output;
 				return Object.freeze(prepared);
 			}
@@ -1505,7 +1501,7 @@ export function makeSpeculativeActionRuntime<
 			if (terminalFailure) actorAction.finishConsumption();
 			else if (actorAction.state.status === "awaiting_fallback") {
 				if (!scheduler.has(actorAction)) preemptForActor(state.session);
-				state.session.effects.enqueue(() => dispatchReady(state.session));
+				state.session.effects.enqueue(() => startQueuedCandidates(state.session));
 				try {
 					const concrete = asConcreteInput(actualCall.input), captureSignal = signal ?? state.generation.signal;
 					if (state.settings.reuseEnabled !== false && adapter.captureAuthoritativeResult && concrete && !captureSignal.aborted && state.actorActions.has(actorAction)) {
@@ -1615,7 +1611,7 @@ export function makeSpeculativeActionRuntime<
 		if (output !== undefined && adapter.observationKey) {
 			const observation = adapter.observationKey(output, key) ?? "";
 			for (const prediction of settlement.matchedPredictions) state.session.plan.observe(prediction, observation);
-			dispatchReady(state.session);
+			startQueuedCandidates(state.session);
 		}
 		const descriptor = candidate && (subscriptions.has("actor_settled") || subscriptions.has("actor_observed") || adapter.onEvent)
 			? Object.freeze(candidateEventDescriptor(candidate))
@@ -1676,7 +1672,7 @@ export function makeSpeculativeActionRuntime<
 			const settlement = state.session.plan.miss(node.proposalID, node.action.id, observation);
 			if (settlement) predictionSettled(state.session, node, settlement);
 		}
-		dispatchReady(state.session);
+		startQueuedCandidates(state.session);
 	};
 
 	const predictionSettled = (session: Session, node: PlanRuntimeNode, settlement: PredictionSettlement): void => {
@@ -2065,7 +2061,7 @@ export function makeSpeculativeActionRuntime<
 		const settled = candidate.work.cancel(failure, executionMs);
 		removeCandidate(session.id, candidate);
 		if (settled) queueCandidateEvent(session, candidate);
-		if (dispatch) dispatchReady(session);
+		if (dispatch) startQueuedCandidates(session);
 	};
 
 	const reconcileStores = async (state: Turn): Promise<void> => {

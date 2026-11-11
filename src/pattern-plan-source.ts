@@ -148,7 +148,10 @@ export function createPatternPlanSource({
 	const source: AgentPlanSource = {
 		id: "pattern_aware",
 		enabled: (settings) => !lifecycle.sealed && sourceSettings(settings).enabled,
-		multiStepEnabled: (settings) => sourceSettings(settings).multiStepEnabled,
+		multiStepEnabled: (settings, feedback) => {
+			const pattern = sourceSettings(settings);
+			return pattern.multiStepEnabled && (feedback === undefined || (feedbacks.get(feedback as object)?.context?.continuation.visitedPatternIDs.length ?? Infinity) < pattern.maxPredictionDepth);
+		},
 		requestLifetime: "actor_decision",
 		propose: ({ startInput, data, settings, signal }) => admit(settings, async (patternSettings) => {
 			if (!patternSettings.enabled) return undefined;
