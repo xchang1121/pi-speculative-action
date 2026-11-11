@@ -37,6 +37,9 @@ linux("captures, consumes and revalidates resource inputs without changing sourc
     inputs.seal();
     expect((await manager.validate(token)).expired).toBe(false);
     expect(await metadata(paths)).toEqual(before);
+    const views = await Promise.all([0, 1].map(() => filesystemEvidence.withFilesystemReadView(undefined, async view => view)));
+    expect(views[0]).toBe(views[1]);
+    await expect(views[0]!.stat(file)).rejects.toThrow("closed");
     await using filesystem = await filesystemEvidence.openFilesystemReadView();
     await expect(filesystem.readlink(file)).rejects.toMatchObject({ code: "EINVAL" });
     await expect(filesystem.pin(cycle, true)).rejects.toMatchObject({ code: "ELOOP" });

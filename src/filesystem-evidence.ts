@@ -235,12 +235,17 @@ function filesystemReadError(message: string, error: number): NodeJS.ErrnoExcept
 
 export const openFilesystemReadView = () => FilesystemReadView.open();
 
-/** Reuse a caller's view, or create and verify exactly one view for this capture. */
+let sharedReadView: { view: Promise<FilesystemReadView>; references: number } | undefined;
+/** Overlapping captures share a mount tree, each retaining its own reads and topology verification. */
 export async function withFilesystemReadView<T>(view: FilesystemReadView | undefined, capture: (view: FilesystemReadView) => Promise<T>, discard?: (result: T) => Promise<unknown>): Promise<T> {
 	if (view) return capture(view);
-	await using owned = await openFilesystemReadView();
-	const result = await capture(owned);
-	try { await owned.verify(); return result; } catch (error) { try { await discard?.(result); } finally { throw error; } }
+	const shared = sharedReadView ??= { view: openFilesystemReadView(), references: 0 }; shared.references++;
+	try {
+		const owned = await shared.view, result = await capture(owned);
+		try { await owned.verify(); return result; } catch (error) { try { await discard?.(result); } finally { throw error; } }
+	} finally {
+		if (!--shared.references) { sharedReadView = undefined; await shared.view.then(view => view.close(), () => {}); }
+	}
 }
 
 export type CapturedFilesystemTransfer = Omit<StableFilesystemCapture, "stat" | "object" | "content" | "computation"> & FilesystemObjectTransfer & {

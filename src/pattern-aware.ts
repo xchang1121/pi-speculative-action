@@ -1275,13 +1275,12 @@ class PatternBindingAnalysis {
 				if (fallbackSources.length > 1) yield { type: "coalesce", sources: fallbackSources };
 			}
 			let selected: PatternAwareBinding | undefined, selectedReplay = -1;
+			const matched = samples.map(sample => Object.entries(bindings).map(([encoded, binding]) => this.bindingRows(binding, sample.context)
+				.filter(row => bindingValueMatches(binding, row.values[0], getPath(sample.target.input, decodePath(encoded))))));
 			// Preserve direct/composite/fallback order and first-best ties without replaying candidates twice.
 			for (const candidate of uniqueBy(candidates(this), bindingStructureKey)) {
-				const proposed = { ...bindings, [encodedPath]: candidate };
-				const replay = samples.reduce(
-					(matches, sample) => matches + Number(this.bindingMatches(proposed, sample.context, sample.target.input)),
-					0,
-				);
+				const replay = samples.reduce((matches, sample, index) => matches + Number(!joinBindingRows([...matched[index]!,
+					this.bindingRows(candidate, sample.context).filter(row => bindingValueMatches(candidate, row.values[0], targets[index]))]).next().done), 0);
 				if (replay <= selectedReplay) continue;
 				selected = candidate;
 				selectedReplay = replay;
@@ -1527,46 +1526,36 @@ class PatternBindingAnalysis {
 	}
 
 	private bindingRows(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): readonly BindingRow[] {
-		return this.memo(context, binding, () => this.evaluateBindingRows(binding, context));
-	}
-
-	private evaluateBindingRows(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): readonly BindingRow[] {
-		const row = (value: unknown, sources: ReadonlyMap<string, number> = new Map()): BindingRow => ({ values: [value], sources });
-		if (binding.type === "constant") return [row(binding.value)];
-		if (binding.type === "event" || binding.type === "each") {
-			const event = context[context.length + binding.relativeEvent];
-			if (!event) return [];
-			const collection = getPath(event[binding.field], binding.path);
-			if (binding.type === "event") return collection === MISSING ? [] : [row(collection)];
-			const key = stableStringify([binding.relativeEvent, binding.field, binding.path]);
-			return Array.isArray(collection) ? collection.flatMap((item, index) => {
-				const value = getPath(item, binding.itemPath);
-				return value === MISSING ? [] : [row(value, new Map([[key, index]]))];
-			}) : [];
-		}
-		if (binding.type === "coalesce") {
-			for (const source of binding.sources) { const rows = this.bindingRows(source, context); if (rows.length) return rows; }
-			return [];
-		}
-		const children = bindingChildren(binding).map(source => this.bindingRows(source, context));
-		if (binding.type === "near") return children[0]!;
-		return [...joinBindingRows(children)].flatMap(({ values, sources }) => {
-			if (!values.every((value): value is string => typeof value === "string")) return [];
-			const first = values[0]!;
-			const result = binding.type === "join" ? [joinPath(first, values[1]!)]
-				: binding.type === "splice" ? [values.reduce((text, value, index) => text + value + binding.parts[index + 1], binding.parts[0]!)]
-				: binding.type === "rebase" ? rebase(first, binding.from, binding.to)
-				: [binding.type === "template" ? binding.prefix + first + binding.suffix : transform(binding.operation, first)];
-			return result.map(value => row(value, sources));
+		return this.memo(binding, context, () => {
+			const row = (value: unknown, sources: ReadonlyMap<string, number> = new Map()): BindingRow => ({ values: [value], sources });
+			if (binding.type === "constant") return [row(binding.value)];
+			if (binding.type === "event" || binding.type === "each") {
+				const event = context[context.length + binding.relativeEvent];
+				if (!event) return [];
+				const collection = getPath(event[binding.field], binding.path);
+				if (binding.type === "event") return collection === MISSING ? [] : [row(collection)];
+				const key = stableStringify([binding.relativeEvent, binding.field, binding.path]);
+				return Array.isArray(collection) ? collection.flatMap((item, index) => {
+					const value = getPath(item, binding.itemPath);
+					return value === MISSING ? [] : [row(value, new Map([[key, index]]))];
+				}) : [];
+			}
+			if (binding.type === "coalesce") {
+				for (const source of binding.sources) { const rows = this.bindingRows(source, context); if (rows.length) return rows; }
+				return [];
+			}
+			const children = bindingChildren(binding).map(source => this.bindingRows(source, context));
+			if (binding.type === "near") return children[0]!;
+			return [...joinBindingRows(children)].flatMap(({ values, sources }) => {
+				if (!values.every((value): value is string => typeof value === "string")) return [];
+				const first = values[0]!;
+				const result = binding.type === "join" ? [joinPath(first, values[1]!)]
+					: binding.type === "splice" ? [values.reduce((text, value, index) => text + value + binding.parts[index + 1], binding.parts[0]!)]
+					: binding.type === "rebase" ? rebase(first, binding.from, binding.to)
+					: [binding.type === "template" ? binding.prefix + first + binding.suffix : transform(binding.operation, first)];
+				return result.map(value => row(value, sources));
+			});
 		});
-	}
-
-	bindingMatches(bindings: Readonly<Record<string, PatternAwareBinding>>, context: ReadonlyArray<PatternAwareEvent>, target: Readonly<Record<string, unknown>>) {
-		const groups = Object.entries(bindings).map(([encoded, binding]) => {
-			const expected = getPath(target, decodePath(encoded));
-			return this.bindingRows(binding, context).filter(row => bindingValueMatches(binding, row.values[0], expected));
-		});
-		return !joinBindingRows(groups).next().done;
 	}
 
 	*leaves(value: unknown, segments: PatternAwarePath = []): Generator<readonly [PatternAwarePath, unknown], undefined> {
