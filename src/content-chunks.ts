@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { FileHandle } from "node:fs/promises";
-import { CONTENT_CHUNK_BYTES, parseContentManifest, readChunkRange, type ChunkedContentManifest, type ArtifactReference } from "./artifact-reference.ts";
+import { CONTENT_CHUNK_BYTES, parseContentManifest, type ChunkedContentManifest, type ArtifactReference } from "./artifact-reference.ts";
 export { CONTENT_CHUNK_BYTES, parseContentManifest, type ChunkedContentManifest } from "./artifact-reference.ts";
 import { ArtifactReadView, type ArtifactTransfer, type ArtifactSource, type ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
@@ -77,7 +77,15 @@ export class ContentChunkPool {
 			if (!isSafeCount(offset) || maxBytes !== undefined && !isSafeCount(maxBytes)) throw new Error("invalid content read budget");
 			const size = Math.min(Math.max(0, manifest.size - offset), maxBytes ?? manifest.size);
 			if (size > this.limits.maxReadBytes) throw new Error("content read budget exceeded; request a bounded prefix");
-			return readChunkRange(offset, size, index => this.block(manifest, index));
+			const result = Buffer.allocUnsafe(size);
+			for (let copied = 0; copied < size;) {
+				const position = offset + copied, start = position % CONTENT_CHUNK_BYTES;
+				const count = Math.min(size - copied, CONTENT_CHUNK_BYTES - start), reference = manifest.chunks[Math.floor(position / CONTENT_CHUNK_BYTES)];
+				if (reference) (await this.artifacts.readRange(reference, start, count)).copy(result, copied);
+				else result.fill(0, copied, copied + count);
+				copied += count;
+			}
+			return result;
 		});
 	}
 	dispose(): Promise<void> { return this.lifetime.dispose(); }
