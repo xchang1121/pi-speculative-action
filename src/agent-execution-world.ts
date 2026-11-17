@@ -323,6 +323,7 @@ export async function evaluateResourceQuery<Output>(
 	validation?: "prepared" | "output",
 	transfer?: (versions: ResourceVersionToken[]) => boolean,
 	session?: ResourceInputSession,
+	acceptObservation?: (observation: ResourceObservation) => boolean,
 ) {
 	signal.throwIfAborted();
 	const capture = () =>
@@ -416,6 +417,13 @@ export async function evaluateResourceQuery<Output>(
 								return proof;
 							}),
 						async (proofs) => {
+							if (
+								acceptObservation &&
+								proofs.some((proof) =>
+									[...proof.observations.values()].some((observation) => !acceptObservation(observation)),
+								)
+							)
+								throw new Error("resource_input_changed_in_transaction");
 							await validateResourceInputs(proofs, true);
 						},
 						session?.memory,

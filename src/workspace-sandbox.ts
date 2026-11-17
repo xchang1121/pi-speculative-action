@@ -35,7 +35,7 @@ import {
 	filesystemExecutionDependsOn,
 	resourceSnapshotBranch,
 } from "./agent-execution-world.ts";
-import { speculativeConfig } from "./config-schema.ts";
+import { currentSpeculativeConfiguration, speculativeConfig } from "./config-schema.ts";
 import type { ContentVersion, FileContentVersion } from "./content-chunks.ts";
 import {
 	captureContent,
@@ -1434,6 +1434,7 @@ const capturedWorkspaceInputs = Symbol("captured workspace inputs");
 type SandboxPreparation = QualifiedWorkspaceSandboxDriver | typeof capturedWorkspaceInputs;
 /** Owns workspace repositories and commit serialization for one extension/runtime lifecycle. */
 export class WorkspaceSandboxService {
+	readonly configuration = currentSpeculativeConfiguration();
 	private store?: ProvenanceCertificateStore;
 	private storage?: Promise<{
 		readonly store: ProvenanceCertificateStore;
@@ -1454,6 +1455,7 @@ export class WorkspaceSandboxService {
 	private readonly overlayfsCapabilities = new LinuxOverlayfsCapabilityRegistry();
 	constructor(store?: ProvenanceCertificateStore) {
 		this.store = store;
+		this.configuration.bind(this);
 	}
 	useContentStore(store: ProvenanceCertificateStore): void {
 		if (!this.storage) this.store = store;
@@ -2393,9 +2395,8 @@ export class WorkspaceSandboxService {
 			const operations: ToolFilesystemOperations = {
 				readFile: (logical, limit) =>
 					track(async () => {
-						const { captured, content } = await fileInput(logical);
+						const { content } = await fileInput(logical);
 						if (content === undefined) throw new Error("Workspace input does not exist");
-						assertExistingInputPolicy(captured);
 						return readContent(content, 0, Math.min(content.byteLength, limit ?? content.byteLength));
 					}),
 				access: (logical, writable) =>
@@ -2486,12 +2487,66 @@ export class WorkspaceSandboxService {
 						return [...names].sort();
 					}),
 				prepare: async (binding, key, build, consume, hint, signal = context.signal) => {
+					let baseline = true;
+					const written = (logical: string, scope: string) => {
+						if (scope === "binding" || scope === "resolution") return false;
+						const target = path.resolve(sourceRoot, logical);
+						const writes = [...changes.values()];
+						for (
+							let parent = this.checkpoint(context.parentCheckpoint, sourceRoot);
+							parent;
+							parent = parent.parent
+						)
+							if (!parent.committed) writes.push(...parent.changes);
+						return writes.some(
+							(change) =>
+								!change.validationOnly &&
+								(filesystemPathKey(change.target) === filesystemPathKey(target) ||
+									(change.kind === "directory" && containsFilesystemPath(change.target, target)) ||
+									(change.kind !== "directory" &&
+										change.aliases?.some(
+											(alias) => filesystemPathKey(alias) === filesystemPathKey(target),
+										)) ||
+									(["names", "entries", "tree_entries", "tree_content"].includes(scope) &&
+										containsFilesystemPath(target, change.target))),
+						);
+					};
+					const transactionView = (captured: ToolFilesystemOperations): ToolFilesystemOperations => {
+						const select = (logical: string, scope: string) => {
+							if (!written(logical, scope)) return captured;
+							baseline = false;
+							return operations;
+						};
+						const overlay: ToolFilesystemOperations = {
+							readFile: (target, limit) => select(target, "content").readFile(target, limit),
+							access: (target, writable) => select(target, "entry").access(target, writable),
+							exists: (target) => select(target, "exists").exists!(target),
+							stat: (target, fields, size) => select(target, fields ?? "stat").stat!(target, fields, size),
+							readdir: (target) => select(target, "names").readdir!(target),
+							prepare: (binding, key, build, use, hint, signal) =>
+								captured.prepare!(
+									binding,
+									key,
+									async (view, signal) => {
+										const result = await build(transactionView(view), signal);
+										return { ...result, cacheable: baseline && result.cacheable !== false };
+									},
+									use,
+									hint,
+									signal,
+								),
+							computeStep: (request, calculate, signal) =>
+								computeStepInView(overlay, request, calculate, signal),
+						};
+						return overlay;
+					};
 					const run = () =>
 						evaluateResourceQuery(
 							undefined,
 							{ ...context, signal },
 							sourceRoot,
-							(captured) => captured.prepare(binding, key, build, async (value) => value, hint, signal),
+							(captured) =>
+								transactionView(captured).prepare!(binding, key, build, async (value) => value, hint, signal),
 							PI_ACTION_SEMANTICS,
 							speculativeConfig().runtime.resourceCacheMaxBytes,
 							true,
@@ -2501,57 +2556,10 @@ export class WorkspaceSandboxService {
 								return true;
 							},
 							session,
+							(observation) => !written(observation.path, observation.scope),
 						);
 					const query = await (session ? session.run(run) : run());
 					if (!query) throw new Error("workspace_preparation_budget_exceeded");
-					let baseline = true;
-					if (workspace || changes.size) {
-						for (const version of query.versions)
-							for (const observation of version.observations.values()) {
-								if (observation.scope === "binding" || observation.scope === "resolution") continue;
-								const logical = observation.path;
-								const info = await Promise.resolve(
-									operations.stat!(logical, observation.scope === "entry" ? "entry" : "type"),
-								).catch((error) => {
-									if (isMissing(error)) return undefined;
-									throw error;
-								});
-								let supplied: import("./resource-version.ts").ResourceInput = null;
-								if (info?.type === "file") supplied = await operations.readFile(logical);
-								else if (info?.type === "directory") supplied = { names: await operations.readdir!(logical) };
-								else if (info) throw new Error("workspace_preparation_input_unsupported");
-								const manager = new ResourceVersionManager(sourceRoot, {
-									watch: false,
-								});
-								let check: ResourceVersionToken | undefined;
-								try {
-									check = await manager.capture(
-										[observation],
-										speculativeConfig().runtime.resourceCacheMaxBytes,
-										new Map([[logical, supplied]]),
-									);
-									if (info && ["stat", "entry"].includes(observation.scope)) {
-										const native = await source.stat(logical, observation.scope !== "entry");
-										if (Number(native.size) !== info.size) baseline = false;
-									}
-									const actual = check.observations.get(observation.scope + ":" + filesystemPathKey(logical));
-									if (actual?.fingerprint !== observation.fingerprint) baseline = false;
-								} catch {
-									baseline = false;
-								} finally {
-									await check?.release();
-									manager.close();
-								}
-							}
-					}
-					if (!baseline) {
-						const result = await build(operations, signal);
-						try {
-							return await consume(result.value);
-						} finally {
-							await result.dispose();
-						}
-					}
 					return consume(query.output);
 				},
 				computeStep: (request, calculate, signal) =>

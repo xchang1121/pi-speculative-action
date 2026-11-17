@@ -17,7 +17,12 @@ import path from "node:path";
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import { serialize } from "node:v8";
-import { nonNegativeNumber, positiveInteger, speculativeConfig } from "./config-schema.ts";
+import {
+	currentSpeculativeConfiguration,
+	nonNegativeNumber,
+	positiveInteger,
+	speculativeConfig,
+} from "./config-schema.ts";
 import {
 	CONTENT_CHUNK_BYTES as ARTIFACT_BLOCK_BYTES,
 	validateArtifact,
@@ -471,18 +476,18 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 }
 /** Certificate metadata and its indexes share one cross-process transaction; immutable payloads remain in the CAS. */
 export class ProvenanceCertificateStore {
+	readonly configuration = currentSpeculativeConfiguration();
 	readonly root: string;
 	readonly artifacts: ArtifactCAS;
-	private limitsValue = DEFAULT_PROVENANCE_STORE_LIMITS;
-	private readonly gcIntervalMs: number;
-	private readonly orphanGraceMs: number;
+	private limitsValue: Partial<ProvenanceStoreLimits> = {};
+	private readonly options: ProvenanceStoreOptions;
 	private readonly acceptedTaints?: readonly ProvenanceTaint[];
-	private readonly maxReadBytes: number;
 	private readonly reservedRoot: boolean;
 	private readonly lifecycle = new RuntimeLifecycleLane();
 	private readonly stopped = new AbortController();
 	private collection?: Promise<ProvenanceStoreGCResult>;
 	private maintenance?: NodeJS.Timeout;
+	private maintenanceIntervalMs?: number;
 	private readonly publication = new AsyncLocalStorage<{
 		database: DatabaseSync;
 		touched: Set<string>;
@@ -490,6 +495,7 @@ export class ProvenanceCertificateStore {
 	}>();
 	private control?: DatabaseSync;
 	constructor(root: string, options: ProvenanceStoreOptions = {}) {
+		this.options = options;
 		this.root = path.resolve(root);
 		this.configure(options);
 		this.reservedRoot = options.reservedRoot === true;
@@ -499,13 +505,24 @@ export class ProvenanceCertificateStore {
 				[this.objectKey(target)],
 			),
 		);
-		this.gcIntervalMs = nonNegativeNumber(options.gcIntervalMs, speculativeConfig().storage.gcIntervalMs);
-		this.orphanGraceMs = nonNegativeNumber(options.orphanGraceMs, speculativeConfig().storage.orphanGraceMs);
 		this.acceptedTaints = options.acceptedTaints && Object.freeze([...options.acceptedTaints]);
-		this.maxReadBytes = positiveInteger(options.maxReadBytes, DEFAULT_PROVENANCE_STORE_LIMITS.maxBytes);
+		this.configuration.bind(this);
 	}
 	get limits(): ProvenanceStoreLimits {
-		return this.limitsValue;
+		const defaults = this.configuration.current.storage;
+		return {
+			maxCertificates: this.limitsValue.maxCertificates ?? defaults.maxCertificates,
+			maxBytes: this.limitsValue.maxBytes ?? defaults.maxBytes,
+		};
+	}
+	private get gcIntervalMs(): number {
+		return nonNegativeNumber(this.options.gcIntervalMs, this.configuration.current.storage.gcIntervalMs);
+	}
+	private get orphanGraceMs(): number {
+		return nonNegativeNumber(this.options.orphanGraceMs, this.configuration.current.storage.orphanGraceMs);
+	}
+	private get maxReadBytes(): number {
+		return positiveInteger(this.options.maxReadBytes, this.configuration.current.storage.maxBytes);
 	}
 	get signal(): AbortSignal {
 		return this.stopped.signal;
@@ -552,9 +569,10 @@ export class ProvenanceCertificateStore {
 	}
 	configure(limits: Partial<ProvenanceStoreLimits>): void {
 		this.limitsValue = Object.freeze({
-			maxCertificates: positiveInteger(limits.maxCertificates, this.limits.maxCertificates),
-			maxBytes: positiveInteger(limits.maxBytes, this.limits.maxBytes),
+			maxCertificates: positiveInteger(limits.maxCertificates, this.limitsValue.maxCertificates),
+			maxBytes: positiveInteger(limits.maxBytes, this.limitsValue.maxBytes),
 		});
+		this.maintain();
 	}
 	async put(certificate: ProcessProvenanceCertificate): Promise<boolean> {
 		if (certificate.result.continuation) return false;
@@ -742,14 +760,17 @@ export class ProvenanceCertificateStore {
 		this.control = undefined;
 	}
 	private maintain(): void {
-		if (!this.control || this.maintenance || this.lifecycle.sealed) return;
+		const interval = this.gcIntervalMs;
+		if (this.maintenanceIntervalMs !== interval) {
+			clearInterval(this.maintenance);
+			this.maintenance = undefined;
+		}
+		if (!this.control || this.maintenance || !interval || this.lifecycle.sealed) return;
+		this.maintenanceIntervalMs = interval;
 		this.publication.exit(() => {
-			this.maintenance = setInterval(
-				() => {
-					void this.gc().catch(() => undefined);
-				},
-				Math.max(100, this.gcIntervalMs),
-			).unref();
+			this.maintenance = setInterval(() => {
+				void this.gc().catch(() => undefined);
+			}, interval).unref();
 		});
 	}
 	async clear(): Promise<ProvenanceStoreGCResult> {

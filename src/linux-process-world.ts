@@ -17,7 +17,7 @@ import { LinuxProcessReuseBackend } from "./linux-process-backend.ts";
 import { isRecord } from "./primitives.ts";
 import type { ProcessExecutionBinding } from "./process-reuse.ts";
 import { spawnControlled } from "./process-startup.mjs";
-import { subcomputeEnvironment } from "./subcompute.ts";
+import { controlledSubcomputeChannel, subcomputeEnvironment } from "./subcompute.ts";
 import type { WorkspaceSandboxOptions } from "./workspace-sandbox.ts";
 import { WorkspaceSandboxService } from "./workspace-sandbox.ts";
 /** Public BashOperations outlet with explicit process interception. */
@@ -42,16 +42,21 @@ export function createControlledBashOperations(
 				import(new URL("./utils/child-process.js", sdk).href),
 			]);
 			const fromStdin = shell.commandTransport === "stdin";
+			const environment = env ?? shellHelpers.getShellEnv();
+			const channel = controlledSubcomputeChannel(environment);
+			const transport = channel
+				? { PI_SUBCOMPUTE_SOCKET: channel.socket, PI_SUBCOMPUTE_CONTEXT: environment.PI_SUBCOMPUTE_CONTEXT }
+				: speculativeConfig().subcomputation.exposeToControlledProcesses
+					? await subcomputeEnvironment()
+					: {};
 			const child = spawnControlled(shell.shell, fromStdin ? shell.args : [...shell.args, command], {
 				cwd,
 				detached: process.platform !== "win32",
 				env: {
 					...(speculativeConfig().processReuse.environmentMode === "isolated"
-						? projectProcessEnvironment(env ?? shellHelpers.getShellEnv())
-						: (env ?? shellHelpers.getShellEnv())),
-					...(speculativeConfig().subcomputation.exposeToControlledProcesses && !env?.PI_SUBCOMPUTE_CONTEXT
-						? await subcomputeEnvironment()
-						: {}),
+						? projectProcessEnvironment(environment)
+						: environment),
+					...transport,
 				},
 				stdio: [fromStdin ? "pipe" : "ignore", "pipe", "pipe"],
 				windowsHide: true,

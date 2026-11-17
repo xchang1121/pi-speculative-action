@@ -72,7 +72,9 @@ export default function extension(pi) {
 
 预测器使用序列 PPM 和结构化字段绑定。旧版 `transform/template/splice/rebase/near/join/coalesce` 绑定已停止执行，旧学习状态按分析器版本隔离。工具应把后续调用所需的参数输出为结构化字段。
 
-环境契约支持 `exact`、`allowlist`、`denylist`、`isolated`。投影列表由 `environmentKeys` 提供，隔离环境由 `isolatedEnvironment` 提供。默认比较完整环境。`replayAcceptedTaints` 默认空列表；用户可显式允许负载所需的 `clock`、`random`、`pid_observation`、`descriptor_observation` 等标记。
+环境契约支持 `exact`、`allowlist`、`denylist`、`isolated`。投影列表由 `environmentKeys` 提供，隔离环境由 `isolatedEnvironment` 提供。默认比较完整业务环境；`PI_SUBCOMPUTE_SOCKET`、`PI_SUBCOMPUTE_CONTEXT` 两个协议句柄排除在环境摘要之外，受控通道读取的输入纳入进程证书。`replayAcceptedTaints` 默认空列表；用户可显式允许负载所需的 `clock`、`random`、`pid_observation`、`descriptor_observation` 等标记。
+
+运行时服务共享随设置更新的配置引用，后台回收使用当前策略。ext4、XFS、Btrfs、F2FS 默认使用 100 ms 文件静置窗，其他文件系统保留 2000 ms 默认值。Windows 对象租约助手默认空闲保活 30 秒，可通过 `filesystem.objectLeaseIdleMs` 调整；解释器启动失败进入重试冷却期，文件工具继续正常执行。
 
 `nativeBuild` 容量用于编译 Linux 助手。调整后将同一份 `config` 对象保存为 JSON，执行 `npm run setup:linux -- --config /path/to/config.json`，再重启执行域。运行时核对源码和编译配置指纹。
 
@@ -80,13 +82,13 @@ export default function extension(pi) {
 
 在 Host 管理的工具调用中调用 `await subcomputeEnvironment()`，把返回的 `PI_SUBCOMPUTE_SOCKET` 与 `PI_SUBCOMPUTE_CONTEXT` 传给子进程。Windows 使用 Named Pipe，Linux 使用 Unix socket。设置 `subcomputation.exposeToControlledProcesses: true` 可向受控进程自动注入这些变量。
 
-每个连接使用换行分隔的 JSON，执行一次查询及至多一次发布：
+每个连接使用换行分隔的 JSON，可在同一调用令牌有效期内顺序执行多个步骤，共享输入会话。每个步骤执行一次查询，未命中时再发布结果：
 
 ```json
 {"protocol":1,"op":"compute","context":"调用令牌","namespace":"example.transform","version":"1","key":"job","inputResources":[{"path":"input.bin","scope":"content"}],"envKeys":["MODE"],"environment":{"MODE":"fast"}}
 ```
 
-命中返回 `state: "hit"` 和 `value`。未命中返回 `state: "miss"` 及已捕获的 `inputResources`；外部程序使用这些输入计算，再发送：
+命中返回 `state: "hit"` 和 `value`。未命中返回 `state: "miss"` 及输入快照的路径和元数据。`includeInputContent` 默认 `false`；需要响应携带文件内容时，在查询中显式设置 `includeInputContent: true`，内容以 Base64 返回。外部程序完成计算后发送：
 
 ```json
 {"op":"publish","value":{"encoding":"base64","value":"YWJj"},"durationMs":12.5}

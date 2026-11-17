@@ -124,6 +124,8 @@ export interface StraceObservation {
 	}[];
 }
 export interface StraceObservationOptions {
+	/** Authenticated host subcomputation channel; its input evidence is imported by the caller. */
+	readonly controlledSocket?: string;
 	readonly metadata?: ReturnType<typeof nativeMetadataTrace>;
 	/** A native exec boundary in this trace; the original execution owns all records. */
 	readonly execution?: {
@@ -1217,6 +1219,16 @@ export async function observeStrace(
 			taints.add("pid_observation");
 		}
 		const endpoint = STREAM_ENDPOINT.exec(args[0] ?? "")?.[2];
+		if (
+			syscall === "connect" &&
+			succeeded &&
+			endpoint &&
+			options.controlledSocket &&
+			/\bsun_path="(\/[^"]+)"/.exec(args[1] ?? "")?.[1] === options.controlledSocket
+		) {
+			ownPipes.add(endpoint);
+			continue;
+		}
 		// A local socket reaches another process only once connected: a refused path (an NSS cache that is absent here) is a
 		// pathname dependency, validated absent where the Actor runs.
 		const refused =

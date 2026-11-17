@@ -3,7 +3,7 @@ import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from 
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
-	resolveSpeculativeConfig,
+	SpeculativeConfiguration,
 	speculativeConfig,
 	withSpeculativeConfig,
 	type SpeculativeConfigInput,
@@ -342,6 +342,7 @@ export interface SpeculativeAgentPreflightContext extends Pick<
 }
 export interface CreateSpeculativeActionHostOptions extends DrafterModelOptions {
 	readonly config?: SpeculativeConfigInput;
+	readonly configuration?: SpeculativeConfiguration;
 	/** Override host observations for embedding or deterministic tests. */
 	readonly resources?: ExecutionResourceMonitor;
 	/** Canonical K(a), projection, and resource-version semantics for this host. */
@@ -445,12 +446,13 @@ export function createAgentExecutionHost(
 		operation: "speculation" | "observation" | "observeOperations",
 	) => string | undefined,
 ): SpeculativeActionHost {
-	const config = resolveSpeculativeConfig(options.config);
-	const storeRoot = config.storage.root ?? path.join(os.tmpdir(), "pi-host-reuse-" + randomUUID());
+	const config = options.configuration ?? new SpeculativeConfiguration(options.config);
+	const ownsRoot = !config.current.storage.root;
+	const storeRoot = config.current.storage.root ?? path.join(os.tmpdir(), "pi-host-reuse-" + randomUUID());
 	const store = withSpeculativeConfig(config, () => new ProvenanceCertificateStore(storeRoot));
 	const service = withSpeculativeConfig(
 		config,
-		() => new SubcomputeService(options.cwd, store, () => config.runtime.resourceCacheMaxBytes),
+		() => new SubcomputeService(options.cwd, store, () => config.current.runtime.resourceCacheMaxBytes),
 	);
 	const bind = <T extends object>(target: T): T =>
 		new Proxy(target, {
@@ -475,7 +477,7 @@ export function createAgentExecutionHost(
 					await service.dispose();
 				} finally {
 					await store.dispose();
-					if (!config.storage.root) await rm(storeRoot, { recursive: true, force: true });
+					if (ownsRoot) await rm(storeRoot, { recursive: true, force: true });
 				}
 			}
 		},

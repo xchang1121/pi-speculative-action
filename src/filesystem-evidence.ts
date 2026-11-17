@@ -613,14 +613,19 @@ const fileDigests = new Map<
 >();
 export const fileIdentity = (stat: BigIntStats) =>
 	`${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+const filesystemTypes = new Map<bigint, bigint>();
 /** A capture standing for re-reading this file, by its identity. */
 export function cachedCapture(stat: BigIntStats, realPath: string): StableFilesystemCapture | undefined {
 	const cached = stat.isFile() ? fileDigests.get(fileIdentity(stat)) : undefined;
 	if (!cached) return undefined;
-	let filesystemType: bigint | undefined;
-	if (Object.keys(speculativeConfig().filesystem.timestampQuietByFilesystem).length) {
+	let filesystemType = filesystemTypes.get(stat.dev);
+	if (
+		filesystemType === undefined &&
+		Object.keys(speculativeConfig().filesystem.timestampQuietByFilesystem).length
+	) {
 		try {
 			filesystemType = statfsSync(realPath, { bigint: true }).type;
+			filesystemTypes.set(stat.dev, filesystemType);
 		} catch {
 			return undefined;
 		}

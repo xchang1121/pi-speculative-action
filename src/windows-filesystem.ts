@@ -22,6 +22,10 @@ const collected = new FinalizationRegistry<Lease>((lease) => {
 	void release(lease).catch(() => {});
 });
 const current = new WeakMap<ReturnType<typeof speculativeConfig>, ObjectConnection>();
+const unavailable = new WeakMap<ReturnType<typeof speculativeConfig>, { retryAt: number; error: unknown }>();
+process.once("exit", () => {
+	for (const connection of connections) connection.terminate();
+});
 
 function failure(code: string, message: string): NodeJS.ErrnoException {
 	return Object.assign(new Error(message), { code });
@@ -41,6 +45,8 @@ class ObjectConnection {
 	private closed = false;
 	private retiring = false;
 	private exitTimer?: NodeJS.Timeout;
+	private idleTimer?: NodeJS.Timeout;
+	private qualified = false;
 	readonly finished = this.completion.promise;
 
 	constructor() {
@@ -65,6 +71,7 @@ class ObjectConnection {
 		this.child.once("close", () => {
 			this.fail(failure("ERR_LEASE_PROVIDER_EXIT", this.errors || "Windows object lease connection closed"));
 			clearTimeout(this.exitTimer);
+			clearTimeout(this.idleTimer);
 			connections.delete(this);
 			this.completion.resolve();
 		});
@@ -74,6 +81,21 @@ class ObjectConnection {
 	}
 	get pid(): number | undefined {
 		return this.child.pid;
+	}
+	get startupFailed(): boolean {
+		return this.closed && !this.qualified;
+	}
+	terminate(): void {
+		this.child.kill();
+	}
+	private reference(active: boolean): void {
+		if (active) this.child.ref();
+		else this.child.unref();
+		for (const stream of [this.child.stdin, this.child.stdout, this.child.stderr]) {
+			const pipe = stream as typeof stream & { ref?(): void; unref?(): void };
+			if (active) pipe.ref?.();
+			else pipe.unref?.();
+		}
 	}
 	request(operation: string, argument: unknown = null): Promise<unknown> {
 		if (!this.accepting) return Promise.reject(failure("WIN32_6", "Windows object lease is closed"));
@@ -86,9 +108,18 @@ class ObjectConnection {
 			return Promise.reject(failure("ERR_LEASE_REQUEST", "Windows object lease request is too large"));
 		}
 		const result = Promise.withResolvers<unknown>();
-		const timer = setTimeout(() => {
-			this.fail(failure("ERR_LEASE_TIMEOUT", "Windows object lease request timed out"));
-		}, this.config.filesystem.objectLeaseTimeoutMs);
+		clearTimeout(this.idleTimer);
+		this.idleTimer = undefined;
+		this.reference(true);
+		const timer = setTimeout(
+			() => {
+				this.fail(failure("ERR_LEASE_TIMEOUT", "Windows object lease request timed out"));
+			},
+			Math.min(
+				this.config.filesystem.objectLeaseTimeoutMs,
+				this.qualified ? Infinity : this.config.filesystem.objectLeaseStartupTimeoutMs,
+			),
+		);
 		this.pending.set(id, { operation, argument, ...result, timer });
 		this.child.stdin.write(frame);
 		return result.promise;
@@ -130,6 +161,7 @@ class ObjectConnection {
 				if (!reply.error && pending.operation === "pin") {
 					if (reply.value !== id) throw new Error("invalid lease identity");
 					this.leases.add(id);
+					this.qualified = true;
 				}
 				if (!reply.error && pending.operation === "close") this.leases.delete(pending.argument as number);
 				clearTimeout(pending.timer);
@@ -145,14 +177,23 @@ class ObjectConnection {
 	}
 	private retireIfIdle(): void {
 		if (this.pending.size || this.leases.size || !this.accepting) return;
-		this.retiring = true;
-		this.child.stdin.end();
-		this.exitTimer = setTimeout(() => this.child.kill(), this.config.processReuse.terminateGraceMs);
-		this.exitTimer.unref();
+		const retire = () => {
+			this.retiring = true;
+			this.child.stdin.end();
+			this.exitTimer = setTimeout(() => this.terminate(), this.config.processReuse.terminateGraceMs);
+			this.exitTimer.unref();
+		};
+		if (!this.config.filesystem.objectLeaseIdleMs) retire();
+		else if (!this.idleTimer) {
+			this.idleTimer = setTimeout(retire, this.config.filesystem.objectLeaseIdleMs);
+			this.idleTimer.unref();
+			this.reference(false);
+		}
 	}
 	private fail(error: Error): void {
 		if (this.closed) return;
 		this.closed = true;
+		clearTimeout(this.idleTimer);
 		for (const pending of this.pending.values()) {
 			clearTimeout(pending.timer);
 			pending.reject(error);
@@ -179,12 +220,20 @@ const provider = {
 		if (typeof target !== "string" || !target || target.includes("\0") || target.length >= 32767)
 			throw failure("ERR_LEASE_PATH", "A nonempty Windows path is required");
 		const config = speculativeConfig();
+		const failed = unavailable.get(config);
+		if (failed && failed.retryAt > Date.now()) throw failed.error;
 		let connection = current.get(config);
 		if (!connection?.accepting) {
 			connection = new ObjectConnection();
 			current.set(config, connection);
 		}
-		const id = (await connection.request("pin", target)) as number;
+		const id = (await connection.request("pin", target).catch(async (error) => {
+			if (connection.startupFailed) {
+				unavailable.set(config, { retryAt: Date.now() + config.filesystem.objectLeaseRetryMs, error });
+				await connection.finished;
+			}
+			throw error;
+		})) as number;
 		const value = Object.freeze({});
 		const lease = { connection, id, closed: false };
 		owners.set(value, lease);

@@ -110,6 +110,7 @@ export interface ToolFilesystemOperations {
 			readonly value: Value;
 			readonly bytes: number;
 			readonly dispose: () => void | Promise<void>;
+			readonly cacheable?: boolean;
 		}>,
 		consume: (value: Value) => Promise<Result>,
 		resource?: string,
@@ -123,6 +124,8 @@ export interface ComputeStepRequest {
 	readonly inputResources?: readonly ResourceDependency[];
 	readonly envKeys?: readonly string[];
 	readonly environment?: Readonly<Record<string, string | undefined>>;
+	/** Include captured file bytes in protocol misses; local computeStep always reads through its view. */
+	readonly includeInputContent?: boolean;
 }
 /** The caller versions every dependency other than the explicitly captured resources and environment. */
 export async function computeStepInView<Value>(
@@ -1231,7 +1234,7 @@ export class ResourceReadView {
 							pending.computation = TimelineInterval.own(evaluation.computation);
 							pending.cancellation.signal.throwIfAborted();
 							computationBytes = serialize(TimelineInterval.serialize(pending.computation)).byteLength;
-							pending.shareable = !view.foreignInputs;
+							pending.shareable = !view.foreignInputs && resource.cacheable !== false;
 							if (pending.shareable && view.collectProofs?.size)
 								for (const proof of view.collectProofs.values())
 									(pending.proofs ??= []).push(
@@ -1275,6 +1278,7 @@ export class ResourceReadView {
 						destination.assertComplete();
 						const retention = destination.preparations();
 						if (
+							resource.cacheable !== false &&
 							inputEpoch === owner.inputEpoch &&
 							!destination.sealed &&
 							bytes <= destination.remainingBytes

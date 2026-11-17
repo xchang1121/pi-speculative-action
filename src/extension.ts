@@ -42,6 +42,7 @@ import {
 	resolveSpeculativeConfig,
 	settingInput,
 	SpeculativeActionSettingsStore,
+	SpeculativeConfiguration,
 	speculativeConfig,
 	withSpeculativeConfig,
 	type SettingInputDescriptor,
@@ -407,7 +408,10 @@ async function installController(
 	const settingsStore =
 		dependencies.createSettingsStore?.(context.cwd) ?? new SpeculativeActionSettingsStore(context.cwd);
 	await settingsStore.load(context.isProjectTrusted());
-	let currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
+	const configuration = new SpeculativeConfiguration(settingsStore.effective()?.config);
+	let currentSettings = configuration.run(() =>
+		normalizeSpeculativeActionSettings(settingsStore.effective()),
+	);
 	let currentMetrics: SpeculativeTraceSummary = emptySpeculativeTraceSummary({
 		cacheCapacity: currentSettings.resourceCacheMaxEntries,
 		cacheByteCapacity: currentSettings.resourceCacheMaxBytes,
@@ -526,15 +530,16 @@ async function installController(
 	});
 	const piToolSettings = loadPiToolSettings(context);
 	const patternWorkspaceIdentity = await resolvePatternWorkspaceIdentity(context.cwd);
-	const primaryExecutionWorlds =
-		dependencies.createExecutionWorlds?.({
-			cwd: context.cwd,
-			autoResizeImages: piToolSettings.autoResizeImages,
-			settings,
-		}) ?? [];
-	const configuration = resolveSpeculativeConfig(settingsStore.effective()?.config);
+	const primaryExecutionWorlds = configuration.run(
+		() =>
+			dependencies.createExecutionWorlds?.({
+				cwd: context.cwd,
+				autoResizeImages: piToolSettings.autoResizeImages,
+				settings,
+			}) ?? [],
+	);
 	let storeRoot =
-		configuration.storage.root ?? path.join(getAgentDir(), "speculative-action", "process-reuse");
+		configuration.current.storage.root ?? path.join(getAgentDir(), "speculative-action", "process-reuse");
 	try {
 		await Promise.all(
 			[storeRoot, path.dirname(patternAwarePersistenceFile(patternWorkspaceIdentity, getAgentDir()))].map(
@@ -545,6 +550,10 @@ async function installController(
 	} catch {
 		/* An unavailable cache cannot prevent the original tools from running. */
 	}
+	configuration.update({
+		...configuration.current,
+		storage: { ...configuration.current.storage, root: storeRoot },
+	});
 	const inputStore = withSpeculativeConfig(
 		configuration,
 		() => new ProvenanceCertificateStore(storeRoot, { reservedRoot: true }),
@@ -586,7 +595,9 @@ async function installController(
 			store: { reservedRoot: true },
 		}),
 	);
-	const workspaceSandbox = dependencies.createWorkspaceSandboxService?.() ?? new WorkspaceSandboxService();
+	const workspaceSandbox = configuration.run(
+		() => dependencies.createWorkspaceSandboxService?.() ?? new WorkspaceSandboxService(),
+	);
 	workspaceSandbox.useContentStore(inputStore);
 	const resourceWorld = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, {
 		maxBytes: () => currentSettings.resourceCacheMaxBytes,
@@ -694,13 +705,7 @@ async function installController(
 	}
 	const host = (dependencies.createHost ?? createSpeculativeActionHost)(sessionID, {
 		cwd: context.cwd,
-		config: {
-			...settingsStore.effective()?.config,
-			storage: {
-				...settingsStore.effective()?.config?.storage,
-				root: storeRoot,
-			},
-		},
+		configuration,
 		getSettings: runtimeSettings,
 		complete: completeDraft,
 		drafterBudget,
@@ -811,7 +816,11 @@ async function installController(
 					),
 				);
 			else settingsStore.clear();
-			currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
+			const updatedConfig = settingsStore.effective()?.config;
+			configuration.update({ ...updatedConfig, storage: { ...updatedConfig?.storage, root: storeRoot } });
+			currentSettings = configuration.run(() =>
+				normalizeSpeculativeActionSettings(settingsStore.effective()),
+			);
 			configureExecutionStorage();
 			if (!currentSettings.enabled || !currentSettings.selfSpeculation.enabled) selfSpeculation.reset();
 			await recoverSpeculation(() =>
@@ -950,7 +959,7 @@ async function installController(
 	} as const;
 	const sdk = attachSdkTools(context, [...agentTools.values()], () => pi.getActiveTools());
 	await recoverSpeculation(() => refreshExecutionDiagnostics());
-	return controller;
+	return configuration.bind(controller);
 }
 async function recoverSpeculation<T>(operation: () => Promise<T>): Promise<T | undefined> {
 	try {

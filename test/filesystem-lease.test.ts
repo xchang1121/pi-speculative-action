@@ -9,10 +9,71 @@ import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 import { ResourceVersionManager } from "../src/resource-version.ts";
 import { deferred, nextTurn } from "./async.ts";
 import { temporaryDirectories, readText } from "./filesystem.ts";
+import { createReadTool, createWriteTool, createEditTool } from "@earendil-works/pi-coding-agent";
+import { SpeculativeConfiguration } from "../src/config-schema.ts";
+import { windowsFilesystem } from "../src/windows-filesystem.ts";
+import { systemHost } from "./agent-system-fixture.ts";
 
 const directories = temporaryDirectories("pi-object-lease-");
 afterAll(() => directories.dispose());
 const output = { result: { content: [], details: {} }, isError: false };
+
+test.skipIf(process.platform !== "win32").for(["missing", "store-stub"])(
+	"ordinary file tools remain usable when the Windows lease interpreter is %s",
+	async (mode) => {
+		const cwd = await directories.create();
+		const starts = path.join(cwd, "starts");
+		const configuration = new SpeculativeConfiguration({
+			filesystem: {
+				windowsObjectLeaseCommand:
+					mode === "missing"
+						? [path.join(cwd, "missing-python.exe")]
+						: [
+								process.execPath,
+								"-e",
+								"require('node:fs').appendFileSync(process.argv[1], 'start\\n'); process.exit(9009)",
+								"--",
+								starts,
+							],
+				objectLeaseStartupTimeoutMs: 300,
+				objectLeaseRetryMs: 30000,
+			},
+		});
+		const service = configuration.run(() => new WorkspaceSandboxService());
+		const world = service.createExecutionWorld({ inPlaceMutations: false });
+		const host = systemHost(cwd, [createReadTool(cwd), createWriteTool(cwd), createEditTool(cwd)], {
+			configuration,
+			executionWorlds: [world],
+		});
+		await writeFile(path.join(cwd, "input.txt"), "base");
+		try {
+			await host.start();
+			let failures = 0;
+			for (const [tool, args, expected] of [
+				["write", { path: "input.txt", content: "changed" }, "changed"],
+				["edit", { path: "input.txt", edits: [{ oldText: "changed", newText: "final" }] }, "final"],
+			] as const) {
+				await host.preview(tool, args);
+				await expect
+					.poll(
+						() =>
+							host.events.filter((event) => event.type === "candidate" && event.state.status === "failed")
+								.length,
+					)
+					.toBe(++failures);
+				await host.execute(tool, args);
+				expect(await readText(cwd, "input.txt")).toBe(expected);
+				const read = await host.execute("read", { path: "input.txt" });
+				expect(JSON.stringify(read.content)).toContain(expected);
+			}
+			if (mode === "store-stub") expect(await readText(starts)).toBe("start\n");
+			expect(windowsFilesystem().processIDs()).toEqual([]);
+		} finally {
+			await host.dispose();
+			await service.dispose();
+		}
+	},
+);
 
 test.for(["fresh", "stale", "closing", "alias", "alias-stale", "binary"])(
 	"transfers workspace inputs through their owner (%s)",
@@ -192,7 +253,7 @@ test.skipIf(process.platform !== "win32")(
 			fileURLToPath(new URL("./windows-filesystem.fixture.mjs", import.meta.url)),
 		]);
 		const result = JSON.parse(stdout);
-		expect(result.results).toHaveLength(10);
+		expect(result.results).toHaveLength(12);
 		expect(
 			result.results.every((entry: { status: string }) => entry.status === "passed"),
 			stdout,

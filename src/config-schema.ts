@@ -169,11 +169,19 @@ export const DEFAULT_SPECULATIVE_CONFIG = freezeConfig({
 	filesystem: {
 		windowsObjectLeaseCommand: ["python"],
 		objectLeaseTimeoutMs: 10000,
+		objectLeaseStartupTimeoutMs: 1000,
+		objectLeaseIdleMs: 30000,
+		objectLeaseRetryMs: 30000,
 		maxWindowsLeaseRequests: 64,
 		timestampRestoreBatch: 1024,
 		utilityOutputBytes: 4 * 1024 * 1024,
 		asyncHashThresholdBytes: 65536,
-		timestampQuietByFilesystem: {} as Record<string, number>,
+		timestampQuietByFilesystem: {
+			"0xef53": 100,
+			"0x58465342": 100,
+			"0x9123683e": 100,
+			"0xf2f52010": 100,
+		} as Record<string, number>,
 		directoryReadBytes: 32768,
 		directoryMetadataBytes: 524288,
 		maxManifestChunks: 65536,
@@ -398,6 +406,7 @@ export function resolveSpeculativeConfig(input: SpeculativeConfigInput = {}): Sp
 		output.filesystem.directoryReadBytes,
 		output.filesystem.stabilityAttempts,
 		output.filesystem.objectLeaseTimeoutMs,
+		output.filesystem.objectLeaseStartupTimeoutMs,
 		output.filesystem.maxWindowsLeaseRequests,
 		output.subcomputation.maxPendingRequests,
 		output.subcomputation.socketTimeoutMs,
@@ -431,11 +440,61 @@ export function resolveSpeculativeConfig(input: SpeculativeConfigInput = {}): Sp
 		fail("probability");
 	return output;
 }
-const configuration = new AsyncLocalStorage<SpeculativeConfig>();
+const configuration = new AsyncLocalStorage<SpeculativeConfiguration>();
+const configurationScopes = new WeakMap<SpeculativeConfig, SpeculativeConfiguration>();
+/** Owned by a Host or service; async callbacks retain this reference across settings updates. */
+export class SpeculativeConfiguration {
+	current: SpeculativeConfig;
+	constructor(input?: SpeculativeConfigInput) {
+		this.current = resolveSpeculativeConfig(input);
+	}
+	update(input?: SpeculativeConfigInput): void {
+		this.current = resolveSpeculativeConfig(input);
+	}
+	run<T>(operation: () => T): T {
+		return configuration.run(this, operation);
+	}
+	bind<T extends object>(target: T): T {
+		const bound = new Set<PropertyKey>();
+		for (
+			let owner: object | null = target;
+			owner && owner !== Object.prototype;
+			owner = Object.getPrototypeOf(owner)
+		) {
+			for (const key of Reflect.ownKeys(owner)) {
+				if (key === "constructor" || bound.has(key)) continue;
+				bound.add(key);
+				const method = Object.getOwnPropertyDescriptor(owner, key)?.value;
+				if (typeof method !== "function") continue;
+				const prototype = owner === target ? undefined : owner;
+				Object.defineProperty(target, key, {
+					configurable: true,
+					writable: true,
+					value: (...args: unknown[]) =>
+						(configuration.getStore() ?? this).run(() =>
+							Reflect.apply(prototype ? Reflect.get(prototype, key, target) : method, target, args),
+						),
+				});
+			}
+		}
+		return target;
+	}
+}
+export const currentSpeculativeConfiguration = (): SpeculativeConfiguration =>
+	configuration.getStore() ?? new SpeculativeConfiguration();
 export const speculativeConfig = (): SpeculativeConfig =>
-	configuration.getStore() ?? DEFAULT_SPECULATIVE_CONFIG;
-export function withSpeculativeConfig<T>(config: SpeculativeConfig, operation: () => T): T {
-	return configuration.run(config, operation);
+	configuration.getStore()?.current ?? DEFAULT_SPECULATIVE_CONFIG;
+export function withSpeculativeConfig<T>(
+	config: SpeculativeConfig | SpeculativeConfiguration,
+	operation: () => T,
+): T {
+	if (config instanceof SpeculativeConfiguration) return config.run(operation);
+	let scope = configurationScopes.get(config);
+	if (!scope) {
+		scope = new SpeculativeConfiguration(config);
+		configurationScopes.set(config, scope);
+	}
+	return scope.run(operation);
 }
 export function nativeBuildDefinitions(config: SpeculativeConfig = speculativeConfig()): string[] {
 	const entries = {
@@ -454,14 +513,16 @@ export function projectProcessEnvironment(
 		"environmentMode" | "environmentKeys" | "isolatedEnvironment"
 	> = speculativeConfig().processReuse,
 ): Readonly<Record<string, string>> {
-	if (policy.environmentMode === "isolated") return Object.freeze({ ...policy.isolatedEnvironment });
 	const keys = new Set(policy.environmentKeys);
 	return Object.freeze(
 		Object.fromEntries(
-			Object.entries(environment).filter(
+			Object.entries(policy.environmentMode === "isolated" ? policy.isolatedEnvironment : environment).filter(
 				([key]) =>
-					policy.environmentMode === "exact" ||
-					(policy.environmentMode === "allowlist" ? keys.has(key) : !keys.has(key)),
+					key !== "PI_SUBCOMPUTE_SOCKET" &&
+					key !== "PI_SUBCOMPUTE_CONTEXT" &&
+					(policy.environmentMode === "exact" ||
+						policy.environmentMode === "isolated" ||
+						(policy.environmentMode === "allowlist" ? keys.has(key) : !keys.has(key))),
 			),
 		),
 	);

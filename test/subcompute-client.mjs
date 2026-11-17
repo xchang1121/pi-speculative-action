@@ -13,6 +13,7 @@ send({
 	version: "1",
 	key: process.argv[2] ?? "shared",
 	inputResources: [{ path: "input.bin", scope: "content" }],
+	includeInputContent: true,
 	envKeys: ["TRANSFORM_MODE"],
 	environment: { TRANSFORM_MODE: process.env.TRANSFORM_MODE },
 });

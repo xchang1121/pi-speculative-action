@@ -11,6 +11,78 @@ import { temporaryDirectories } from "./filesystem.ts";
 const directories = temporaryDirectories("pi-subcompute-boundary-");
 afterEach(directories.dispose);
 
+test("one protocol connection reuses steps, revalidates snapshots and omits large input content by default", async () => {
+	const cwd = await directories.create();
+	const target = path.join(cwd, "large.bin");
+	await writeFile(target, Buffer.alloc(1024 * 1024, 65));
+	const tool = {
+		name: "sequential_steps",
+		label: "Sequential steps",
+		description: "Read several steps on one connection",
+		parameters: Type.Object({}),
+		execute: async () => {
+			const environment = await subcomputeEnvironment();
+			const peer = client(environment);
+			const compute = async (key: string, includeInputContent?: boolean) => {
+				peer.send({
+					protocol: 1,
+					op: "compute",
+					context: environment.PI_SUBCOMPUTE_CONTEXT,
+					namespace: "sequential",
+					version: "1",
+					key,
+					includeInputContent,
+					inputResources: [{ path: "large.bin", scope: "content" }],
+				});
+				const initial = await peer.read();
+				if (initial.state === "miss") {
+					peer.send({ op: "publish", durationMs: 1, value: { encoding: "json", value: key } });
+					expect(await peer.read()).toMatchObject({ state: "published", value: { value: key } });
+				}
+				return initial;
+			};
+			try {
+				const first = await compute("large");
+				expect(first).toMatchObject({ state: "miss", inputResources: [{ path: target, size: 1024 * 1024 }] });
+				expect(first.inputResources[0]).not.toHaveProperty("content");
+				expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThan(1024);
+				for (let step = 0; step < 4; step++) expect(await compute("large")).toMatchObject({ state: "hit" });
+				await writeFile(target, "updated");
+				expect(await compute("large")).toMatchObject({ state: "miss", inputResources: [{ size: 7 }] });
+				expect(await compute("bytes", true)).toMatchObject({
+					state: "miss",
+					inputResources: [
+						{ content: { encoding: "base64", value: Buffer.from("updated").toString("base64") } },
+					],
+				});
+				expect(await compute("bytes", true)).toMatchObject({ state: "hit" });
+				const other = await subcomputeEnvironment();
+				peer.send({ protocol: 1, op: "compute", context: other.PI_SUBCOMPUTE_CONTEXT });
+				expect(await peer.read()).toMatchObject({ state: "error", error: "subcompute_context_changed" });
+				return { content: [], details: { checked: true } };
+			} finally {
+				peer.close();
+			}
+		},
+	};
+	const host = systemHost(
+		cwd,
+		[tool],
+		{
+			executionWorlds: [],
+			resolveInvocation: () => undefined,
+			config: { subcomputation: { socketRequestBytes: 2048 } },
+		},
+		{ enabled: false },
+	);
+	try {
+		await host.start();
+		expect((await host.execute(tool.name, {})).details).toEqual({ checked: true });
+	} finally {
+		await host.dispose();
+	}
+}, 30000);
+
 function client(environment: Readonly<Record<string, string>>) {
 	const socket = connect(environment.PI_SUBCOMPUTE_SOCKET!);
 	socket.on("error", () => {});
@@ -58,6 +130,7 @@ test("public protocol rejects abandoned and oversized work and revalidates chang
 					version: "1",
 					key,
 					inputResources: [{ path: "input.bin", scope: "content" }],
+					includeInputContent: true,
 				});
 				const initial = await peer.read();
 				if (initial.state === "hit") return { content: [], details: initial };

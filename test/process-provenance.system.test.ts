@@ -2,6 +2,8 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { expect, test } from "vitest";
 import {
@@ -93,14 +95,21 @@ int main(int argc, char **argv) {
 	},
 );
 
-test.skipIf(process.platform !== "linux")(
-	"public Actor execution publishes completed provenance and a new host replays SQLite evidence repeatedly",
-	async () => {
+test.skipIf(process.platform !== "linux").for([false, true])(
+	"public Actor persists and replays provenance (exact environment with subcompute=%s)",
+	{ timeout: 60000 },
+	async (exposeToControlledProcesses) => {
 		const root = await mkdtemp(path.join(os.homedir(), "pi-provenance-public-"));
 		const cwd = path.join(root, "workspace");
 		const storeRoot = path.join(root, "cache");
 		await mkdir(cwd);
 		await writeFile(path.join(cwd, "input.txt"), "first\n");
+		if (exposeToControlledProcesses)
+			execFileSync("cc", [
+				fileURLToPath(new URL("./subcompute-process.c", import.meta.url)),
+				"-o",
+				path.join(cwd, "subcompute-process"),
+			]);
 		let environment = {
 			PATH: "/usr/bin:/bin",
 			HOME: os.homedir(),
@@ -153,11 +162,12 @@ test.skipIf(process.platform !== "linux")(
 						storage: { root: storeRoot },
 						processReuse: {
 							actorObservationMode: "provenance",
-							environmentMode: "allowlist",
+							environmentMode: exposeToControlledProcesses ? "exact" : "allowlist",
 							environmentKeys: ["PATH", "HOME", "LANG", "DECLARED"],
 							replayAcceptedTaints: ["clock", "random", "pid_observation", "descriptor_observation"],
 						},
 						runtime: { resourceCacheMaxEntries: 0 },
+						subcomputation: { exposeToControlledProcesses },
 					},
 				},
 				{
@@ -173,7 +183,7 @@ test.skipIf(process.platform !== "linux")(
 			const ready = await host.backend.check(true, cwd);
 			expect(ready.state, ready.detail).toBe("ready");
 			await host.start();
-			const command = "cat input.txt";
+			const command = exposeToControlledProcesses ? "./subcompute-process" : "cat input.txt";
 			expect(textOutput(await host.execute("bash", { command }))).toBe("first\n");
 			// The first read changes the freshly created file's observed atime. The next actual run sees a stable version.
 			expect(textOutput(await host.execute("bash", { command }))).toBe("first\n");
@@ -190,7 +200,7 @@ test.skipIf(process.platform !== "linux")(
 				database.close();
 			}
 			await host.dispose();
-			environment = { ...environment, UNOBSERVED: "changed" };
+			if (!exposeToControlledProcesses) environment = { ...environment, UNOBSERVED: "changed" };
 			host = open();
 			await host.start();
 			for (let index = 0; index < 2; index++)
@@ -208,17 +218,23 @@ test.skipIf(process.platform !== "linux")(
 			await rm(root, { recursive: true, force: true });
 		}
 	},
-	60000,
 );
 
-test.skipIf(process.platform !== "linux")(
-	"public speculative execution survives memory eviction and replays SQLite L2",
-	async () => {
+test.skipIf(process.platform !== "linux").for([false, true])(
+	"public speculative execution survives memory eviction and replays SQLite L2 (subcompute=%s)",
+	{ timeout: 60000 },
+	async (exposeToControlledProcesses) => {
 		const root = await mkdtemp(path.join(os.homedir(), "pi-speculative-l2-"));
 		const cwd = path.join(root, "workspace");
 		const storeRoot = path.join(root, "cache");
 		await mkdir(cwd);
 		await writeFile(path.join(cwd, "input.txt"), "published by speculation\n");
+		if (exposeToControlledProcesses)
+			execFileSync("cc", [
+				fileURLToPath(new URL("./subcompute-process.c", import.meta.url)),
+				"-o",
+				path.join(cwd, "subcompute-process"),
+			]);
 		const environment = {
 			PATH: "/usr/bin:/bin",
 			HOME: os.homedir(),
@@ -228,6 +244,7 @@ test.skipIf(process.platform !== "linux")(
 		const config = resolveSpeculativeConfig({
 			storage: { root: storeRoot },
 			runtime: { completedProcesses: 1, resourceCacheMaxEntries: 1 },
+			subcomputation: { exposeToControlledProcesses },
 			processReuse: {
 				replayAcceptedTaints: ["clock", "random", "pid_observation", "descriptor_observation"],
 			},
@@ -266,7 +283,7 @@ test.skipIf(process.platform !== "linux")(
 		);
 		try {
 			await host.start();
-			const command = "cat input.txt";
+			const command = exposeToControlledProcesses ? "./subcompute-process" : "cat input.txt";
 			expect(textOutput(await host.execute("bash", { command }))).toBe("published by speculation\n");
 			const nativeCalls = host.fallbacks.length;
 			await host.preview("bash", { command });
@@ -277,7 +294,7 @@ test.skipIf(process.platform !== "linux")(
 			await host.ready(2);
 			expect(textOutput(await host.execute("bash", { command: "printf second" }))).toBe("second");
 			// Public storage maintenance retires completed memory owners while retaining valid SQLite certificates.
-			await withSpeculativeConfig(config, () => world.storage!.maintain("gc"));
+			await world.storage!.maintain("gc");
 			const database = new DatabaseSync(path.join(storeRoot, "metadata.sqlite"), { readOnly: true });
 			try {
 				const rows = database.prepare("SELECT value FROM certificates").all();
@@ -297,5 +314,4 @@ test.skipIf(process.platform !== "linux")(
 			await rm(root, { recursive: true, force: true });
 		}
 	},
-	60000,
 );

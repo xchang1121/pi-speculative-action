@@ -64,6 +64,7 @@ export { registerSpeculativeTool } from "./agent-integration.ts";
 export {
 	DEFAULT_SPECULATIVE_CONFIG,
 	resolveSpeculativeConfig,
+	SpeculativeConfiguration,
 	withSpeculativeConfig,
 	type SpeculativeConfig,
 	type SpeculativeConfigInput,

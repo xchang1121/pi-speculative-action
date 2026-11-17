@@ -33,7 +33,12 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { ResourceObjectInputs } from "./agent-execution-world.ts";
-import { projectProcessEnvironment, speculativeConfig } from "./config-schema.ts";
+import {
+	currentSpeculativeConfiguration,
+	projectProcessEnvironment,
+	speculativeConfig,
+} from "./config-schema.ts";
+import { controlledSubcomputeChannel } from "./subcompute.ts";
 import {
 	captureFileContent,
 	ContentChunkPool,
@@ -685,6 +690,7 @@ interface NativeObservation {
 }
 /** Linux-only process substrate. Unavailable dependencies remove the route instead of weakening it. */
 export class LinuxProcessReuseBackend {
+	readonly configuration = currentSpeculativeConfiguration();
 	private readonly observations = new AsyncLocalStorage<NativeObservation>();
 	/** Keep actual completed launches and acknowledged adoptions in their enclosing native call's order. */
 	async observeBindings<Value>(
@@ -750,6 +756,7 @@ export class LinuxProcessReuseBackend {
 	private disposal?: Promise<void>;
 	private producers = 0;
 	constructor(options: LinuxProcessBackendOptions) {
+		this.configuration.bind(this);
 		this.options = {
 			sandlockBinary: process.env.PI_SPEC_SANDLOCK,
 			straceBinary: process.env.PI_SPEC_STRACE,
@@ -770,7 +777,7 @@ export class LinuxProcessReuseBackend {
 		this.handoffs.configure(
 			Math.min(speculativeConfig().runtime.completedProcesses, this.store.limits.maxCertificates),
 		);
-		this.storage = {
+		this.storage = this.configuration.bind({
 			configure: ({ maxEntries, maxBytes }) => {
 				this.store.configure({ maxCertificates: maxEntries, maxBytes });
 				this.handoffs.configure(
@@ -787,7 +794,7 @@ export class LinuxProcessReuseBackend {
 					removedBytes: result.removedBytes,
 				};
 			},
-		};
+		});
 	}
 	async check(refresh = false, sourceRoot?: string): Promise<LinuxProcessBackendStatus> {
 		if (process.platform !== "linux") return { state: "unavailable", detail: "Linux host required" };
@@ -1013,7 +1020,7 @@ export class LinuxProcessReuseBackend {
 			LinuxHeldExecBoundary.command(() => host.execute(request));
 		const acceptProducer = (producer: ProcessProducerProof) =>
 			actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
-		return {
+		return this.configuration.bind({
 			execute: async (request) => {
 				if (
 					this.disposed ||
@@ -1090,7 +1097,7 @@ export class LinuxProcessReuseBackend {
 				}
 				return execute(request);
 			},
-		};
+		});
 	}
 	private async captureActorExecution(
 		request: ProcessExecutionRequest,
@@ -1103,6 +1110,7 @@ export class LinuxProcessReuseBackend {
 	> {
 		const invocation = options.invocation(request);
 		if (!invocation) return;
+		const channel = controlledSubcomputeChannel(request.environment);
 		let directory: string | undefined;
 		let proof: ReturnType<typeof executionDomainProof> | undefined;
 		let output: SpawnOutcome | undefined;
@@ -1153,9 +1161,11 @@ export class LinuxProcessReuseBackend {
 				},
 			);
 			const ended = performance.now();
-			const observation = await observeStrace(trace, invocation.shell, request.cwd, {
+			let observation = await observeStrace(trace, invocation.shell, request.cwd, {
+				controlledSocket: channel?.socket,
 				guardFilesystemSemanticsWithin: [options.sourceRoot],
 			});
+			if (channel) observation = await channel.observe(observation);
 			if (
 				output.captureComplete === false ||
 				!observation.complete ||
@@ -1165,6 +1175,7 @@ export class LinuxProcessReuseBackend {
 			)
 				throw new Error(`actor_observation_incomplete:${observation.incompleteReasons.join(",")}`);
 			const dependencies = await captureActorDependencies(observation, request.signal);
+			await channel?.validate();
 			const validate = proof.seal(dependencies, (target) => target);
 			if (!validate()) throw new Error(`actor_inputs_changed:${proof.reason}`);
 			const computation = new TimelineInterval(began, ended);
@@ -1178,6 +1189,7 @@ export class LinuxProcessReuseBackend {
 						data: await this.store.artifacts.put(event.data),
 					});
 				if (!validate()) throw new Error(`actor_inputs_changed:${proof!.reason}`);
+				await channel?.validate();
 				const certificate = sealProcessCertificate({
 					prototype,
 					producer: {
@@ -2023,6 +2035,7 @@ export class LinuxProcessReuseBackend {
 			session,
 			async () => {
 				const { outputRoute } = request;
+				const channel = controlledSubcomputeChannel(request.environment);
 				const signal = AbortSignal.any([session.signal, ...(outlet?.signal ? [outlet.signal] : [])]);
 				signal.throwIfAborted();
 				const captured = prototype
@@ -2183,6 +2196,7 @@ export class LinuxProcessReuseBackend {
 								inputs ??= new Set(
 									(
 										await observeStrace(domain?.trace ?? tracePrefix, image, logicalCwd, {
+											controlledSocket: channel?.socket,
 											launchPath,
 											previewBytes: speculativeConfig().processReuse.tracePreviewBytes,
 											metadata: session.metadata,
@@ -2232,7 +2246,7 @@ export class LinuxProcessReuseBackend {
 								...sandboxPolicyArguments(
 									logicalCwd,
 									[...session.deniedPaths, `${dispatcher}.configuration`],
-									[session.workspace.sandboxRoot, session.socketPath],
+									[session.workspace.sandboxRoot, session.socketPath, ...(channel ? [channel.socket] : [])],
 									[
 										{
 											virtualPath: session.sourceRoot,
@@ -2304,6 +2318,7 @@ export class LinuxProcessReuseBackend {
 							completedObservation
 								? Promise.resolve(completedObservation)
 								: observeStrace(writer!.tail!, image, logicalCwd, {
+										controlledSocket: channel?.socket,
 										launchPath,
 										brokeredWrites: (pid) => brokeredWrites(session, pid, writer),
 										privateUpper: privateUpper(session),
@@ -2462,7 +2477,10 @@ export class LinuxProcessReuseBackend {
 							if (!effects.complete) unattributed = observation;
 							stage = "dependencies";
 							const sources = evidenceSources([...(own.descendants ?? []), ...proofOwners]);
-							const observed = [observation, ...sources.flatMap((child) => child.observation ?? [])];
+							const observed = [
+								channel ? await channel.observe(observation) : observation,
+								...sources.flatMap((child) => child.observation ?? []),
+							];
 							const external = await privateCommits(
 								session,
 								own.startedAt,
@@ -2606,6 +2624,7 @@ export class LinuxProcessReuseBackend {
 										this.setError(session, detail);
 								}
 								stage = "certificate_publication";
+								await channel?.validate();
 								if (speculativeConfig().processReuse.persistCompletedCertificates) {
 									const bytesOnly =
 										observation.streamMetadataObserved === false &&

@@ -136,6 +136,7 @@ async function fixture(
 			error = false,
 		) => {
 			const id = `template-${++sequence}`;
+			let previewFailure: unknown;
 			provider.setResponses([
 				async () => {
 					await before?.(async (input = args) => {
@@ -146,6 +147,9 @@ async function fixture(
 							args: input,
 							tools: turn.tools,
 						});
+					}).catch((error) => {
+						previewFailure = error;
+						throw error;
 					});
 					return fauxAssistantMessage(fauxToolCall(name, args, { id }), {
 						stopReason: "toolUse",
@@ -154,6 +158,7 @@ async function fixture(
 				fauxAssistantMessage("done"),
 			]);
 			await session.prompt(`Run ${name}.`);
+			if (previewFailure) throw previewFailure;
 			const result = session.messages.find(
 				(message) => message.role === "toolResult" && message.toolCallId === id,
 			);
@@ -232,6 +237,74 @@ test("public computeStep retains async binary results above one MiB using the co
 	});
 	expect(builds).toBe(1);
 });
+
+test.for([
+	{ target: "new.txt", warm: false },
+	{ target: "data/rows.json", warm: false },
+	{ target: "data/rows.json", warm: true },
+])(
+	"a mutation step reads its pending write once ($target, cached baseline=$warm)",
+	async ({ target, warm }) => {
+		let stepBuilds = 0;
+		let computeBuilds = 0;
+		const step = defineSpeculativeStep({
+			id: "transaction.read-written",
+			version: "1",
+			dependencies: {},
+			run: async ({ fs }, input: { path: string }) => {
+				stepBuilds++;
+				return (await fs.readFile(input.path)).toString();
+			},
+		});
+		const tool = defineSpeculativeTool({
+			name: "read_pending_write",
+			label: "Read pending write",
+			description: "Read the current transaction through both step APIs",
+			parameters: Type.Object({ text: Type.String(), output: Type.String() }),
+			version: "1",
+			effect: "workspace_mutation",
+			steps: { step },
+			execute: async ({ fs, step, computeStep }, args) => {
+				if (warm) expect(await step("step", { path: target })).toBe("[2,3]");
+				await fs.writeFile(target, args.text);
+				const first = await step("step", { path: target });
+				const second = await computeStep(
+					{
+						namespace: "transaction.compute-written",
+						version: "1",
+						key: target,
+						inputResources: [{ path: target, scope: "content" }],
+					},
+					async (view) => {
+						computeBuilds++;
+						return (await view.readFile(path.join(f.cwd, target))).toString();
+					},
+				);
+				await fs.writeFile(args.output, first + second);
+				return { content: [], details: { first, second } };
+			},
+		});
+		const f = await fixture([tool], true);
+		await using _cleanup = onExit(f.dispose);
+		const result = await f.execute(tool.name, { text: "actual", output: "actual.txt" }, async (preview) => {
+			await preview({ text: "private", output: "discarded.txt" });
+			await expect
+				.poll(() => f.events.filter((event) => event.type === "candidate").map((event) => event.state), {
+					message: "transaction candidate must complete",
+				})
+				.toContainEqual(expect.objectContaining({ status: "succeeded" }));
+			expect(stepBuilds).toBe(warm ? 2 : 1);
+			expect(computeBuilds).toBe(1);
+			expect(await readFile(path.join(f.cwd, target), "utf8").catch(() => undefined)).toBe(
+				target === "new.txt" ? undefined : "[2,3]",
+			);
+		});
+		expect(result.details).toEqual({ first: "actual", second: "actual" });
+		expect({ stepBuilds, computeBuilds }).toEqual({ stepBuilds: warm ? 3 : 2, computeBuilds: 2 });
+		expect(await readFile(path.join(f.cwd, "actual.txt"), "utf8")).toBe("actualactual");
+		expect(await readFile(path.join(f.cwd, "discarded.txt")).catch(() => undefined)).toBeUndefined();
+	},
+);
 
 test("a rejected outer mutation retains baseline steps after unrelated private writes", async () => {
 	let builds = 0;

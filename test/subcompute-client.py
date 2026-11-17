@@ -18,7 +18,8 @@ def send(value):
 
 send({"protocol": 1, "op": "compute", "context": os.environ["PI_SUBCOMPUTE_CONTEXT"],
       "namespace": "cross-language.reverse", "version": "1", "key": sys.argv[1] if len(sys.argv) > 1 else "shared",
-      "inputResources": [{"path": "input.bin", "scope": "content"}], "envKeys": ["TRANSFORM_MODE"],
+      "inputResources": [{"path": "input.bin", "scope": "content"}], "includeInputContent": True,
+      "envKeys": ["TRANSFORM_MODE"],
       "environment": {"TRANSFORM_MODE": os.environ.get("TRANSFORM_MODE")}})
 reply = json.loads(channel.readline())
 hit = reply["state"] == "hit"

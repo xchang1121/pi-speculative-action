@@ -58,6 +58,31 @@ async function processTrace(content: string, suffix = "101") {
 	};
 }
 
+test.for([undefined, "/tmp/other/socket", "/tmp/pi-step-test/socket"])(
+	"only the authenticated subcompute endpoint bypasses socket taint (%s)",
+	async (controlledSocket) => {
+		const { tail } = await processTrace(
+			[
+				'1.000000 execve("/tools/client", ["client"], []) = 0',
+				"1.000001 socket(AF_UNIX, SOCK_STREAM, 0) = 3<UNIX-STREAM:[31]>",
+				'1.000002 connect(3<UNIX-STREAM:[31]>, {sa_family=AF_UNIX, sun_path="/tmp/pi-step-test/socket"}, 110) = 0',
+				'1.000003 write(3<UNIX-STREAM:[31->32]>, "request", 7) = 7',
+				'1.000004 read(3<UNIX-STREAM:[31->32]>, "reply", 5) = 5',
+				"1.000005 close(3<UNIX-STREAM:[31->32]>) = 0",
+				"1.000006 +++ exited with 0 +++",
+				"",
+			].join("\n"),
+		);
+		const observation = await observeStrace(tail, "/tools/client", "/work", { controlledSocket });
+		const authenticated = controlledSocket === "/tmp/pi-step-test/socket";
+		expect(observation.taints.includes("network")).toBe(!authenticated);
+		if (authenticated) {
+			expect(observation.complete, observation.incompleteReasons.join(",")).toBe(true);
+			expect(observation.paths.some((input) => input.path.includes("pi-step-test"))).toBe(false);
+		}
+	},
+);
+
 test("distinguishes adding a sibling from removing and restoring a pathname binding", async () => {
 	const { tail, append } = await processTrace(
 		'1.000000 openat(AT_FDCWD, "input", O_RDONLY) = 3</work/input>\n1.000001 openat(AT_FDCWD, "output", O_WRONLY|O_CREAT, 0600) = 4</work/output>\n',
