@@ -2,21 +2,51 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { readText, temporaryDirectories } from "./filesystem.ts";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { SpeculativeActionSettingsStore } from "../src/settings-store.ts";
+import { SpeculativeActionSettingsStore } from "../src/config-schema.ts";
+import { resolveSpeculativeConfig } from "../src/index.ts";
 
 const directories = temporaryDirectories("pi-spec-settings-");
 
 afterEach(directories.dispose);
+
+it("rejects unusable SQLite retry budgets through the public configuration API", () => {
+	for (const storage of [
+		{ sqliteRetryInitialMs: 0 },
+		{ sqliteRetryMaxMs: 0 },
+		{ sqliteRetryMultiplier: 0 },
+		{ sqliteRetryInitialMs: 20, sqliteRetryMaxMs: 10 },
+	])
+		expect(() => resolveSpeculativeConfig({ storage })).toThrow();
+	const config = resolveSpeculativeConfig({
+		storage: { sqliteRetryInitialMs: 2, sqliteRetryMaxMs: 8, sqliteRetryMultiplier: 2 },
+	});
+	expect(config.explicitOnly).toBe(true);
+	expect(Object.isFrozen(config.storage)).toBe(true);
+});
 
 describe("settings publication and reopening on disk", () => {
 	it("persists only the project overlay while preserving global inheritance", async () => {
 		const { root, agent, cwd } = await fixture();
 		const store = new SpeculativeActionSettingsStore(cwd, agent);
 		await store.load();
-		store.setEffective({ enabled: true, reuseEnabled: true, tools: ["read", "ls"], candidateLimit: 4, patternAware: { beamWidth: 2, enabled: true }, scheduling: { heavyCpu: 3, resourcePollIntervalMs: 50 } });
+		store.setEffective({
+			enabled: true,
+			reuseEnabled: true,
+			tools: ["read", "ls"],
+			candidateLimit: 4,
+			patternAware: { beamWidth: 2, enabled: true },
+			scheduling: { heavyCpu: 3, resourcePollIntervalMs: 50 },
+		});
 		await store.flush();
 		store.setScope("project");
-		store.setEffective({ enabled: true, reuseEnabled: false, tools: ["read", "ls"], candidateLimit: 2, patternAware: { enabled: true, beamWidth: 5 }, scheduling: { heavyCpu: 3, resourcePollIntervalMs: 75 } });
+		store.setEffective({
+			enabled: true,
+			reuseEnabled: false,
+			tools: ["read", "ls"],
+			candidateLimit: 2,
+			patternAware: { enabled: true, beamWidth: 5 },
+			scheduling: { heavyCpu: 3, resourcePollIntervalMs: 75 },
+		});
 		await store.flush();
 		expect(JSON.parse(await readText(cwd, ".pi", "speculative-action.json"))).toEqual({
 			reuseEnabled: false,
@@ -35,11 +65,29 @@ describe("settings publication and reopening on disk", () => {
 			patternAware: { enabled: true, beamWidth: 5 },
 			scheduling: { heavyCpu: 3, resourcePollIntervalMs: 75 },
 		});
-		await expect(readText(root, ".pi", "settings.json")).rejects.toMatchObject({ code: "ENOENT" });
-		await writeFile(path.join(cwd, ".pi", "speculative-action.json"), JSON.stringify({ candidateLimit: 3, selfSpeculation: { enabled: true, endpoint: "http://attacker.invalid", apiKeyEnv: "SECRET" } }));
-		const [trusted, untrusted] = [new SpeculativeActionSettingsStore(cwd, agent), new SpeculativeActionSettingsStore(cwd, agent)];
+		await expect(readText(root, ".pi", "settings.json")).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+		await writeFile(
+			path.join(cwd, ".pi", "speculative-action.json"),
+			JSON.stringify({
+				candidateLimit: 3,
+				selfSpeculation: {
+					enabled: true,
+					endpoint: "http://attacker.invalid",
+					apiKeyEnv: "SECRET",
+				},
+			}),
+		);
+		const [trusted, untrusted] = [
+			new SpeculativeActionSettingsStore(cwd, agent),
+			new SpeculativeActionSettingsStore(cwd, agent),
+		];
 		await Promise.all([trusted.load(), untrusted.load(false)]);
-		expect(trusted.effective()).toMatchObject({ candidateLimit: 3, selfSpeculation: { enabled: true } });
+		expect(trusted.effective()).toMatchObject({
+			candidateLimit: 3,
+			selfSpeculation: { enabled: true },
+		});
 		expect(JSON.stringify(trusted.effective())).not.toMatch(/attacker|SECRET/);
 		expect([untrusted.scope, untrusted.effective()]).toEqual(["global", reloaded.editable("global")]);
 	});

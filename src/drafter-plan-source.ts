@@ -1,21 +1,112 @@
-import { BoundedRecencyMap } from "./bounded-recency-map.ts";
-import { calculateContextTokens, type AgentToolCall } from "@earendil-works/pi-agent-core";
-import {
-	clampThinkingLevel, fauxAssistantMessage, Type, validateToolArguments, type Api, type AssistantMessage, type Context, type Model,
-	type SimpleStreamOptions, type ToolResultMessage,
+import type { AgentToolCall } from "@earendil-works/pi-agent-core";
+import { calculateContextTokens } from "@earendil-works/pi-agent-core";
+import type {
+	Api,
+	AssistantMessage,
+	Context,
+	Model,
+	SimpleStreamOptions,
+	ToolResultMessage,
 } from "@earendil-works/pi-ai";
-import { clampCandidateLimit, DEFAULTS, drafterRequestTemperature, normalizeDrafterRequestSettings, type DrafterRequestSettings } from "./common.ts";
-import { DrafterTaskBudget, drafterOpportunityKey, type DrafterBudgetSnapshot } from "./drafter-budget.ts";
-import { agentBatchKey, type AgentPlanSource, type AgentRuntime, type DrafterModelOptions } from "./agent-runtime-types.ts";
-import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
-import type { SpeculativeActionSettings } from "./runtime.ts";
-import { stableValueHash } from "./stable-value-hash.ts";
-import { immutableSnapshot } from "./stable-json.ts";
-import { predictionLearning } from "./settlement.ts";
-import { canonicalToolObservation, toolObservationContract, toolObservationKey, type ToolSettlement } from "./tool-settlement.ts";
+import { clampThinkingLevel, fauxAssistantMessage, Type, validateToolArguments } from "@earendil-works/pi-ai";
 import type { ActionKey } from "./action-semantics.ts";
+import type { AgentPlanSource, AgentRuntime, DrafterModelOptions } from "./agent-integration.ts";
+import { agentBatchKey } from "./agent-integration.ts";
+import type { DrafterRequestSettings } from "./config-schema.ts";
+import {
+	clampCandidateLimit,
+	DEFAULTS,
+	speculativeConfig,
+	drafterRequestTemperature,
+	normalizeDrafterRequestSettings,
+} from "./config-schema.ts";
+import type { ToolSettlement } from "./execution-world.ts";
+import { canonicalToolObservation, toolObservationContract, toolObservationKey } from "./execution-world.ts";
+import { BoundedRecencyMap, immutableSnapshot, stableValueHash } from "./primitives.ts";
+import type { SpeculativeActionSettings } from "./runtime-engine.ts";
 import { SharedAbortScope, waitForCompletion } from "./runtime-lifecycle.ts";
-
+import type { PlanAction, PlanProposal } from "./settlement.ts";
+import { predictionLearning } from "./settlement.ts";
+export interface DrafterBudgetSnapshot {
+	readonly requests: number;
+	readonly reportedTokens: number;
+	readonly unreportedRequests: number;
+}
+/** Shared usage accounting; request limits belong to the host and provider. */
+export class DrafterTaskBudget {
+	private state = this.empty();
+	private finished = false;
+	async run(input: {
+		readonly model: Model<Api>;
+		readonly context: Context;
+		readonly options?: SimpleStreamOptions;
+		readonly complete: (
+			model: Model<Api>,
+			context: Context,
+			options?: SimpleStreamOptions,
+		) => Promise<AssistantMessage>;
+	}): Promise<AssistantMessage> {
+		input.options?.signal?.throwIfAborted();
+		if (this.finished) {
+			this.state = this.empty();
+			this.finished = false;
+		}
+		const state = this.state;
+		state.requests++;
+		state.unreportedRequests++;
+		const message = await input.complete(input.model, input.context, input.options);
+		const tokens = calculateContextTokens(message.usage);
+		if (
+			Number.isFinite(tokens) &&
+			tokens >= 0 &&
+			(tokens > 0 || !["error", "aborted"].includes(message.stopReason))
+		) {
+			state.reportedTokens += tokens;
+			state.unreportedRequests--;
+		}
+		return message;
+	}
+	finishTask(): void {
+		this.finished = true;
+	}
+	snapshot(): DrafterBudgetSnapshot {
+		return { ...this.state };
+	}
+	private empty() {
+		return { requests: 0, reportedTokens: 0, unreportedRequests: 0 };
+	}
+}
+/** Probability calibration follows actual tool context and workflow shape, never argument churn. */
+export function drafterOpportunityKey(
+	model: Model<Api>,
+	context: Context,
+	schemas?: Readonly<Record<string, string>>,
+	hints: readonly {
+		readonly tool: string;
+		readonly horizon?: number;
+	}[] = [],
+	kind = "root",
+): string {
+	const previous = [...context.messages]
+		.reverse()
+		.find(
+			(message) => message.role === "assistant" && message.content.some((part) => part.type === "toolCall"),
+		);
+	const calls =
+		previous?.role === "assistant"
+			? [...new Set(previous.content.flatMap((part) => (part.type === "toolCall" ? [part.name] : [])))].sort()
+			: [];
+	return JSON.stringify([
+		model.provider,
+		model.api,
+		model.baseUrl,
+		model.id,
+		kind,
+		stableValueHash(schemas ?? context.tools ?? []),
+		calls,
+		[...new Set(hints.map((hint) => JSON.stringify([hint.tool, hint.horizon ?? 0])))].sort(),
+	]);
+}
 interface DrafterBatch {
 	readonly model: Model<Api>;
 	readonly context: Context;
@@ -23,95 +114,200 @@ interface DrafterBatch {
 	readonly key: string;
 	readonly budgetPolicy: DrafterRequestSettings;
 }
-
 interface DrafterPlanFeedback extends DrafterBatch {
 	readonly message: AssistantMessage;
 	readonly depth: number;
 	readonly calls: ReadonlyMap<string, DrafterCall>;
-	readonly continuations: readonly { readonly actionIDs: readonly string[]; readonly feedback: DrafterContinuation }[];
+	readonly continuations: readonly {
+		readonly actionIDs: readonly string[];
+		readonly feedback: DrafterContinuation;
+	}[];
 }
 interface DrafterContinuation {
 	readonly forecasts: Map<string, DrafterObservation>;
-	request?: { readonly controller: AbortController; observations?: readonly string[] };
+	request?: {
+		readonly controller: AbortController;
+		observations?: readonly string[];
+	};
 }
-interface DrafterObservation { readonly message: ToolResultMessage; readonly key: string; }
+interface DrafterObservation {
+	readonly message: ToolResultMessage;
+	readonly key: string;
+}
 interface DrafterCall {
 	readonly call: AgentToolCall;
 	action?: ActionKey;
 	result?: DrafterObservation;
 }
-
 export interface DrafterPlanSnapshot {
 	readonly budget: DrafterBudgetSnapshot;
-	readonly observations: { readonly forecasted: number; readonly compared: number; readonly matched: number };
+	readonly observations: {
+		readonly forecasted: number;
+		readonly compared: number;
+		readonly matched: number;
+	};
 }
-
-export function createDrafterPlanSource(input: DrafterModelOptions & {
-	readonly sessionID: string;
-	readonly patternHints?: (input: { readonly sessionID: string; readonly schemaHashes: Readonly<Record<string, string>>; readonly settings: SpeculativeActionSettings })
-		=> Promise<readonly { readonly tool: string; readonly input: Readonly<Record<string, unknown>>; readonly horizon: number }[]>;
-}) {
-	const batches = new Map<string, { lifetime: SharedAbortScope; ready: Promise<DrafterBatch | undefined> }>();
+export function createDrafterPlanSource(
+	input: DrafterModelOptions & {
+		readonly sessionID: string;
+		readonly patternHints?: (input: {
+			readonly sessionID: string;
+			readonly schemaHashes: Readonly<Record<string, string>>;
+			readonly settings: SpeculativeActionSettings;
+		}) => Promise<
+			readonly {
+				readonly tool: string;
+				readonly input: Readonly<Record<string, unknown>>;
+				readonly horizon: number;
+			}[]
+		>;
+	},
+) {
+	const batches = new Map<
+		string,
+		{
+			lifetime: SharedAbortScope;
+			ready: Promise<DrafterBatch | undefined>;
+		}
+	>();
 	const budget = input.drafterBudget ?? new DrafterTaskBudget();
 	const observations = { forecasted: 0, compared: 0, matched: 0 };
 	const feedbacks = new WeakMap<object, DrafterPlanFeedback>();
 	// Separate Beta(1, 1) estimates over the latest 32 eligible outcomes per model and tool contract.
-	const calibration = new BoundedRecencyMap<string, { matches: number[]; adoptions: number[] }>(128);
+	const calibration = new BoundedRecencyMap<
+		string,
+		{
+			matches: number[];
+			adoptions: number[];
+		}
+	>(speculativeConfig().prediction.calibrationBuckets);
 	const calibrationKey = (batch: DrafterBatch, tool: string) => JSON.stringify([batch.key, tool]);
-	const probability = (samples: readonly number[] = []) => (samples.reduce((sum, value) => sum + value, 0) + 1) / (samples.length + 2);
-	const observe = (samples: number[], outcome: boolean) => { samples.push(Number(outcome)); if (samples.length > 32) samples.shift(); };
+	const probability = (samples: readonly number[] = []) =>
+		(samples.reduce((sum, value) => sum + value, 0) +
+			speculativeConfig().prediction.calibrationSuccessPrior) /
+		(samples.length +
+			speculativeConfig().prediction.calibrationSuccessPrior +
+			speculativeConfig().prediction.calibrationFailurePrior);
+	const observe = (samples: number[], outcome: boolean) => {
+		samples.push(Number(outcome));
+		if (samples.length > speculativeConfig().prediction.calibrationWindow) samples.shift();
+	};
 	const finishBatch = (key: string) => {
 		const batch = batches.get(key);
 		batches.delete(key);
 		batch?.lifetime.abort();
 	};
-	const completeRequest = async (batch: DrafterBatch, context: Context, signal: AbortSignal,
-		report: ((tokens: number) => void) | undefined, force?: true | string) => {
+	const completeRequest = async (
+		batch: DrafterBatch,
+		context: Context,
+		signal: AbortSignal,
+		report: ((tokens: number) => void) | undefined,
+		force?: true | string,
+	) => {
 		signal.throwIfAborted();
-		const options = { ...batch.options, deferred: false,
-			sessionId: batch.options.sessionId ?? input.sessionID, cacheRetention: batch.options.cacheRetention ?? "short" as const };
-		const forced = !options.reasoning && force ? { onPayload: forceToolChoice(options.onPayload, force === true ? undefined : force) } : {};
-		const response = await waitForCompletion(budget.run({ model: batch.model, context, options: { ...options, ...forced, signal },
-			complete: input.complete }).then(message => {
-			if (!message) return undefined;
-			report?.(calculateContextTokens(message.usage));
-			if (message.stopReason === "error" || message.stopReason === "aborted")
-				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
-			return message;
-		}), signal);
+		const options = {
+			...batch.options,
+			deferred: false,
+			sessionId: batch.options.sessionId ?? input.sessionID,
+			cacheRetention: batch.options.cacheRetention ?? ("short" as const),
+		};
+		const forced =
+			!options.reasoning && force
+				? {
+						onPayload: forceToolChoice(options.onPayload, force === true ? undefined : force),
+					}
+				: {};
+		const response = await waitForCompletion(
+			budget
+				.run({
+					model: batch.model,
+					context,
+					options: { ...options, ...forced, signal },
+					complete: input.complete,
+				})
+				.then((message) => {
+					if (!message) return undefined;
+					report?.(calculateContextTokens(message.usage));
+					if (message.stopReason === "error" || message.stopReason === "aborted")
+						throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
+					return message;
+				}),
+			signal,
+		);
 		return response.status === "completed" ? response.value : undefined;
 	};
-	const completeDraft = async (batch: DrafterBatch, signal: AbortSignal, report: ((tokens: number) => void) | undefined,
-		prefix: string, depth = 0, dependsOn?: PlanAction["dependsOn"]) => {
-		const message = await completeRequest(batch, batch.context, signal, report, depth === 0 ? true : undefined);
+	const completeDraft = async (
+		batch: DrafterBatch,
+		signal: AbortSignal,
+		report: ((tokens: number) => void) | undefined,
+		prefix: string,
+		depth = 0,
+		dependsOn?: PlanAction["dependsOn"],
+	) => {
+		const message = await completeRequest(
+			batch,
+			batch.context,
+			signal,
+			report,
+			depth === 0 ? true : undefined,
+		);
 		if (!message) return undefined;
 		const calls = message.content.filter((item): item is AgentToolCall => item.type === "toolCall");
-		if (!calls.length || new Set(calls.map(call => call.id)).size !== calls.length) return undefined;
-		let scopes = [calls.map(call => call.id)];
+		if (!calls.length || new Set(calls.map((call) => call.id)).size !== calls.length) return undefined;
+		let scopes = [calls.map((call) => call.id)];
 		if (calls.length > 1 && depth < batch.budgetPolicy.drafterMaxDepth) {
 			// Decide visibility before any observations exist; post-hoc dependency labels could hide inputs already read.
 			const context = scopeContext(batch, message, calls);
 			try {
-				const args = privateToolArguments(await completeRequest(batch, context, signal, report, CONTINUATION_TOOL), context);
+				const args = privateToolArguments(
+					await completeRequest(batch, context, signal, report, CONTINUATION_TOOL),
+					context,
+				);
 				if (args) scopes = args.scopes as string[][];
-			} catch { /* An unavailable or invalid scope selection conservatively reads the full batch. */ }
+			} catch {
+				/* An unavailable or invalid scope selection conservatively reads the full batch. */
+			}
 		}
 		if (signal.aborted) return undefined;
-		const unique = new Map(scopes.map(scope => { const ids = calls.flatMap((call, index) => scope.includes(call.id) ? [`${prefix}:${index}`] : []); return [JSON.stringify(ids), ids]; }));
-		const feedback: DrafterPlanFeedback = { ...batch, depth, message,
+		const unique = new Map(
+			scopes.map((scope) => {
+				const ids = calls.flatMap((call, index) => (scope.includes(call.id) ? [`${prefix}:${index}`] : []));
+				return [JSON.stringify(ids), ids];
+			}),
+		);
+		const feedback: DrafterPlanFeedback = {
+			...batch,
+			depth,
+			message,
 			calls: new Map(calls.map((call, member) => [`${prefix}:${member}`, { call }])),
-			continuations: [...unique.values()].map(actionIDs => ({ actionIDs, feedback: { forecasts: new Map() } })) };
+			continuations: [...unique.values()].map((actionIDs) => ({
+				actionIDs,
+				feedback: { forecasts: new Map() },
+			})),
+		};
 		feedbacks.set(feedback, feedback);
 		for (const continuation of feedback.continuations) feedbacks.set(continuation.feedback, feedback);
-		return { actions: [...feedback.calls].map(([id, { call }]): PlanAction => {
-			const samples = calibration.get(calibrationKey(batch, call.name));
-			return { id, type: "tool_call", tool: call.name, input: call.arguments, depth, feedback, dependsOn,
-				empiricalProbability: probability(samples?.matches), adoptionProbability: probability(samples?.adoptions) };
-		}) };
+		return {
+			actions: [...feedback.calls].map(([id, { call }]): PlanAction => {
+				const samples = calibration.get(calibrationKey(batch, call.name));
+				return {
+					id,
+					type: "tool_call",
+					tool: call.name,
+					input: call.arguments,
+					depth,
+					feedback,
+					dependsOn,
+					empiricalProbability: probability(samples?.matches),
+					adoptionProbability: probability(samples?.adoptions),
+				};
+			}),
+		};
 	};
 	const source: AgentPlanSource = {
 		id: "drafter",
-		enabled: (settings) => (settings.drafterEnabled ?? DEFAULTS.drafterEnabled) && settings.tools?.length !== 0,
+		enabled: (settings) =>
+			(settings.drafterEnabled ?? DEFAULTS.drafterEnabled) && settings.tools?.length !== 0,
 		timeoutMs: (settings) => settings.predictionTimeoutMs,
 		requestLifetime: "turn",
 		continuationBatch: ({ feedback }) => {
@@ -126,7 +322,8 @@ export function createDrafterPlanSource(input: DrafterModelOptions & {
 			return previous !== undefined && previous.depth < maxDepth;
 		},
 		continueOn: ({ actionID, action, feedback, output }) => {
-			const previous = feedbacks.get(feedback as object), member = previous?.calls.get(actionID);
+			const previous = feedbacks.get(feedback as object);
+			const member = previous?.calls.get(actionID);
 			if (!previous || !member) return false;
 			const result = output && privateObservation(member.call, output, action);
 			if (result) member.result = result;
@@ -135,10 +332,11 @@ export function createDrafterPlanSource(input: DrafterModelOptions & {
 				if (!actionIDs.includes(actionID)) return false;
 				const forecast = continuation.forecasts.get(actionID);
 				if (result && forecast) {
-					observations.compared++; observations.matched += Number(forecast.key === result.key);
+					observations.compared++;
+					observations.matched += Number(forecast.key === result.key);
 					continuation.forecasts.delete(actionID);
 				}
-				if (!actionIDs.every(id => previous.calls.get(id)!.action)) return false;
+				if (!actionIDs.every((id) => previous.calls.get(id)!.action)) return false;
 				const request = continuation.request;
 				if (!request) return true;
 				if (!result || result.key === request.observations?.[actionIDs.indexOf(actionID)]) return false;
@@ -147,33 +345,85 @@ export function createDrafterPlanSource(input: DrafterModelOptions & {
 			});
 		},
 		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
-		concurrentProposalPolicy: (settings) =>
-			clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit) === 2 ? "first_produced" : "all",
-		propose: async ({ startInput, data, proposalIndex, proposalCount, signal, settings, reportDraftTokens }): Promise<PlanProposal | undefined> => {
+		concurrentProposalPolicy: () => speculativeConfig().prediction.concurrentProposalPolicy,
+		propose: async ({
+			startInput,
+			data,
+			proposalIndex,
+			proposalCount,
+			signal,
+			settings,
+			reportDraftTokens,
+		}): Promise<PlanProposal | undefined> => {
 			if (signal.aborted) return undefined;
 			const drafter = normalizeDrafterRequestSettings(settings.sourceConfig);
 			const batchKey = agentBatchKey(startInput.sessionID, startInput.turnID);
 			let batch = batches.get(batchKey);
 			if (!batch) {
-				const lifetime = new SharedAbortScope(), signal = lifetime.signal;
-				batch = { lifetime, ready: Promise.resolve().then(async () => {
-					if (signal.aborted) return undefined;
-					const { draftModel, getDraftOptions } = input, { actorModel, actorOptions } = startInput;
-					// Optional pattern hints follow the Actor history to preserve its prefix.
-					const hints = await input.patternHints?.({ sessionID: startInput.sessionID, schemaHashes: data.schemaHashes, settings });
-					const selected: Context = settings.tools ? { ...startInput.context, tools: startInput.context.tools?.filter(tool => settings.tools!.includes(tool.name)) } : startInput.context;
-					const context: Context = drafter.drafterPatternHints && hints?.length ? { ...selected, messages: [...selected.messages, { role: "user", timestamp: Date.now(),
-						content: `(Speculation hint, not from the user.) Calls that followed similar steps in this workspace:\n${hints.map((hint) => `- ${hint.tool} ${JSON.stringify(hint.input)}${hint.horizon === undefined ? "" : `; expected after ${hint.horizon} batches`}`).join("\n")}` }] }
-						: selected;
-					const model = (typeof draftModel === "function" ? await draftModel(actorModel) : draftModel) ?? actorModel;
-					if (signal.aborted) return undefined;
-					const key = drafterOpportunityKey(model, startInput.context, data.schemaHashes, hints);
-					const configuredDraftOptions = getDraftOptions ? await getDraftOptions({ actorModel, draftModel: model, actorOptions, signal }) : actorOptions;
-					if (signal.aborted) return undefined;
-					const { reasoning: requestedReasoning, ...requestOptions } = configuredDraftOptions ?? {};
-					const reasoning = clampThinkingLevel(model, getDraftOptions ? requestedReasoning ?? "off" : "off");
-					return { model, context, options: { ...requestOptions, reasoning: reasoning === "off" ? undefined : reasoning }, key, budgetPolicy: drafter };
-				}) };
+				const lifetime = new SharedAbortScope();
+				const signal = lifetime.signal;
+				batch = {
+					lifetime,
+					ready: Promise.resolve().then(async () => {
+						if (signal.aborted) return undefined;
+						const { draftModel, getDraftOptions } = input;
+						const { actorModel, actorOptions } = startInput;
+						// Optional pattern hints follow the Actor history to preserve its prefix.
+						const hints = await input.patternHints?.({
+							sessionID: startInput.sessionID,
+							schemaHashes: data.schemaHashes,
+							settings,
+						});
+						const selected: Context = settings.tools
+							? {
+									...startInput.context,
+									tools: startInput.context.tools?.filter((tool) => settings.tools!.includes(tool.name)),
+								}
+							: startInput.context;
+						const context: Context =
+							drafter.drafterPatternHints && hints?.length
+								? {
+										...selected,
+										messages: [
+											...selected.messages,
+											{
+												role: "user",
+												timestamp: Date.now(),
+												content: `(Speculation hint, not from the user.) Calls that followed similar steps in this workspace:\n${hints.map((hint) => `- ${hint.tool} ${JSON.stringify(hint.input)}${hint.horizon === undefined ? "" : `; expected after ${hint.horizon} batches`}`).join("\n")}`,
+											},
+										],
+									}
+								: selected;
+						const model =
+							(typeof draftModel === "function" ? await draftModel(actorModel) : draftModel) ?? actorModel;
+						if (signal.aborted) return undefined;
+						const key = drafterOpportunityKey(model, startInput.context, data.schemaHashes, hints);
+						const configuredDraftOptions = getDraftOptions
+							? await getDraftOptions({
+									actorModel,
+									draftModel: model,
+									actorOptions,
+									signal,
+								})
+							: actorOptions;
+						if (signal.aborted) return undefined;
+						const { reasoning: requestedReasoning, ...requestOptions } = configuredDraftOptions ?? {};
+						const reasoning = clampThinkingLevel(
+							model,
+							getDraftOptions ? (requestedReasoning ?? "off") : "off",
+						);
+						return {
+							model,
+							context,
+							options: {
+								...requestOptions,
+								reasoning: reasoning === "off" ? undefined : reasoning,
+							},
+							key,
+							budgetPolicy: drafter,
+						};
+					}),
+				};
 				batches.set(batchKey, batch);
 			}
 			const release = batch.lifetime.acquire(signal);
@@ -182,136 +432,391 @@ export function createDrafterPlanSource(input: DrafterModelOptions & {
 			try {
 				const prepared = await batch.ready;
 				if (!prepared || signal.aborted) return undefined;
-				draft = await completeDraft({ ...prepared, options: { ...prepared.options, temperature: drafterRequestTemperature(proposalIndex, proposalCount, drafter) } },
-					signal, reportDraftTokens, String(proposalIndex));
-				return draft && { id: `drafter:${startInput.turnID}:${proposalIndex}`, source: "drafter", revision: 0, ...draft };
-			} finally { if (!draft) release(); }
+				draft = await completeDraft(
+					{
+						...prepared,
+						options: {
+							...prepared.options,
+							temperature: drafterRequestTemperature(proposalIndex, proposalCount, drafter),
+						},
+					},
+					signal,
+					reportDraftTokens,
+					String(proposalIndex),
+				);
+				return (
+					draft && {
+						id: `drafter:${startInput.turnID}:${proposalIndex}`,
+						source: "drafter",
+						revision: 0,
+						...draft,
+					}
+				);
+			} finally {
+				if (!draft) release();
+			}
 		},
-		continue: async ({ proposalID, revision, reserveRevision, feedback, signal, reportDraftTokens, settings }) => {
+		continue: async ({
+			proposalID,
+			revision,
+			reserveRevision,
+			feedback,
+			signal,
+			reportDraftTokens,
+			settings,
+		}) => {
 			const previous = feedbacks.get(feedback as object);
-			const branch = previous?.continuations.find(branch => branch.feedback === feedback);
+			const branch = previous?.continuations.find((branch) => branch.feedback === feedback);
 			if (!previous || !branch || signal.aborted) return undefined;
 			const continuation = branch.feedback;
 			if (continuation.request && !continuation.request.controller.signal.aborted) return undefined;
-			const request: NonNullable<DrafterContinuation["request"]> = { controller: new AbortController() };
+			const request: NonNullable<DrafterContinuation["request"]> = {
+				controller: new AbortController(),
+			};
 			continuation.request = request;
 			signal = AbortSignal.any([signal, request.controller.signal]);
 			const policy = normalizeDrafterRequestSettings(settings.sourceConfig);
 			if (previous.depth >= policy.drafterMaxDepth) return undefined;
 			const current = (id: string) => previous.calls.get(id)!.result ?? continuation.forecasts.get(id);
-			const missing = branch.actionIDs.filter(id => !current(id)).map(id => [id, previous.calls.get(id)!] as const);
+			const missing = branch.actionIDs
+				.filter((id) => !current(id))
+				.map((id) => [id, previous.calls.get(id)!] as const);
 			if (missing.length) {
-				const context = observationContext(previous, missing.map(([, member]) => member), branch.actionIDs.flatMap(id => current(id) ? [current(id)!.message] : []));
-				const message = await completeRequest({ ...previous, budgetPolicy: policy }, context, signal, reportDraftTokens, OBSERVATION_TOOL);
+				const context = observationContext(
+					previous,
+					missing.map(([, member]) => member),
+					branch.actionIDs.flatMap((id) => (current(id) ? [current(id)!.message] : [])),
+				);
+				const message = await completeRequest(
+					{ ...previous, budgetPolicy: policy },
+					context,
+					signal,
+					reportDraftTokens,
+					OBSERVATION_TOOL,
+				);
 				if (signal.aborted) return undefined;
-				const values = privateToolArguments(message, context)?.results as (Pick<ToolResultMessage, "content" | "isError"> & { callID: string; exitCode?: number })[] | undefined;
-				if (!values || new Set(values.map(value => value.callID)).size !== missing.length) return undefined;
+				const values = privateToolArguments(message, context)?.results as
+					| (Pick<ToolResultMessage, "content" | "isError"> & {
+							callID: string;
+							exitCode?: number;
+					  })[]
+					| undefined;
+				if (!values || new Set(values.map((value) => value.callID)).size !== missing.length) return undefined;
 				for (const [id, member] of missing) {
-					const { content, isError, exitCode } = values.find(value => value.callID === member.call.id)!;
-					continuation.forecasts.set(id, privateObservation(member.call, { result: { content, details: {} }, isError, exitCode }, member.action));
+					const { content, isError, exitCode } = values.find((value) => value.callID === member.call.id)!;
+					continuation.forecasts.set(
+						id,
+						privateObservation(
+							member.call,
+							{ result: { content, details: {} }, isError, exitCode },
+							member.action,
+						),
+					);
 					observations.forecasted++;
 				}
 			}
 			if (signal.aborted) return undefined;
 			// Freeze the exact private observations used for this prediction, even if real results arrive during inference.
-			const context = continuationContext(previous.context, previous.message, [...previous.calls].map(([id, { call }]) =>
-				branch.actionIDs.includes(id) ? current(id)!.message : privateObservation(call, { result: { content: [{ type: "text",
-					text: "Observation withheld from this continuation branch." }], details: {} }, isError: false }).message));
-			request.observations = branch.actionIDs.map(id => current(id)!.key);
-			const draft = await completeDraft({ ...previous, context, budgetPolicy: policy }, signal, reportDraftTokens, `rollout:${revision}`, previous.depth + 1,
-				[...previous.calls.keys()].map(actionID => { const index = branch.actionIDs.indexOf(actionID); return { actionID,
-					...index < 0 ? { condition: "resource" as const } : { condition: "prediction" as const, observation: request.observations![index]! } }; }));
-			return draft && { proposalID, source: "drafter", revision: reserveRevision?.() ?? revision, upsert: draft.actions };
+			const context = continuationContext(
+				previous.context,
+				previous.message,
+				[...previous.calls].map(([id, { call }]) =>
+					branch.actionIDs.includes(id)
+						? current(id)!.message
+						: privateObservation(call, {
+								result: {
+									content: [
+										{
+											type: "text",
+											text: "Observation withheld from this continuation branch.",
+										},
+									],
+									details: {},
+								},
+								isError: false,
+							}).message,
+				),
+			);
+			request.observations = branch.actionIDs.map((id) => current(id)!.key);
+			const draft = await completeDraft(
+				{ ...previous, context, budgetPolicy: policy },
+				signal,
+				reportDraftTokens,
+				`rollout:${revision}`,
+				previous.depth + 1,
+				[...previous.calls.keys()].map((actionID) => {
+					const index = branch.actionIDs.indexOf(actionID);
+					return {
+						actionID,
+						...(index < 0
+							? { condition: "resource" as const }
+							: {
+									condition: "prediction" as const,
+									observation: request.observations![index]!,
+								}),
+					};
+				}),
+			);
+			return (
+				draft && {
+					proposalID,
+					source: "drafter",
+					revision: reserveRevision?.() ?? revision,
+					upsert: draft.actions,
+				}
+			);
 		},
 		// A peer's executed batch, such as a fork's early calls, rolls out as the Drafter's own does: its calls and results extend the Actor context.
 		continueFrom: async ({ startInput, settings, batch: peers, signal, reportDraftTokens }) => {
-			const prepared = await batches.get(agentBatchKey(startInput.sessionID, startInput.turnID))?.ready.catch(() => undefined);
-			const drafter = normalizeDrafterRequestSettings(settings.sourceConfig), ids = peers.map((_, index) => `peer:${index}`);
+			const prepared = await batches
+				.get(agentBatchKey(startInput.sessionID, startInput.turnID))
+				?.ready.catch(() => undefined);
+			const drafter = normalizeDrafterRequestSettings(settings.sourceConfig);
+			const ids = peers.map((_, index) => `peer:${index}`);
 			if (!prepared || signal.aborted) return undefined;
-			const calls = peers.map(({ candidate }, index) => ({ type: "toolCall" as const, id: ids[index]!, name: candidate.tool, arguments: { ...candidate.input } }));
-			const context = continuationContext(prepared.context, { ...fauxAssistantMessage(calls, { stopReason: "toolUse" }),
-				api: prepared.model.api, provider: prepared.model.provider, model: prepared.model.id },
-				peers.map(({ candidate, output }, index) => privateObservation(calls[index]!, output, candidate.key).message));
-			const options = { ...prepared.options, temperature: drafterRequestTemperature(0, 1, drafter) };
+			const calls = peers.map(({ candidate }, index) => ({
+				type: "toolCall" as const,
+				id: ids[index]!,
+				name: candidate.tool,
+				arguments: { ...candidate.input },
+			}));
+			const context = continuationContext(
+				prepared.context,
+				{
+					...fauxAssistantMessage(calls, { stopReason: "toolUse" }),
+					api: prepared.model.api,
+					provider: prepared.model.provider,
+					model: prepared.model.id,
+				},
+				peers.map(
+					({ candidate, output }, index) => privateObservation(calls[index]!, output, candidate.key).message,
+				),
+			);
+			const options = {
+				...prepared.options,
+				temperature: drafterRequestTemperature(0, 1, drafter),
+			};
 			const id = `drafter:peer:${stableValueHash(peers.map(({ identity }) => identity.id))}`;
-			const draft = await completeDraft({ ...prepared, context, options, budgetPolicy: drafter }, signal, reportDraftTokens, id, 1, peers.map(({ identity, candidate, output }) =>
-				({ proposalID: identity.proposalID, actionID: identity.actionID, identity: identity.id, condition: "prediction" as const, observation: toolObservationKey(output, candidate.key) ?? "" })));
+			const draft = await completeDraft(
+				{ ...prepared, context, options, budgetPolicy: drafter },
+				signal,
+				reportDraftTokens,
+				id,
+				1,
+				peers.map(({ identity, candidate, output }) => ({
+					proposalID: identity.proposalID,
+					actionID: identity.actionID,
+					identity: identity.id,
+					condition: "prediction" as const,
+					observation: toolObservationKey(output, candidate.key) ?? "",
+				})),
+			);
 			return draft && { id, source: "drafter", revision: 0, actions: draft.actions };
 		},
 	};
-
 	return {
 		source,
-		connect: (runtime: AgentRuntime) => runtime.subscribe({
-			prediction_feedback: ({ actionID, feedback, settlement, served }) => {
-				const batch = feedbacks.get(feedback as object), tool = batch?.calls.get(actionID)?.call.name;
-				const { matched, adopted } = predictionLearning(settlement, served);
-				if (!batch || !tool || matched === undefined && adopted === undefined) return;
-				const key = calibrationKey(batch, tool), samples = calibration.getOrCreate(key, () => ({ matches: [], adoptions: [] }));
-				if (matched !== undefined) observe(samples.matches, matched);
-				if (adopted !== undefined) observe(samples.adoptions, adopted);
-			},
-			turn_finished: ({ startInput }) => { finishBatch(agentBatchKey(startInput.sessionID, startInput.turnID)); },
-			session_closed: () => { for (const key of batches.keys()) finishBatch(key); budget.finishTask(); },
+		connect: (runtime: AgentRuntime) =>
+			runtime.subscribe({
+				prediction_feedback: ({ actionID, feedback, settlement, served }) => {
+					const batch = feedbacks.get(feedback as object);
+					const tool = batch?.calls.get(actionID)?.call.name;
+					const { matched, adopted } = predictionLearning(settlement, served);
+					if (!batch || !tool || (matched === undefined && adopted === undefined)) return;
+					const key = calibrationKey(batch, tool);
+					const samples = calibration.getOrCreate(key, () => ({
+						matches: [],
+						adoptions: [],
+					}));
+					if (matched !== undefined) observe(samples.matches, matched);
+					if (adopted !== undefined) observe(samples.adoptions, adopted);
+				},
+				turn_finished: ({ startInput }) => {
+					finishBatch(agentBatchKey(startInput.sessionID, startInput.turnID));
+				},
+				session_closed: () => {
+					for (const key of batches.keys()) finishBatch(key);
+					budget.finishTask();
+				},
+			}),
+		snapshot: (): DrafterPlanSnapshot => ({
+			budget: budget.snapshot(),
+			observations: { ...observations },
 		}),
-		snapshot: (): DrafterPlanSnapshot => ({ budget: budget.snapshot(), observations: { ...observations } }),
 	};
 }
-
 /** Simple streams drop toolChoice for most APIs; spell a forced call on the final payload where the API has one. */
-export function forceToolChoice(inherited: SimpleStreamOptions["onPayload"], tool?: string): SimpleStreamOptions["onPayload"] {
+export function forceToolChoice(
+	inherited: SimpleStreamOptions["onPayload"],
+	tool?: string,
+): SimpleStreamOptions["onPayload"] {
 	return async (payload, model) => {
 		const next = (await inherited?.(payload, model)) ?? payload;
-		const forced = !tool ? FORCED_TOOL_CHOICE[model.api] : model.api === "anthropic-messages" ? { type: "tool", name: tool }
-			: model.api === "openai-completions" ? { type: "function", function: { name: tool } }
-			: FORCED_TOOL_CHOICE[model.api] ? { type: "function", name: tool } : undefined;
-		return forced && next && typeof next === "object" && "tools" in next ? { ...next, tool_choice: forced } : next;
+		let forced;
+		if (!tool) {
+			forced = FORCED_TOOL_CHOICE[model.api];
+		} else {
+			if (model.api === "anthropic-messages") {
+				forced = { type: "tool", name: tool };
+			} else {
+				if (model.api === "openai-completions") {
+					forced = { type: "function", function: { name: tool } };
+				} else {
+					if (FORCED_TOOL_CHOICE[model.api]) {
+						forced = { type: "function", name: tool };
+					} else {
+						forced = undefined;
+					}
+				}
+			}
+		}
+		return forced && next && typeof next === "object" && "tools" in next
+			? { ...next, tool_choice: forced }
+			: next;
 	};
 }
-const FORCED_TOOL_CHOICE: Readonly<Record<string, unknown>> = { "anthropic-messages": { type: "any" }, "openai-completions": "required",
-	"openai-responses": "required", "azure-openai-responses": "required", "openai-codex-responses": "required" };
-
+const FORCED_TOOL_CHOICE: Readonly<Record<string, unknown>> = {
+	"anthropic-messages": { type: "any" },
+	"openai-completions": "required",
+	"openai-responses": "required",
+	"azure-openai-responses": "required",
+	"openai-codex-responses": "required",
+};
 const OBSERVATION_TOOL = "speculative_observations";
 const CONTINUATION_TOOL = "speculative_continuations";
-function scopeContext(batch: DrafterBatch, message: AssistantMessage, calls: readonly AgentToolCall[]): Context {
-	return { ...batch.context, messages: [...batch.context.messages, { role: "user", timestamp: Date.now(),
-		content: `Before seeing this batch's results, choose the observation scopes needed to predict subsequent tool calls. Each scope starts an independent continuation that can read only those call results. Use separate scopes for independent work and a joint scope when results must be combined. Do not duplicate work across scopes.\n${JSON.stringify({ draft: message.content })}` }],
-		tools: [{ name: CONTINUATION_TOOL, description: "Select the minimal sets of tool observations needed by subsequent branches.", parameters: Type.Object({
-			scopes: Type.Array(Type.Array(Type.Union(calls.map(call => Type.Literal(call.id))), { minItems: 1, uniqueItems: true }), { minItems: 1, uniqueItems: true }),
-		}, { additionalProperties: false }) }] };
+function scopeContext(
+	batch: DrafterBatch,
+	message: AssistantMessage,
+	calls: readonly AgentToolCall[],
+): Context {
+	return {
+		...batch.context,
+		messages: [
+			...batch.context.messages,
+			{
+				role: "user",
+				timestamp: Date.now(),
+				content: `Before seeing this batch's results, choose the observation scopes needed to predict subsequent tool calls. Each scope starts an independent continuation that can read only those call results. Use separate scopes for independent work and a joint scope when results must be combined. Do not duplicate work across scopes.\n${JSON.stringify({ draft: message.content })}`,
+			},
+		],
+		tools: [
+			{
+				name: CONTINUATION_TOOL,
+				description: "Select the minimal sets of tool observations needed by subsequent branches.",
+				parameters: Type.Object(
+					{
+						scopes: Type.Array(
+							Type.Array(Type.Union(calls.map((call) => Type.Literal(call.id))), {
+								minItems: 1,
+								uniqueItems: true,
+							}),
+							{ minItems: 1, uniqueItems: true },
+						),
+					},
+					{ additionalProperties: false },
+				),
+			},
+		],
+	};
 }
-const OBSERVATION_CONTENT = Type.Array(Type.Union([
-	Type.Object({ type: Type.Literal("text"), text: Type.String() }),
-	Type.Object({ type: Type.Literal("image"), data: Type.String(), mimeType: Type.String() }),
-]));
-function observationContext(batch: DrafterPlanFeedback, missing: readonly DrafterCall[], observations: readonly ToolResultMessage[]): Context {
+const OBSERVATION_CONTENT = Type.Array(
+	Type.Union([
+		Type.Object({ type: Type.Literal("text"), text: Type.String() }),
+		Type.Object({
+			type: Type.Literal("image"),
+			data: Type.String(),
+			mimeType: Type.String(),
+		}),
+	]),
+);
+function observationContext(
+	batch: DrafterPlanFeedback,
+	missing: readonly DrafterCall[],
+	observations: readonly ToolResultMessage[],
+): Context {
 	const candidates = missing.map(({ call, action }) => {
 		const { version, content = OBSERVATION_CONTENT } = toolObservationContract(action);
-		return { call, tool: batch.context.tools?.find(tool => tool.name === call.name), observation: { version, content } };
+		return {
+			call,
+			tool: batch.context.tools?.find((tool) => tool.name === call.name),
+			observation: { version, content },
+		};
 	});
-	return { ...batch.context, messages: [...batch.context.messages, { role: "user", timestamp: Date.now(),
-		content: `Predict the pending observations under their bound schemas.\n${JSON.stringify({ draft: batch.message.content,
-			observations, candidates })}` }],
-		tools: [{ name: OBSERVATION_TOOL, description: "Private predicted tool observations; never executable results.", parameters: Type.Object({
-			results: Type.Array(Type.Union(candidates.map(({ call, observation }) => Type.Object({ callID: Type.Literal(call.id),
-				isError: Type.Boolean(), exitCode: Type.Optional(Type.Integer()), content: observation.content,
-			}, { additionalProperties: false }))), { minItems: missing.length, maxItems: missing.length }),
-		}, { additionalProperties: false }) }] };
+	return {
+		...batch.context,
+		messages: [
+			...batch.context.messages,
+			{
+				role: "user",
+				timestamp: Date.now(),
+				content: `Predict the pending observations under their bound schemas.\n${JSON.stringify({
+					draft: batch.message.content,
+					observations,
+					candidates,
+				})}`,
+			},
+		],
+		tools: [
+			{
+				name: OBSERVATION_TOOL,
+				description: "Private predicted tool observations; never executable results.",
+				parameters: Type.Object(
+					{
+						results: Type.Array(
+							Type.Union(
+								candidates.map(({ call, observation }) =>
+									Type.Object(
+										{
+											callID: Type.Literal(call.id),
+											isError: Type.Boolean(),
+											exitCode: Type.Optional(Type.Integer()),
+											content: observation.content,
+										},
+										{ additionalProperties: false },
+									),
+								),
+							),
+							{ minItems: missing.length, maxItems: missing.length },
+						),
+					},
+					{ additionalProperties: false },
+				),
+			},
+		],
+	};
 }
-
-function privateObservation(call: AgentToolCall, output: ToolSettlement, action?: ActionKey): DrafterObservation {
+function privateObservation(
+	call: AgentToolCall,
+	output: ToolSettlement,
+	action?: ActionKey,
+): DrafterObservation {
 	const { key, content } = canonicalToolObservation(output, action);
-	return { key, message: { role: "toolResult", toolCallId: call.id, toolName: call.name, content: immutableSnapshot(content), isError: output.isError, timestamp: Date.now() } };
+	return {
+		key,
+		message: {
+			role: "toolResult",
+			toolCallId: call.id,
+			toolName: call.name,
+			content: immutableSnapshot(content),
+			isError: output.isError,
+			timestamp: Date.now(),
+		},
+	};
 }
-
-function privateToolArguments(message: AssistantMessage | undefined, context: Context): Record<string, unknown> | undefined {
-	const calls = message?.content.filter((item): item is AgentToolCall => item.type === "toolCall"), tool = context.tools![0]!;
+function privateToolArguments(
+	message: AssistantMessage | undefined,
+	context: Context,
+): Record<string, unknown> | undefined {
+	const calls = message?.content.filter((item): item is AgentToolCall => item.type === "toolCall");
+	const tool = context.tools![0]!;
 	if (calls?.length !== 1 || calls[0]!.name !== tool.name) return undefined;
 	const args = validateToolArguments(tool, calls[0]!);
 	return stableValueHash(args) === stableValueHash(calls[0]!.arguments) ? args : undefined;
 }
-
-
-function continuationContext(context: Context, message: AssistantMessage, results: ToolResultMessage[]): Context {
+function continuationContext(
+	context: Context,
+	message: AssistantMessage,
+	results: ToolResultMessage[],
+): Context {
 	return { ...context, messages: [...context.messages, message, ...results] };
 }

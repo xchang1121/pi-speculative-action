@@ -1,83 +1,402 @@
-import { hash, randomUUID } from "node:crypto";
-import { errorMessage } from "./error-utils.ts";
 import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
-import { ACTOR_PROBE_SCHEDULE, createActorForkPlanSource, type ActorProbeSchedule, type ActorProbeSnapshot, type ActorForkActionBatch, type ActorForkActionCall, type ActorForkPlanSource } from "./actor-fork-plan-source.ts";
-import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "./runtime.ts";
+import { hash, randomUUID } from "node:crypto";
 import type { ActionKey } from "./action-semantics.ts";
-import type { ActorActionSettlement } from "./settlement.ts";
-import { EvidenceLedger } from "./self-speculation-evidence.ts";
-import { asRecord as record, isRecord, stableStringify } from "./stable-json.ts";
-import { isFiniteNumber, isSafeCount, finiteNumber, nonNegativeFinite, nonNegativeCount } from "./number-utils.ts";
-import { booleanOr, nonNegativeNumber, positiveInteger, positiveMilliseconds, probability, settingsParser } from "./setting-input.ts";
+import type { AgentPlanSource } from "./agent-integration.ts";
+import {
+	DEFAULT_SPECULATIVE_CONFIG,
+	speculativeConfig,
+	booleanOr,
+	nonNegativeNumber,
+	positiveInteger,
+	positiveMilliseconds,
+	probability,
+	settingsParser,
+} from "./config-schema.ts";
+import {
+	BoundedRecencyMap,
+	errorMessage,
+	finiteNumber,
+	isFiniteNumber,
+	isRecord,
+	isSafeCount,
+	nonNegativeCount,
+	nonNegativeFinite,
+	asRecord as record,
+	stableStringify,
+} from "./primitives.ts";
+import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "./runtime-engine.ts";
 import { PendingTasks } from "./runtime-lifecycle.ts";
-import { BoundedRecencyMap } from "./bounded-recency-map.ts";
-
-/** A hosted API cannot fork the Actor's decode: `drafter` has the Drafter read the Actor's reasoning so far instead. */
-export type SelfSpeculationForkTransport = "provider" | "sidecar" | "drafter";
-
+import type { ActorActionSettlement } from "./settlement.ts";
+interface EvidenceState {
+	observations: number;
+	trials: number;
+	successes: number;
+}
+/** Beta-prior evidence over opaque structural contexts. */
+export class EvidenceLedger {
+	private readonly states = new Map<string, EvidenceState>();
+	private readonly priorTrials: number;
+	private readonly priorSuccesses: number;
+	constructor(priorTrials: number, priorSuccesses: number) {
+		this.priorTrials = priorTrials;
+		this.priorSuccesses = priorSuccesses;
+	}
+	observe(context: object, trials: number, successes: number): void {
+		if (!isSafeCount(trials, 1)) return;
+		if (!isSafeCount(successes, 0, trials)) return;
+		const key = stableStringify(context);
+		const state = this.states.get(key) ?? {
+			observations: 0,
+			trials: 0,
+			successes: 0,
+		};
+		state.observations++;
+		state.trials += trials;
+		state.successes += successes;
+		this.states.set(key, state);
+	}
+	probability(contexts: readonly object[]): number {
+		if (!contexts.length) return this.priorSuccesses / this.priorTrials;
+		return (
+			contexts.reduce((total, context) => {
+				const state = this.states.get(stableStringify(context));
+				return (
+					total + ((state?.successes ?? 0) + this.priorSuccesses) / ((state?.trials ?? 0) + this.priorTrials)
+				);
+			}, 0) / contexts.length
+		);
+	}
+	snapshot(): Readonly<
+		EvidenceState & {
+			contexts: number;
+		}
+	> {
+		const total = {
+			contexts: this.states.size,
+			observations: 0,
+			trials: 0,
+			successes: 0,
+		};
+		for (const state of this.states.values()) {
+			total.observations += state.observations;
+			total.trials += state.trials;
+			total.successes += state.successes;
+		}
+		return total;
+	}
+}
+export interface ActorForkActionCall {
+	readonly id: string;
+	readonly index: number;
+	readonly callID?: string;
+	readonly format?: string;
+	readonly tool: string;
+	readonly input: Readonly<Record<string, unknown>>;
+}
+export interface ActorForkActionBatch {
+	readonly id: string;
+	readonly calls: readonly ActorForkActionCall[];
+}
+export interface ActorProbeSnapshot extends Readonly<
+	Pick<PendingFork, "generatedText" | "content" | "reasoning" | "outputChunks">
+> {
+	readonly attempt: number;
+}
+export interface ActorProbeSchedule {
+	readonly maxAttempts: number;
+	/** Non-empty Actor stream updates required between sidecar retries. */
+	readonly retryStreamUpdates: number;
+	/** Fewer updates suffice at a sentence end; a finished thought needs one. */
+	readonly boundaryStreamUpdates: number;
+}
+export const ACTOR_PROBE_SCHEDULE: ActorProbeSchedule = Object.freeze({
+	maxAttempts: DEFAULT_SPECULATIVE_CONFIG.selfSpeculation.forkMaxAttempts,
+	retryStreamUpdates: DEFAULT_SPECULATIVE_CONFIG.selfSpeculation.forkRetryStreamUpdates,
+	boundaryStreamUpdates: DEFAULT_SPECULATIVE_CONFIG.selfSpeculation.forkBoundaryStreamUpdates,
+});
+interface PendingFork {
+	readonly schedule: ActorProbeSchedule;
+	readonly reuseFeedback?: unknown;
+	readonly promise: Promise<readonly ActorForkActionBatch[]>;
+	readonly resolve: (batches: readonly ActorForkActionBatch[]) => void;
+	readonly controller: AbortController;
+	generatedText: string;
+	content: string;
+	reasoning: string;
+	outputChunks: number;
+	requestBound: boolean;
+	attempts: number;
+	lastProbeOutputChunks: number;
+	retryAt: number;
+	probeInFlight: boolean;
+	settled: boolean;
+}
+/** One turn-scoped Actor probe source, including result delivery and cancellation. */
+export class ActorForkPlanSource {
+	private readonly pending = new Map<string, PendingFork>();
+	private readonly configuration: Partial<ActorProbeSchedule> | (() => Partial<ActorProbeSchedule>);
+	constructor(configuration: Partial<ActorProbeSchedule> | (() => Partial<ActorProbeSchedule>) = {}) {
+		this.configuration = configuration;
+		void this.schedule;
+	}
+	get schedule(): ActorProbeSchedule {
+		const normalized = {
+			...ACTOR_PROBE_SCHEDULE,
+			...(typeof this.configuration === "function" ? this.configuration() : this.configuration),
+		};
+		for (const [field, value] of Object.entries(normalized)) {
+			if (!isSafeCount(value, 1)) throw new Error(`${field} must be a positive integer`);
+		}
+		return Object.freeze(normalized);
+	}
+	readonly source: AgentPlanSource = {
+		id: "self-speculation",
+		enabled: (settings) => settings.sourceConfig?.actorForkActionEnabled === true,
+		timeoutMs: (settings) => settings.predictionTimeoutMs,
+		requestLifetime: "actor_decision",
+		// A forked batch is one decision, as a Drafter batch is: peers such as PatternAware continue from all of it.
+		continuationBatch: ({ feedback }) => {
+			const calls = (
+				feedback as
+					| {
+							batchCalls?: unknown;
+					  }
+					| undefined
+			)?.batchCalls;
+			return Array.isArray(calls) && calls.every((id) => typeof id === "string") ? calls : undefined;
+		},
+		propose: async ({ startInput, signal }) => {
+			const pending = this.pending.get(startInput.turnID);
+			const batches = await this.waitForBatches(startInput.turnID, signal);
+			return batches
+				.filter((batch) => batch.calls.length)
+				.map((batch) => ({
+					id: `self-speculation:${startInput.turnID}:${batch.id}`,
+					source: "self-speculation",
+					revision: 0,
+					actions: batch.calls.map((call) => ({
+						id: call.id,
+						type: "tool_call" as const,
+						tool: call.tool,
+						input: call.input,
+						reuseFeedback: pending?.reuseFeedback,
+						feedback: { batchCalls: batch.calls.map(({ id }) => id) },
+					})),
+				}));
+		},
+	};
+	startTurn(turnID: string, reuseFeedback?: unknown): void {
+		this.closeTurn(turnID);
+		const { promise, resolve } = Promise.withResolvers<readonly ActorForkActionBatch[]>();
+		this.pending.set(turnID, {
+			schedule: this.schedule,
+			reuseFeedback,
+			promise,
+			resolve,
+			controller: new AbortController(),
+			generatedText: "",
+			content: "",
+			reasoning: "",
+			outputChunks: 0,
+			requestBound: false,
+			attempts: 0,
+			lastProbeOutputChunks: 0,
+			retryAt: 1,
+			probeInFlight: false,
+			settled: false,
+		});
+	}
+	bindActorRequest(turnID: string): void {
+		const pending = this.pending.get(turnID);
+		if (pending) pending.requestBound = true;
+	}
+	observeActorDelta(turnID: string, event: AssistantMessageEvent): ActorProbeSnapshot | undefined {
+		const pending = this.pending.get(turnID);
+		if (!pending || pending.settled || !pending.requestBound) return undefined;
+		const retrySooner = (updates: number) => {
+			pending.retryAt = Math.min(pending.retryAt, pending.lastProbeOutputChunks + updates);
+		};
+		if (event.type === "thinking_end") retrySooner(pending.schedule.boundaryStreamUpdates);
+		else if ((event.type !== "text_delta" && event.type !== "thinking_delta") || !event.delta)
+			return undefined;
+		else {
+			if (event.type === "text_delta") pending.content += event.delta;
+			else pending.reasoning += event.delta;
+			pending.generatedText += event.delta;
+			pending.outputChunks++;
+		}
+		return this.claimProbe(pending);
+	}
+	finishProbe(turnID: string): boolean {
+		const pending = this.pending.get(turnID);
+		if (!pending || pending.settled) return true;
+		pending.probeInFlight = false;
+		return pending.attempts >= pending.schedule.maxAttempts;
+	}
+	claimPendingProbe(turnID: string): ActorProbeSnapshot | undefined {
+		const pending = this.pending.get(turnID);
+		return pending ? this.claimProbe(pending) : undefined;
+	}
+	private claimProbe(pending: PendingFork): ActorProbeSnapshot | undefined {
+		if (
+			pending.settled ||
+			pending.probeInFlight ||
+			!pending.requestBound ||
+			pending.attempts >= pending.schedule.maxAttempts ||
+			pending.outputChunks < pending.retryAt
+		)
+			return undefined;
+		pending.probeInFlight = true;
+		pending.lastProbeOutputChunks = pending.outputChunks;
+		pending.retryAt = pending.outputChunks + pending.schedule.retryStreamUpdates;
+		pending.attempts++;
+		return {
+			attempt: pending.attempts,
+			generatedText: pending.generatedText,
+			content: pending.content,
+			reasoning: pending.reasoning,
+			outputChunks: pending.outputChunks,
+		};
+	}
+	probeSignal(turnID: string): AbortSignal | undefined {
+		return this.pending.get(turnID)?.controller.signal;
+	}
+	finishActorStream(turnID: string): void {
+		const pending = this.pending.get(turnID);
+		if (!pending || pending.settled) return;
+		pending.controller.abort();
+		this.publish(turnID, []);
+	}
+	publish(turnID: string, batches: readonly ActorForkActionBatch[]): void {
+		const pending = this.pending.get(turnID);
+		if (!pending || pending.settled) return;
+		pending.settled = true;
+		pending.resolve(structuredClone(batches));
+	}
+	closeTurn(turnID: string): void {
+		const pending = this.pending.get(turnID);
+		if (!pending) return;
+		pending.controller.abort();
+		if (!pending.settled) pending.resolve([]);
+		this.pending.delete(turnID);
+	}
+	reset(): void {
+		for (const turnID of [...this.pending.keys()]) this.closeTurn(turnID);
+	}
+	waitForBatches(turnID: string, signal: AbortSignal): Promise<readonly ActorForkActionBatch[]> {
+		const pending = this.pending.get(turnID);
+		if (!pending || signal.aborted) return Promise.resolve([]);
+		return new Promise((resolve) => {
+			const aborted = () => {
+				pending.controller.abort();
+				resolve([]);
+			};
+			signal.addEventListener("abort", aborted, { once: true });
+			void pending.promise.then((batches) => {
+				signal.removeEventListener("abort", aborted);
+				resolve(batches);
+			});
+		});
+	}
+}
+export function createActorForkPlanSource(
+	schedule: Partial<ActorProbeSchedule> | (() => Partial<ActorProbeSchedule>) = {},
+): ActorForkPlanSource {
+	return new ActorForkPlanSource(schedule);
+}
 export interface SelfSpeculationSettingsInput extends Partial<SelfSpeculationSettings> {}
-
 export interface SelfSpeculationSettings extends Readonly<typeof selfSpeculationDefaults> {
 	/** Optional environment variable containing a bearer token for the control plane. */
 	readonly apiKeyEnv?: string;
 }
+const { defaults: selfSpeculationDefaults, parse: parseSettings } = settingsParser(
+	DEFAULT_SPECULATIVE_CONFIG.selfSpeculation,
+	{
+		enabled: booleanOr,
 
-const { defaults: selfSpeculationDefaults, parse: parseSettings } = settingsParser({
-	enabled: [false, booleanOr],
-	/** Trusted control-plane endpoint exposed by the inference runtime. */
-	endpoint: ["http://127.0.0.1:8000", httpEndpoint],
-	/** Top-level field carrying the stable request ID in provider payloads. */
-	requestIDField: ["request_id", textOr],
-	candidatePath: ["/self-speculation/candidates", httpPath],
-	forkPath: ["/self-speculation/fork", httpPath],
-	clearPath: ["/self-speculation/clear", httpPath],
-	/** Optional declaration of what the control plane serves (client side only; not yet verified against a vLLM sidecar). */
-	capabilitiesPath: ["/self-speculation/capabilities", httpPath],
-	timeoutMs: [2_000, positiveMilliseconds],
-	maxCandidates: [8, positiveInteger],
-	maxDraftTokens: [28, positiveInteger],
-	/** Actor tool-call protocol Profile; D3 serialization always follows this Profile. */
-	actorProfile: ["tagged_json", textOr],
-	/** Tool-call body format used when concrete K(a) candidates are tokenized. */
-	draftFormat: ["auto", textOr],
-	/** Exact target-model boundary preceding a boundary-relative action draft. */
-	draftBoundary: ["auto", textOr],
-	forkEnabled: [true, booleanOr],
-	/** Admit complete sidecar fork tool calls to the ordinary speculative-action runtime. */
-	forkActionEnabled: [true, booleanOr],
-	/** Minimum SPORK selected-token top-1 probability required for action execution. */
-	forkActionMinConfidence: [0.9, probability],
-	forkTransport: ["provider" as SelfSpeculationForkTransport, (value) => value === "sidecar" || value === "drafter" ? value : "provider"],
-	forkTemperature: [0, nonNegativeNumber],
-	forkMaxAttempts: [ACTOR_PROBE_SCHEDULE.maxAttempts, positiveInteger],
-	forkRetryStreamUpdates: [ACTOR_PROBE_SCHEDULE.retryStreamUpdates, positiveInteger],
-	forkBoundaryStreamUpdates: [ACTOR_PROBE_SCHEDULE.boundaryStreamUpdates, positiveInteger],
-	forkDecoder: ["auto", textOr],
-	forkForcedPrefix: ["auto", textOr],
-	/** Require a capable engine to expose token logprobs to its SPORK fork. */
-	requireLogprobs: [false, booleanOr],
-});
+		/** Trusted control-plane endpoint exposed by the inference runtime. */
+		endpoint: httpEndpoint,
 
+		/** Top-level field carrying the stable request ID in provider payloads. */
+		requestIDField: textOr,
+
+		candidatePath: httpPath,
+
+		forkPath: httpPath,
+
+		clearPath: httpPath,
+
+		/** Optional declaration of what the control plane serves (client side only; not yet verified against a vLLM sidecar). */
+		capabilitiesPath: httpPath,
+
+		timeoutMs: positiveMilliseconds,
+
+		maxCandidates: positiveInteger,
+
+		maxDraftTokens: positiveInteger,
+
+		/** Actor tool-call protocol Profile; D3 serialization always follows this Profile. */
+		actorProfile: textOr,
+
+		/** Tool-call body format used when concrete K(a) candidates are tokenized. */
+		draftFormat: textOr,
+
+		/** Exact target-model boundary preceding a boundary-relative action draft. */
+		draftBoundary: textOr,
+
+		forkEnabled: booleanOr,
+
+		/** Admit complete sidecar fork tool calls to the ordinary speculative-action runtime. */
+		forkActionEnabled: booleanOr,
+
+		/** Minimum SPORK selected-token top-1 probability required for action execution. */
+		forkActionMinConfidence: probability,
+
+		forkTransport: (value) => (value === "sidecar" || value === "drafter" ? value : "provider"),
+
+		forkTemperature: nonNegativeNumber,
+
+		forkMaxAttempts: positiveInteger,
+
+		forkRetryStreamUpdates: positiveInteger,
+
+		forkBoundaryStreamUpdates: positiveInteger,
+
+		forkDecoder: textOr,
+
+		forkForcedPrefix: textOr,
+
+		/** Require a capable engine to expose token logprobs to its SPORK fork. */
+		requireLogprobs: booleanOr,
+	},
+);
 export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculationSettings {
 	const input = isRecord(value) ? value : {};
-	const result = parseSettings(input);
+	const result = parseSettings({
+		...speculativeConfig().selfSpeculation,
+		...input,
+	});
 	const apiKeyEnv = nonEmptyString(input.apiKeyEnv);
 	return apiKeyEnv ? { ...result, apiKeyEnv } : result;
 }
-
-export interface SelfSpeculationCoordinatorSnapshot extends ReturnType<SelfSpeculationCoordinator["snapshot"]> {}
-
+export interface SelfSpeculationCoordinatorSnapshot extends ReturnType<
+	SelfSpeculationCoordinator["snapshot"]
+> {}
 export interface SelfSpeculationVerificationOutcome extends ReturnType<typeof parseVerificationOutcome> {}
-
 export interface SelfSpeculationCoordinatorOptions {
 	readonly settings: () => SelfSpeculationSettings;
 	readonly fetch?: typeof globalThis.fetch;
 	readonly requestID?: () => string;
 	readonly actorForkPlanSource?: ActorForkPlanSource;
-	readonly draftFork?: (input: { readonly model: Model<Api>; readonly context: Context; readonly reasoning: string; readonly content: string;
-		readonly signal: AbortSignal; readonly temperature: number }) => Promise<readonly Pick<ActorForkActionCall, "tool" | "input">[]>;
+	readonly draftFork?: (input: {
+		readonly model: Model<Api>;
+		readonly context: Context;
+		readonly reasoning: string;
+		readonly content: string;
+		readonly signal: AbortSignal;
+		readonly temperature: number;
+	}) => Promise<readonly Pick<ActorForkActionCall, "tool" | "input">[]>;
 }
-
 interface TurnState {
 	readonly turnID: string;
 	readonly decisionSequence: number;
@@ -100,12 +419,12 @@ interface TurnState {
 	readonly modelKey: string;
 	ended: boolean;
 }
-
 /** Unknown until declared; a declaration serves only the kinds it lists as true. */
 type ControlPlaneCapabilities = Partial<Record<"fork" | "candidates" | "logprobs" | "provider", boolean>>;
-
-interface ReportedCandidate { readonly sources: Set<string>; readonly tools: Set<string>; }
-
+interface ReportedCandidate {
+	readonly sources: Set<string>;
+	readonly tools: Set<string>;
+}
 interface CandidateRecord {
 	readonly id: string;
 	readonly key: string;
@@ -114,7 +433,10 @@ interface CandidateRecord {
 	readonly tool: string;
 	readonly input: Readonly<Record<string, unknown>>;
 	readonly sources: Set<string>;
-	readonly provenance: Array<{ readonly proposalID: string; readonly actionID: string }>;
+	readonly provenance: Array<{
+		readonly proposalID: string;
+		readonly actionID: string;
+	}>;
 	readonly sequence: number;
 	readonly expectedDecisionSequence: number;
 	depth: number;
@@ -124,18 +446,38 @@ interface CandidateRecord {
 	empiricalProbability: number;
 	expectedDurationMs?: number;
 }
-
 interface CandidateCalibration {
 	readonly decoderProbability: number;
 	readonly actionProbability: number;
 	readonly jointProbability: number;
 }
-
-interface ForkReceiptOutcome { readonly committed: boolean; readonly batches: readonly ActorForkActionBatch[]; }
-const COUNTERS = ["candidateSubmissions", "forkRequests", "forkRetries", "candidateReceipts", "forkCompletions", "forkCandidates", "forkAgreements", "forkExactMatches",
-	"submittedDraftTokens", "acceptedDraftTokens", "verificationRequests", "verifiedDraftProposals", "verifiedDraftTokens", "verifiedAcceptedDraftTokens",
-	"verifiedRejectedDraftTokens", "unresolvedDraftProposals", "unresolvedDraftTokens", "forkLatencyMs", "forkLogprobTokens", "forkActionAdoptions", "failures"] as const;
-
+interface ForkReceiptOutcome {
+	readonly committed: boolean;
+	readonly batches: readonly ActorForkActionBatch[];
+}
+const COUNTERS = [
+	"candidateSubmissions",
+	"forkRequests",
+	"forkRetries",
+	"candidateReceipts",
+	"forkCompletions",
+	"forkCandidates",
+	"forkAgreements",
+	"forkExactMatches",
+	"submittedDraftTokens",
+	"acceptedDraftTokens",
+	"verificationRequests",
+	"verifiedDraftProposals",
+	"verifiedDraftTokens",
+	"verifiedAcceptedDraftTokens",
+	"verifiedRejectedDraftTokens",
+	"unresolvedDraftProposals",
+	"unresolvedDraftTokens",
+	"forkLatencyMs",
+	"forkLogprobTokens",
+	"forkActionAdoptions",
+	"failures",
+] as const;
 /**
  * Request-scoped decoder-feedback coordinator for a SPORK-capable engine.
  * Network work is serialized and best-effort; it never owns Actor correctness or lifecycle.
@@ -148,9 +490,17 @@ export class SelfSpeculationCoordinator {
 	private readonly draftFork: SelfSpeculationCoordinatorOptions["draftFork"];
 	/** Per service configuration; absent declarations keep the legacy request behavior. */
 	private readonly capabilities = new Map<string, ControlPlaneCapabilities>();
-	private readonly decoderEvidence = new EvidenceLedger(4, 2);
-	private readonly actionEvidence = new EvidenceLedger(2, 1);
-	private readonly actionModels = new BoundedRecencyMap<string, string>(128);
+	private readonly decoderEvidence = new EvidenceLedger(
+		speculativeConfig().prediction.decoderEvidenceCapacity,
+		speculativeConfig().prediction.decoderEvidenceMinimum,
+	);
+	private readonly actionEvidence = new EvidenceLedger(
+		speculativeConfig().prediction.actionEvidenceCapacity,
+		speculativeConfig().prediction.actionEvidenceMinimum,
+	);
+	private readonly actionModels = new BoundedRecencyMap<string, string>(
+		speculativeConfig().prediction.actionModelEntries,
+	);
 	private readonly background = new PendingTasks();
 	private readonly pendingCandidates = new Map<number, Map<string, CandidateRecord>>();
 	private active?: TurnState;
@@ -158,24 +508,31 @@ export class SelfSpeculationCoordinator {
 	private acceptingCandidates = false;
 	private candidateSequence = 0;
 	/** acceptedDraftTokens counts registration acknowledgements; verifiedAcceptedDraftTokens counts target acceptance. */
-	private readonly counters = Object.fromEntries(COUNTERS.map(key => [key, 0])) as Record<typeof COUNTERS[number], number>;
+	private readonly counters = Object.fromEntries(COUNTERS.map((key) => [key, 0])) as Record<
+		(typeof COUNTERS)[number],
+		number
+	>;
 	private lastVerification?: SelfSpeculationVerificationOutcome;
 	private totalForkLogprob = 0;
 	private lastFailure?: string;
 	private lastResolvedActorProfile?: string;
 	private lastProfileResolutionSource?: string;
-
 	constructor(options: SelfSpeculationCoordinatorOptions) {
 		this.settings = options.settings;
 		this.fetch = options.fetch ?? globalThis.fetch;
 		this.requestID = options.requestID ?? randomUUID;
-		this.actorForkPlanSource = options.actorForkPlanSource ?? createActorForkPlanSource(() => {
-			const settings = this.active?.settings ?? this.settings();
-			return { maxAttempts: settings.forkMaxAttempts, retryStreamUpdates: settings.forkRetryStreamUpdates, boundaryStreamUpdates: settings.forkBoundaryStreamUpdates };
-		});
+		this.actorForkPlanSource =
+			options.actorForkPlanSource ??
+			createActorForkPlanSource(() => {
+				const settings = this.active?.settings ?? this.settings();
+				return {
+					maxAttempts: settings.forkMaxAttempts,
+					retryStreamUpdates: settings.forkRetryStreamUpdates,
+					boundaryStreamUpdates: settings.forkBoundaryStreamUpdates,
+				};
+			});
 		this.draftFork = options.draftFork;
 	}
-
 	startTurn(turnID: string, model: Model<Api>, context: Context, decisionSequence: number): void {
 		this.closeActive(true);
 		const settings = this.settings();
@@ -188,7 +545,8 @@ export class SelfSpeculationCoordinator {
 		}
 		this.acceptingCandidates = true;
 		this.latestStartedDecisionSequence = decisionSequence;
-		for (const target of this.pendingCandidates.keys()) if (target < decisionSequence) this.pendingCandidates.delete(target);
+		for (const target of this.pendingCandidates.keys())
+			if (target < decisionSequence) this.pendingCandidates.delete(target);
 		const candidates = this.pendingCandidates.get(decisionSequence) ?? new Map();
 		this.pendingCandidates.delete(decisionSequence);
 		this.active = {
@@ -210,9 +568,9 @@ export class SelfSpeculationCoordinator {
 			ended: false,
 		};
 		this.actorForkPlanSource.startTurn(turnID);
-		if (settings.forkTransport !== "drafter" && !this.capabilities.has(controlPlaneKey(settings))) this.negotiate(settings);
+		if (settings.forkTransport !== "drafter" && !this.capabilities.has(controlPlaneKey(settings)))
+			this.negotiate(settings);
 	}
-
 	/** Bind exactly one authoritative Actor provider request to the current speculative turn. */
 	decorateActorPayload(payload: unknown): unknown {
 		const state = this.active;
@@ -225,10 +583,12 @@ export class SelfSpeculationCoordinator {
 		this.actorForkPlanSource.bindActorRequest(state.turnID);
 		this.scheduleFlush(state);
 		// Only the runtime exposing the control plane accepts these fields; hosted APIs reject unknown ones.
-		return settings.forkTransport !== "drafter" && this.capabilities.get(controlPlaneKey(settings))?.provider !== false && originOf(state.model.baseUrl) === originOf(settings.endpoint)
-			? providerPayload(payload, settings, state.requestID, this.actorForkPlanSource.schedule) : payload;
+		return settings.forkTransport !== "drafter" &&
+			this.capabilities.get(controlPlaneKey(settings))?.provider !== false &&
+			originOf(state.model.baseUrl) === originOf(settings.endpoint)
+			? providerPayload(payload, settings, state.requestID, this.actorForkPlanSource.schedule)
+			: payload;
 	}
-
 	addCandidate(candidate: MaterializedSpeculativeCandidate<string>): void {
 		const state = this.active;
 		if (!this.settings().enabled || !this.acceptingCandidates) return;
@@ -239,7 +599,7 @@ export class SelfSpeculationCoordinator {
 		const candidates =
 			state && targetDecisionSequence === state.decisionSequence
 				? state.candidates
-				: this.pendingCandidates.get(targetDecisionSequence) ?? new Map<string, CandidateRecord>();
+				: (this.pendingCandidates.get(targetDecisionSequence) ?? new Map<string, CandidateRecord>());
 		if (candidates !== state?.candidates) this.pendingCandidates.set(targetDecisionSequence, candidates);
 		const record = this.mergeCandidate(candidates, candidate);
 		if (state && candidates === state.candidates && record.sources.has("self-speculation")) {
@@ -247,7 +607,10 @@ export class SelfSpeculationCoordinator {
 				state.forkCandidateKeys.add(record.key);
 				this.counters.forkCandidates++;
 			}
-			if ([...record.sources].some((source) => source !== "self-speculation") && !state.agreedForkKeys.has(record.key)) {
+			if (
+				[...record.sources].some((source) => source !== "self-speculation") &&
+				!state.agreedForkKeys.has(record.key)
+			) {
 				state.agreedForkKeys.add(record.key);
 				this.counters.forkAgreements++;
 			}
@@ -257,7 +620,6 @@ export class SelfSpeculationCoordinator {
 		state.dirty = true;
 		this.scheduleFlush(state);
 	}
-
 	private mergeCandidate(
 		candidates: Map<string, CandidateRecord>,
 		candidate: MaterializedSpeculativeCandidate<string>,
@@ -268,15 +630,25 @@ export class SelfSpeculationCoordinator {
 		const source = candidate.source || "unknown";
 		if (existing) {
 			existing.sources.add(source);
-			if (!existing.provenance.some((item) => item.proposalID === candidate.proposalID && item.actionID === candidate.actionID))
-				existing.provenance.push({ proposalID: candidate.proposalID, actionID: candidate.actionID });
+			if (
+				!existing.provenance.some(
+					(item) => item.proposalID === candidate.proposalID && item.actionID === candidate.actionID,
+				)
+			)
+				existing.provenance.push({
+					proposalID: candidate.proposalID,
+					actionID: candidate.actionID,
+				});
 			for (const field of ["depth", "horizon"] as const)
 				existing[field] = Math.min(existing[field], finiteNumber(candidate[field]) ?? 0);
 			for (const field of ["conditionalProbability", "empiricalProbability", "expectedDurationMs"] as const) {
 				const supplied = finiteNumber(candidate[field]);
 				if (supplied !== undefined) existing[field] = Math.max(existing[field] ?? 0, supplied);
 			}
-			existing.latestDecisionSequence = Math.max(existing.latestDecisionSequence, candidate.latestDecisionSequence);
+			existing.latestDecisionSequence = Math.max(
+				existing.latestDecisionSequence,
+				candidate.latestDecisionSequence,
+			);
 			return existing;
 		} else {
 			const record: CandidateRecord = {
@@ -301,56 +673,67 @@ export class SelfSpeculationCoordinator {
 			return record;
 		}
 	}
-
 	observeActorOutput(event: AssistantMessageEvent): void {
 		const state = this.active;
 		if (!state || !state.settings.forkEnabled || state.settings.forkTransport === "provider") return;
-		if (event.type === "toolcall_start" || event.type === "done" || event.type === "error") return this.finishActorOutput();
+		if (event.type === "toolcall_start" || event.type === "done" || event.type === "error")
+			return this.finishActorOutput();
 		const snapshot = this.actorForkPlanSource.observeActorDelta(state.turnID, event);
 		if (snapshot) this.scheduleActorProbe(state, snapshot);
 	}
-
 	/** Pi ends an Actor message with message_end, never a done update: a text-only answer leaves nothing to fork. */
 	finishActorOutput(): void {
 		if (this.active) this.actorForkPlanSource.finishActorStream(this.active.turnID);
 	}
-
 	private scheduleActorProbe(state: TurnState, snapshot?: ActorProbeSnapshot): void {
-		if (state.ended || state.forkTask || !state.requestID && state.settings.forkTransport !== "drafter") return;
+		if (state.ended || state.forkTask || (!state.requestID && state.settings.forkTransport !== "drafter"))
+			return;
 		const probe = snapshot ?? this.actorForkPlanSource.claimPendingProbe(state.turnID);
 		if (!probe) return;
-		const settings = state.settings, served = settings.forkTransport === "drafter" ? undefined : this.capabilities.get(controlPlaneKey(settings));
-		if (served?.fork === false || served?.logprobs === false && requiresForkLogprobs(settings)) {
+		const settings = state.settings;
+		const served =
+			settings.forkTransport === "drafter" ? undefined : this.capabilities.get(controlPlaneKey(settings));
+		if (served?.fork === false || (served?.logprobs === false && requiresForkLogprobs(settings))) {
 			this.actorForkPlanSource.publish(state.turnID, []);
 			return;
 		}
 		if (probe.attempt > 1) this.counters.forkRetries++;
 		this.counters.forkRequests++;
 		const signal = this.actorForkPlanSource.probeSignal(state.turnID);
-		const task = (settings.forkTransport === "drafter" ? this.draftedFork(state, probe, signal) : this.post(
-			settings.forkPath,
-			{
-				version: 1,
-				request_id: state.requestID,
-				model: modelPayload(state.model),
-				context: { ...state.context, ...(state.providerPayload !== undefined ? { provider_payload: state.providerPayload } : {}) },
-				snapshot: {
-					attempt: probe.attempt,
-					generated_text: probe.generatedText,
-					content: probe.content,
-					reasoning: probe.reasoning,
-					chunk_count: probe.outputChunks,
-					output_chunk_count: probe.outputChunks,
-				},
-				options: forkPayload(settings),
-			},
-			settings,
-			signal,
-		).then((receipt) => this.recordReceipt(receipt, state, true)))
+		const task = (
+			settings.forkTransport === "drafter"
+				? this.draftedFork(state, probe, signal)
+				: this.post(
+						settings.forkPath,
+						{
+							version: 1,
+							request_id: state.requestID,
+							model: modelPayload(state.model),
+							context: {
+								...state.context,
+								...(state.providerPayload !== undefined ? { provider_payload: state.providerPayload } : {}),
+							},
+							snapshot: {
+								attempt: probe.attempt,
+								generated_text: probe.generatedText,
+								content: probe.content,
+								reasoning: probe.reasoning,
+								chunk_count: probe.outputChunks,
+								output_chunk_count: probe.outputChunks,
+							},
+							options: forkPayload(settings),
+						},
+						settings,
+						signal,
+					).then((receipt) => this.recordReceipt(receipt, state, true))
+		)
 			.then((outcome) => {
 				const exhausted = this.actorForkPlanSource.finishProbe(state.turnID);
 				if (settings.forkActionEnabled && !outcome?.committed && !exhausted) return;
-				this.actorForkPlanSource.publish(state.turnID, state.settings.forkActionEnabled ? outcome?.batches ?? [] : []);
+				this.actorForkPlanSource.publish(
+					state.turnID,
+					state.settings.forkActionEnabled ? (outcome?.batches ?? []) : [],
+				);
 				this.reconcileForkMatches(state);
 			})
 			.catch((error: unknown) => {
@@ -366,17 +749,36 @@ export class SelfSpeculationCoordinator {
 		state.forkTask = task;
 		this.background.track(task);
 	}
-
 	/** The Drafter reads the Actor's reasoning so far and names the calls it expects next; no logprobs gate them. */
-	private async draftedFork(state: TurnState, probe: ActorProbeSnapshot, signal?: AbortSignal): Promise<ForkReceiptOutcome> {
+	private async draftedFork(
+		state: TurnState,
+		probe: ActorProbeSnapshot,
+		signal?: AbortSignal,
+	): Promise<ForkReceiptOutcome> {
 		if (!this.draftFork) throw new Error("self-speculation Drafter fork is not configured");
-		const calls = await this.draftFork({ model: state.model, context: state.actorContext, reasoning: probe.reasoning, content: probe.content,
-			temperature: state.settings.forkTemperature, signal: signal ?? AbortSignal.any([]) });
+		const calls = await this.draftFork({
+			model: state.model,
+			context: state.actorContext,
+			reasoning: probe.reasoning,
+			content: probe.content,
+			temperature: state.settings.forkTemperature,
+			signal: signal ?? AbortSignal.any([]),
+		});
 		this.counters.forkCompletions++;
-		const batches = calls.length ? [{ id: sidecarActionBatchID(stableStringify(calls)), calls: calls.map((call, index) => ({ id: `${index}:fork`, index, ...call })) }] : [];
+		const batches = calls.length
+			? [
+					{
+						id: sidecarActionBatchID(stableStringify(calls)),
+						calls: calls.map((call, index) => ({
+							id: `${index}:fork`,
+							index,
+							...call,
+						})),
+					},
+				]
+			: [];
 		return { committed: batches.length > 0, batches };
 	}
-
 	/** Observe the authoritative Actor action regardless of fork completion order. */
 	observeActorAction(action: ActionKey): void {
 		const state = this.active;
@@ -385,13 +787,14 @@ export class SelfSpeculationCoordinator {
 		state.actorActionKeys.add(key);
 		this.reconcileForkMatches(state);
 	}
-
 	/** Credit actual consumed producer work, including a retained fork from an earlier turn. */
 	observeActorSettlement(settlement: ActorActionSettlement): void {
-		if (settlement.provider.kind === "speculative" && settlement.matchedPredictions.some(prediction => prediction.source === "self-speculation"))
+		if (
+			settlement.provider.kind === "speculative" &&
+			settlement.matchedPredictions.some((prediction) => prediction.source === "self-speculation")
+		)
 			this.counters.forkActionAdoptions++;
 	}
-
 	/** Feed semantic prediction adoption into decoder ranking without touching token evidence. */
 	observePredictionSettlement(feedback: PredictionFeedback<string>): void {
 		const settlement = feedback.settlement;
@@ -399,13 +802,15 @@ export class SelfSpeculationCoordinator {
 		const model = this.actionModels.get(settlement.actorAction.turnID);
 		if (!model) return;
 		const adopted = settlement.match.matched && settlement.match.adoption.status === "adopted";
-		this.actionEvidence.observe({ model, tool: feedback.tool, source: settlement.prediction.source }, 1, adopted ? 1 : 0);
+		this.actionEvidence.observe(
+			{ model, tool: feedback.tool, source: settlement.prediction.source },
+			1,
+			adopted ? 1 : 0,
+		);
 	}
-
 	endTurn(): void {
 		this.closeActive(true);
 	}
-
 	/** Clear both the active request and every future-decision candidate. */
 	reset(): void {
 		this.closeActive(false);
@@ -414,17 +819,21 @@ export class SelfSpeculationCoordinator {
 		this.latestStartedDecisionSequence = 0;
 		this.acceptingCandidates = false;
 	}
-
 	private closeActive(preserveForRetry: boolean): void {
 		const state = this.active;
-		if (state) { state.ended = true; this.actorForkPlanSource.closeTurn(state.turnID); }
+		if (state) {
+			state.ended = true;
+			this.actorForkPlanSource.closeTurn(state.turnID);
+		}
 		this.active = undefined;
 		if (state && preserveForRetry && state.candidates.size) {
 			// The active decision owns its bundle exclusively; outstanding submissions keep the old snapshot.
 			this.pendingCandidates.set(state.decisionSequence, structuredClone(state.candidates));
 		}
 		if (!state?.requestID || state.settings.forkTransport === "drafter") return;
-		const pending = [state.flushTask, state.forkTask].filter((task): task is Promise<void> => task !== undefined);
+		const pending = [state.flushTask, state.forkTask].filter(
+			(task): task is Promise<void> => task !== undefined,
+		);
 		const cleanup = Promise.allSettled(pending)
 			.then(() =>
 				this.post(state.settings.clearPath, { version: 1, request_id: state.requestID }, state.settings),
@@ -432,7 +841,6 @@ export class SelfSpeculationCoordinator {
 			.then((receipt) => this.recordVerification(receipt, state));
 		this.background.track(cleanup);
 	}
-
 	snapshot() {
 		const decoderEvidence = this.decoderEvidence.snapshot();
 		const actionEvidence = this.actionEvidence.snapshot();
@@ -440,15 +848,24 @@ export class SelfSpeculationCoordinator {
 			...this.counters,
 			...(this.active?.requestID ? { actorRequestID: this.active.requestID } : {}),
 			...(this.lastResolvedActorProfile ? { resolvedActorProfile: this.lastResolvedActorProfile } : {}),
-			...(this.lastProfileResolutionSource ? { profileResolutionSource: this.lastProfileResolutionSource } : {}),
+			...(this.lastProfileResolutionSource
+				? { profileResolutionSource: this.lastProfileResolutionSource }
+				: {}),
 			bufferedCandidates:
 				(this.active?.candidates.size ?? 0) +
 				[...this.pendingCandidates.values()].reduce((total, candidates) => total + candidates.size, 0),
 			...(this.counters.verifiedDraftTokens > 0
-				? { verifiedDraftAcceptanceRate: this.counters.verifiedAcceptedDraftTokens / this.counters.verifiedDraftTokens }
+				? {
+						verifiedDraftAcceptanceRate:
+							this.counters.verifiedAcceptedDraftTokens / this.counters.verifiedDraftTokens,
+					}
 				: {}),
 			...(this.lastVerification ? { lastVerification: this.lastVerification } : {}),
-			...(this.counters.forkLogprobTokens > 0 ? { forkMeanLogprob: this.totalForkLogprob / this.counters.forkLogprobTokens } : {}),
+			...(this.counters.forkLogprobTokens > 0
+				? {
+						forkMeanLogprob: this.totalForkLogprob / this.counters.forkLogprobTokens,
+					}
+				: {}),
 			decoderEvidenceContexts: decoderEvidence.contexts,
 			decoderVerificationSteps: decoderEvidence.observations,
 			actionEvidenceContexts: actionEvidence.contexts,
@@ -458,7 +875,6 @@ export class SelfSpeculationCoordinator {
 		};
 		return snapshot as Readonly<typeof snapshot>;
 	}
-
 	private recordVerification(receipt: unknown, state: TurnState): void {
 		const verification = record(record(receipt)?.verification);
 		if (!verification || !state.requestID) return;
@@ -473,42 +889,58 @@ export class SelfSpeculationCoordinator {
 			this.counters.unresolvedDraftTokens += outcome.unresolvedDraftTokens;
 			this.lastVerification = outcome;
 			this.observeVerificationEvidence(state, outcome);
-		} catch (error) { this.counters.failures++; this.lastFailure = errorMessage(error); }
+		} catch (error) {
+			this.counters.failures++;
+			this.lastFailure = errorMessage(error);
+		}
 	}
-
 	private observeVerificationEvidence(state: TurnState, outcome: SelfSpeculationVerificationOutcome): void {
 		for (const step of outcome.steps) {
-			const records = [...state.candidates.values()].filter((candidate) => step.candidateIDs.includes(candidate.id));
+			const records = [...state.candidates.values()].filter((candidate) =>
+				step.candidateIDs.includes(candidate.id),
+			);
 			const tools = new Set(records.map((candidate) => candidate.tool));
-			for (const candidateID of step.candidateIDs) for (const tool of state.reportedCandidates.get(candidateID)?.tools ?? []) tools.add(tool);
+			for (const candidateID of step.candidateIDs)
+				for (const tool of state.reportedCandidates.get(candidateID)?.tools ?? []) tools.add(tool);
 			if (!tools.size) continue;
-			const sources = step.sources.length ? step.sources : [...new Set(records.flatMap((candidate) => [...candidate.sources]))];
+			const sources = step.sources.length
+				? step.sources
+				: [...new Set(records.flatMap((candidate) => [...candidate.sources]))];
 			for (const tool of tools) {
 				for (const source of sources) {
-					this.decoderEvidence.observe(decoderEvidenceContext(state, tool, source), step.draftedTokens, step.acceptedTokens);
+					this.decoderEvidence.observe(
+						decoderEvidenceContext(state, tool, source),
+						step.draftedTokens,
+						step.acceptedTokens,
+					);
 				}
 			}
 		}
 	}
-
-	async dispose(): Promise<void> { this.reset(); await this.background.drain(); }
-
+	async dispose(): Promise<void> {
+		this.reset();
+		await this.background.drain();
+	}
 	private scheduleFlush(state: TurnState): void {
-		if (!state.requestID || state.flushTask || state.settings.forkTransport === "drafter" || this.capabilities.get(controlPlaneKey(state.settings))?.candidates === false) return;
+		if (
+			!state.requestID ||
+			state.flushTask ||
+			state.settings.forkTransport === "drafter" ||
+			this.capabilities.get(controlPlaneKey(state.settings))?.candidates === false
+		)
+			return;
 		state.flushTask = this.flush(state).finally(() => {
 			state.flushTask = undefined;
 			if (state.dirty && state.requestID && this.active === state) this.scheduleFlush(state);
 		});
 		this.background.track(state.flushTask);
 	}
-
 	private async flush(state: TurnState): Promise<void> {
 		while (state.dirty && state.requestID) {
 			state.dirty = false;
 			const settings = state.settings;
-			const candidates = rankedCandidates(
-				state.candidates.values(),
-				(candidate) => this.candidateCalibration(state, candidate),
+			const candidates = rankedCandidates(state.candidates.values(), (candidate) =>
+				this.candidateCalibration(state, candidate),
 			).slice(0, settings.maxCandidates);
 			if (!candidates.length) continue;
 			const receipt = await this.post(
@@ -521,7 +953,9 @@ export class SelfSpeculationCoordinator {
 					actor_profile: settings.actorProfile,
 					...(settings.draftFormat === "auto" ? {} : { format: settings.draftFormat }),
 					...(settings.draftBoundary === "auto" ? {} : { boundary: settings.draftBoundary }),
-					candidates: candidates.map(({ candidate, calibration }) => candidatePayload(candidate, calibration)),
+					candidates: candidates.map(({ candidate, calibration }) =>
+						candidatePayload(candidate, calibration),
+					),
 				},
 				settings,
 			);
@@ -529,7 +963,6 @@ export class SelfSpeculationCoordinator {
 			this.counters.candidateSubmissions++;
 		}
 	}
-
 	private candidateCalibration(state: TurnState, candidate: CandidateRecord): CandidateCalibration {
 		const decoderProbability = this.decoderEvidence.probability(
 			[...candidate.sources].map((source) => decoderEvidenceContext(state, candidate.tool, source)),
@@ -537,9 +970,12 @@ export class SelfSpeculationCoordinator {
 		const actionProbability = this.actionEvidence.probability(
 			[...candidate.sources].map((source) => actionEvidenceContext(state, candidate.tool, source)),
 		);
-		return { decoderProbability, actionProbability, jointProbability: decoderProbability * actionProbability };
+		return {
+			decoderProbability,
+			actionProbability,
+			jointProbability: decoderProbability * actionProbability,
+		};
 	}
-
 	private recordReceipt(receipt: unknown, state: TurnState, fork: boolean): ForkReceiptOutcome | undefined {
 		if (!isRecord(receipt)) return fork ? { committed: false, batches: [] } : undefined;
 		this.counters.candidateReceipts++;
@@ -565,7 +1001,10 @@ export class SelfSpeculationCoordinator {
 				.map((value, index) => parsedSidecarActionCall(value, index))
 				.filter((value) => value !== undefined);
 			for (const candidateID of candidateIDs) {
-				const known = state.reportedCandidates.get(candidateID) ?? { sources: new Set<string>(), tools: new Set<string>() };
+				const known = state.reportedCandidates.get(candidateID) ?? {
+					sources: new Set<string>(),
+					tools: new Set<string>(),
+				};
 				for (const source of sources) known.sources.add(source);
 				for (const call of calls) known.tools.add(call.tool);
 				state.reportedCandidates.set(candidateID, known);
@@ -601,7 +1040,6 @@ export class SelfSpeculationCoordinator {
 		const batches = [...actionBatches.values()].slice(0, state.settings.maxCandidates);
 		return { committed: batches.length > 0, batches };
 	}
-
 	private reconcileForkMatches(state: TurnState): void {
 		for (const key of state.forkCandidateKeys) {
 			if (!state.actorActionKeys.has(key) || state.matchedForkKeys.has(key)) continue;
@@ -609,21 +1047,31 @@ export class SelfSpeculationCoordinator {
 			this.counters.forkExactMatches++;
 		}
 	}
-
 	/** Ask once which requests the endpoint serves; any failure leaves the legacy behavior (everything is attempted). */
 	private negotiate(settings: SelfSpeculationSettings): void {
-		const key = controlPlaneKey(settings), apiKey = settings.apiKeyEnv ? process.env[settings.apiKeyEnv] : undefined;
+		const key = controlPlaneKey(settings);
+		const apiKey = settings.apiKeyEnv ? process.env[settings.apiKeyEnv] : undefined;
 		this.capabilities.set(key, {});
-		const task = this.fetch(`${settings.endpoint}${settings.capabilitiesPath}`, { signal: AbortSignal.timeout(settings.timeoutMs),
-			...(apiKey ? { headers: { authorization: `Bearer ${apiKey}` } } : {}) })
+		const task = this.fetch(`${settings.endpoint}${settings.capabilitiesPath}`, {
+			signal: AbortSignal.timeout(settings.timeoutMs),
+			...(apiKey ? { headers: { authorization: `Bearer ${apiKey}` } } : {}),
+		})
 			.then(async (response) => {
 				const declared = response.ok ? record(record(await response.json())?.capabilities) : undefined;
-				if (declared) this.capabilities.set(key, Object.fromEntries((["fork", "candidates", "logprobs", "provider"] as const)
-					.map((name) => [name, declared[name] === true])));
-			}).catch(() => undefined);
+				if (declared)
+					this.capabilities.set(
+						key,
+						Object.fromEntries(
+							(["fork", "candidates", "logprobs", "provider"] as const).map((name) => [
+								name,
+								declared[name] === true,
+							]),
+						),
+					);
+			})
+			.catch(() => undefined);
 		this.background.track(task);
 	}
-
 	private async post(
 		path: string,
 		payload: Readonly<Record<string, unknown>>,
@@ -637,22 +1085,26 @@ export class SelfSpeculationCoordinator {
 			const apiKey = settings.apiKeyEnv ? process.env[settings.apiKeyEnv] : undefined;
 			const response = await this.fetch(`${settings.endpoint}${path}`, {
 				method: "POST",
-				headers: { "content-type": "application/json", ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) },
+				headers: {
+					"content-type": "application/json",
+					...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+				},
 				body: JSON.stringify(payload),
 				signal,
 			});
 			if (!response.ok) throw new Error(`self-speculation control plane returned HTTP ${response.status}`);
 			return response.status === 204 ? undefined : await response.json().catch(() => undefined);
 		} catch (error) {
-			if (!externalSignal?.aborted) { this.counters.failures++; this.lastFailure = errorMessage(error); }
+			if (!externalSignal?.aborted) {
+				this.counters.failures++;
+				this.lastFailure = errorMessage(error);
+			}
 			throw error;
 		} finally {
 			clearTimeout(timeout);
 		}
 	}
-
 }
-
 function providerPayload(
 	payload: unknown,
 	settings: SelfSpeculationSettings,
@@ -682,7 +1134,6 @@ function providerPayload(
 		},
 	};
 }
-
 function forkPayload(settings: SelfSpeculationSettings) {
 	return {
 		actor_profile: settings.actorProfile,
@@ -695,8 +1146,10 @@ function forkPayload(settings: SelfSpeculationSettings) {
 		...(settings.draftBoundary === "auto" ? {} : { draft_boundary: settings.draftBoundary }),
 	};
 }
-
-function candidatePayload(candidate: CandidateRecord, calibration: CandidateCalibration): Readonly<Record<string, unknown>> {
+function candidatePayload(
+	candidate: CandidateRecord,
+	calibration: CandidateCalibration,
+): Readonly<Record<string, unknown>> {
 	return {
 		id: candidate.id,
 		action_identity: {
@@ -722,8 +1175,10 @@ function candidatePayload(candidate: CandidateRecord, calibration: CandidateCali
 		},
 	};
 }
-
-function rankedCandidates(candidates: Iterable<CandidateRecord>, calibration: (candidate: CandidateRecord) => CandidateCalibration) {
+function rankedCandidates(
+	candidates: Iterable<CandidateRecord>,
+	calibration: (candidate: CandidateRecord) => CandidateCalibration,
+) {
 	return [...candidates]
 		.map((candidate) => ({ candidate, calibration: calibration(candidate) }))
 		.sort(
@@ -737,29 +1192,44 @@ function rankedCandidates(candidates: Iterable<CandidateRecord>, calibration: (c
 				left.candidate.sequence - right.candidate.sequence,
 		);
 }
-
 function contextPayload(context: Context) {
-	return { system_prompt: context.systemPrompt, messages: structuredClone(context.messages),
-		tools: context.tools?.map(({ name, description, parameters }) => ({ name, description, parameters: structuredClone(parameters) })) };
+	return {
+		system_prompt: context.systemPrompt,
+		messages: structuredClone(context.messages),
+		tools: context.tools?.map(({ name, description, parameters }) => ({
+			name,
+			description,
+			parameters: structuredClone(parameters),
+		})),
+	};
 }
-
-function cloneSerializable(value: unknown): unknown { try { return structuredClone(value); } catch { return undefined; } }
-
+function cloneSerializable(value: unknown): unknown {
+	try {
+		return structuredClone(value);
+	} catch {
+		return undefined;
+	}
+}
 function modelPayload(model: Model<Api>): Readonly<Record<string, unknown>> {
 	return { provider: model.provider, api: model.api, id: model.id };
 }
-
-const originOf = (value: string | undefined) => URL.canParse(value ?? "") ? new URL(value!).origin : undefined;
-
+const originOf = (value: string | undefined) =>
+	URL.canParse(value ?? "") ? new URL(value!).origin : undefined;
 function decoderEvidenceContext(state: TurnState, tool: string, source: string) {
 	const { endpoint, actorProfile, draftFormat: format, draftBoundary: boundary } = state.settings;
-	return { model: state.modelKey, endpoint, actorProfile, format, boundary, tool, source };
+	return {
+		model: state.modelKey,
+		endpoint,
+		actorProfile,
+		format,
+		boundary,
+		tool,
+		source,
+	};
 }
-
 function actionEvidenceContext(state: TurnState, tool: string, source: string) {
 	return { model: state.modelKey, tool, source };
 }
-
 function parseVerificationOutcome(
 	verification: Readonly<Record<string, unknown>>,
 	requestID: string,
@@ -773,7 +1243,10 @@ function parseVerificationOutcome(
 		if (!step) throw new Error("self-speculation verification step must be an object");
 		const tokens = verificationTokenCounts(step);
 		const candidateIndex = verificationNumber(step, "candidate_index") ?? index;
-		const candidateID = step.candidate_id === undefined || step.candidate_id === null ? undefined : nonEmptyString(step.candidate_id);
+		const candidateID =
+			step.candidate_id === undefined || step.candidate_id === null
+				? undefined
+				: nonEmptyString(step.candidate_id);
 		if (step.candidate_id !== undefined && step.candidate_id !== null && !candidateID)
 			throw new Error("self-speculation verification candidate_id must be a non-empty string");
 		const candidateIDs = uniqueStrings([candidateID, ...array(step.candidate_ids)]);
@@ -793,7 +1266,10 @@ function parseVerificationOutcome(
 	const stepAcceptedTokens = steps.reduce((total, step) => total + step.acceptedTokens, 0);
 	const stepRejectedTokens = steps.reduce((total, step) => total + step.rejectedTokens, 0);
 	const speculativeSteps = verificationNumber(verification, "num_spec_steps") ?? steps.length;
-	const tokens = verificationTokenCounts(verification, { draftedTokens: stepDraftedTokens, acceptedTokens: stepAcceptedTokens });
+	const tokens = verificationTokenCounts(verification, {
+		draftedTokens: stepDraftedTokens,
+		acceptedTokens: stepAcceptedTokens,
+	});
 	const { draftedTokens, acceptedTokens, rejectedTokens } = tokens;
 	if (
 		steps.length > 0 &&
@@ -805,7 +1281,8 @@ function parseVerificationOutcome(
 		throw new Error("self-speculation verification totals do not match its steps");
 	const unresolvedProposals = verificationNumber(verification, "unresolved_proposals") ?? 0;
 	const unresolvedDraftTokens = verificationNumber(verification, "unresolved_draft_tokens") ?? 0;
-	const meanAcceptanceLength = verificationNumber(verification, "mean_acceptance_length", false) ??
+	const meanAcceptanceLength =
+		verificationNumber(verification, "mean_acceptance_length", false) ??
 		(speculativeSteps > 0 ? 1 + acceptedTokens / speculativeSteps : 1);
 	return Object.freeze({
 		requestID,
@@ -818,19 +1295,31 @@ function parseVerificationOutcome(
 		steps: Object.freeze(steps),
 	});
 }
-
-function verificationTokenCounts(value: Readonly<Record<string, unknown>>, totals?: { draftedTokens: number; acceptedTokens: number }) {
-	const draftedTokens = totals ? verificationNumber(value, "num_draft_tokens") ?? totals.draftedTokens
+function verificationTokenCounts(
+	value: Readonly<Record<string, unknown>>,
+	totals?: {
+		draftedTokens: number;
+		acceptedTokens: number;
+	},
+) {
+	const draftedTokens = totals
+		? (verificationNumber(value, "num_draft_tokens") ?? totals.draftedTokens)
 		: requiredVerificationInteger(value, "drafted_tokens", true);
-	const acceptedTokens = totals ? verificationNumber(value, "num_accepted_draft_tokens") ?? totals.acceptedTokens
+	const acceptedTokens = totals
+		? (verificationNumber(value, "num_accepted_draft_tokens") ?? totals.acceptedTokens)
 		: requiredVerificationInteger(value, "accepted_tokens");
-	const rejectedTokens = verificationNumber(value, totals ? "num_rejected_draft_tokens" : "rejected_tokens") ?? draftedTokens - acceptedTokens;
+	const rejectedTokens =
+		verificationNumber(value, totals ? "num_rejected_draft_tokens" : "rejected_tokens") ??
+		draftedTokens - acceptedTokens;
 	if (acceptedTokens > draftedTokens || acceptedTokens + rejectedTokens !== draftedTokens)
 		throw new Error(`self-speculation verification ${totals ? "" : "step "}token counts are inconsistent`);
 	return { draftedTokens, acceptedTokens, rejectedTokens };
 }
-
-function verificationNumber(record: Readonly<Record<string, unknown>>, field: string, integer = true): number | undefined {
+function verificationNumber(
+	record: Readonly<Record<string, unknown>>,
+	field: string,
+	integer = true,
+): number | undefined {
 	const value = record[field];
 	if (value === undefined || value === null) return undefined;
 	if (!isFiniteNumber(value) || value < 0)
@@ -839,29 +1328,40 @@ function verificationNumber(record: Readonly<Record<string, unknown>>, field: st
 		throw new Error(`self-speculation verification ${field} must be an integer`);
 	return value;
 }
-
-function requiredVerificationInteger(value: Readonly<Record<string, unknown>>, field: string, positive = false): number {
+function requiredVerificationInteger(
+	value: Readonly<Record<string, unknown>>,
+	field: string,
+	positive = false,
+): number {
 	const number = verificationNumber(value, field);
 	if (number === undefined || (positive && number === 0))
-		throw new Error(
-			`self-speculation verification ${field} must be ${positive ? "positive" : "present"}`,
-		);
+		throw new Error(`self-speculation verification ${field} must be ${positive ? "positive" : "present"}`);
 	return number;
 }
-
 export function httpEndpoint(value: unknown, fallback: string): string {
 	const selected = nonEmptyString(value);
-	try { const url = new URL(selected ?? ""); return /^https?:\/\//i.test(selected!) && url.hostname && !url.search && !url.hash && !url.username && !url.password && !/[\s\\]/.test(selected!) ? selected!.replace(/\/+$/u, "") : fallback; }
-	catch { return fallback; }
+	try {
+		const url = new URL(selected ?? "");
+		return /^https?:\/\//i.test(selected!) &&
+			url.hostname &&
+			!url.search &&
+			!url.hash &&
+			!url.username &&
+			!url.password &&
+			!/[\s\\]/.test(selected!)
+			? selected!.replace(/\/+$/u, "")
+			: fallback;
+	} catch {
+		return fallback;
+	}
 }
-
-function controlPlaneKey(settings: SelfSpeculationSettings): string { return JSON.stringify([settings.endpoint, settings.capabilitiesPath, settings.apiKeyEnv]); }
-
+function controlPlaneKey(settings: SelfSpeculationSettings): string {
+	return JSON.stringify([settings.endpoint, settings.capabilitiesPath, settings.apiKeyEnv]);
+}
 export function httpPath(value: unknown, fallback: string): string {
 	const selected = nonEmptyString(value);
 	return selected && /^\/(?!\/)[^\s\\]*$/.test(selected) ? selected : fallback;
 }
-
 function requiresForkLogprobs(settings: SelfSpeculationSettings): boolean {
 	return (
 		settings.requireLogprobs ||
@@ -869,23 +1369,18 @@ function requiresForkLogprobs(settings: SelfSpeculationSettings): boolean {
 			settings.forkActionMinConfidence > 0)
 	);
 }
-
 function textOr(value: unknown, fallback: string): string {
 	return nonEmptyString(value) ?? fallback;
 }
-
 function nonEmptyString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
-
 function array(value: unknown): readonly unknown[] {
 	return Array.isArray(value) ? value : [];
 }
-
 function actionIdentity(key: string): string {
 	return `action:${hash("sha256", key)}`;
 }
-
 function parsedSidecarActionCall(value: unknown, fallbackIndex: number) {
 	const call = record(value);
 	const tool = nonEmptyString(call?.name);
@@ -894,13 +1389,23 @@ function parsedSidecarActionCall(value: unknown, fallbackIndex: number) {
 	const index = isSafeCount(call?.index) ? call.index : fallbackIndex;
 	const callID = nonEmptyString(call?.call_id);
 	const format = nonEmptyString(call?.format);
-	return { index, ...(callID ? { callID } : {}), ...(format ? { format } : {}), tool, input: structuredClone(input) };
+	return {
+		index,
+		...(callID ? { callID } : {}),
+		...(format ? { format } : {}),
+		tool,
+		input: structuredClone(input),
+	};
 }
-
 function sidecarActionBatchID(fingerprint: string): string {
 	return `fork:${hash("sha256", fingerprint).slice(0, 32)}`;
 }
-
 function uniqueStrings(value: unknown): string[] {
-	return [...new Set(array(value).map(nonEmptyString).filter((item): item is string => item !== undefined))];
+	return [
+		...new Set(
+			array(value)
+				.map(nonEmptyString)
+				.filter((item): item is string => item !== undefined),
+		),
+	];
 }

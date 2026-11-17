@@ -33,20 +33,32 @@ export interface SuiteBenchmarkRun {
 }
 
 type MeasuredRun = SuiteBenchmarkRun & {
-	readonly summary: SuiteBenchmarkSummary & { readonly toolComputeMs: number; readonly hiddenComputeMs: number };
+	readonly summary: SuiteBenchmarkSummary & {
+		readonly toolComputeMs: number;
+		readonly hiddenComputeMs: number;
+	};
 };
 type ToolWaitRun = SuiteBenchmarkRun & { readonly summary: SuiteBenchmarkSummary };
 
 export function summarizeSuite(runs: readonly SuiteBenchmarkRun[]) {
 	const measured = runs.filter(hasTiming);
-	const toolWaits = runs.filter(hasToolWait).map(run => run.summary.toolWaitMs);
-	const reused = runs.flatMap(run => measuredValue(run.summary?.hiddenComputeMs));
-	const adoption = runs.flatMap(run => measuredValue(run.summary?.adoptionWaitMs));
+	const toolWaits = runs.filter(hasToolWait).map((run) => run.summary.toolWaitMs);
+	const reused = runs.flatMap((run) => measuredValue(run.summary?.hiddenComputeMs));
+	const adoption = runs.flatMap((run) => measuredValue(run.summary?.adoptionWaitMs));
 	const invalidRuns = runs.flatMap((run) => {
 		const reasons = [...(run.error ? ["runner_error"] : []), ...screeningFailures(run.summary)];
 		if (run.summary && !hasTiming(run)) reasons.push("unavailable_timing");
-		return reasons.length ? [{ instance: run.instance, repeat: run.repeat, output: run.output,
-			...(run.error ? { error: run.error } : {}), reasons }] : [];
+		return reasons.length
+			? [
+					{
+						instance: run.instance,
+						repeat: run.repeat,
+						output: run.output,
+						...(run.error ? { error: run.error } : {}),
+						reasons,
+					},
+				]
+			: [];
 	});
 	return {
 		runs: runs.length,
@@ -60,14 +72,19 @@ export function summarizeSuite(runs: readonly SuiteBenchmarkRun[]) {
 		unmeasuredRuns: runs.length - measured.length,
 		// Incomplete denominators must not hide known hidden calculation or actual waits.
 		diagnostics: {
-			adoptionWaitMeasuredRuns: adoption.length, adoptionWaitMs: total(adoption),
-			toolWaitMeasuredRuns: toolWaits.length, toolWaitMs: total(toolWaits),
+			adoptionWaitMeasuredRuns: adoption.length,
+			adoptionWaitMs: total(adoption),
+			toolWaitMeasuredRuns: toolWaits.length,
+			toolWaitMs: total(toolWaits),
 			toolWaitMeanMs: toolWaits.length ? total(toolWaits)! / toolWaits.length : undefined,
 			toolWaitP95Ms: nearestRank(toolWaits, 0.95),
-			hiddenMeasuredRuns: reused.length, hiddenComputeMs: total(reused),
-			hiddenComputeIncomplete: runs.some(run => run.summary?.hiddenComputeIncomplete) || undefined,
+			hiddenMeasuredRuns: reused.length,
+			hiddenComputeMs: total(reused),
+			hiddenComputeIncomplete: runs.some((run) => run.summary?.hiddenComputeIncomplete) || undefined,
 		},
-		implementationCommits: [...new Set(runs.flatMap((run) => run.implementationCommit ? [run.implementationCommit] : []))],
+		implementationCommits: [
+			...new Set(runs.flatMap((run) => (run.implementationCommit ? [run.implementationCommit] : []))),
+		],
 		invalidRuns,
 		pooled: measured.length ? pooled(measured) : undefined,
 		byInstance: Object.fromEntries(
@@ -81,12 +98,25 @@ export function summarizeSuite(runs: readonly SuiteBenchmarkRun[]) {
 
 /** Paired tool wait comparison; independent runs may be slower with speculation. */
 export function summarizePairs(runs: readonly SuiteBenchmarkRun[]) {
-	const on = runs.filter((run) => run.arm === "on"), off = runs.filter((run) => run.arm === "off");
+	const on = runs.filter((run) => run.arm === "on");
+	const off = runs.filter((run) => run.arm === "off");
 	const pairs = on.filter(hasToolWait).flatMap((run) => {
-		const other = off.find((candidate) => candidate.instance === run.instance && candidate.repeat === run.repeat);
-		return other && hasToolWait(other) ? [{ instance: run.instance, repeat: run.repeat, onToolWaitMs: run.summary.toolWaitMs, offToolWaitMs: other.summary.toolWaitMs }] : [];
+		const other = off.find(
+			(candidate) => candidate.instance === run.instance && candidate.repeat === run.repeat,
+		);
+		return other && hasToolWait(other)
+			? [
+					{
+						instance: run.instance,
+						repeat: run.repeat,
+						onToolWaitMs: run.summary.toolWaitMs,
+						offToolWaitMs: other.summary.toolWaitMs,
+					},
+				]
+			: [];
 	});
-	const onMs = pairs.reduce((total, pair) => total + pair.onToolWaitMs, 0), offMs = pairs.reduce((total, pair) => total + pair.offToolWaitMs, 0);
+	const onMs = pairs.reduce((total, pair) => total + pair.onToolWaitMs, 0);
+	const offMs = pairs.reduce((total, pair) => total + pair.offToolWaitMs, 0);
 	return {
 		pairs,
 		pairedToolWaitRatio: onMs > 0 ? offMs / onMs : null,
@@ -100,7 +130,13 @@ export function safeName(value: string): string {
 }
 
 function hasTiming(run: SuiteBenchmarkRun): run is MeasuredRun {
-	return !!run.summary && !run.summary.hiddenComputeIncomplete && measured(run.summary.toolComputeMs) && measured(run.summary.hiddenComputeMs) && run.summary.hiddenComputeMs <= run.summary.toolComputeMs;
+	return (
+		!!run.summary &&
+		!run.summary.hiddenComputeIncomplete &&
+		measured(run.summary.toolComputeMs) &&
+		measured(run.summary.hiddenComputeMs) &&
+		run.summary.hiddenComputeMs <= run.summary.toolComputeMs
+	);
 }
 
 function hasToolWait(run: SuiteBenchmarkRun): run is ToolWaitRun {
@@ -111,8 +147,12 @@ function measured(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
-function measuredValue(value: unknown): number[] { return measured(value) ? [value] : []; }
-function total(values: readonly number[]): number | undefined { return values.length ? values.reduce((sum, value) => sum + value, 0) : undefined; }
+function measuredValue(value: unknown): number[] {
+	return measured(value) ? [value] : [];
+}
+function total(values: readonly number[]): number | undefined {
+	return values.length ? values.reduce((sum, value) => sum + value, 0) : undefined;
+}
 
 export function nearestRank(values: readonly number[], percentile: number): number | undefined {
 	if (!values.length) return undefined;
@@ -123,20 +163,28 @@ export function nearestRank(values: readonly number[], percentile: number): numb
 
 function pooled(runs: readonly MeasuredRun[]) {
 	const actualEndToEndMs = sum(runs, "actualEndToEndMs");
-	const toolComputeMs = sum(runs, "toolComputeMs"), hiddenComputeMs = sum(runs, "hiddenComputeMs");
-	const toolWaitRuns = runs.filter(hasToolWait), toolWaitMs = toolWaitRuns.length ? sum(toolWaitRuns, "toolWaitMs") : undefined;
+	const toolComputeMs = sum(runs, "toolComputeMs");
+	const hiddenComputeMs = sum(runs, "hiddenComputeMs");
+	const toolWaitRuns = runs.filter(hasToolWait);
+	const toolWaitMs = toolWaitRuns.length ? sum(toolWaitRuns, "toolWaitMs") : undefined;
 	const actorActions = sum(runs, "actorActions");
 	const speculativeHits = sum(runs, "speculativeHits");
 	return {
 		runs: runs.length,
-		instanceClusters: new Set(runs.map(run => run.instance)).size,
+		instanceClusters: new Set(runs.map((run) => run.instance)).size,
 		actualEndToEndMs,
 		actualEndToEndMeanMs: actualEndToEndMs / runs.length,
-		actualEndToEndP95Ms: nearestRank(runs.map((run) => run.summary.actualEndToEndMs), 0.95),
+		actualEndToEndP95Ms: nearestRank(
+			runs.map((run) => run.summary.actualEndToEndMs),
+			0.95,
+		),
 		toolWaitMs,
 		toolWaitMeasuredRuns: toolWaitRuns.length,
 		toolWaitMeanMs: toolWaitMs === undefined ? undefined : toolWaitMs / toolWaitRuns.length,
-		toolWaitP95Ms: nearestRank(toolWaitRuns.map((run) => run.summary.toolWaitMs), 0.95),
+		toolWaitP95Ms: nearestRank(
+			toolWaitRuns.map((run) => run.summary.toolWaitMs),
+			0.95,
+		),
 		toolComputeMs,
 		hiddenComputeMs,
 		unhiddenComputeMs: toolComputeMs - hiddenComputeMs,

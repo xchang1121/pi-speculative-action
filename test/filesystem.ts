@@ -15,8 +15,10 @@ export function temporaryDirectories(prefix: string, base?: string) {
 			return root;
 		},
 		async dispose(): Promise<void> {
-			const removed = await Promise.allSettled(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
-			const failed = removed.find(result => result.status === "rejected");
+			const removed = await Promise.allSettled(
+				roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
+			);
+			const failed = removed.find((result) => result.status === "rejected");
 			if (failed) throw failed.reason;
 		},
 	};

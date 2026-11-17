@@ -1,107 +1,141 @@
-# Pi 投机执行与缓存复用
+# Pi 投机执行与显式子计算复用
 
-纯 Pi 扩展：提前执行可能需要的工作，让正式工具调用复用已经完成的部分，保留原工具的输出和副作用语义。
+提前执行工具，并通过输入证明复用已完成的成果。进程内步骤和外部程序共用资源版本、CAS、持久化存储与计算计时。
 
-## 主线架构
+## 接入
 
-**投机决定提前做什么，缓存复用决定已有工作能否使用。** 两者由同一运行时编排；缓存既接收投机产物，也接收正常执行留下的可复用成果。
-
-```mermaid
-flowchart LR
-    P[预测来源] --> S[计划与调度]
-    S --> E[提前执行]
-    E --> R[成果与依赖、效果、所有权证明]
-    A[Actor 正式调用] --> V[查找与验新]
-    R --> V
-    V -->|可采用| U[复用已有部分，完成剩余工作]
-    V -->|未命中或证明不足| N[正常执行]
-    N -->|捕获可复用部分| R
-```
-
-- **投机生产**：Drafter、PatternAware 和 Actor 信号提供候选，计划与调度负责依赖、预算、并发和取消，执行后端负责受控执行。提前准备已观察的子操作也属于这一层。预测观测只用于私有续推，Actor 历史只接收真实结果。
-- **缓存复用**：保存、发现并验证工具结果、输入、纯子计算及受支持的进程状态。正式调用按实际操作、依赖、效果和当前所有权采用成果，继续执行剩余部分；工具名称和预测来源不授予复用权限。
-
-预测匹配、成果有效性和实际消费分别记账。关闭投机后，正常调用仍可积累并使用缓存；预测失配也不自动作废独立有效的成果。效果只提交一次，消费期间保留资源，取消、淘汰和关闭按所有权释放。收益只计实际消费的计算，等待和未消费的工作另行统计。
-
-复用沿实际调用边界从外到内进行：完整工具或 Bash 分支有效时直接采用；整体失效后执行剩余流程，并在子进程、可证明的同步函数及输入资源边界继续查找。父级失效不会直接清空仍有自身证明的子成果；父级命中则跳过内部调用与查找。同模块纯函数可以组合成多层计算，改变外层参数只重算外层，改变子函数代码或闭包数据会重新核验所有依赖它的层级。各层共用原存储、预算、所有权与消费计量，父子重叠计算只计一次。Bash 的层级来自实际观察的进程，不能仅靠拆分命令字符串授权复用；这也不保证小计算的采纳成本低于重算。
-
-源码主线：[Host 接入](./src/agent-integration.ts) → [运行时编排](./src/runtime-engine.ts) → [统一执行入口](./src/tool-execution-gateway.ts)。[执行世界](./src/execution-world.ts)提供捕获、验证和提交契约；[资源版本](./src/resource-version.ts)与[存储](./src/reuse-store.ts)管理可复用成果及证明。
-
-## 使用
-
-自定义工具可使用[通用投机工具接入模板](./docs/speculative-tool-template.md)：以 `defineSpeculativeStep` 声明可共享的同步或异步计算，以 `defineSpeculativeTool` 声明效果边界，再照常 `pi.registerTool`。附带[可运行的三层报表示例](./examples/speculative-tool.ts)，展示跨工具共享、局部失效及工作区写入；所有步骤共用现有缓存和生命周期。
-
-需要 Node.js ≥ 22.19；使用未修改的 Pi，当前兼容验证基线为 `0.84.1`。
-
-```sh
-pi install git:github.com/xchang1121/pi-speculative-action@speculative-action
-pi
-```
-
-运行 `/speculative-action`，调整开关和预测来源后选择 **Apply changes**。
-
-| 开关 | 默认值 | 职责 |
-| --- | --- | --- |
-| **Speculative production** (`enabled`) | 关闭 | 启用额外的提前生产，包括调用预测、流式预览和已观察操作的准备。 |
-| **Cache & reuse** (`reuseEnabled`) | 开启 | 捕获并采用可复用成果；关闭后停止缓存采用及新的提前生产。 |
-
-两个开关都保留实际调用的观察与模式学习。`tools` 和各预测来源开关只筛选提前生产，不限制其他工具复用合格成果。
-
-`grep/find` 默认采用通过版本检查的 Captured 搜索契约，让 Actor 和提前执行共享同一搜索实现；资格不足时仍由原工具执行。保存 `searchExecution: "native"` 可显式选择 Native Pi。这个选择决定搜索语义，开启投机与否不会切换 Actor 的实现。
-
-全局配置位于 `<agent-dir>/speculative-action.json`，项目配置位于 `.pi/speculative-action.json`。安装准备阶段使用随依赖保留的 TypeScript 编译器生成入口，兼容 Pi 默认省略开发依赖的 Git 安装；类型检查在开发验证阶段单独运行。Pi 加载已编译入口；本地修改源码后运行 `npm run build`，再用 `pi -e /absolute/path/to/pi-speculative-action` 加载。
-
-Linux / WSL 2 需在扩展目录运行 `npm run setup:linux`，升级后重新运行；WSL checkout 放在 Linux 原生文件系统。Windows x64 使用随包提供的本地 NTFS 对象租约，无需另行编译。
-
-Linux 的透明子进程观察还需要合格的观察助手：通过 `PI_SPEC_HELD_EXEC_OBSERVER` 指向管理员部署、普通用户不可修改且具有 `CAP_SYS_PTRACE` 的独立 `.observer` 文件。助手核对调用者及目标进程身份，并在附着后释放该能力；工作负载本身不获得此权限。若启动环境已经设置 `no_new_privs`，助手也可在该约束下工作，但这会阻止依赖提权的 FUSE 挂载，不能用作完整验证环境的通用替代。权限不足时原工具正常执行，透明复用不可用。
-Linux 进程复用统一要求 cgroup v2、内核 BTF 与所需 eBPF tracing/kprobe hooks、`bpf_loop`；构建采集器还需要 Clang 和 libbpf、libelf、zlib 开发库。安装后，保留上面配置的观察助手，通过前台执行域启动 Pi：
-
-```sh
-sudo ~/.local/bin/pi-speculative-domain --user "$(id -u)" env \
-  PATH="$PATH" PI_SPEC_HELD_EXEC_OBSERVER="$PI_SPEC_HELD_EXEC_OBSERVER" "$(command -v pi)"
-```
-
-执行域负责对象版本、描述符身份、元数据观察和进程回收，Pi 与工具仍以原用户运行；进程接管、资源所有权、效果提交和计量沿用现有执行世界。仅配置旧观察助手已不足以启用 Linux 进程复用；普通启动或内核条件不足时，工具照常执行，文件输入和纯计算仍按各自能力工作。
-
-同一采集器共享已加载的观察探针，执行结束只释放其借用；最多保留 256 个探针对象，容量满时淘汰空闲对象，退出时统一关闭。执行域最多同时持有 256 个观察所有者，稀疏的内核对象表按需分配，各有 65,536 条上限；分配失败、溢出、丢失或观察中断使相关证明失效，不能以不完整证据交付资源。重新启动执行域可重新建立观察代际。
-
-## 支持边界
-
-资格由实际操作、依赖、效果和所有权决定。下表描述可验收的能力；某个工具名称或“只读”声明不会授权缓存其完整结果。
-
-| 能力 | 成立条件与不满足时的行为 | 公开入口验收 |
-| --- | --- | --- |
-| 共享输入、纯子计算 | 实际操作绑定、有效依赖证明；可跨工具消费，缺少绑定或证明时正常执行。 | `agent.system`、`persistent-inputs` |
-| 普通工具内部计算 | 自动接入同一已加载 JS 模块内可证明的同步数据函数和原生 `JSON.parse`；以当前代码、完整参数、闭包数据和内建实现核验，外层工具继续执行。未知调用、访问器、代理、别名、预算不足或取消时正常执行。 | `resource-computation`，真实 Pi 注册工具与独立调用计数 |
-| 工作区效果 | 私有工作区隔离、验新、事务提交及所有权释放；提交前失效可回退，已产生效果且恢复不明时终止。 | `process-reuse.system`、`host-closure`、`linux-overlayfs` |
-| Linux 完成成果与进程接管 | 已验证 x86-64、同一 ext4 挂载、合格 Bash 分支、已观察子操作及可封存的单线程进程；需要当前构建的执行域、观察助手和通过行为探测的后端。缺少执行域时进程复用不可用。 | `extension.system`、`linux-reuse-chain`、`held-exec` |
-| 检查点跨进程恢复 | 另限同一次系统启动、同一 Pi 会话、工作区和原缓存位置；身份、输入、所有权或镜像不符时拒绝恢复。 | `process-reuse.system` |
-| Windows | 本地 NTFS 文件资源与私有工作区；没有 Linux 同等进程接管能力。 | `filesystem-lease`、`host-closure` |
-
-普通工具内部计算通过进程内 V8 LiveEdit 接入，不打开调试端口。当前自动证明限于普通有限 JSON 数据、已审查的内建操作及同模块不可变函数绑定组成的无环调用链，不覆盖任意导入库、异步计算或函数源码反射；含已识别源码反射的模块不接入，外部调试器仍可能看到临时包装。代码、闭包数据或文件内容改变不会沿用旧计算，返回的数据副本允许调用者独立修改。结果继续使用现有资源视图、预算、消费计时和回收链，仅保留在当前会话；显式绑定的持久化接口保持原有契约。它不会提前运行不透明工具的外层副作用，也不保证每个小计算都有净耗时收益。
-
-进程观察根允许空格、反斜杠和 UTF-8 字符；须为规范化后的绝对目录、归调用者所有且组/其他用户不可写。路径须小于 Linux `PATH_MAX`（4,096 字节），每条祖先链最多 64 项（包括根自身和 `/`），同一观察所有者最多 4 个根、64 个去重父目录。限额耗尽或权限不符会给出具体拒绝原因。`linux-environment` 验证诊断与真实准入一致，`extension.system` 验证这些路径下的实际消费。
-
-菜单中的 **Check Linux environment** 使用运行时同一执行域握手、工作区准入及观察助手探测，分别列出构建条件、当前缺口和未验证事项；**Refresh and show capabilities** 显示已启用后端的实际资格。构建工具或库存在并不等于操作已获复用资格。升级后须重新 `setup:linux` 并重启前台执行域；仅保留旧观察助手不能恢复进程复用。
-
-任意原生程序、多线程续接、Windows 原生进程续接及宿主中断工具批次的透明恢复尚不支持；保持当前纯扩展部署，不引入检查点服务或虚拟机来扩大这一边界。外部服务状态与副作用不属于投机范围。Linux 实测环境为 WSL 2 / Ubuntu 24.04、x86-64 和原生 ext4，不外推其他内核、文件系统或架构。上表用例位于 `test/`，平台专属跳过不计为支持证据。
-
-验新不提供任意外部并发写入的隔离保证。证明不足时沿原路径执行；若提交已产生副作用且无法证明恢复，则报错终止，避免重复执行。
-
-## 开发
+运行环境为 Node.js ≥ 22.19；仓库的 Pi SDK 回归基线为 0.84.1。
 
 ```sh
 npm ci
 npm run check
 npm run build
-npm test -- --maxWorkers=1 --no-file-parallelism
-npm run bench:check
+pi -e /absolute/path/to/pi-speculative-action
 ```
 
-Windows 开发可在 WSL 中运行 `scripts/wsl-verify.sh`。它将当前提交和未提交改动复制到独立 Linux checkout，构建私有助手，再通过 `sudo` 启动该构建的前台执行域；测试仍以原用户运行。先按上文配置 `PI_SPEC_HELD_EXEC_OBSERVER`，脚本不安装持久服务或替换用户助手。
+开发构建需要 `devDependencies` 中的 TypeScript。发布包包含 `dist/`，运行时加载编译后的入口。
 
-扩展接口见 [Pi Host API](./src/index.ts)、[core](./src/core.ts) 和 [process-reuse](./src/process-reuse.ts)。新预测来源提交计划，新执行后端实现执行世界契约；反馈通过 `runtime.subscribe()` 接收，结束时调用 `host.dispose()`。
+运行 `/speculative-action` 调整预测来源和缓存开关。`enabled` 控制提前生产，默认关闭；`reuseEnabled` 控制成果复用，默认开启。
 
-公共 Host 接纳通过 `registerExecutionWorld(implementation, qualification)` 注册的运行时后端，通用 Linux 工厂也走此入口。注册声明具体入口并提供 `verify({ cwd, operation, signal, refresh })` 行为探测，返回当前隔离实现的 fingerprint 及 `externalEffects: "excluded"`；这是受信任后端对实际隔离、观察与回收能力的证明接口，不能用常量替代探测。执行前重新检查资格和版本，失败时回到可用路径；逐成果验新、效果事务和所有权仍由原流程检查。复制或修改后的实现须重新注册，关闭即撤销资格。
+自定义工具使用 `defineSpeculativeTool`，并通过 `registerSpeculativeTool(pi, definition)` 注册。覆盖同名基础工具时，把该注册扩展放在本扩展之前。宿主适配通过 Pi 的公开注册接口完成。
 
-[验证与收益口径](./bench/README.md) · [变更记录](./CHANGELOG.md)
+```ts
+import path from "node:path";
+import { defineSpeculativeTool, registerSpeculativeTool } from "@earendil-works/pi-speculative-action";
+import { Type } from "@earendil-works/pi-ai";
+
+export default function extension(pi) {
+  registerSpeculativeTool(pi, defineSpeculativeTool({
+    name: "count_bytes", label: "Count bytes", description: "Count bytes in a file",
+    parameters: Type.Object({ path: Type.String() }),
+    version: "1", effect: "observation", steps: {},
+    execute: async ({ computeStep, cwd }, input) => {
+      const file = path.resolve(cwd, input.path);
+      const count = await computeStep({
+        namespace: "example.byte-count", version: "1", key: input.path,
+        inputResources: [{ path: file, scope: "content" }],
+      }, async view => (await view.readFile(file)).length);
+      return { content: [{ type: "text", text: String(count) }], details: { count } };
+    },
+  }));
+}
+```
+
+`computeStep` 接受同步或异步计算，返回结构化数据、`Buffer` 或 `Uint8Array`。结果按序列化后的真实字节数计费。实现或依赖库变化时更新 `version`；文件通过传入视图读取，其他输入放入 `key` 或声明的环境键。
+
+分层计算继续使用 `defineSpeculativeStep`；见[工具模板](docs/speculative-tool-template.md)和[报表示例](examples/speculative-tool.ts)。修改类工具的视图提供 `prepare`、`computeStep`、`stat`、`readdir`。外层工作区分支回滚后，仅依赖基线只读输入的步骤仍可供后续调用采用。
+
+## 统一配置
+
+全局配置为 `<agent-dir>/speculative-action.json`，项目配置为 `.pi/speculative-action.json`。底层策略写在 `config` 中；直接使用 Host 时传入 `createSpeculativeActionHost(..., { config })`。类型、默认值及验证统一位于 [config-schema.ts](src/config-schema.ts)。
+
+```json
+{
+  "enabled": false,
+  "reuseEnabled": true,
+  "config": {
+    "explicitOnly": true,
+    "subcomputation": { "maxStepResultBytes": 16777216, "persistTimelineIntervals": true },
+    "filesystem": {
+      "sandboxDriver": "in_memory", "excludes": [".git", "node_modules", "target"],
+      "timestampQuietMs": 2000, "timestampQuietByFilesystem": { "0xef53": 10 }
+    },
+    "processReuse": {
+      "actorObservationMode": "none", "persistCompletedCertificates": true,
+      "environmentMode": "exact", "replayAcceptedTaints": []
+    }
+  }
+}
+```
+
+`explicitOnly` 默认开启。内置预测预设和自由文本路径推测已移除；显式计划、结构化观测及声明的步骤仍可使用。
+
+预测器使用序列 PPM 和结构化字段绑定。旧版 `transform/template/splice/rebase/near/join/coalesce` 绑定已停止执行，旧学习状态按分析器版本隔离。工具应把后续调用所需的参数输出为结构化字段。
+
+环境契约支持 `exact`、`allowlist`、`denylist`、`isolated`。投影列表由 `environmentKeys` 提供，隔离环境由 `isolatedEnvironment` 提供。默认比较完整环境。`replayAcceptedTaints` 默认空列表；用户可显式允许负载所需的 `clock`、`random`、`pid_observation`、`descriptor_observation` 等标记。
+
+`nativeBuild` 容量用于编译 Linux 助手。调整后将同一份 `config` 对象保存为 JSON，执行 `npm run setup:linux -- --config /path/to/config.json`，再重启执行域。运行时核对源码和编译配置指纹。
+
+## 外部程序协议
+
+在 Host 管理的工具调用中调用 `await subcomputeEnvironment()`，把返回的 `PI_SUBCOMPUTE_SOCKET` 与 `PI_SUBCOMPUTE_CONTEXT` 传给子进程。Windows 使用 Named Pipe，Linux 使用 Unix socket。设置 `subcomputation.exposeToControlledProcesses: true` 可向受控进程自动注入这些变量。
+
+每个连接使用换行分隔的 JSON，执行一次查询及至多一次发布：
+
+```json
+{"protocol":1,"op":"compute","context":"调用令牌","namespace":"example.transform","version":"1","key":"job","inputResources":[{"path":"input.bin","scope":"content"}],"envKeys":["MODE"],"environment":{"MODE":"fast"}}
+```
+
+命中返回 `state: "hit"` 和 `value`。未命中返回 `state: "miss"` 及已捕获的 `inputResources`；外部程序使用这些输入计算，再发送：
+
+```json
+{"op":"publish","value":{"encoding":"base64","value":"YWJj"},"durationMs":12.5}
+```
+
+结构化输出使用 `{"encoding":"json","value":...}`。发布完成返回 `state: "published"`；错误返回 `state: "error"`。令牌随工具调用结束或超时撤销。示例见 [JavaScript 客户端](test/subcompute-client.mjs)和 [Python 客户端](test/subcompute-client.py)。
+
+## Linux 进程复用
+
+```sh
+npm run setup:linux
+sudo ~/.local/bin/pi-speculative-domain --user "$(id -u)" env PATH="$PATH" "$(command -v pi)"
+```
+
+执行域需要 cgroup v2、内核 BTF、eBPF tracing/kprobe hooks 和 `bpf_loop`。构建依赖 Clang、libbpf、libelf、zlib 及安装脚本报告的工具。使用 Linux 原生文件系统上的 checkout。
+
+Linux 后端保留已完成进程的输出和可验证效果，并发布 SQLite L2 证书。`actorObservationMode: "provenance"` 为真实 Actor 执行采集依赖；当前 Actor 沉淀支持可完整验证的只读命令。写入、外部状态或不完整观测会阻止该次证书发布。
+
+Actor 观测与普通受控执行共享子进程采用通道。纯字节输出的子进程可以多次重放，环境和非确定性接纳范围由显式契约控制。内核观测容量位于 `nativeBuild`；观测历史丢失时诊断报告 `observer_history_incomplete` 及原因位。
+
+标准输出能否跨 pipe/socket 载体复用，由真实 syscall 观测决定。程序探测标准流元数据时，证书保留载体约束。受控异步启动使用 `createControlledBashOperations`。子进程观察另需合格的 `PI_SPEC_HELD_EXEC_OBSERVER`，安装脚本和环境诊断会报告当前资格。
+
+进程中途续接、OFD 图迁移和可恢复进程镜像已移除。
+
+## Windows 文件资源复用
+
+Windows 使用显式子计算协议及文件资源复用。文件租约由 Python 3 标准库 `ctypes` 调用 `OpenFileById` 持有，支持文件和父目录重命名、删除后身份校验及硬链接。运行环境需要可执行的 Python 3，默认命令为 `python`；可通过 `filesystem.windowsObjectLeaseCommand` 指定，例如 `["py", "-3"]` 或 Python 的绝对路径。
+
+辅助进程按配置共享，最后一个租约释放后退出。GC、工作线程退出和父进程管道关闭会回收句柄。`filesystem.objectLeaseTimeoutMs` 控制请求超时，`filesystem.maxWindowsLeaseRequests` 控制请求并发；批量释放会等待可用容量。实现随包附带，原有 `.node` 模块及其编译步骤已移除。
+
+可在 Windows 直接运行文件资源与工作区提交回归：
+
+```sh
+npx vitest run test/filesystem-lease.test.ts --maxWorkers=1 --no-file-parallelism
+```
+
+## 计量与验证
+
+`actionHitRate` 统计整动作采用；`subcomputationHits` 与 `reusedComputeMs` 统计内部计算复用。持久化步骤保留计算区间，跨轮恢复的实际消费继续计入隐藏计算量 `H`。
+
+```sh
+npm run check
+npm run build
+npm test -- --maxWorkers=1 --no-file-parallelism
+npm run bench:check
+node bench/portable-kernel.mjs
+node bench/grep-captured-qualification.mjs
+```
+
+测试从公开 Host、真实 Pi 工具或本地协议触发计算。平台专属测试在对应系统执行，本机资格失败记录为失败原因。
+
+公开入口为包根、`core`、`extension`、`pattern-aware`、`process-reuse`。详见 [Host API](src/index.ts)、[执行世界](src/execution-world.ts)、[验证口径](bench/README.md)。

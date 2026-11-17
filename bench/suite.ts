@@ -5,7 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { safeName, summarizePairs, summarizeSuite, type SuiteBenchmarkRun, type SuiteBenchmarkSummary } from "./suite-report.ts";
+import {
+	safeName,
+	summarizePairs,
+	summarizeSuite,
+	type SuiteBenchmarkRun,
+	type SuiteBenchmarkSummary,
+} from "./suite-report.ts";
 import { parsePatternPresets } from "./pattern-options.ts";
 
 type SuiteFile = Readonly<Record<string, readonly string[]>>;
@@ -20,18 +26,25 @@ const parsed = parseSuiteArguments(process.argv.slice(2));
 const suites = validateSuites(JSON.parse(await readFile(path.join(directory, "suite.json"), "utf8")));
 const instances = suites[parsed.suite];
 if (!instances) throw new Error(`Unknown suite ${parsed.suite}; expected ${Object.keys(suites).join(", ")}`);
-for (const option of ["--instance", "--output", "--prepare-only", ...(parsed.paired ? ["--speculation-disabled"] : [])]) {
+for (const option of [
+	"--instance",
+	"--output",
+	"--prepare-only",
+	...(parsed.paired ? ["--speculation-disabled"] : []),
+]) {
 	if (hasOption(parsed.forwarded, option)) throw new Error(`${option} is controlled by the suite runner`);
 }
 if (hasOption(parsed.forwarded, "--pattern-presets")) {
 	const selection = optionValue(parsed.forwarded, "--pattern-presets");
-	if (selection === undefined || selection.startsWith("--")) throw new Error("--pattern-presets requires a value");
+	if (selection === undefined || selection.startsWith("--"))
+		throw new Error("--pattern-presets requires a value");
 	parsePatternPresets(selection); // Validate before creating outputs; forward the explicit selection unchanged to every arm.
 }
 
 const label = optionValue(parsed.forwarded, "--label") ?? "baseline";
 const outputRoot = path.resolve(
-	parsed.outputRoot ?? path.join(os.tmpdir(), "pi-speculative-ablation-suites", `${safeName(label)}-${Date.now()}`),
+	parsed.outputRoot ??
+		path.join(os.tmpdir(), "pi-speculative-ablation-suites", `${safeName(label)}-${Date.now()}`),
 );
 const runner = path.join(directory, "run.ts");
 const tsx = fileURLToPath(import.meta.resolve("tsx/cli"));
@@ -41,34 +54,64 @@ await mkdir(outputRoot, { recursive: true });
 try {
 	for (let repeat = 1; repeat <= parsed.repeats; repeat++) {
 		// Paired runs alternate which arm goes first, so drift in the provider or machine does not favor one arm.
-		for (const instance of instances) for (const arm of parsed.paired ? (repeat % 2 ? ["on", "off"] as const : ["off", "on"] as const) : [undefined]) {
-			const output = path.join(outputRoot, `repeat-${repeat}`, `${safeName(instance)}${arm ? `.${arm}` : ""}.json`);
-			let run: SuiteBenchmarkRun = { instance, repeat, output, ...(arm ? { arm } : {}) };
-			try {
-				await mkdir(path.dirname(output), { recursive: true });
-				await writeFile(output, "", { flag: "wx" }); // Only this attempt may supply the result, including after failure.
-				const failed = await execute(process.execPath, [tsx, runner, ...parsed.forwarded, ...(arm === "off" ? ["--speculation-disabled"] : []),
-					"--instance", instance, "--output", output])
-					.then(() => undefined, (error: unknown) => ({ error }));
+		for (const instance of instances)
+			for (const arm of parsed.paired
+				? repeat % 2
+					? (["on", "off"] as const)
+					: (["off", "on"] as const)
+				: [undefined]) {
+				const output = path.join(
+					outputRoot,
+					`repeat-${repeat}`,
+					`${safeName(instance)}${arm ? `.${arm}` : ""}.json`,
+				);
+				let run: SuiteBenchmarkRun = { instance, repeat, output, ...(arm ? { arm } : {}) };
 				try {
-					const result = validateResult(JSON.parse(await readFile(output, "utf8")), output);
-					run = { ...run, implementationCommit: result.metadata.implementationCommit, summary: result.summary };
-				} catch (error) { if (!failed) throw error; }
-				if (failed) throw failed.error;
-				const errors = Object.values(run.summary?.benchmarkErrors ?? {});
-				if (errors.length) throw new Error(`Benchmark failed: ${errors.join("; ")}`);
-			} catch (error) {
-				run = { ...run, error: String(error) };
-				throw error;
-			} finally {
-				runs.push(run);
+					await mkdir(path.dirname(output), { recursive: true });
+					await writeFile(output, "", { flag: "wx" }); // Only this attempt may supply the result, including after failure.
+					const failed = await execute(process.execPath, [
+						tsx,
+						runner,
+						...parsed.forwarded,
+						...(arm === "off" ? ["--speculation-disabled"] : []),
+						"--instance",
+						instance,
+						"--output",
+						output,
+					]).then(
+						() => undefined,
+						(error: unknown) => ({ error }),
+					);
+					try {
+						const result = validateResult(JSON.parse(await readFile(output, "utf8")), output);
+						run = {
+							...run,
+							implementationCommit: result.metadata.implementationCommit,
+							summary: result.summary,
+						};
+					} catch (error) {
+						if (!failed) throw error;
+					}
+					if (failed) throw failed.error;
+					const errors = Object.values(run.summary?.benchmarkErrors ?? {});
+					if (errors.length) throw new Error(`Benchmark failed: ${errors.join("; ")}`);
+				} catch (error) {
+					run = { ...run, error: String(error) };
+					throw error;
+				} finally {
+					runs.push(run);
+				}
 			}
-		}
 	}
 } finally {
 	const report = {
 		metadata: {
-			suite: parsed.suite, label, repeats: parsed.repeats, paired: parsed.paired, instances, forwardedArguments: parsed.forwarded,
+			suite: parsed.suite,
+			label,
+			repeats: parsed.repeats,
+			paired: parsed.paired,
+			instances,
+			forwardedArguments: parsed.forwarded,
 		},
 		...(parsed.paired ? summarizePairs(runs) : summarizeSuite(runs)),
 		runOutputs: runs.map(({ instance, repeat, arm, output }) => ({ instance, repeat, arm, output })),
@@ -86,7 +129,13 @@ function parseSuiteArguments(args: readonly string[]) {
 	if (!Number.isSafeInteger(repeats) || repeats <= 0) throw new Error("--repeats must be a positive integer");
 	const outputRoot = takeOption(forwarded, "--output-root");
 	const paired = forwarded.includes("--paired");
-	return { suite, repeats, outputRoot, paired, forwarded: forwarded.filter((argument) => argument !== "--paired") };
+	return {
+		suite,
+		repeats,
+		outputRoot,
+		paired,
+		forwarded: forwarded.filter((argument) => argument !== "--paired"),
+	};
 }
 
 function takeOption(args: string[], name: string): string | undefined {
@@ -112,13 +161,19 @@ function hasOption(args: readonly string[], name: string): boolean {
 }
 
 function validateSuites(value: unknown): SuiteFile {
-	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("suite.json must be an object");
+	if (!value || typeof value !== "object" || Array.isArray(value))
+		throw new Error("suite.json must be an object");
 	const suites: Record<string, readonly string[]> = {};
 	for (const [name, instances] of Object.entries(value)) {
-		if (!Array.isArray(instances) || !instances.length || !instances.every((item) => typeof item === "string")) {
+		if (
+			!Array.isArray(instances) ||
+			!instances.length ||
+			!instances.every((item) => typeof item === "string")
+		) {
 			throw new Error(`Suite ${name} must contain instance names`);
 		}
-		if (new Set(instances).size !== instances.length) throw new Error(`Suite ${name} contains duplicate instances`);
+		if (new Set(instances).size !== instances.length)
+			throw new Error(`Suite ${name} contains duplicate instances`);
 		suites[name] = instances;
 	}
 	return suites;
@@ -127,7 +182,11 @@ function validateSuites(value: unknown): SuiteFile {
 function validateResult(value: unknown, file: string): StoredResult {
 	if (!value || typeof value !== "object") throw new Error(`Invalid benchmark result ${file}`);
 	const result = value as Partial<StoredResult>;
-	if (!result.metadata?.implementationCommit || !result.summary || typeof result.summary.patchCandidate !== "boolean") {
+	if (
+		!result.metadata?.implementationCommit ||
+		!result.summary ||
+		typeof result.summary.patchCandidate !== "boolean"
+	) {
 		throw new Error(`Incomplete benchmark result ${file}`);
 	}
 	return result as StoredResult;

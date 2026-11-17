@@ -1,6 +1,6 @@
 # 投机工具接入模板
 
-用 `defineSpeculativeStep` 声明可复用计算，用 `defineSpeculativeTool` 声明工具的效果边界，最后照常 `pi.registerTool(tool)`。扩展将这份契约接入现有资源视图、执行后端、预算、取消和回收机制；工具作者不需要维护结果缓存。
+用 `defineSpeculativeStep` 声明可复用计算，用 `defineSpeculativeTool` 声明工具的效果边界，通过公开的 `registerSpeculativeTool(pi, tool)` 注册。扩展将契约接入资源视图、执行后端、预算、取消和回收机制。
 
 完整可运行示例：[examples/speculative-tool.ts](../examples/speculative-tool.ts)。它注册 `inspect_dataset` 和 `write_dataset_report`，共同使用 `rows → summary → report` 三层计算。将文件放进能解析本包依赖的 Pi 扩展项目，启用本包扩展，并通过 `pi -e /absolute/path/to/speculative-tool.ts` 加载示例。输入文件内容例如 `[2,3]`；工具参数为 `path`、`multiplier`、`title`，写入工具另有 `output`。示例参与项目类型检查，并随 npm 包发布。
 
@@ -9,7 +9,7 @@
 ```ts
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { defineSpeculativeStep, defineSpeculativeTool } from "@earendil-works/pi-speculative-action";
+import { defineSpeculativeStep, defineSpeculativeTool, registerSpeculativeTool } from "@earendil-works/pi-speculative-action";
 
 const count = defineSpeculativeStep({
   id: "my-package.count", version: "1", dependencies: {},
@@ -20,7 +20,7 @@ const count = defineSpeculativeStep({
 });
 
 export default function register(pi: ExtensionAPI) {
-  pi.registerTool(defineSpeculativeTool({
+  registerSpeculativeTool(pi, defineSpeculativeTool({
     name: "count_lines", label: "Count lines", description: "Count newline-separated segments.",
     parameters: Type.Object({ path: Type.String() }),
     version: "1", effect: "observation", steps: { count },
@@ -37,9 +37,9 @@ export default function register(pi: ExtensionAPI) {
 
 - 步骤是确定性的无副作用计算，可以同步返回，也可以 `await` 文件读取、声明过的子步骤和纯计算。所有可变配置必须进入 `input`；文件读取必须通过 `context.fs`。不要直接读 `node:fs`、环境变量、时钟、随机数、网络、数据库或可变全局变量。
 - `dependencies` 声明直接子步骤；通过 `step("name", input)` 调用它们。每个子步骤只接收实际影响自己的参数，例如标题不应传给解析数据的步骤。依赖定义创建后不可修改，未知步骤名会被拒绝；静态定义自然形成无环图。
-- 输入和输出是有限的 JSON 数据树：普通对象、密集数组、字符串、布尔、`null` 和有限数字。不能包含 `undefined`、`NaN`、`Infinity`、`-0`、函数、访问器、代理、循环或共享对象引用、类实例、Buffer、句柄。输入被独立复制并冻结；返回值被独立复制给每个消费者。
-- 单次输入或输出使用现有准备数据限制：约 1 MiB 编码预算、最多 65,536 个节点和 64 层深度；超过限制会报错。较大任务应按稳定分块定义步骤。结果在限制内但缓存空间不足时仍可正常计算，只是不保证保留。
-- 将同一个步骤定义导出给多个工具使用。`id`、`version` 用于标识契约；同名字符串不能让独立定义互相采纳。修改实现、依赖库或不作为输入传入的固定配置时，创建新定义并更新版本。运行时不会证明作者提供的任意回调确实纯净。
+- 输入和输出支持普通对象、数组、字符串、布尔、`null`、有限数字，以及 `Buffer`/`Uint8Array`。循环、访问器、函数和资源句柄会被拒绝。每个消费者获得独立结果副本。
+- 容量由顶层配置的 `subcomputation.maxStepResultBytes/maxStepObjectNodes/maxStepObjectDepth` 控制；缓存按真实序列化字节数计费。默认结果上限为 16 MiB。配置示例见 [README](../README.md)。
+- `id`、`version` 标识计算契约；相同契约及参数可以共享持久化结果。修改实现、依赖库或固定配置时更新版本。文件读取必须经过受控视图，其他影响结果的值应显式放入参数。
 - 遵守 `signal`，异步长任务应响应取消，循环应主动检查 `signal.throwIfAborted()`；不要把取消状态当成业务输入，也不要启动脱离调用生命周期的后台任务。
 
 ## 工具的效果边界
@@ -54,7 +54,7 @@ export default function register(pi: ExtensionAPI) {
 
 `resources(input)` 是纯函数，返回潜在访问路径，用于调度顺序；应列出可能读取或写入的路径。它不代替实际读取证据，也不授予访问权限。全部路径相对当前工作区，越出根目录的路径会被拒绝。`fs` 提供 `readFile/access/exists/stat/readdir`；可写模式另有 `writeFile/mkdir`。步骤始终只拿到只读接口。`readFile(path, maxBytes)` 返回最多指定字节的前缀，需要完整内容的步骤应像完整示例一样检查长度。
 
-各执行后端的文件接口覆盖不同：当前工作区提前执行视图支持 `readFile/access/exists/writeFile/mkdir`，尚不支持 `stat/readdir` 和步骤准备接口；在那里步骤正常计算，完整工具成果仍可采用。逐层步骤缓存通过资源视图和正式调用的准备接口提供。需要读目录等能力时，工作区提前执行可能失败并回到正式调用；模板不会用宿主文件访问绕过后端限制。
+只读视图和修改沙箱都提供 `prepare`、`computeStep`、`stat` 和 `readdir`。外层修改回滚后，只依赖基线只读输入的步骤继续保留；依赖私有写入的结果随分支释放。
 
 效果留在步骤外部。例如先 `await step("report", calculationArgs)`，再 `await fs.writeFile(output, report)`。输出路径不影响报表内容时，不应放入计算参数；切换输出路径即可共享报表计算，同时仍执行本次写入。不要在可复用步骤中发送请求、写日志或保存文件，否则命中缓存时这些行为会被跳过。
 
@@ -73,7 +73,7 @@ export default function register(pi: ExtensionAPI) {
 
 父步骤命中时不再调用或查找子步骤；父步骤未命中才自然进入其函数，逐个检查实际调用的子步骤。有效成果可以来自此前的正式调用，也可以来自受控提前执行；父子重叠收益继续按原有计算身份去重。
 
-这是显式声明的进程内数据步骤模板，支持异步步骤，并不为任意宿主回调、子进程内部状态或外部服务授予复用资格。步骤定义和数据成果使用当前会话的所有权；本接口不承诺跨进程或重启后的步骤结果持久复用。已有原生子进程复用仍遵循自己的观察、依赖、效果和后端资格。小计算也可能重算更快，应把步骤边界放在具有实际成本的计算上。
+设置 `config.storage.root` 后，步骤结果、文件依赖与计算区间保存在 SQLite/CAS 中，新宿主重新验证依赖后可以复用。外部工具通过 `PI_SUBCOMPUTE_SOCKET` 查询和发布，协议与 Python 示例见 [README](../README.md) 及 [test/subcompute-client.py](../test/subcompute-client.py)。受控子进程需显式开启 `subcomputation.exposeToControlledProcesses`。
 
 ## 接入验收
 
