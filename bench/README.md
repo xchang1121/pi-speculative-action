@@ -13,7 +13,7 @@ npm run bench:overlay-probe
 
 前两项使用当前完整构建、合格的本地 Pi rg 和共享 Host 流程，验证原版 find、显式 captured grep 的输出、编码、排序、链接、输入变化、增量重算、取消及回收；grep 支持 `--case=<名称>`。
 
-Linux 进程资格在原生文件系统的 checkout 运行。Windows 可用 `wsl.exe -e bash -lc 'bash "$(wslpath "<checkout>")/scripts/wsl-verify.sh" [vitest 参数]'` 同步当前代码、构建助手并执行测试；`PI_SPEC_WSL_WORK/CHECKOUT/HOME` 调整隔离目录。已验证的 binary 可通过 `PI_SPEC_SANDLOCK`、`PI_SPEC_HELD_EXEC`、`PI_SPEC_STRACE` 指定，观察器资格见[Linux 进程复用](../README.md#linux-进程复用)。
+Linux 进程资格在原生文件系统的 checkout 运行。Windows 可用 `wsl.exe -e bash -lc 'bash "$(wslpath "<checkout>")/scripts/wsl-verify.sh" [vitest 参数]'` 同步当前代码、构建助手并执行测试；`PI_SPEC_WSL_WORK/CHECKOUT/HOME` 调整隔离目录。已验证的 binary 可通过 `PI_SPEC_SANDLOCK`、`PI_SPEC_HELD_EXEC` 指定，观察器资格见[Linux 进程复用](../README.md#linux-进程复用)。
 
 exec 入口验证真实退出、描述符、输出、文件效果、已完成结果重放和输入变化后的回退。显式受控执行器负责子进程入口。OverlayFS 按生产能力检查执行或带原因跳过。共享场景位于 `test/linux-process-fixture.ts`，资格以当前构建为准。
 

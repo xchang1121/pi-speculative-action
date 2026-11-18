@@ -339,7 +339,7 @@ export async function createLinuxProcessBenchmark(
 			prepare: async () => {
 				const status = await backend.check(true);
 				if (status.state !== "ready") throw new Error(status.detail);
-				if (!status.sandlockBinary || !status.straceBinary)
+				if (!status.sandlockBinary)
 					throw new Error("Linux process backend omitted ready binaries");
 				await world.speculation.prepare?.({ cwd: workspace });
 				return {

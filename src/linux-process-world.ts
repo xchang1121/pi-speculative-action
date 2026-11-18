@@ -182,7 +182,6 @@ type HostProcessWorldOptions = Pick<
 	| "storeRoot"
 	| "store"
 	| "sandlockBinary"
-	| "straceBinary"
 	| "heldExecBinary"
 	| "deniedPaths"
 >;

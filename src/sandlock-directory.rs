@@ -27,11 +27,18 @@ pub(crate) async fn read_directory(
     };
     let mut state: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(pin.as_raw_fd(), &mut state) } != 0 { return NotifAction::Errno(libc::EBADF); }
+    let target = std::fs::read_link(format!("/proc/self/fd/{}", pin.as_raw_fd())).ok();
+    if notif.data.nr as i64 != libc::SYS_lseek {
+        if let Some(target) = &target {
+            let name = target.as_os_str().as_encoded_bytes();
+            crate::seccomp::notif::pi_observe_record(notif.id, 7, name.as_ptr(), name.len());
+        }
+    }
     let image = directory_images.iter().find_map(|(directory, bytes)| {
         let named = std::fs::metadata(directory).ok()?;
         (named.dev() == state.st_dev && named.ino() == state.st_ino).then_some(bytes)
     });
-    let merged = if image.is_some() { None } else { merged_listing(cs.branch.as_ref(), pin.as_raw_fd(), &state, inode_projection) };
+    let merged = if image.is_some() { None } else { merged_listing(cs.branch.as_ref(), target.as_deref(), &state, inode_projection) };
     let image = image.map(Vec::as_slice).or(merged.as_deref());
     let native = image.is_none();
     if native && (inode_projection.is_none() || notif.data.nr as i64 == libc::SYS_lseek) { return NotifAction::Continue; }
@@ -101,11 +108,11 @@ pub(crate) async fn read_directory(
 
 /// The listing of the directory `fd` names when the COW branch holds entries in it: its own entry, its parent's,
 /// then each merged name, as getdents64 records keyed by their position.
-fn merged_listing(cow: Option<&SeccompCowBranch>, fd: RawFd, state: &libc::stat,
+fn merged_listing(cow: Option<&SeccompCowBranch>, target: Option<&Path>, state: &libc::stat,
     inode_projection: Option<&(dyn Fn(u64, u64) -> u64 + Sync)>) -> Option<Vec<u8>> {
     use std::os::unix::fs::MetadataExt;
     let cow = cow?;
-    let target = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok()?;
+    let target = target?;
     let rel = match target.strip_prefix(cow.upper_dir()) {
         Ok(rest) => rest.to_str()?.to_string(),
         Err(_) if cow.matches(target.to_str()?) => cow.safe_rel(target.to_str()?)?,

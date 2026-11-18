@@ -87,7 +87,7 @@ export async function executionDomainCollector(binary: string) {
 	const check = (root?: string): void => {
 		const hello = request(0);
 		if (
-			hello.readBigUInt64LE(8) !== 17n ||
+			hello.readBigUInt64LE(8) !== 18n ||
 			hello.readUInt32LE(4) !== 8 ||
 			hello.toString("ascii", 16, 80) !== fingerprint.slice(7)
 		)
@@ -118,7 +118,7 @@ export async function executionDomainCollector(binary: string) {
 				get failure() {
 					return failure;
 				},
-				trace: (broker: string) => {
+				trace: (broker = "") => {
 					if (phase === "closed" || descriptor !== undefined)
 						throw new Error("execution record owner is unavailable");
 					descriptor = Number(request(11, id, Buffer.from(`${broker}\0`)).readBigUInt64LE(16));
@@ -439,8 +439,7 @@ export type HeldExecDecision = {
 	readonly observeTiming?: (timing: HeldExecTiming) => void;
 } &
 	/** Continue only this held launch; a later launch must observe candidates available then. */
-	(
-		| {
+	(| {
 				readonly kind: "continue";
 				readonly observeCompletion?: (
 					durationMs: number | undefined,
@@ -504,6 +503,9 @@ export class LinuxHeldExecBoundary {
 	private readonly server: net.Server;
 	private readonly sockets = new Set<net.Socket>();
 	private readonly socketPath: string;
+	get endpoint() {
+		return this.socketPath;
+	}
 	private closing?: Promise<void>;
 	private readonly startup: (operation: number) => number;
 	private readonly observerBinary: string;
@@ -694,29 +696,9 @@ export class LinuxHeldExecBoundary {
 			observer.stdin?.end(),
 		);
 	}
-	/** The tracing process uses the same held-exec exchange as the launch observer. */
-	async trace<Value>(
-		options: HeldObservation,
-		execute: (configuration: string, attach: (child: ChildProcess) => void) => Promise<Value>,
-	): Promise<Value> {
-		const execution = randomBytes(24).toString("hex");
-		const controller = new AbortController();
-		let active: ActiveExecution | undefined;
-		try {
-			return await execute([this.socketPath, this.token, execution, ""].join("\n"), (child) => {
-				const done = new Promise<void>((resolve) => child.once("close", () => resolve()));
-				active = this.registerExecution(
-					{ ...options, descriptors: false },
-					child,
-					execution,
-					controller,
-					done,
-					() => child.kill(),
-				);
-			});
-		} finally {
-			if (active) await active.completion;
-		}
+	/** Attach at the controlled launch gate before the kernel installs its first image. */
+	trace<Value>(options: HeldObservation, execute: () => Promise<Value>): Promise<Value> {
+		return this.observe({ ...options, skipRoot: true }, execute);
 	}
 	private registerExecution(
 		options: HeldObservation,

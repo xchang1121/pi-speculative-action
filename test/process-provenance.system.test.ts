@@ -1,9 +1,12 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
+import { mkdir, mkdtemp, open, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
-import { execFileSync } from "node:child_process";
+import { executionDomainCollector, resolveLinuxExecHelper } from "../src/linux-held-exec.ts";
+import { executionRecords, observeExecution, traceTail } from "../src/strace-observer.ts";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { expect, test } from "vitest";
 import {
@@ -91,6 +94,82 @@ int main(int argc, char **argv) {
 		} finally {
 			await host.dispose();
 			await fixture.dispose();
+		}
+	},
+);
+
+test.skipIf(process.platform !== "linux")(
+	"records ordered writes through a redirected stdout alias and bounds repeated regular reads",
+	async () => {
+		const binary = await resolveLinuxExecHelper(process.env.PI_SPEC_HELD_EXEC);
+		const domain = (await executionDomainCollector(binary)).open();
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-binary-observation-"));
+		const input = path.join(root, "input");
+		try {
+			await writeFile(input, "data");
+			await using directory = await open(root);
+			const inode = (await stat(input, { bigint: true })).ino;
+			const records = executionRecords(domain.trace());
+			await using tail = traceTail(records, root);
+			const program = [
+				"import os",
+				"assert 'input' in os.listdir(4)",
+				"fd = os.open('input', os.O_RDONLY)",
+				"for _ in range(1500):",
+				"    os.read(fd, 1)",
+				"    os.pread(fd, 1, 0)",
+				"os.close(fd)",
+				"out = os.dup(1)",
+				"os.dup2(os.open('/dev/null', os.O_WRONLY), 1)",
+				"os.write(out, b'one')",
+				"child = os.fork()",
+				"if not child:",
+				"    os.write(2, b'two')",
+				"    os._exit(0)",
+				"os.waitpid(child, 0)",
+				"os.write(out, b'three')",
+			].join("\n");
+			const [launch, ...args] = domain.launch(["/usr/bin/python3", "-I", "-S", "-c", program]);
+			const child = spawn(binary, ["--output-channel=3", launch, ...args], {
+				cwd: root,
+				stdio: ["ignore", "pipe", "pipe", "pipe", directory.fd],
+			});
+			const completed = once(child, "close");
+			child.stdout!.resume();
+			child.stderr!.resume();
+			const channel = child.stdio[3] as import("node:stream").Duplex;
+			let header = Buffer.alloc(0);
+			try {
+				for await (const chunk of channel) {
+					header = Buffer.concat([header, chunk]);
+					if (header.length === 16) channel.end("R");
+					if (header.length > 16) throw new Error("invalid output channel header");
+				}
+				expect((await completed)[0]).toBe(0);
+			} finally {
+				if (child.exitCode === null && child.signalCode === null) child.kill();
+			}
+			const outputEndpoints = [0, 8].map((offset) => "socket:[" + header.readBigUInt64LE(offset) + "]");
+			const result = await observeExecution(tail, "/usr/bin/python3", root, {
+				captureOutput: true,
+				outputEndpoints: [outputEndpoints[0]!, outputEndpoints[1]!],
+			});
+			expect(result.complete, result.incompleteReasons.join(",")).toBe(true);
+			expect(result.tracedProcesses).toBe(2);
+			expect(result.paths).toContainEqual({ path: root, role: "input", listed: true });
+			expect(result.output?.map(({ fd, data }) => [fd, data.toString()])).toEqual([
+				[1, "one"],
+				[2, "two"],
+				[1, "three"],
+			]);
+			expect(
+				records.journal.filter(
+					(event) => ["descriptor_read", "pread64"].includes(event.name) && event.anchors[0]?.inode === inode,
+				),
+			).toHaveLength(1);
+		} finally {
+			domain.close();
+			await rm(root, { recursive: true, force: true });
 		}
 	},
 );

@@ -73,6 +73,7 @@ index 96309ec..f30b2a3 100644
          if policy.workdir.is_none() {
              return Err(anyhow!("--dry-run requires --workdir"));
 diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/src/chroot/dispatch.rs
+index 6e4ab93..031a9cc 100644
 --- a/crates/sandlock-core/src/chroot/dispatch.rs
 +++ b/crates/sandlock-core/src/chroot/dispatch.rs
 @@ -47,9 +47,10 @@
@@ -87,7 +88,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
  use std::path::{Path, PathBuf};
  use std::sync::Arc;
 
-@@ -59,7 +60,7 @@
+@@ -59,7 +60,7 @@ use crate::chroot::resolve::{
      confine, resolve_existing_in_root, resolve_in_root, resolve_in_root_nofollow,
  };
  use crate::sys::fs::{openat2_in_root, openat2_in_root_with_resolve};
@@ -96,7 +97,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
  use crate::seccomp::state::{ChrootState, CowState, ProcessIndex};
  use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
 
-@@ -76,9 +77,28 @@
+@@ -76,9 +77,28 @@ pub(crate) struct ChrootCtx<'a> {
      pub mounts: &'a [(PathBuf, PathBuf)],
      /// Virtual paths of read-only mounts: reads allowed, writes denied.
      pub mount_ro: &'a [PathBuf],
@@ -125,7 +126,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
  }
 
  impl<'a> ChrootCtx<'a> {
-@@ -94,12 +114,42 @@
+@@ -94,12 +114,42 @@ impl<'a> ChrootCtx<'a> {
              denied: &policy.chroot_denied,
              mounts: &policy.chroot_mounts,
              mount_ro: &policy.chroot_mount_ro,
@@ -168,12 +169,10 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
      fn is_denied(&self, virtual_path: &Path) -> bool {
          self.denied.iter().any(|p| virtual_path.starts_with(p))
      }
-@@ -141,6 +191,18 @@
-             return true;
-         }
+@@ -143,6 +193,18 @@ impl ChrootCtx<'_> {
          self.writable.iter().any(|p| virtual_path.starts_with(p))
-+    }
-+
+     }
+
 +    /// Whether a write may proceed: granted by policy, or one the host user could make natively, which the branch then takes.
 +    fn write_allowed(&self, virtual_path: &Path, host_path: &Path, kind: WriteKind) -> bool {
 +        self.can_write(virtual_path) || self.private_writes && !self.is_denied(virtual_path) && !self.is_mounted(virtual_path)
@@ -184,10 +183,12 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +    fn unresolved_private(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
 +        let confined = confine(virtual_path);
 +        (self.private_writes && self.mount_target(&confined).is_none()).then(|| (confined.clone(), confined))
-     }
-
++    }
++
      /// Check if a virtual path falls under any mount point.
-@@ -169,67 +231,40 @@
+     fn is_mounted(&self, virtual_path: &Path) -> bool {
+         self.mounts.iter().any(|(vp, _)| virtual_path.starts_with(vp))
+@@ -169,68 +231,41 @@ impl ChrootCtx<'_> {
          Some((mount_hp, sub_str))
      }
 
@@ -205,21 +206,6 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -        let confined = confine(virtual_path);
 -        let (mount_target, sub_path) = self.mount_target(&confined)?;
 -        resolver(mount_target, &sub_path).map(|(host, _)| (host, confined))
--    }
--
--    /// Resolve against mounts for paths that may not exist yet (O_CREAT).
--    fn resolve_mount(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
--        self.resolve_mount_with(virtual_path, resolve_in_root)
--    }
--
--    /// Resolve against mounts for paths that must exist.
--    fn resolve_mount_existing(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
--        self.resolve_mount_with(virtual_path, resolve_existing_in_root)
--    }
--
--    /// Resolve against mounts without following a final symlink.
--    fn resolve_mount_nofollow(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
--        self.resolve_mount_with(virtual_path, resolve_in_root_nofollow)
 +        resolver: fn(&Path, &str) -> Result<(PathBuf, PathBuf), i32>,
 +    ) -> Result<(PathBuf, PathBuf), i32> {
 +        let requested = Path::new(virtual_path);
@@ -230,28 +216,41 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +        Ok((host, virtual_root.join(resolved.strip_prefix("/").map_err(|_| libc::EACCES)?)))
      }
 
-     /// Inverse: given a host path, return the virtual path.
-     /// Checks mount targets first, then falls back to chroot root.
-     fn host_to_virtual(&self, host_path: &Path) -> Option<PathBuf> {
--        crate::chroot::resolve::host_to_virtual(self.root, self.mounts, host_path)
--    }
+-    /// Resolve against mounts for paths that may not exist yet (O_CREAT).
+-    fn resolve_mount(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
+-        self.resolve_mount_with(virtual_path, resolve_in_root)
++    /// Inverse: given a host path, return the virtual path.
++    /// Checks mount targets first, then falls back to chroot root.
++    fn host_to_virtual(&self, host_path: &Path) -> Option<PathBuf> {
 +        let original = self.cow_roots.and_then(|(upper, lower)| host_path.strip_prefix(upper).ok().map(|rel| lower.join(rel)));
 +        crate::chroot::resolve::host_to_virtual(self.root, self.mounts, original.as_deref().unwrap_or(host_path))
-+    }
-+
+     }
+
+-    /// Resolve against mounts for paths that must exist.
+-    fn resolve_mount_existing(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
+-        self.resolve_mount_with(virtual_path, resolve_existing_in_root)
 +    fn exec_target(&self, virtual_path: &Path) -> Option<&Path> {
 +        self.exec_mounts.iter().find_map(|(virtual_exec, host_exec)| {
 +            (virtual_exec == virtual_path).then_some(host_exec.as_path())
 +        })
-+    }
-+
-+
+     }
+
+-    /// Resolve against mounts without following a final symlink.
+-    fn resolve_mount_nofollow(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
+-        self.resolve_mount_with(virtual_path, resolve_in_root_nofollow)
+-    }
+
+-    /// Inverse: given a host path, return the virtual path.
+-    /// Checks mount targets first, then falls back to chroot root.
+-    fn host_to_virtual(&self, host_path: &Path) -> Option<PathBuf> {
+-        crate::chroot::resolve::host_to_virtual(self.root, self.mounts, host_path)
+-    }
  }
 
  // ============================================================
  // Shared helpers
  // ============================================================
--
+
 -/// Read a NUL-terminated path from child memory, page-by-page.
 -fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String> {
 -    if addr == 0 {
@@ -273,10 +272,11 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -    }
 -    String::from_utf8(result).ok()
 -}
-
+-
  /// Rewrite the magic `/proc/self` and `/proc/thread-self` symlinks to the
  /// caller's real PID.  Under chroot, `/proc` is serviced by an on-behalf
-@@ -272,6 +307,8 @@
+ /// `openat2` in the *supervisor*, so the kernel would otherwise resolve `self`
+@@ -272,6 +307,8 @@ fn virtual_cwd_of(notif: &SeccompNotif, ctx: &ChrootCtx<'_>) -> Option<PathBuf>
  /// Record the calling task's new virtual cwd.
  fn set_virtual_cwd(notif: &SeccompNotif, ctx: &ChrootCtx<'_>, cwd: PathBuf) {
      if let Ok(pid) = i32::try_from(notif.pid) {
@@ -285,13 +285,16 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
          ctx.processes.set_virtual_cwd(pid, cwd);
      }
  }
-@@ -404,63 +441,44 @@
+@@ -404,63 +441,44 @@ fn build_virtual_path(
          let combined = base_virtual.join(path);
          combined.to_string_lossy().to_string()
      };
 -    Some(canon_proc_cwd(&canon_proc_self(&vpath, notif.pid), ctx))
--}
--
++    let path = canon_proc_cwd(&canon_proc_self(&vpath, notif.pid), ctx);
++    crate::seccomp::notif::pi_observe_record(notif.id, 1, path.as_ptr(), path.len());
++    Some(path)
+ }
+
 -/// Resolve a child path to (host_path, virtual_path) within the chroot.
 -///
 -/// Falls back to parent resolution for paths whose final component does not
@@ -299,11 +302,6 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -/// Checks mounts first — if the virtual path falls under a mount point,
 -/// resolution is confined to the mount target directory.
 -fn resolve_chroot_path(
-+    let path = canon_proc_cwd(&canon_proc_self(&vpath, notif.pid), ctx);
-+    crate::seccomp::notif::pi_observe_record(notif.id, 1, path.as_ptr(), path.len());
-+    Some(path)
-+}
-+
 +/// Resolve in the mounted view without discarding the kernel's lookup failure.
 +fn resolve_chroot_path_with(
      notif: &SeccompNotif,
@@ -316,8 +314,23 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -        return Some(result);
 -    }
 -    resolve_in_root(ctx.root, &full_path)
--}
--
++    resolver: fn(&Path, &str) -> Result<(PathBuf, PathBuf), i32>,
++) -> Result<(PathBuf, PathBuf), i32> {
++    // A relative lookup needs a directory, even if an unlinked fd has no name.
++    if dirfd as i32 != libc::AT_FDCWD && !path.is_empty() && !Path::new(path).is_absolute() {
++        let directory = std::fs::metadata(format!("/proc/{}/fd/{}", notif.pid, dirfd as i32)).map_err(|_| libc::EBADF)?;
++        if !directory.is_dir() { return Err(libc::ENOTDIR); }
++    }
++    let full_path = build_virtual_path(notif, dirfd, path, ctx).ok_or(libc::EBADF)?;
++    if ctx.mount_target(Path::new(&full_path)).is_some() {
++        return ctx.resolve_mount_with(&full_path, resolver);
++    }
++    resolver(ctx.root, &full_path).or_else(|errno| {
++        // Only a missing host path can instead live in the private branch.
++        if errno == libc::ENOENT { ctx.unresolved_private(&full_path).ok_or(errno) } else { Err(errno) }
++    })
+ }
+
 -/// Resolve a child path without following a final symlink.
 -///
 -/// For the no-follow family: lstat describes the link, unlink removes it,
@@ -334,8 +347,10 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -        return Some(result);
 -    }
 -    resolve_in_root_nofollow(ctx.root, &full_path)
--}
--
++fn resolve_chroot_path(notif: &SeccompNotif, dirfd: i64, path: &str, ctx: &ChrootCtx<'_>) -> Result<(PathBuf, PathBuf), i32> {
++    resolve_chroot_path_with(notif, dirfd, path, ctx, resolve_in_root)
+ }
+
 -/// Resolve a child path that must already exist within the chroot.
 -///
 -/// Unlike [`resolve_chroot_path`], this does NOT fall back to parent
@@ -353,27 +368,6 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -        return Some(result);
 -    }
 -    resolve_existing_in_root(ctx.root, &full_path)
-+    resolver: fn(&Path, &str) -> Result<(PathBuf, PathBuf), i32>,
-+) -> Result<(PathBuf, PathBuf), i32> {
-+    // A relative lookup needs a directory, even if an unlinked fd has no name.
-+    if dirfd as i32 != libc::AT_FDCWD && !path.is_empty() && !Path::new(path).is_absolute() {
-+        let directory = std::fs::metadata(format!("/proc/{}/fd/{}", notif.pid, dirfd as i32)).map_err(|_| libc::EBADF)?;
-+        if !directory.is_dir() { return Err(libc::ENOTDIR); }
-+    }
-+    let full_path = build_virtual_path(notif, dirfd, path, ctx).ok_or(libc::EBADF)?;
-+    if ctx.mount_target(Path::new(&full_path)).is_some() {
-+        return ctx.resolve_mount_with(&full_path, resolver);
-+    }
-+    resolver(ctx.root, &full_path).or_else(|errno| {
-+        // Only a missing host path can instead live in the private branch.
-+        if errno == libc::ENOENT { ctx.unresolved_private(&full_path).ok_or(errno) } else { Err(errno) }
-+    })
-+}
-+
-+fn resolve_chroot_path(notif: &SeccompNotif, dirfd: i64, path: &str, ctx: &ChrootCtx<'_>) -> Result<(PathBuf, PathBuf), i32> {
-+    resolve_chroot_path_with(notif, dirfd, path, ctx, resolve_in_root)
-+}
-+
 +fn resolve_chroot_path_nofollow(notif: &SeccompNotif, dirfd: i64, path: &str, ctx: &ChrootCtx<'_>) -> Result<(PathBuf, PathBuf), i32> {
 +    resolve_chroot_path_with(notif, dirfd, path, ctx, resolve_in_root_nofollow)
 +}
@@ -383,12 +377,10 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
  }
 
  /// Convert a Path to CString, returning Errno on failure.
-@@ -473,6 +491,23 @@
-     std::io::Error::last_os_error()
-         .raw_os_error()
+@@ -475,6 +493,23 @@ fn last_errno(fallback: i32) -> i32 {
          .unwrap_or(fallback)
-+}
-+
+ }
+
 +/// Where a write to `host_path` lands: a copy the branch makes first when the path is its own, else the path itself.
 +async fn write_target(cow_state: &Arc<Mutex<CowState>>, host_path: &Path) -> Result<PathBuf, NotifAction> {
 +    let mut cs = cow_state.lock().await;
@@ -404,10 +396,12 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +        }
 +    }
 +    Ok(host_path.to_path_buf())
- }
-
++}
++
  /// Resolve host_path through COW (handle_stat), returning the real path.
-@@ -493,60 +528,6 @@
+ /// Falls back to host_path if COW is inactive or doesn't match.
+ async fn cow_resolve(
+@@ -493,60 +528,6 @@ async fn cow_resolve(
      Ok(host_path.to_path_buf())
  }
 
@@ -468,11 +462,10 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
  fn exec_on_host(f: impl FnOnce(*const libc::c_char) -> libc::c_int, host: &Path) -> NotifAction {
      let c = match path_cstr(host, libc::EINVAL) {
          Ok(c) => c,
-@@ -562,6 +543,102 @@
- // ============================================================
+@@ -563,6 +544,102 @@ fn exec_on_host(f: impl FnOnce(*const libc::c_char) -> libc::c_int, host: &Path)
  // openat handler
  // ============================================================
-+
+
 +fn chroot_open_allowed(ctx: &ChrootCtx<'_>, path: &Path, host_path: &Path, flags: u64) -> bool {
 +    let writes = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)) != 0;
 +    if writes { ctx.write_allowed(path, host_path, WriteKind::Content) } else { ctx.can_read(path) }
@@ -568,10 +561,11 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +        }
 +    })
 +}
-
++
  pub(crate) async fn handle_chroot_open(
      notif: &SeccompNotif,
-@@ -573,8 +650,8 @@
+     _chroot_state: &Arc<Mutex<ChrootState>>,
+@@ -573,8 +650,8 @@ pub(crate) async fn handle_chroot_open(
      // Every open spelling lands here, and they do not share an argument
      // layout: openat2 keeps flags, mode and resolve in a struct open_how in
      // child memory, where args[2] is the pointer to it rather than the flags.
@@ -582,7 +576,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
          None => return NotifAction::Continue,
      };
 
-@@ -583,24 +660,43 @@
+@@ -583,24 +660,43 @@ pub(crate) async fn handle_chroot_open(
          None => return NotifAction::Continue,
      };
 
@@ -636,7 +630,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
          return NotifAction::Errno(libc::EACCES);
      }
 
-@@ -610,6 +706,12 @@
+@@ -610,6 +706,12 @@ pub(crate) async fn handle_chroot_open(
          if let Some(cow) = cs.branch.as_mut() {
              let host_str = host_path.to_string_lossy();
              if cow.matches(&host_str) {
@@ -649,7 +643,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
                  match cow.handle_open(&host_str, flags) {
                      Ok(Some(real_path)) => {
                          drop(cs);
-@@ -617,25 +719,22 @@
+@@ -617,25 +719,22 @@ pub(crate) async fn handle_chroot_open(
                              Ok(c) => c,
                              Err(a) => return a,
                          };
@@ -669,23 +663,23 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
                          };
 -                        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
 -                        return NotifAction::InjectFdSend { srcfd: owned, newfd_flags };
-+                        if blocking_fifo(Path::new(&real_path), flags_i) {
-+                            return defer_open(open, newfd_flags);
-+                        }
-+                        return match open() { Ok(srcfd) => NotifAction::InjectFdSend { srcfd, newfd_flags }, Err(errno) => NotifAction::Errno(errno) };
-                     }
+-                    }
 -                    Ok(None) => {
 -                        // Fall through to openat2_in_root below. This keeps
 -                        // directory opens and other non-COW / non-whiteout
 -                        // cases confined to the chroot instead of executing the
 -                        // original host syscall. (Whiteouts are handled by the
 -                        // BranchError::Deleted arm below, not here.)
--                    }
++                        if blocking_fifo(Path::new(&real_path), flags_i) {
++                            return defer_open(open, newfd_flags);
++                        }
++                        return match open() { Ok(srcfd) => NotifAction::InjectFdSend { srcfd, newfd_flags }, Err(errno) => NotifAction::Errno(errno) };
+                     }
 +                    Ok(None) => {} // The common open plan leaves unchanged objects in their confined namespace.
                      Err(crate::error::BranchError::QuotaExceeded) => {
                          return NotifAction::Errno(libc::ENOSPC);
                      }
-@@ -657,25 +756,8 @@
+@@ -657,25 +756,8 @@ pub(crate) async fn handle_chroot_open(
      }
 
      // Resolve the path to an fd to hand the child: either a freshly opened tree
@@ -713,7 +707,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
  }
 
  /// Open `virtual_path` within the child's virtual namespace, returning an fd to
-@@ -714,34 +796,71 @@
+@@ -714,22 +796,20 @@ fn open_in_namespace(
 
      // Category 2, named directly: skip the open and dup straight away.
      if let Some(child_fd) = magic_self_fd(&vp_str, child_pid) {
@@ -740,10 +734,10 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
                  None => Err(errno),
              }
          }
-         Err(errno) => Err(errno),
+@@ -737,11 +817,50 @@ fn open_in_namespace(
      }
-+}
-+
+ }
+
 +fn open_owned_fd(pid: u32, fd: i32, flags: i32) -> Result<OwnedFd, i32> {
 +    let pin = crate::seccomp::notif::dup_fd_from_pid(pid, fd).map_err(|_| libc::EBADF)?;
 +    let mut state: libc::stat = unsafe { std::mem::zeroed() };
@@ -775,8 +769,8 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +        return Ok(unsafe { OwnedFd::from_raw_fd(opened) });
 +    }
 +    Ok(pin)
- }
-
++}
++
  /// If `path` is a self-referential `/proc/.../fd/N` magic link for the calling
  /// child (`/proc/self`, `/proc/thread-self`, or `/proc/<child_pid>`), return the
  /// child fd `N`. The fd component must be a bare number (no trailing path).
@@ -792,7 +786,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
      let is_self =
          who == "self" || who == "thread-self" || who.parse::<u32>().ok() == Some(child_pid);
      if !is_self || fd_part.contains('/') {
-@@ -867,6 +986,62 @@
+@@ -867,6 +986,62 @@ fn read_pt_interp(fd: RawFd) -> Option<(String, u64, usize)> {
      None
  }
 
@@ -855,13 +849,13 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
  /// Create a memfd copy of `src_fd` with PT_INTERP patched to `new_interp`.
  /// Uses sendfile for efficient kernel-to-kernel copy, then patches the
  /// interpreter path in place.
-@@ -934,12 +1109,62 @@
+@@ -934,12 +1109,61 @@ fn memfd_with_patched_interp(
  // execve/execveat handler
  // ============================================================
 
 +#[derive(Clone, Default)]
 +pub struct ExecRecord {
-+    image: PathBuf, invoked: String, comm: String, prefix: Vec<Vec<u8>>, broker: bool, injected: Option<i32>,
++    image: PathBuf, invoked: String, comm: String, broker: bool,
 +}
 +
  pub(crate) async fn handle_chroot_exec(
@@ -869,8 +863,8 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
      chroot_state: &Arc<Mutex<ChrootState>>,
 -    _cow_state: &Arc<Mutex<CowState>>,
 +    cow_state: &Arc<Mutex<CowState>>,
-     notif_fd: RawFd,
-     ctx: &ChrootCtx<'_>,
++    notif_fd: RawFd,
++    ctx: &ChrootCtx<'_>,
 +) -> NotifAction {
 +    // The tracer retains this same inode until cancellation and publication settle.
 +    let _lease = if let Some(broker) = ctx.exec_target(Path::new("/")).filter(|_| matches!(notif.data.args[5] >> 32, 0x50494558 | 0x50494559)) {
@@ -898,8 +892,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +        if matches!(action, NotifAction::Continue | NotifAction::ReturnValue(_)) {
 +            let mut bytes = if offered { b"B\0".to_vec() } else { b"N\0".to_vec() };
 +            let cwd = match virtual_cwd_of(notif, ctx) { Some(cwd) => cwd, None => return NotifAction::Errno(libc::ENOENT) };
-+            for field in [record.image.as_os_str().as_encoded_bytes(), record.invoked.as_bytes(), record.comm.as_bytes(), record.injected.map(|fd| fd.to_string()).unwrap_or_default().as_bytes()]
-+                .into_iter().chain(record.prefix.iter().map(Vec::as_slice)).chain(std::iter::once(cwd.as_os_str().as_encoded_bytes())) {
++            for field in [record.image.as_os_str().as_encoded_bytes(), record.invoked.as_bytes(), record.comm.as_bytes(), cwd.as_os_str().as_encoded_bytes()] {
 +                bytes.extend(field); bytes.push(0);
 +            }
 +            if std::fs::write(&route, bytes).is_err() { return NotifAction::Errno(libc::EIO); }
@@ -913,13 +906,13 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +    notif: &SeccompNotif,
 +    chroot_state: &Arc<Mutex<ChrootState>>,
 +    cow_state: &Arc<Mutex<CowState>>,
-+    notif_fd: RawFd,
-+    ctx: &ChrootCtx<'_>,
+     notif_fd: RawFd,
+     ctx: &ChrootCtx<'_>,
 +    record: &mut ExecRecord,
  ) -> NotifAction {
      let nr = notif.data.nr as i64;
      let (dirfd, path_ptr, argv_ptr, envp_ptr) = if nr == libc::SYS_execveat {
-@@ -952,7 +1177,23 @@
+@@ -952,7 +1176,23 @@ pub(crate) async fn handle_chroot_exec(
          Some(p) => p,
          None => return NotifAction::Continue,
      };
@@ -944,7 +937,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
      // Build the full virtual path from dirfd + relative path.
      let full_path = if Path::new(&rel_path).is_absolute() {
          rel_path
-@@ -974,29 +1215,119 @@
+@@ -974,29 +1214,142 @@ pub(crate) async fn handle_chroot_exec(
          return NotifAction::Errno(libc::EACCES);
      }
 
@@ -973,16 +966,6 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +        fd
      } else {
 -        (ctx.root.to_path_buf(), virtual_path.to_string_lossy().to_string())
--    };
--    let src_fd = match openat2_in_root(
--        &exec_root,
--        &exec_path,
--        libc::O_RDONLY | libc::O_CLOEXEC,
--        0,
--    ) {
--        Ok(fd) => fd,
--        Err(_) => return NotifAction::Errno(libc::ENOENT),
--    };
 +        // An image the branch holds (made or changed there) runs from the branch; one it deleted is gone.
 +        let held = {
 +            let cs = cow_state.lock().await;
@@ -1000,19 +983,47 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +            Some(fd) => fd,
 +            None => return NotifAction::Errno(last_errno(libc::ENOENT)),
 +        }
-+    };
+     };
+-    let src_fd = match openat2_in_root(
+-        &exec_root,
+-        &exec_path,
+-        libc::O_RDONLY | libc::O_CLOEXEC,
+-        0,
+-    ) {
+-        Ok(fd) => fd,
+-        Err(_) => return NotifAction::Errno(libc::ENOENT),
 +    let logical_image = std::fs::read_link(format!("/proc/self/fd/{src_fd}")).ok().and_then(|name| ctx.host_to_virtual(&name)).unwrap_or(virtual_path.clone());
 +    record.invoked = if nr == libc::SYS_execveat && dirfd != libc::AT_FDCWD as i64 && !Path::new(&given).is_absolute() {
 +        format!("/dev/fd/{dirfd}{}{}", if given.is_empty() { "" } else { "/" }, given)
 +    } else { given.clone() };
 +    record.comm = Path::new(if given.is_empty() { logical_image.to_str().unwrap_or("") } else { &given })
 +        .file_name().unwrap_or_default().to_string_lossy().into_owned();
++    let native = |path: &str, fd: RawFd| {
++        use std::os::unix::fs::MetadataExt;
++        let mut state: libc::stat = unsafe { std::mem::zeroed() };
++        let path = if let Ok(rest) = Path::new(path).strip_prefix("/") { PathBuf::from(format!("/proc/{}/root", notif.pid)).join(rest) } else { PathBuf::from(format!("/proc/{}/cwd", notif.pid)).join(path) };
++        (unsafe { libc::fstat(fd, &mut state) }) == 0
++            && std::fs::metadata(path).is_ok_and(|meta| meta.dev() == state.st_dev && meta.ino() == state.st_ino)
+     };
++    let original = if nr == libc::SYS_execveat && dirfd != libc::AT_FDCWD as i64 && !Path::new(&given).is_absolute() {
++        PathBuf::from(format!("/proc/{}/fd/{dirfd}", notif.pid)).join(&given)
++    } else { PathBuf::from(&given) };
++    let native_chain = original.to_str().is_some_and(|path| native(path, src_fd));
++    let mut original_script = None;
++    let mut native_interpreters = true;
 +    let mut src_fd = src_fd;
 +    let mut image_path = logical_image.clone();
 +    if substitute.is_none() && ctx.root == Path::new("/") && broker_image.is_some() {
-+        let mut filename = record.invoked.clone();
 +        for depth in 0..=4 {
-+            let Some((interpreter, argument)) = read_shebang(src_fd) else { break };
++            let Some((interpreter, _)) = read_shebang(src_fd) else { break };
++            if depth == 0 {
++                use std::os::fd::BorrowedFd;
++                let saved = unsafe { BorrowedFd::borrow_raw(src_fd) }.try_clone_to_owned();
++                match saved {
++                    Ok(file) => original_script = Some(file),
++                    Err(_) => { unsafe { libc::close(src_fd) }; return NotifAction::Errno(last_errno(libc::EMFILE)); }
++                }
++            }
 +            // do_open_execat validates the opened script before count(argv) rejects this inaccessible pointer.
 +            unsafe { libc::syscall(libc::SYS_execveat, src_fd, b"\0".as_ptr(), usize::MAX as *const *const u8, std::ptr::null::<u8>(), libc::AT_EMPTY_PATH); }
 +            let error = last_errno(libc::EIO);
@@ -1034,10 +1045,8 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +            let next = open_in_view(ctx, &image_path, 0);
 +            unsafe { libc::close(src_fd) };
 +            let Some(next) = next else { return NotifAction::Errno(libc::ENOENT) };
-+            let mut prefix = vec![interpreter.as_bytes().to_vec()];
-+            prefix.extend(argument); prefix.push(filename.into_bytes());
-+            prefix.extend(std::mem::take(&mut record.prefix).into_iter().skip(1));
-+            record.prefix = prefix; filename = interpreter; src_fd = next;
++            native_interpreters &= native(&interpreter, next);
++            src_fd = next;
 +        }
 +    }
 +    record.image = std::fs::read_link(format!("/proc/self/fd/{src_fd}")).ok().and_then(|name| ctx.host_to_virtual(&name)).unwrap_or(image_path.clone());
@@ -1048,25 +1057,30 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +    // Where the host resolves a path to the very image vetted here (the root is the host's and nothing substitutes it),
 +    // the kernel execs it by that name, so comm, AT_EXECFN and a script's $0 stay native: by the given one, with no path
 +    // or argv bytes rewritten (nor a vfork parent held for them). A script's interpreter has to resolve the same way.
-+    let native = |path: &str, fd: RawFd| {
-+        use std::os::unix::fs::MetadataExt;
-+        let mut state: libc::stat = unsafe { std::mem::zeroed() };
-+        let path = if Path::new(path).is_absolute() { PathBuf::from(path) } else { PathBuf::from(format!("/proc/{}/cwd", notif.pid)).join(path) };
-+        (unsafe { libc::fstat(fd, &mut state) }) == 0
-+            && std::fs::metadata(path).is_ok_and(|meta| meta.dev() == state.st_dev && meta.ino() == state.st_ino)
-+    };
 +    let native_interpreter = || read_shebang(src_fd).and_then(|(interpreter, _)| String::from_utf8(interpreter).ok()).is_some_and(|interpreter| {
 +        let interpreter_path = crate::chroot::resolve::confine(&interpreter);
 +        ctx.can_read(&interpreter_path) && open_in_view(ctx, &interpreter_path, 0)
 +            .is_some_and(|fd| { let fd = unsafe { OwnedFd::from_raw_fd(fd) }; native(&interpreter, fd.as_raw_fd()) })
 +    });
 +    if ctx.root == Path::new("/") && substitute.is_none() &&
-+        ((given.is_empty() && record.prefix.is_empty()) ||
-+         (nr == libc::SYS_execve && native(&given, src_fd) && (executable_is_elf || native_interpreter()))) {
++        ((given.is_empty() && original_script.is_none()) ||
++         (native_chain && native_interpreters && (executable_is_elf || native_interpreter()))) {
 +        unsafe { libc::close(src_fd) };
 +        chroot_state.lock().await.chroot_exe = Some(virtual_path);
 +        return NotifAction::Continue;
 +    }
++
++    if substitute.is_none() && broker_image.is_some() {
++        // A descriptor launch has a different AT_EXECFN. Its speculative
++        // effects cannot attest to a native execution by the requested name.
++        crate::seccomp::notif::pi_observe_record(notif.id, 25, std::ptr::null(), 0);
++        if let Some(script) = original_script {
++            unsafe { libc::close(src_fd) };
++            if !native_interpreters { return NotifAction::Errno(libc::EXDEV); }
++            src_fd = std::os::fd::IntoRawFd::into_raw_fd(script);
++        }
++    }
++    let executable_is_elf = is_elf(src_fd);
 
      // Read PT_INTERP from the binary. If it has one, open the image's
      // interpreter and create a memfd copy with PT_INTERP patched to
@@ -1080,7 +1094,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
          // Open the image's interpreter from the chroot root (intentionally
          // NOT mount-aware ��� the dynamic linker should come from the base
          // image, not from workspace mounts).
-@@ -1019,7 +1350,7 @@
+@@ -1019,7 +1372,7 @@ pub(crate) async fn handle_chroot_exec(
              flags: 0,
              srcfd: interp_src as u32,
              newfd: 0,
@@ -1089,7 +1103,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
          };
          let child_interp_fd = unsafe {
              libc::ioctl(
-@@ -1058,7 +1389,7 @@
+@@ -1058,7 +1411,7 @@ pub(crate) async fn handle_chroot_exec(
      // correct path (memfd-backed binaries would otherwise show the memfd path).
      {
          let mut cs = chroot_state.lock().await;
@@ -1098,7 +1112,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
      }
 
      // Inject the (possibly patched) binary fd into the child and rewrite
-@@ -1068,7 +1399,7 @@
+@@ -1068,7 +1421,7 @@ pub(crate) async fn handle_chroot_exec(
          flags: 0,
          srcfd: exec_fd.as_raw_fd() as u32,
          newfd: 0,
@@ -1107,11 +1121,10 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
      };
      let child_fd = unsafe {
          libc::ioctl(
-@@ -1083,14 +1414,17 @@
+@@ -1083,14 +1436,16 @@ pub(crate) async fn handle_chroot_exec(
          return NotifAction::Errno(libc::EIO);
      }
 
-+    record.injected = Some(child_fd);
 +    if mediated { return NotifAction::ReturnValue(child_fd as i64 + 1); }
 +
      // Rewrite the path to /proc/self/fd/N, relocating argv[0] when it aliases
@@ -1130,25 +1143,25 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
      )
      .is_err()
      {
-@@ -1111,348 +1445,391 @@
+@@ -1111,348 +1466,391 @@ pub(crate) async fn handle_chroot_write(
      notif_fd: RawFd,
      ctx: &ChrootCtx<'_>,
  ) -> NotifAction {
+-    let nr = notif.data.nr as i64;
 +    chroot_write(notif, cow_state, notif_fd, ctx).await
 +        .map_or_else(|action| action, NotifAction::ReturnValue)
 +}
-+
-+// Every mutation resolves its names, checks both authorities, offers the operation
-+// to the private branch, and only then considers a permitted host mutation.
-+async fn chroot_write(notif: &SeccompNotif, cow_state: &Arc<Mutex<CowState>>, notif_fd: RawFd,
-+    ctx: &ChrootCtx<'_>) -> Result<i64, NotifAction> {
-     let nr = notif.data.nr as i64;
--
+
 -    if nr == libc::SYS_unlinkat {
 -        // unlink(2) removes the link, never what it points at.
 -        let (_, host_path, vp) = match read_and_resolve_nofollow(notif, notif_fd, ctx, 0, 1) {
 -            Ok(r) => r,
 -            Err(a) => return a,
++// Every mutation resolves its names, checks both authorities, offers the operation
++// to the private branch, and only then considers a permitted host mutation.
++async fn chroot_write(notif: &SeccompNotif, cow_state: &Arc<Mutex<CowState>>, notif_fd: RawFd,
++    ctx: &ChrootCtx<'_>) -> Result<i64, NotifAction> {
++    let nr = notif.data.nr as i64;
 +    let args = notif.data.args;
 +    let rename = nr == libc::SYS_renameat2 || Some(nr) == crate::arch::sys_renameat();
 +    let link = nr == libc::SYS_linkat;
@@ -1249,13 +1262,28 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -            |p| if is_dir { unsafe { libc::rmdir(p) } } else { unsafe { libc::unlink(p) } },
 -            &host_path,
 -        );
--    }
+     }
 -
 -    if nr == libc::SYS_mkdirat {
 -        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx, 0, 1) {
 -            Ok(r) => r,
 -            Err(a) => return a,
-+    }
+-        };
+-        if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
+-        let mode = notif.data.args[2] as u32;
+-
+-        {
+-            let mut cs = cow_state.lock().await;
+-            if let Some(cow) = cs.branch.as_mut() {
+-                let s = host_path.to_string_lossy();
+-                if cow.matches(&s) {
+-                    match cow.handle_mkdir(&s) {
+-                        Ok(true) => return NotifAction::ReturnValue(0),
+-                        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+-                        _ => {}
+-                    }
+-                }
+-            }
 +    // Declined private work cannot reach the host through any mutation opcode.
 +    if !ctx.can_write(&virtual_path) || destination.as_ref().is_some_and(|(_, vp)| !ctx.can_write(vp)) {
 +        return Err(NotifAction::Errno(libc::EACCES));
@@ -1276,7 +1304,9 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +            if fd >= 0 && setgid { libc::fchown(fd, libc::uid_t::MAX, above.st_gid); }
 +            if fd >= 0 { libc::fchmod(fd, mode | if setgid { libc::S_ISGID } else { 0 }); libc::close(fd); }
 +            0
-+        }
+         }
+-        return exec_on_host(|p| unsafe { libc::mkdir(p, mode) }, &host_path);
+-    }
 +        libc::SYS_mknodat => libc::mknod(source.as_ptr(), args[2] as u32, args[3]),
 +        libc::SYS_symlinkat => libc::symlink(target.as_ref().unwrap().as_ptr(), source.as_ptr()),
 +        libc::SYS_fchmodat => libc::chmod(source.as_ptr(), mode),
@@ -1293,7 +1323,28 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +    } };
 +    if result < 0 { Err(NotifAction::Errno(last_errno(libc::EIO))) } else { Ok(0) }
 +}
-+
+
+-    // renameat carries the same (olddirfd, oldpath, newdirfd, newpath) slots
+-    // as renameat2 and differs only by the flags argument, which this handler
+-    // does not read.
+-    if nr == libc::SYS_renameat2 || Some(nr) == crate::arch::sys_renameat() {
+-        let old_path = match read_path(notif, notif.data.args[1], notif_fd) {
+-            Some(p) => p,
+-            None => return NotifAction::Continue,
+-        };
+-        let new_path = match read_path(notif, notif.data.args[3], notif_fd) {
+-            Some(p) => p,
+-            None => return NotifAction::Continue,
+-        };
+-        // rename(2) moves the names themselves: a symlink on either side is
+-        // renamed, not chased.
+-        let (old_host, old_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[0] as i64, &old_path, ctx) {
+-            Some(r) => r,
+-            None => return NotifAction::Errno(libc::EACCES),
+-        };
+-        let (new_host, new_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[2] as i64, &new_path, ctx) {
+-            Some(r) => r,
+-            None => return NotifAction::Errno(libc::EACCES),
 +// ============================================================
 +// stat/access handler
 +// ============================================================
@@ -1434,20 +1485,9 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +            fs::write(&proof, serde_json::to_vec(&image)?)?;
 +            image
          };
--        if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
--        let mode = notif.data.args[2] as u32;
--
--        {
--            let mut cs = cow_state.lock().await;
--            if let Some(cow) = cs.branch.as_mut() {
--                let s = host_path.to_string_lossy();
--                if cow.matches(&s) {
--                    match cow.handle_mkdir(&s) {
--                        Ok(true) => return NotifAction::ReturnValue(0),
--                        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
--                        _ => {}
--                    }
--                }
+-        if !ctx.can_write(&old_vp) || !ctx.can_write(&new_vp) {
+-            return NotifAction::Errno(libc::EACCES);
+-        }
 +        if image.path != original_path { return Err(invalid()); }
 +        let parse = |row: &[String; 14]| row.iter().map(|value| value.parse::<i128>()).collect::<Result<Vec<_>, _>>()
 +            .map_err(|_| invalid()).map(|values| <[i128; 14]>::try_from(values).unwrap());
@@ -1462,64 +1502,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +    if result.is_err() { index_input_image(metadata, original_path, requested, None, false)?; }
 +    result
 +}
-+
-+/// The owner pins each private object while this mapping exists. Inodes cannot be
-+/// recycled under a retained identity, including after rename, unlink, or replacement.
-+#[derive(Debug, Default)]
-+pub struct MetadataImage {
-+    inputs: std::sync::RwLock<std::collections::HashMap<String, serde_json::Value>>,
-+    objects: std::sync::RwLock<std::collections::HashMap<(u64, u64), ([i128; 14], [i128; 14], u8)>>,
-+}
-+
-+impl MetadataImage {
-+    pub fn decode(bytes: &[u8]) -> std::io::Result<Self> {
-+        let rows: Vec<([String; 14], [String; 14], u8)> = serde_json::from_slice(bytes)?;
-+        let parse = |row: [String; 14]| -> std::io::Result<[i128; 14]> {
-+            Ok(row.into_iter().map(|value| value.parse()).collect::<Result<Vec<i128>, _>>()
-+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?.try_into().unwrap())
-+        };
-+        Self::from_rows(rows.into_iter().map(|(a, b, policy)| Ok((parse(a)?, parse(b)?, policy))).collect::<std::io::Result<Vec<_>>>()?)
-+    }
-+
-+    fn from_rows(rows: Vec<([i128; 14], [i128; 14], u8)>) -> std::io::Result<Self> {
-+        let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
-+        if rows.len() > 100_002 { return Err(invalid("metadata object bound exceeded")); }
-+        let mut image = Self::default();
-+        for (physical, original, policy) in rows {
-+            if policy > 2 { return Err(invalid("invalid access-time policy")); }
-+            if !physical[..10].iter().chain(&original[..10]).all(|value| *value >= 0 && *value <= u64::MAX as i128) {
-+                return Err(invalid("invalid metadata value"));
-             }
--        }
--        return exec_on_host(|p| unsafe { libc::mkdir(p, mode) }, &host_path);
--    }
--
--    // renameat carries the same (olddirfd, oldpath, newdirfd, newpath) slots
--    // as renameat2 and differs only by the flags argument, which this handler
--    // does not read.
--    if nr == libc::SYS_renameat2 || Some(nr) == crate::arch::sys_renameat() {
--        let old_path = match read_path(notif, notif.data.args[1], notif_fd) {
--            Some(p) => p,
--            None => return NotifAction::Continue,
--        };
--        let new_path = match read_path(notif, notif.data.args[3], notif_fd) {
--            Some(p) => p,
--            None => return NotifAction::Continue,
--        };
--        // rename(2) moves the names themselves: a symlink on either side is
--        // renamed, not chased.
--        let (old_host, old_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[0] as i64, &old_path, ctx) {
--            Some(r) => r,
--            None => return NotifAction::Errno(libc::EACCES),
--        };
--        let (new_host, new_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[2] as i64, &new_path, ctx) {
--            Some(r) => r,
--            None => return NotifAction::Errno(libc::EACCES),
--        };
--        if !ctx.can_write(&old_vp) || !ctx.can_write(&new_vp) {
--            return NotifAction::Errno(libc::EACCES);
--        }
--
+
 -        {
 -            let mut cs = cow_state.lock().await;
 -            if let Some(cow) = cs.branch.as_mut() {
@@ -1531,20 +1514,32 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -                        Ok(false) => {}
 -                    }
 -                }
-+            if image.objects.get_mut().unwrap().insert((physical[0] as u64, physical[1] as u64), (physical, original, policy)).is_some() {
-+                return Err(invalid("duplicate snapshot object"));
-             }
-         }
--
+-            }
+-        }
++/// The owner pins each private object while this mapping exists. Inodes cannot be
++/// recycled under a retained identity, including after rename, unlink, or replacement.
++#[derive(Debug, Default)]
++pub struct MetadataImage {
++    inputs: std::sync::RwLock<std::collections::HashMap<String, serde_json::Value>>,
++    objects: std::sync::RwLock<std::collections::HashMap<(u64, u64), ([i128; 14], [i128; 14], u8)>>,
++}
+
 -        let c_old = match path_cstr(&old_host, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
 -        let c_new = match path_cstr(&new_host, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
 -        return if unsafe { libc::rename(c_old.as_ptr(), c_new.as_ptr()) } < 0 {
 -            NotifAction::Errno(last_errno(libc::EIO))
 -        } else {
 -            NotifAction::ReturnValue(0)
--        };
--    }
--
++impl MetadataImage {
++    pub fn decode(bytes: &[u8]) -> std::io::Result<Self> {
++        let rows: Vec<([String; 14], [String; 14], u8)> = serde_json::from_slice(bytes)?;
++        let parse = |row: [String; 14]| -> std::io::Result<[i128; 14]> {
++            Ok(row.into_iter().map(|value| value.parse()).collect::<Result<Vec<i128>, _>>()
++                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?.try_into().unwrap())
+         };
++        Self::from_rows(rows.into_iter().map(|(a, b, policy)| Ok((parse(a)?, parse(b)?, policy))).collect::<std::io::Result<Vec<_>>>()?)
+     }
+
 -    if nr == libc::SYS_symlinkat {
 -        // symlinkat(target, newdirfd, linkpath)
 -        let target = match read_path(notif, notif.data.args[0], notif_fd) {
@@ -1572,9 +1567,22 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -                        _ => {}
 -                    }
 -                }
--            }
--        }
--
++    fn from_rows(rows: Vec<([i128; 14], [i128; 14], u8)>) -> std::io::Result<Self> {
++        let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
++        if rows.len() > 100_002 { return Err(invalid("metadata object bound exceeded")); }
++        let mut image = Self::default();
++        for (physical, original, policy) in rows {
++            if policy > 2 { return Err(invalid("invalid access-time policy")); }
++            if !physical[..10].iter().chain(&original[..10]).all(|value| *value >= 0 && *value <= u64::MAX as i128) {
++                return Err(invalid("invalid metadata value"));
++            }
++            if image.objects.get_mut().unwrap().insert((physical[0] as u64, physical[1] as u64), (physical, original, policy)).is_some() {
++                return Err(invalid("duplicate snapshot object"));
+             }
+         }
++        Ok(image)
++    }
+
 -        let c_target = match CString::new(target.as_str()) { Ok(c) => c, Err(_) => return NotifAction::Errno(libc::EINVAL) };
 -        let c_link = match path_cstr(&host_link, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
 -        return if unsafe { libc::symlink(c_target.as_ptr(), c_link.as_ptr()) } < 0 {
@@ -1582,8 +1590,10 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -        } else {
 -            NotifAction::ReturnValue(0)
 -        };
--    }
--
++    pub fn serialize<S: serde::Serializer>(image: &Arc<Self>, serializer: S) -> Result<S::Ok, S::Error> {
++        serde::Serialize::serialize(&image.objects.read().unwrap().values().collect::<Vec<_>>(), serializer)
+     }
+
 -    if nr == libc::SYS_linkat {
 -        // linkat(olddirfd, oldpath, newdirfd, newpath, flags)
 -        let old_path = match read_path(notif, notif.data.args[1], notif_fd) {
@@ -1682,8 +1692,10 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -        } else {
 -            NotifAction::ReturnValue(0)
 -        };
--    }
--
++    pub fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Arc<Self>, D::Error> {
++        Self::from_rows(serde::Deserialize::deserialize(deserializer)?).map(Arc::new).map_err(serde::de::Error::custom)
+     }
+
 -    if nr == libc::SYS_fchmodat {
 -        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx, 0, 1) {
 -            Ok(r) => r,
@@ -1707,7 +1719,8 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -        }
 -        return exec_on_host(|p| unsafe { libc::chmod(p, mode) }, &host_path);
 -    }
--
++    pub fn is_empty(&self) -> bool { self.objects.read().unwrap().is_empty() }
+
 -    if nr == libc::SYS_fchownat {
 -        let nofollow = (notif.data.args[4] & libc::AT_SYMLINK_NOFOLLOW as u64) != 0;
 -        let resolved = if nofollow {
@@ -1742,8 +1755,10 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -            },
 -            &host_path,
 -        );
--    }
--
++    fn inode(&self, device: u64, inode: u64) -> u64 {
++        self.objects.read().unwrap().get(&(device, inode)).map_or(inode, |(_, source, _)| source[1] as u64)
+     }
+
 -    if nr == libc::SYS_truncate {
 -        let path = match read_path(notif, notif.data.args[0], notif_fd) {
 -            Some(p) => p,
@@ -1768,33 +1783,6 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -                    }
 -                }
 -            }
--        }
--        return exec_on_host(|p| unsafe { libc::truncate(p, length) }, &host_path);
--    }
--
--    NotifAction::Continue
--}
--
--// ============================================================
--// stat/access handler
--// ============================================================
-+        Ok(image)
-+    }
-+
-+    pub fn serialize<S: serde::Serializer>(image: &Arc<Self>, serializer: S) -> Result<S::Ok, S::Error> {
-+        serde::Serialize::serialize(&image.objects.read().unwrap().values().collect::<Vec<_>>(), serializer)
-+    }
-+
-+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Arc<Self>, D::Error> {
-+        Self::from_rows(serde::Deserialize::deserialize(deserializer)?).map(Arc::new).map_err(serde::de::Error::custom)
-+    }
-+
-+    pub fn is_empty(&self) -> bool { self.objects.read().unwrap().is_empty() }
-+
-+    fn inode(&self, device: u64, inode: u64) -> u64 {
-+        self.objects.read().unwrap().get(&(device, inode)).map_or(inode, |(_, source, _)| source[1] as u64)
-+    }
-+
 +    fn project(&self, values: &mut [i128; 14]) {
 +        let objects = self.objects.read().unwrap();
 +        let Some((before, source, policy)) = objects.get(&(values[0] as u64, values[1] as u64)) else { return; };
@@ -1839,10 +1827,17 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +        state.stx_size = fields[7] as _; state.stx_blksize = fields[8] as _; state.stx_blocks = fields[9] as _;
 +        for (stamp, value) in [&mut state.stx_atime, &mut state.stx_mtime, &mut state.stx_ctime, &mut state.stx_btime].into_iter().zip(&fields[10..]) {
 +            stamp.tv_sec = value.div_euclid(1_000_000_000) as _; stamp.tv_nsec = value.rem_euclid(1_000_000_000) as _;
-+        }
-+    }
-+}
+         }
+-        return exec_on_host(|p| unsafe { libc::truncate(p, length) }, &host_path);
+     }
+-
+-    NotifAction::Continue
+ }
 
+-// ============================================================
+-// stat/access handler
+-// ============================================================
+-
  /// Pack struct stat and write to child buffer.
 -fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAction {
 -    let statbuf_addr = notif.data.args[2];
@@ -1853,7 +1848,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 
      // Let libc lay the struct out. Hand-packing it in field order is an
      // x86_64 assumption: aarch64 and riscv64 put st_mode and st_nlink before
-@@ -1476,6 +1853,11 @@
+@@ -1476,6 +1874,11 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
          return NotifAction::Errno(last_errno(libc::ENOENT));
      }
 
@@ -1865,7 +1860,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
      let bytes = unsafe {
          std::slice::from_raw_parts(
              &st as *const libc::stat as *const u8,
-@@ -1488,6 +1870,8 @@
+@@ -1488,6 +1891,8 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
      NotifAction::ReturnValue(0)
  }
 
@@ -1874,7 +1869,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
  pub(crate) async fn handle_chroot_stat(
      notif: &SeccompNotif,
      _chroot_state: &Arc<Mutex<ChrootState>>,
-@@ -1496,98 +1880,105 @@
+@@ -1496,98 +1901,105 @@ pub(crate) async fn handle_chroot_stat(
      ctx: &ChrootCtx<'_>,
  ) -> NotifAction {
      let nr = notif.data.nr as i64;
@@ -1936,7 +1931,13 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -    let real_path = match cow_resolve(cow_state, &host_path).await {
 -        Ok(p) => p,
 -        Err(a) => return a,
--    };
++        let path = match path { Some(path) if !extended || !path.is_empty() => path, _ => return NotifAction::Continue };
++        let resolve = if flags & libc::AT_SYMLINK_NOFOLLOW != 0 { resolve_chroot_path_nofollow } else { resolve_chroot_path_existing };
++        let (host_path, vp) = match resolve(notif, dirfd, &path, ctx) { Ok(paths) => paths, Err(errno) => return NotifAction::Errno(errno) };
++        if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
++        let real_path = match cow_resolve(cow_state, &host_path).await { Ok(path) => path, Err(action) => return action };
++        (real_path, mounted_device(ctx, &host_path, &vp, flags & libc::AT_SYMLINK_NOFOLLOW == 0))
+     };
 -
 -    if nr == libc::SYS_faccessat || nr == crate::arch::SYS_FACCESSAT2 {
 -        return if real_path.exists() || real_path.is_symlink() {
@@ -1944,7 +1945,9 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -        } else {
 -            NotifAction::Errno(libc::ENOENT)
 -        };
--    }
++    if access {
++        return exec_on_host(|path| unsafe { libc::faccessat(libc::AT_FDCWD, path, notif.data.args[2] as i32, flags) }, &real_path);
+     }
 -
 -    stat_and_write(notif, notif_fd, &real_path)
 -}
@@ -1969,8 +1972,14 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -    // AT_EMPTY_PATH: stat the fd directly, no chroot path resolution needed.
 -    if (flags & libc::AT_EMPTY_PATH) != 0 {
 -        return NotifAction::Continue;
--    }
--
++    if extended {
++        statx_and_write(notif, notif_fd, &real_path, flags, notif.data.args[3] as u32, device, ctx.metadata_image)
++    } else {
++        let target = notif.data.args[if descriptor { 1 } else { 2 }];
++        stat_and_write(notif, notif_fd, &real_path, target, flags, device, ctx.metadata_image)
+     }
++}
+
 -    let path = match read_path(notif, path_ptr, notif_fd) {
 -        Some(p) if !p.is_empty() => p,
 -        _ => return NotifAction::Continue,
@@ -1978,19 +1987,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -
 -    let resolved = if (flags & libc::AT_SYMLINK_NOFOLLOW) != 0 {
 -        resolve_chroot_path_nofollow(notif, dirfd, &path, ctx)
-+        let path = match path { Some(path) if !extended || !path.is_empty() => path, _ => return NotifAction::Continue };
-+        let resolve = if flags & libc::AT_SYMLINK_NOFOLLOW != 0 { resolve_chroot_path_nofollow } else { resolve_chroot_path_existing };
-+        let (host_path, vp) = match resolve(notif, dirfd, &path, ctx) { Ok(paths) => paths, Err(errno) => return NotifAction::Errno(errno) };
-+        if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
-+        let real_path = match cow_resolve(cow_state, &host_path).await { Ok(path) => path, Err(action) => return action };
-+        (real_path, mounted_device(ctx, &host_path, &vp, flags & libc::AT_SYMLINK_NOFOLLOW == 0))
-+    };
-+    if access {
-+        return exec_on_host(|path| unsafe { libc::faccessat(libc::AT_FDCWD, path, notif.data.args[2] as i32, flags) }, &real_path);
-+    }
-+    if extended {
-+        statx_and_write(notif, notif_fd, &real_path, flags, notif.data.args[3] as u32, device, ctx.metadata_image)
-     } else {
+-    } else {
 -        resolve_chroot_path_existing(notif, dirfd, &path, ctx)
 -    };
 -    let (host_path, vp) = match resolved {
@@ -1998,18 +1995,6 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -        None => return NotifAction::Errno(libc::ENOENT),
 -    };
 -    if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
--
--    let real_path = match cow_resolve(cow_state, &host_path).await {
--        Ok(p) => p,
--        Err(a) => return a,
--    };
--
--    let c_path = match path_cstr(&real_path, libc::ENOENT) {
-+        let target = notif.data.args[if descriptor { 1 } else { 2 }];
-+        stat_and_write(notif, notif_fd, &real_path, target, flags, device, ctx.metadata_image)
-+    }
-+}
-+
 +/// The mounted tree represents its source filesystem; FUSE's transport device is not a program input.
 +fn mounted_device(ctx: &ChrootCtx<'_>, host: &Path, virtual_path: &Path, follow: bool) -> Option<u64> {
 +    use std::os::unix::fs::MetadataExt;
@@ -2017,7 +2002,11 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +    let path = viewed_filesystem(ctx, host, virtual_path);
 +    (if follow { std::fs::metadata(path) } else { std::fs::symlink_metadata(path) }).ok().map(|state| state.dev())
 +}
-+
+
+-    let real_path = match cow_resolve(cow_state, &host_path).await {
+-        Ok(p) => p,
+-        Err(a) => return a,
+-    };
 +/// FUSE overlay directories count their merged child directories, but its inode
 +/// cache can forget children between lookups. Count the actual view, including
 +/// new directories and whiteouts, instead of exposing that partial cache count.
@@ -2030,7 +2019,8 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +        entry?.file_type().map(|kind| count + u64::from(kind.is_dir()))
 +    }).ok()
 +}
-+
+
+-    let c_path = match path_cstr(&real_path, libc::ENOENT) {
 +fn statx_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path, flags: i32, mask: u32, device: Option<u64>, metadata: &MetadataImage) -> NotifAction {
 +    let c_path = match path_cstr(path, libc::ENOENT) {
          Ok(c) => c,
@@ -2061,7 +2051,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
          return NotifAction::Continue;
      }
      NotifAction::ReturnValue(0)
-@@ -1687,7 +2078,7 @@
+@@ -1687,7 +2099,7 @@ pub(crate) async fn handle_chroot_readlink(
      // (needed because memfd-backed binaries would show "/memfd:sandlock-exec" otherwise).
      if path == format!("{}/exe", own_proc) {
          let cs = chroot_state.lock().await;
@@ -2070,7 +2060,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
              let s = exe.to_string_lossy();
              return write_target(s.as_bytes());
          }
-@@ -1704,8 +2095,8 @@
+@@ -1704,8 +2116,8 @@ pub(crate) async fn handle_chroot_readlink(
      // readlink must read the link itself, never what it points at, which is
      // exactly what the no-follow resolver gives.
      let (host_path, _) = match resolve_chroot_path_nofollow(notif, dirfd, &path, ctx) {
@@ -2081,7 +2071,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
      };
 
      // COW
-@@ -1716,7 +2107,12 @@
+@@ -1716,7 +2128,12 @@ pub(crate) async fn handle_chroot_readlink(
              if cow.matches(&host_str) {
                  let target = match cow.handle_readlink(&host_str) {
                      Some(t) => t,
@@ -2095,7 +2085,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
                  };
                  drop(cs);
                  return write_target(target.as_bytes());
-@@ -1726,7 +2122,7 @@
+@@ -1726,7 +2143,7 @@ pub(crate) async fn handle_chroot_readlink(
 
      let target = match std::fs::read_link(&host_path) {
          Ok(t) => t,
@@ -2104,7 +2094,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
      };
 
      // Strip chroot/mount prefix from absolute targets
-@@ -1742,96 +2138,8 @@
+@@ -1742,96 +2159,8 @@ pub(crate) async fn handle_chroot_readlink(
  // xattr handler
  // ============================================================
 
@@ -2203,7 +2193,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
  pub(crate) async fn handle_chroot_xattr(
      notif: &SeccompNotif,
      _chroot_state: &Arc<Mutex<ChrootState>>,
-@@ -1839,100 +2147,60 @@
+@@ -1839,100 +2168,60 @@ pub(crate) async fn handle_chroot_xattr(
      notif_fd: RawFd,
      ctx: &ChrootCtx<'_>,
  ) -> NotifAction {
@@ -2321,7 +2311,10 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -            } else {
 -                NotifAction::ReturnValue(0)
 -            }
--        }
++        if buffer_index != 0 {
++            args[buffer_index] = if !writing && buffer.is_empty() { 0 } else { buffer.as_mut_ptr() as u64 };
++            args[buffer_index + 1] = buffer.len() as u64;
+         }
 -        XattrOp::Remove => {
 -            let name = match read_name() {
 -                Ok(n) => n,
@@ -2334,25 +2327,20 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -            } else {
 -                NotifAction::ReturnValue(0)
 -            }
--        }
--    }
-+        if buffer_index != 0 {
-+            args[buffer_index] = if !writing && buffer.is_empty() { 0 } else { buffer.as_mut_ptr() as u64 };
-+            args[buffer_index + 1] = buffer.len() as u64;
-+        }
 +        let ret = unsafe { libc::syscall(nr, args[0], args[1], args[2], args[3], args[4]) };
 +        if ret < 0 { return Err(NotifAction::Errno(last_errno(if writing { libc::EIO } else { libc::ENODATA }))); }
 +        if !writing && !buffer.is_empty() && ret > 0 {
 +            write_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[buffer_index], &buffer[..ret as usize])
 +                .map_err(|_| NotifAction::Errno(libc::EFAULT))?;
-+        }
+         }
+-    }
 +        Ok(ret)
 +    }.await;
 +    result.map_or_else(|action| action, NotifAction::ReturnValue)
  }
 
  // ============================================================
-@@ -1940,18 +2208,15 @@
+@@ -1940,18 +2229,15 @@ pub(crate) async fn handle_chroot_xattr(
  // ============================================================
 
  pub(crate) async fn handle_chroot_getdents(
@@ -2378,7 +2366,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
  }
 
  // ============================================================
-@@ -1961,57 +2226,24 @@
+@@ -1961,57 +2247,24 @@ pub(crate) async fn handle_chroot_getdents(
  pub(crate) async fn handle_chroot_chdir(
      notif: &SeccompNotif,
      _chroot_state: &Arc<Mutex<ChrootState>>,
@@ -2405,7 +2393,10 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -        (mt.to_path_buf(), sub)
 -    } else {
 -        (ctx.root.to_path_buf(), full_path.clone())
--    };
++    let Some(path) = read_path(notif, notif.data.args[0], notif_fd) else { return NotifAction::Errno(libc::EFAULT); };
++    let (host, virtual_path) = match resolve_chroot_path_existing(notif, libc::AT_FDCWD as i64, &path, ctx) {
++        Ok(paths) => paths, Err(errno) => return NotifAction::Errno(errno),
+     };
 -    let src_fd = match openat2_in_root(
 -        &chdir_root,
 -        &chdir_path,
@@ -2414,7 +2405,10 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -    ) {
 -        Ok(fd) => fd,
 -        Err(errno) => return NotifAction::Errno(errno),
--    };
++    let host = match cow_resolve(cow_state, &host).await { Ok(path) => path, Err(action) => return action };
++    let fd = match openat2_in_root(Path::new("/"), &host.to_string_lossy(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC, 0) {
++        Ok(fd) => unsafe { OwnedFd::from_raw_fd(fd) }, Err(errno) => return NotifAction::Errno(errno),
+     };
 -    // Record where the kernel actually landed, not what the child asked for:
 -    // symlinks and .. are already collapsed in the resolved fd.
 -    let resolved = std::fs::read_link(format!("/proc/self/fd/{}", src_fd)).ok();
@@ -2434,14 +2428,6 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -    // (the kernel re-read the path we wrote) and a force-write through
 -    // /proc/<pid>/mem that permanently corrupted a .rodata path literal.
 -    set_virtual_cwd(notif, ctx, virtual_cwd);
-+    let Some(path) = read_path(notif, notif.data.args[0], notif_fd) else { return NotifAction::Errno(libc::EFAULT); };
-+    let (host, virtual_path) = match resolve_chroot_path_existing(notif, libc::AT_FDCWD as i64, &path, ctx) {
-+        Ok(paths) => paths, Err(errno) => return NotifAction::Errno(errno),
-+    };
-+    let host = match cow_resolve(cow_state, &host).await { Ok(path) => path, Err(action) => return action };
-+    let fd = match openat2_in_root(Path::new("/"), &host.to_string_lossy(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC, 0) {
-+        Ok(fd) => unsafe { OwnedFd::from_raw_fd(fd) }, Err(errno) => return NotifAction::Errno(errno),
-+    };
 +    // Kernel resolution checks existence and directory type; the logical cwd
 +    // names the merged path even when that object only exists in the upper.
 +    let resolved = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).ok();
@@ -2451,7 +2437,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
      NotifAction::ReturnValue(0)
  }
 
-@@ -2043,6 +2275,20 @@
+@@ -2043,6 +2296,20 @@ pub(crate) async fn handle_chroot_fchdir(
      NotifAction::Continue
  }
 
@@ -2472,20 +2458,17 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
  // ============================================================
  // getcwd handler
  // ============================================================
-@@ -2092,12 +2338,38 @@
+@@ -2092,12 +2359,38 @@ pub(crate) async fn handle_chroot_statfs(
          None => return NotifAction::Continue,
      };
 
 -    let (host_path, _) = match resolve_chroot_path_existing(notif, libc::AT_FDCWD as i64, &path, ctx) {
 -        Some(r) => r,
 -        None => return NotifAction::Errno(libc::ENOENT),
--    };
--
--    let c_path = match path_cstr(&host_path, libc::ENOENT) {
 +    let (host_path, virtual_path) = match resolve_chroot_path_existing(notif, libc::AT_FDCWD as i64, &path, ctx) {
 +            Ok(r) => r,
 +            Err(errno) => return NotifAction::Errno(errno),
-+    };
+     };
 +    write_statfs(notif, notif_fd, statfsbuf_addr, &viewed_filesystem(ctx, &host_path, &virtual_path))
 +}
 +
@@ -2496,7 +2479,8 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 +    }
 +    virtual_path.ancestors().find(|ancestor| ancestor.exists()).unwrap_or(host_path).to_path_buf()
 +}
-+
+
+-    let c_path = match path_cstr(&host_path, libc::ENOENT) {
 +/// fstatfs of a descriptor on a mounted path, answered for its virtual path; any other descriptor is the kernel's to answer.
 +pub(crate) async fn handle_chroot_fstatfs(
 +    notif: &SeccompNotif,
@@ -2517,12 +2501,10 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
          Ok(c) => c,
          Err(a) => return a,
      };
-@@ -2116,327 +2388,6 @@
-         return NotifAction::Continue;
-     }
+@@ -2118,327 +2411,6 @@ pub(crate) async fn handle_chroot_statfs(
      NotifAction::ReturnValue(0)
--}
--
+ }
+
 -// ============================================================
 -// utimensat handler
 -// ============================================================
@@ -2842,10 +2824,12 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
 -    ]);
 -    synth.data.nr = libc::SYS_fchownat as i32;
 -    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
- }
-
+-}
+-
  #[cfg(test)]
-@@ -2475,13 +2426,19 @@
+ mod self_rewrite_tests {
+     use super::canon_proc_self;
+@@ -2475,13 +2447,19 @@ mod mount_ro_tests {
          writable: &'a [PathBuf],
          processes: &'a Arc<ProcessIndex>,
      ) -> ChrootCtx<'a> {
@@ -2865,7 +2849,7 @@ diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/
              processes,
          }
      }
-@@ -2511,3 +2468,76 @@
+@@ -2511,3 +2489,76 @@ mod mount_ro_tests {
          assert!(c.can_write(Path::new("/data/file")));
      }
  }
@@ -3242,11 +3226,40 @@ index f796767..c5ff80f 100644
      }
  }
 diff --git a/crates/sandlock-core/src/context.rs b/crates/sandlock-core/src/context.rs
+index 1ee2513..a92d7b3 100644
 --- a/crates/sandlock-core/src/context.rs
 +++ b/crates/sandlock-core/src/context.rs
-@@ -415,7 +415,12 @@
+@@ -411,11 +411,39 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
+         }
+     }
+
++    // Mount the workspace in the guest only. The supervisor retains the
++    // caller's namespace and returns the original metadata through seccomp.
++    let mounts = crate::chroot::resolve::resolve_chroot_mounts(&sandbox.fs_mount);
++    let native_view = sandbox.chroot.as_deref() == Some(std::path::Path::new("/"))
++        && sandbox.exec_mount.iter().any(|(path, _)| path == std::path::Path::new("/"))
++        && mounts.iter().any(|(logical, physical)| logical != physical);
++    if native_view {
++        if sandbox.user.is_some() || unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0
++            || write_id_maps(real_uid, real_gid, real_uid, real_gid).is_err()
++            || unsafe { libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(),
++                libc::MS_PRIVATE | libc::MS_REC, std::ptr::null()) } != 0 {
++            fail!("private workspace mount namespace");
++        }
++        for (logical, physical) in &mounts {
++            if logical == physical { continue; }
++            let to = CString::new(logical.as_os_str().as_encoded_bytes()).unwrap();
++            let from = CString::new(physical.as_os_str().as_encoded_bytes()).unwrap();
++            if unsafe { libc::mount(from.as_ptr(), to.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) } != 0 {
++                fail!("private workspace mount");
++            }
++        }
++    }
++
+     // 6. Optional: change working directory
      // cwd controls where the child starts; workdir is only for COW
-     let effective_cwd = if let Some(ref cwd) = sandbox.cwd {
+-    let effective_cwd = if let Some(ref cwd) = sandbox.cwd {
++    let effective_cwd = if native_view { sandbox.cwd.clone() } else if let Some(ref cwd) = sandbox.cwd {
          if let Some(ref chroot_root) = sandbox.chroot {
 -            Some(chroot_root.join(cwd.strip_prefix("/").unwrap_or(cwd)))
 +            // A mounted directory lives at the mount's host place (the deepest mount serving it): one only the mount holds,
@@ -3258,15 +3271,14 @@ diff --git a/crates/sandlock-core/src/context.rs b/crates/sandlock-core/src/cont
          } else {
              Some(cwd.clone())
          }
-@@ -443,6 +448,8 @@
-     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+@@ -444,6 +472,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
          fail!("prctl(PR_SET_NO_NEW_PRIVS)");
      }
-+
-+    if let Err(error) = crate::seccomp::trace_gate::install(&sandbox.exec_mount) { fail!(format!("trace gate filter: {error}")); }
 
++
      // 8. Apply Landlock confinement (IRREVERSIBLE)
      if let Err(e) = crate::landlock::confine(sandbox) {
+         fail!(format!("landlock: {}", e));
 diff --git a/crates/sandlock-core/src/cow/deletions.rs b/crates/sandlock-core/src/cow/deletions.rs
 index f96622d..6e8c060 100644
 --- a/crates/sandlock-core/src/cow/deletions.rs
@@ -4098,11 +4110,15 @@ index 687ead5..15f8466 100644
      }
  }
 diff --git a/crates/sandlock-core/src/network/connect.rs b/crates/sandlock-core/src/network/connect.rs
-index d1dcdf9..ef886c0 100644
+index d1dcdf9..afeb9f1 100644
 --- a/crates/sandlock-core/src/network/connect.rs
 +++ b/crates/sandlock-core/src/network/connect.rs
-@@ -131,14 +131,11 @@ pub(super) async fn connect_on_behalf(
-         match named_unix_socket_path(&addr_bytes) {
+@@ -128,17 +128,14 @@ pub(super) async fn connect_on_behalf(
+         // EACCES. The decision is made on `addr_bytes` (our immune copy) and we
+         // never return Continue on the deny path, so it is TOCTOU-safe.
+         // Abstract sockets (no path) are handled by the Landlock abstract scope.
+-        match named_unix_socket_path(&addr_bytes) {
++        let action = match named_unix_socket_path(&addr_bytes) {
              Some(path) if ctx.policy.has_unix_fs_gate => {
                  if ctx.policy.chroot_root.is_some() {
 -                    // Chroot mode: the child's paths are virtual, so a lexical
@@ -4118,6 +4134,18 @@ index d1dcdf9..ef886c0 100644
                      }
                  } else {
                      // Non-chroot: resolve the symlink-followed real target and
+@@ -154,7 +151,11 @@ pub(super) async fn connect_on_behalf(
+             }
+             // Abstract/unnamed socket, non-AF_UNIX family, or gate disabled.
+             _ => NotifAction::Continue,
++        };
++        if !matches!(action, NotifAction::Continue) {
++            crate::seccomp::notif::pi_observe_record(notif.id, 22, addr_bytes.as_ptr(), addr_bytes.len());
+         }
++        action
+     }
+ }
+
 diff --git a/crates/sandlock-core/src/resolved.rs b/crates/sandlock-core/src/resolved.rs
 index 634755e..38fd708 100644
 --- a/crates/sandlock-core/src/resolved.rs
@@ -4843,9 +4871,10 @@ index 3673d84..fb851ec 100644
 
      /// All registered handlers run, in registration order, when each
 diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/src/seccomp/notif.rs
+index abcd92c..06d7dd4 100644
 --- a/crates/sandlock-core/src/seccomp/notif.rs
 +++ b/crates/sandlock-core/src/seccomp/notif.rs
-@@ -360,13 +360,13 @@
+@@ -360,13 +360,13 @@ pub(crate) fn is_path_denied_for_notif(
      notif: &SeccompNotif,
      notif_fd: RawFd,
  ) -> bool {
@@ -4861,21 +4890,21 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
          if is_denied_with_symlink_resolve(policy_fn_state, &path) {
              return true;
          }
-@@ -512,6 +512,13 @@
-     pub(crate) mode: u64,
-     /// `openat2` `resolve` flags (`RESOLVE_*`); 0 for `open`/`openat`.
+@@ -514,6 +514,13 @@ pub(crate) struct OpenArgs {
      pub(crate) resolve: u64,
-+}
-+
+ }
+
 +/// The mode a creating call gives natively: the call's own, under the child's umask rather than the supervisor's.
 +pub(crate) fn creation_mode(pid: u32, requested: u64) -> u32 {
 +    let umask = std::fs::read_to_string(format!("/proc/{pid}/status")).ok().and_then(|status| status.lines()
 +        .find_map(|line| line.strip_prefix("Umask:").and_then(|value| u32::from_str_radix(value.trim(), 8).ok())));
 +    requested as u32 & 0o7777 & !umask.unwrap_or(0o022)
- }
-
++}
++
  /// Decode the open arguments. `openat2` carries flags/mode/resolve inside a
-@@ -773,6 +780,8 @@
+ /// `struct open_how` in child memory, so its decode reads child memory and
+ /// can fail; `None` means "could not decode" and the caller soft-falls-through
+@@ -773,6 +780,8 @@ pub struct NotifPolicy {
      pub num_cpus: Option<u32>,
      pub port_remap: bool,
      pub cow_enabled: bool,
@@ -4884,7 +4913,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
      pub chroot_root: Option<std::path::PathBuf>,
      /// Virtual paths allowed for reading under chroot (original user-specified paths).
      pub chroot_readable: Vec<std::path::PathBuf>,
-@@ -787,6 +796,10 @@
+@@ -787,6 +796,10 @@ pub struct NotifPolicy {
      /// procfs mount and OCI `ro` bind mounts so a writable rootfs cannot make
      /// e.g. `/proc/sys/*` writable.
      pub chroot_mount_ro: Vec<std::path::PathBuf>,
@@ -4895,7 +4924,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
      pub deterministic_dirs: bool,
      pub virtual_hostname: Option<String>,
      pub has_http_acl: bool,
-@@ -937,10 +950,11 @@
+@@ -937,10 +950,11 @@ fn inject_failure_resp(id: u64) -> SeccompNotifResp {
  /// The ioctl return value is the fd number assigned in the child process.
  /// After this call, no additional SECCOMP_IOCTL_NOTIF_SEND is needed.
  fn inject_fd_and_send(fd: RawFd, id: u64, srcfd: RawFd, newfd_flags: u32) -> io::Result<i32> {
@@ -4908,16 +4937,16 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
          newfd: 0,   // ignored when SECCOMP_ADDFD_FLAG_SETFD is not set
          newfd_flags,
      };
-@@ -950,7 +964,29 @@
+@@ -950,10 +964,32 @@ fn inject_fd_and_send(fd: RawFd, id: u64, srcfd: RawFd, newfd_flags: u32) -> io:
      if ret < 0 {
          Err(io::Error::last_os_error())
      } else {
 +        let response = SeccompNotifResp { id, val: ret as i64, error: 0, flags: 0 };
 +        pi_observe_record(id, 4, &response as *const _ as *const u8, std::mem::size_of::<SeccompNotifResp>());
          Ok(ret as i32)
-+    }
-+}
-+
+     }
+ }
+
 +/// ADDFD takes the file with fget, which refuses O_PATH ones: the nearest the kernel lets a supervisor hand over is
 +/// the same object opened for reading (not blocking on a FIFO or device), which fails as reading it would.
 +fn readable_in_place_of_path_fd(fd: RawFd) -> io::Result<Option<OwnedFd>> {
@@ -4935,10 +4964,13 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
 +    match unsafe { libc::open(link.as_ptr(), flags) } {
 +        -1 => Err(io::Error::last_os_error()),
 +        reopened => Ok(Some(unsafe { OwnedFd::from_raw_fd(reopened) })),
-     }
- }
-
-@@ -975,13 +1011,22 @@
++    }
++}
++
+ /// Inject a file descriptor into the child process (without responding).
+ /// ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd)
+ fn inject_fd(fd: RawFd, id: u64, srcfd: RawFd, targetfd: i32) -> io::Result<()> {
+@@ -975,13 +1011,22 @@ fn inject_fd(fd: RawFd, id: u64, srcfd: RawFd, targetfd: i32) -> io::Result<()>
  }
 
  /// Raw ioctl to send a notification response.
@@ -4962,7 +4994,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
          Ok(())
      }
  }
-@@ -1088,8 +1133,8 @@
+@@ -1088,8 +1133,8 @@ pub fn read_child_mem(
  ///
  /// Page-aware: reads up to a page boundary at a time and stops at the
  /// first NUL byte, never crossing into unmapped memory.  Returns
@@ -4973,7 +5005,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
  ///
  /// Public — used by downstream `Handler` implementations that read
  /// path arguments from notifications (`openat`, `unlinkat`, `statx`,
-@@ -1214,11 +1259,14 @@
+@@ -1214,11 +1259,14 @@ const EXEC_MAX_PTR_ENTRIES: usize = 1 << 20;
  /// child, plus the relocation buffer being assembled for it.
  struct ExecRewritePlan {
      /// Bytes to write at the path pointer: the fd path, then every
@@ -4989,7 +5021,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
  }
 
  /// Read a NULL-terminated pointer array (argv or envp) from child memory.
-@@ -1313,6 +1361,10 @@
+@@ -1313,6 +1361,10 @@ fn read_exec_cstr(
  ///   downward so each gap segment is read once, and once a NUL is seen every
  ///   lower string is known to terminate before the window.
  ///
@@ -5000,7 +5032,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
  /// Fails if the argv/envp pointer arrays themselves fall inside the final
  /// window: the kernel reads those arrays after we return, and they cannot be
  /// moved because their addresses live in syscall registers.
-@@ -1322,6 +1374,7 @@
+@@ -1322,6 +1374,7 @@ fn plan_exec_rewrite(
      fd_path: &[u8],
      argv_ptr: u64,
      envp_ptr: u64,
@@ -5008,7 +5040,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
  ) -> Result<ExecRewritePlan, NotifError> {
      let argv = read_exec_ptr_array(read, argv_ptr)?;
      let envp = read_exec_ptr_array(read, envp_ptr)?;
-@@ -1331,48 +1384,54 @@
+@@ -1331,48 +1384,54 @@ fn plan_exec_rewrite(
          .map(|(i, &p)| (argv_ptr + 8 * i as u64, p))
          .chain(envp.iter().enumerate().map(|(i, &p)| (envp_ptr + 8 * i as u64, p)))
          .collect();
@@ -5049,12 +5081,6 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
 -        let seg = read_exec_range(read, p, (nul_free_from - p) as usize)?;
 -        if seg.contains(&0) {
 -            break;
--        }
--        relocate(&mut buf, &mut relocated, read, p)?;
--        nul_free_from = p;
--    }
--
--    // Strings starting inside the (growing) window.
 +    {
 +        let start = path_ptr;
 +        let mut reaching: Vec<u64> = slots
@@ -5072,9 +5098,12 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
 +            }
 +            relocate(&mut buf, &mut scratch, &mut relocated, read, p)?;
 +            nul_free_from = p;
-+        }
-+    }
-+
+         }
+-        relocate(&mut buf, &mut relocated, read, p)?;
+-        nul_free_from = p;
+     }
+
+-    // Strings starting inside the (growing) window.
 +    // Strings starting inside a (growing) window.
      loop {
          let end = path_ptr + buf.len() as u64;
@@ -5088,7 +5117,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
                  grew = true;
              }
          }
-@@ -1382,19 +1441,138 @@
+@@ -1382,19 +1441,138 @@ fn plan_exec_rewrite(
      }
 
      let end = path_ptr + buf.len() as u64;
@@ -5097,14 +5126,6 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
 -            return Err(NotifError::Supervisor(
 -                "execve argv/envp pointer array overlaps the path rewrite window".into(),
 -            ));
--        }
--    }
--
--    let patches = slots
--        .iter()
--        .filter_map(|&(slot, p)| relocated.get(&p).map(|&np| (slot, np)))
--        .collect();
--    Ok(ExecRewritePlan { buf, patches })
 +    let meets = |base: u64, len: u64, (start, stop): (u64, u64)| base != 0 && base < stop && base + len > start;
 +    let argv_len = 8 * (argv.len() as u64 + 1);
 +    let envp_len = 8 * (envp.len() as u64 + 1);
@@ -5134,9 +5155,14 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
 +        }
 +        if !clear {
 +            return Err(NotifError::Supervisor("strings set below the stack overlap exec arguments".into()));
-+        }
-+    }
-+
+         }
+     }
+
+-    let patches = slots
+-        .iter()
+-        .filter_map(|&(slot, p)| relocated.get(&p).map(|&np| (slot, np)))
+-        .collect();
+-    Ok(ExecRewritePlan { buf, patches })
 +    let patches = slots.iter().filter_map(|&(slot, p)| relocated.get(&p).map(|&np| (slot, np))).collect();
 +    Ok(ExecRewritePlan { buf, patches, scratch: (!scratch.is_empty()).then_some((start, scratch)) })
 +}
@@ -5240,7 +5266,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
  }
 
  /// Rewrite an execve/execveat path argument to `/proc/self/fd/<child_fd>`,
-@@ -1425,23 +1603,26 @@
+@@ -1425,23 +1603,26 @@ fn plan_exec_rewrite(
  ///
  /// `argv_ptr`/`envp_ptr` are the syscall's argv/envp arguments (args[1]/[2]
  /// for execve, args[2]/[3] for execveat); 0 (NULL) arrays are skipped.
@@ -5276,7 +5302,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
  }
 
  // ============================================================
-@@ -1593,12 +1774,37 @@
+@@ -1593,12 +1774,37 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
      }
  }
 
@@ -5320,7 +5346,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
  }
 
  fn normalize_path(path: &std::path::Path) -> String {
-@@ -1645,129 +1851,35 @@
+@@ -1645,129 +1851,35 @@ fn resolve_at_path_for_event(notif: &SeccompNotif, dirfd: i64, path: &str) -> Op
      Some(normalize_path(&base.join(path)))
  }
 
@@ -5416,11 +5442,27 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
 -        n if Some(n) == arch::sys_rename() => {
 -            let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
 -            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
--        }
++    let args = notif.data.args;
++    let pair = nr == libc::SYS_linkat || nr == libc::SYS_renameat2 || Some(nr) == arch::sys_renameat();
++    if second && !pair { return None; }
++    let (dirfd, pathname) = if pair {
++        let offset = if second { 2 } else { 0 };
++        (args[offset] as i64, args[offset + 1])
++    } else {
++        match nr {
++            libc::SYS_openat | arch::SYS_OPENAT2 | libc::SYS_execveat |
++            libc::SYS_mkdirat | libc::SYS_mknodat | libc::SYS_unlinkat => (args[0] as i64, args[1]),
++            libc::SYS_symlinkat => (args[1] as i64, args[2]),
++            libc::SYS_execve | libc::SYS_truncate => (libc::AT_FDCWD as i64, args[0]),
++            n if Some(n) == arch::sys_open() => (libc::AT_FDCWD as i64, args[0]),
++            _ => return None,
+         }
 -        _ => None,
 -    }
--}
--
++    };
++    Some((dirfd, pathname))
+ }
+
 -/// Resolve the second (destination) path for two-path syscalls.
 -///
 -/// Returns `None` for syscalls that only have a single path argument.
@@ -5451,25 +5493,6 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
 -        }
 -        _ => None,
 -    }
-+    let args = notif.data.args;
-+    let pair = nr == libc::SYS_linkat || nr == libc::SYS_renameat2 || Some(nr) == arch::sys_renameat();
-+    if second && !pair { return None; }
-+    let (dirfd, pathname) = if pair {
-+        let offset = if second { 2 } else { 0 };
-+        (args[offset] as i64, args[offset + 1])
-+    } else {
-+        match nr {
-+            libc::SYS_openat | arch::SYS_OPENAT2 | libc::SYS_execveat |
-+            libc::SYS_mkdirat | libc::SYS_mknodat | libc::SYS_unlinkat => (args[0] as i64, args[1]),
-+            libc::SYS_symlinkat => (args[1] as i64, args[2]),
-+            libc::SYS_execve | libc::SYS_truncate => (libc::AT_FDCWD as i64, args[0]),
-+            n if Some(n) == arch::sys_open() => (libc::AT_FDCWD as i64, args[0]),
-+            _ => return None,
-+        }
-+    };
-+    Some((dirfd, pathname))
-+}
-+
 +/// Policy observation uses every path recognized above; deny enforcement still
 +/// admits only fs_denied_path_syscalls, independently of this argument decoder.
 +fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd, second: bool) -> Option<String> {
@@ -5478,7 +5501,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
  }
 
  /// Extract the `sun_path` from an `AF_UNIX` sockaddr in child memory.
-@@ -1810,7 +1922,7 @@
+@@ -1810,7 +1922,7 @@ fn read_argv_for_event(notif: &SeccompNotif, argv_ptr: u64, notif_fd: RawFd) ->
          let str_ptr = u64::from_ne_bytes(ptr_bytes[..8].try_into().ok()?);
          if str_ptr == 0 { break; } // NULL terminator
 
@@ -5487,7 +5510,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
              args.push(s);
          } else {
              break;
-@@ -1934,7 +2046,7 @@
+@@ -1934,7 +2046,7 @@ async fn emit_policy_event(
              notif.data.args[1]
          };
          argv = read_argv_for_event(notif, argv_ptr, notif_fd);
@@ -5496,7 +5519,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
              .map(std::path::PathBuf::from);
      }
 
-@@ -1998,7 +2110,7 @@
+@@ -1998,7 +2110,7 @@ async fn emit_policy_event(
      // openat/openat2/open: resolved path + flags.
      if nr == libc::SYS_openat || nr == arch::SYS_OPENAT2 || Some(nr) == arch::sys_open() {
          if let Some(open_args) = decode_open_args(notif, notif_fd) {
@@ -5505,7 +5528,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
                  .map(std::path::PathBuf::from);
              flags = Some(open_args.flags);
          }
-@@ -2016,8 +2128,8 @@
+@@ -2016,8 +2128,8 @@ async fn emit_policy_event(
          || Some(nr) == arch::sys_link() || Some(nr) == arch::sys_rename()
          || Some(nr) == arch::sys_renameat();
      if is_fs_mutating {
@@ -5516,21 +5539,18 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
      }
 
      
-@@ -2155,7 +2267,13 @@
+@@ -2155,8 +2267,10 @@ async fn handle_notification(
      fd: RawFd,
      defer_sem: &Arc<tokio::sync::Semaphore>,
  ) {
 +    pi_observe_record(notif.id, 0, &notif as *const _ as *const u8, std::mem::size_of::<SeccompNotif>());
      let policy = &ctx.policy;
-+    match super::trace_gate::forward(&notif, fd, &policy.chroot_exec_mounts) {
-+        Ok(true) => return, Ok(false) => (),
-+        Err(error) => { eprintln!("trace gate failed: {error}"); let _ = send_resp_raw(fd, &SeccompNotifResp { id: notif.id, val: 0, error: -libc::EIO, flags: 0 }); return; }
-+    }
-+
 
++
      // Ensure every pid that produces a notification has per-process
      // supervisor state and an exit watcher. The fork handler runs on
-@@ -2420,7 +2538,7 @@
+     // the *parent* pid (the child doesn't exist yet at clone-time), so
+@@ -2420,7 +2534,7 @@ pub async fn supervisor(
      // child on an old kernel, or its watcher panicked). At 5 minutes
      // this is cheap enough to leave on; the primary cleanup path is
      // still per-child pidfd readiness in `spawn_pid_watcher`.
@@ -5539,7 +5559,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
 
      // Bounds the number of in-flight deferred handler futures (see
      // `DEFER_MAX_INFLIGHT`). Shared across all notifications this supervisor
-@@ -2475,14 +2593,13 @@
+@@ -2475,14 +2589,13 @@ pub async fn supervisor(
  /// Periodic sweep that drops `ProcessIndex` entries for exited PIDs.
  /// Per-process state hangs off these entries via `Arc`, so dropping
  /// them releases everything in one step.
@@ -5550,15 +5570,14 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
          tokio::time::sleep(interval).await;
 -        if processes.len() == 0 {
 -            continue;
--        }
--        processes.prune_dead();
 +        for (key, process, state) in ctx.processes.prune_dead() {
 +            release_process(&ctx, key, process, state).await;
-+        }
+         }
+-        processes.prune_dead();
      }
  }
 
-@@ -2538,14 +2655,25 @@
+@@ -2538,14 +2651,25 @@ pub(crate) fn spawn_pid_watcher(
  /// killing innocent workloads. Only a thread-group leader's entry carries
  /// a charge, so crediting whatever this entry holds is self-limiting.
  pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::state::PidKey) {
@@ -5568,8 +5587,6 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
 -            let mut st = ctx.resource.lock().await;
 -            crate::resource::release_charge(&mut st, &mut per);
 -        }
--    }
--    ctx.processes.unregister(key);
 +    if let Some((process, state)) = ctx.processes.unregister(key) {
 +        release_process(ctx, key, process, state).await;
 +    }
@@ -5588,15 +5605,15 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
 +        .and_then(|info| info.lines().find_map(|line| line.strip_prefix("Pid:")?.trim().parse::<i32>().ok()));
 +    if main.is_some_and(|main| main != key.pid) && super::state::read_ppid(key.pid) == Some(unsafe { libc::getpid() }) {
 +        unsafe { libc::waitpid(key.pid, std::ptr::null_mut(), libc::WNOHANG) };
-+    }
+     }
+-    ctx.processes.unregister(key);
  }
 
  // ============================================================
-@@ -2556,6 +2684,44 @@
- mod tests {
+@@ -2557,6 +2681,44 @@ mod tests {
      use super::*;
      use std::os::unix::io::FromRawFd;
-+
+
 +    #[test]
 +    fn policy_paths_preserve_each_syscall_abi_and_symlink_destination() {
 +        let cwd = libc::AT_FDCWD as i64;
@@ -5634,10 +5651,11 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
 +            assert_eq!(path_argument(&notif, true), None);
 +        }
 +    }
-
++
      fn gettid() -> u32 {
          (unsafe { libc::syscall(libc::SYS_gettid) }) as u32
-@@ -2585,6 +2751,16 @@
+     }
+@@ -2585,6 +2747,16 @@ mod tests {
          path_ptr: u64,
          argv_ptr: u64,
          envp_ptr: u64,
@@ -5654,7 +5672,7 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
      ) -> Result<ExecRewritePlan, NotifError> {
          let mut read = |addr: u64, len: usize| {
              let off = addr
-@@ -2595,101 +2771,48 @@
+@@ -2595,101 +2767,48 @@ mod tests {
                  .map(|s| s.to_vec())
                  .ok_or_else(|| NotifError::Supervisor("read past fake memory".into()))
          };
@@ -5677,12 +5695,9 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
 +        let p = plan_with(&mem, FAKE_BASE + 0x106, FAKE_BASE + 0x900, FAKE_BASE + 0x800, Some(FAKE_BASE + 0xF00)).unwrap();
          assert_eq!(p.buf, FD);
 -        assert!(p.patches.is_empty());
-+        assert_eq!(p.scratch, Some((FAKE_BASE + 0xEE0, b"SHELL=/bin/sh\0/bin/sh\0A=1\0".to_vec())));
-+        let moved = vec![(FAKE_BASE + 0x900, FAKE_BASE + 0xEEE), (FAKE_BASE + 0x800, FAKE_BASE + 0xEE0), (FAKE_BASE + 0x808, FAKE_BASE + 0xEF6)];
-+        assert_eq!(p.patches, moved);
-     }
-
-     #[test]
+-    }
+-
+-    #[test]
 -    fn exec_rewrite_relocates_aliased_argv0() {
 -        // The common shell case: execve path and argv[0] are the same buffer.
 -        let mut mem = vec![0u8; 4096];
@@ -5691,9 +5706,12 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
 -        let p = plan(&mem, FAKE_BASE, FAKE_BASE + 0x800, 0).unwrap();
 -        assert_eq!(p.buf, [FD, b"./m\0".as_slice()].concat());
 -        assert_eq!(p.patches, vec![(FAKE_BASE + 0x800, FAKE_BASE + 16)]);
--    }
--
--    #[test]
++        assert_eq!(p.scratch, Some((FAKE_BASE + 0xEE0, b"SHELL=/bin/sh\0/bin/sh\0A=1\0".to_vec())));
++        let moved = vec![(FAKE_BASE + 0x900, FAKE_BASE + 0xEEE), (FAKE_BASE + 0x800, FAKE_BASE + 0xEE0), (FAKE_BASE + 0x808, FAKE_BASE + 0xEF6)];
++        assert_eq!(p.patches, moved);
+     }
+
+     #[test]
 -    fn exec_rewrite_relocates_packed_argv1() {
 -        // argv[1] sits right after the path string, inside the fd-path
 -        // window; both strings must survive.
@@ -5790,12 +5808,10 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
      }
 
      #[test]
-@@ -2710,6 +2833,19 @@
-         let p = plan(&mem, FAKE_BASE, 0, 0).unwrap();
-         assert_eq!(p.buf, FD);
+@@ -2712,6 +2831,19 @@ mod tests {
          assert!(p.patches.is_empty());
-+    }
-+
+     }
+
 +    #[test]
 +    fn o_path_fds_are_handed_over_opened_for_reading() {
 +        use std::os::unix::io::{AsRawFd, OwnedFd};
@@ -5807,9 +5823,11 @@ diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/sr
 +        unsafe { (libc::fstat(path_fd.as_raw_fd(), &mut a), libc::fstat(readable.as_raw_fd(), &mut b)) };
 +        assert_eq!((a.st_dev, a.st_ino), (b.st_dev, b.st_ino));
 +        assert!(readable_in_place_of_path_fd(readable.as_raw_fd()).unwrap().is_none());
-     }
-
++    }
++
      #[test]
+     fn inject_failure_response_denies_not_continues() {
+         // When fd injection fails, the supervisor must fail closed: deny the
 diff --git a/crates/sandlock-core/src/seccomp/state.rs b/crates/sandlock-core/src/seccomp/state.rs
 index 0b4a2c4..9a9156e 100644
 --- a/crates/sandlock-core/src/seccomp/state.rs
@@ -7710,144 +7728,3 @@ index 9b4b13e..e30de4b 100644
          .fs_storage(&storage)
          .on_exit(BranchAction::Keep)
          .build()
-diff --git a/crates/sandlock-core/src/seccomp/mod.rs b/crates/sandlock-core/src/seccomp/mod.rs
---- a/crates/sandlock-core/src/seccomp/mod.rs
-+++ b/crates/sandlock-core/src/seccomp/mod.rs
-@@ -4,3 +4,5 @@
- pub mod notif;
- pub(crate) mod state;
- pub mod syscall;
-+
-+pub(crate) mod trace_gate;
-diff --git a/crates/sandlock-core/src/seccomp/bpf.rs b/crates/sandlock-core/src/seccomp/bpf.rs
---- a/crates/sandlock-core/src/seccomp/bpf.rs
-+++ b/crates/sandlock-core/src/seccomp/bpf.rs
-@@ -134,6 +134,7 @@
-     prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));               // ret_kill_idx
-
-     debug_assert_eq!(prog.len(), total, "BPF program length mismatch");
-+    super::trace_gate::filter(&mut prog, notif_syscalls, notif_base)?;
-     Ok(prog)
- }
-
-diff --git a/crates/sandlock-core/src/seccomp/trace_gate.rs b/crates/sandlock-core/src/seccomp/trace_gate.rs
-new file mode 100644
---- /dev/null
-+++ b/crates/sandlock-core/src/seccomp/trace_gate.rs
-@@ -0,0 +1,116 @@
-+use std::io;
-+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-+use std::path::{Path, PathBuf};
-+use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
-+use crate::sys::structs::{SeccompNotif, SockFilter};
-+
-+const HEADER: usize = 32784;
-+static FILTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-+struct Gate { mapped: usize, size: usize, pids: usize, filter: usize, channel: OwnedFd }
-+impl Drop for Gate { fn drop(&mut self) { unsafe { libc::munmap(self.mapped as *mut _, self.size); } } }
-+impl Gate {
-+    fn open(mounts: &[(PathBuf, PathBuf)], owner: i32) -> io::Result<Option<Self>> {
-+        if !mounts.iter().any(|(path, _)| path == Path::new("/")) { return Ok(None); }
-+        let directory = format!("/proc/{owner}/fd");
-+        let mut file = None;
-+        for entry in std::fs::read_dir(directory)? {
-+            let entry = entry?;
-+            if std::fs::read_link(entry.path()).ok().as_deref() != Some(Path::new("/memfd:pi-trace-gate (deleted)")) { continue; }
-+            if file.is_some() { return Err(io::Error::from_raw_os_error(libc::EPROTO)); }
-+            file = Some(std::fs::File::open(entry.path())?);
-+        }
-+        let Some(file) = file else { return Ok(None); };
-+        let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_FUTURE_WRITE;
-+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) } & seals != seals { return Err(io::Error::from_raw_os_error(libc::EPROTO)); }
-+        let size = usize::try_from(file.metadata()?.len()).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-+        if size != HEADER + (1 << 22) * 8 { return Err(io::Error::from_raw_os_error(libc::EPROTO)); }
-+        let mapped = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0) };
-+        if mapped == libc::MAP_FAILED { return Err(io::Error::last_os_error()); }
-+        let header = unsafe { std::slice::from_raw_parts(mapped as *const u32, 4) };
-+        if header[0] != 0x50494731 || header[1] != owner as u32 || header[2] != 1 << 22 || header[3] == 0 || header[3] > 4096 {
-+            unsafe { libc::munmap(mapped, size); } return Err(io::Error::from_raw_os_error(libc::EPROTO));
-+        }
-+        let channel = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-+        if channel < 0 { unsafe { libc::munmap(mapped, size); } return Err(io::Error::last_os_error()); }
-+        let channel = unsafe { OwnedFd::from_raw_fd(channel) };
-+        let gate = Self { mapped: mapped as usize, size, pids: header[2] as usize, filter: header[3] as usize, channel };
-+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-+        address.sun_family = libc::AF_UNIX as u16;
-+        let name = format!("pi-trace-gate-{owner}");
-+        for (to, byte) in address.sun_path[1..].iter_mut().zip(name.bytes()) { *to = byte as i8; }
-+        if unsafe { libc::connect(gate.channel.as_raw_fd(), &address as *const _ as *const _, (2 + 1 + name.len()) as u32) } != 0 { return Err(io::Error::last_os_error()); }
-+        let timeout = libc::timeval { tv_sec: 2, tv_usec: 0 };
-+        if unsafe { libc::setsockopt(gate.channel.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDTIMEO, &timeout as *const _ as *const _, std::mem::size_of_val(&timeout) as u32) } != 0 { return Err(io::Error::last_os_error()); }
-+        Ok(Some(gate))
-+    }
-+    fn forward(&self, notification: &SeccompNotif, listener: RawFd) -> io::Result<bool> {
-+        let nr = notification.data.nr as i64;
-+        if [libc::SYS_stat, libc::SYS_lstat, libc::SYS_fstat, libc::SYS_newfstatat, libc::SYS_statx].contains(&nr) { return Ok(false); }
-+        let pid = notification.pid as usize;
-+        if pid >= self.pids { return Err(io::Error::from_raw_os_error(libc::EOVERFLOW)); }
-+        let state = unsafe { &*((self.mapped + HEADER) as *const AtomicU64).add(pid) };
-+        if state.load(Ordering::Acquire) != 0 { return Ok(false); }
-+        let mut vector = libc::iovec { iov_base: notification as *const _ as *mut _, iov_len: std::mem::size_of_val(notification) };
-+        let mut control = [0u64; 4];
-+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-+        message.msg_iov = &mut vector; message.msg_iovlen = 1;
-+        message.msg_control = control.as_mut_ptr() as *mut _;
-+        message.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as usize;
-+        unsafe {
-+            let header = libc::CMSG_FIRSTHDR(&message);
-+            (*header).cmsg_level = libc::SOL_SOCKET; (*header).cmsg_type = libc::SCM_RIGHTS; (*header).cmsg_len = libc::CMSG_LEN(4) as usize;
-+            std::ptr::write_unaligned(libc::CMSG_DATA(header) as *mut i32, listener);
-+        }
-+        let result = unsafe { libc::sendmsg(self.channel.as_raw_fd(), &message, libc::MSG_NOSIGNAL) };
-+        if result != std::mem::size_of_val(notification) as isize { return Err(io::Error::last_os_error()); }
-+        Ok(true)
-+    }
-+}
-+pub(crate) fn forward(notification: &SeccompNotif, listener: RawFd, mounts: &[(PathBuf, PathBuf)]) -> io::Result<bool> {
-+    static GATE: OnceLock<Result<Option<Gate>, i32>> = OnceLock::new();
-+    match GATE.get_or_init(|| Gate::open(mounts, unsafe { libc::getppid() }).map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))) {
-+        Ok(Some(gate)) => gate.forward(notification, listener), Ok(None) => Ok(false), Err(error) => Err(io::Error::from_raw_os_error(*error)),
-+    }
-+}
-+pub(crate) fn install(mounts: &[(PathBuf, PathBuf)]) -> io::Result<()> {
-+    let status = std::fs::read_to_string("/proc/self/status")?;
-+    let tracer = status.lines().find_map(|line| line.strip_prefix("TracerPid:")).and_then(|text| text.trim().parse::<i32>().ok()).unwrap_or(0);
-+    if tracer == 0 { return Ok(()); }
-+    if let Some(gate) = Gate::open(mounts, tracer)? {
-+        let filter = unsafe { std::slice::from_raw_parts((gate.mapped + 16) as *const SockFilter, gate.filter) };
-+        super::bpf::install_deny_filter(filter)?;
-+        FILTERED.store(true, Ordering::Release);
-+    }
-+    Ok(())
-+}
-+
-+const COOKIE: u32 = 0x50495452;
-+const TRACE: u32 = 0x7ff00000 | 0x5049;
-+
-+pub(crate) fn filter(prog: &mut Vec<SockFilter>, calls: &[u32], base: usize) -> io::Result<()> {
-+    if !FILTERED.load(Ordering::Acquire) { return Ok(()); }
-+    // These ABI calls do not consume r9. Their original value is restored by
-+    // the tracing owner before user code, fork children, or signal handlers run.
-+    let selected = [libc::SYS_clone, libc::SYS_clone3, libc::SYS_fork, libc::SYS_vfork,
-+        libc::SYS_execve, libc::SYS_execveat, libc::SYS_open, libc::SYS_openat, libc::SYS_openat2, libc::SYS_creat,
-+        libc::SYS_statfs, libc::SYS_fstatfs, libc::SYS_readlink, libc::SYS_readlinkat, libc::SYS_getdents, libc::SYS_getdents64,
-+        libc::SYS_getcwd, libc::SYS_chdir, libc::SYS_fchdir, libc::SYS_chmod, libc::SYS_fchmod, libc::SYS_fchmodat,
-+        libc::SYS_chown, libc::SYS_fchown, libc::SYS_lchown, libc::SYS_fchownat, libc::SYS_utime, libc::SYS_utimes,
-+        libc::SYS_futimesat, libc::SYS_utimensat, libc::SYS_truncate, libc::SYS_ftruncate, libc::SYS_mkdir, libc::SYS_mkdirat,
-+        libc::SYS_rmdir, libc::SYS_unlink, libc::SYS_unlinkat, libc::SYS_link, libc::SYS_linkat, libc::SYS_symlink,
-+        libc::SYS_symlinkat, libc::SYS_rename, libc::SYS_renameat, libc::SYS_renameat2, libc::SYS_access, libc::SYS_faccessat,
-+        libc::SYS_faccessat2, libc::SYS_connect, libc::SYS_bind, libc::SYS_sendmsg, libc::SYS_sendmmsg, libc::SYS_recvmsg,
-+        libc::SYS_recvmmsg, libc::SYS_socket, libc::SYS_socketpair, libc::SYS_setsockopt, libc::SYS_getsockopt];
-+    let target = prog.len();
-+    for (index, number) in calls.iter().enumerate() {
-+        if !selected.contains(&(*number as i64)) { continue; }
-+        prog[base + index].jt = u8::try_from(target - base - index - 1).map_err(|_| io::Error::from_raw_os_error(libc::E2BIG))?;
-+    }
-+    use super::bpf::{stmt, jump};
-+    prog.extend([
-+        stmt(0x20, 16 + 5 * 8 + 4),
-+        jump(0x15, COOKIE, 3, 0), jump(0x15, 0x50494558, 2, 0), jump(0x15, 0x50494559, 1, 0),
-+        stmt(0x06, TRACE), stmt(0x06, 0x7fc00000),
-+    ]);
-+    Ok(())
-+}

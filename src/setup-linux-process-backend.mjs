@@ -2,7 +2,6 @@
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -21,14 +20,6 @@ const SANDLOCK_PATCH = fileURLToPath(
 );
 const SANDLOCK_DIRECTORY = fileURLToPath(new URL("./sandlock-directory.rs", import.meta.url));
 const ARCHIVES = {
-	strace: {
-		target: "pi-speculative-strace",
-		url: "https://strace.io/files/6.8/strace-6.8.tar.xz",
-		sha256: "ba6950a96824cdf93a584fa04f0a733896d2a6bc5f0ad9ffe505d9b41e970149",
-		patch: "strace-handoff.patch",
-		configure: ["--enable-mpers=no", "--without-libunwind", "--without-libdw"],
-		artifact: "src/strace",
-	},
 	overlayfs: {
 		target: "fuse-overlayfs",
 		url: "https://codeload.github.com/containers/fuse-overlayfs/tar.gz/refs/tags/v1.18",
@@ -59,8 +50,7 @@ async function setup() {
 		installExecutionDomain(undefined, config),
 	);
 	const held = helper && (await optional("Actor child handoff", () => qualifyNativeStartup(heldExec)));
-	const tracing = helper && (await optional("Running process handoff tracer", installStrace));
-	const missing = await missingExecutables([...(tracing ? [] : ["strace"]), "git"]);
+	const missing = await missingExecutables(["git"]);
 	let producer = false;
 	if (!helper || !collector)
 		console.warn(
@@ -71,7 +61,7 @@ async function setup() {
 	else producer = await optional("Speculative Bash producer", installSandlock);
 	const overlay = await optional("OverlayFS workspace optimization", installFuseOverlayfs);
 	console.log(
-		`Linux backend setup complete: cgroup/eBPF collector ${collector ? "built" : "unavailable"}; completed child replay ${held ? "ready" : "unavailable"}; syscall observation ${tracing ? "ready" : "unavailable"}; speculative producer ${producer ? "ready" : "unavailable"}; OverlayFS ${overlay ? "ready" : "unavailable"}. Process reuse requires an active execution domain.`,
+		`Linux backend setup complete: cgroup/eBPF collector ${collector ? "built" : "unavailable"}; completed child replay ${held ? "ready" : "unavailable"}; speculative producer ${producer ? "ready" : "unavailable"}; OverlayFS ${overlay ? "ready" : "unavailable"}. Process reuse requires an active execution domain.`,
 	);
 }
 async function installSandlock() {
@@ -147,43 +137,31 @@ async function qualifySandlock(binary) {
 			["run", "--chroot", "/", "--fs-read", "/", "--exec-mount", `/bin/false:${image}`, "--", "/bin/false"],
 			42,
 		);
-		await copyFile(heldExec, image);
-		await chmod(image, 0o755);
-		// Qualify the same stopped-image route used by the producer; the broker replaces /bin/false's exit.
-		const broker = net.createServer({ allowHalfOpen: true }, (socket) =>
-			socket.resume().on("end", () => socket.end("x 0\n")),
-		);
-		await writeFile(`${image}.configuration`, `${path.join(root, "broker")}\ntoken\n`, { mode: 0o600 });
-		await new Promise((resolve) => broker.listen(path.join(root, "broker"), resolve));
-		try {
-			await run(path.join(localBin, "pi-speculative-strace"), [
-				"--kill-on-exit",
-				"--trace-children-only",
-				"-f",
-				"-q",
-				"-e",
-				"trace=none",
-				"-o",
-				"/dev/null",
-				`--process-library=${heldExec}.so`,
-				`--exec-context-source=${image}`,
-				"--",
-				binary,
+		const logical = path.join(root, "logical");
+		await mkdir(logical);
+		await run(
+			binary,
+			[
 				"run",
 				"--chroot",
 				"/",
+				"--workdir",
+				"/",
+				"--cwd",
+				logical,
 				"--fs-read",
 				"/",
-				"--fs-write",
-				path.join(root, "broker"),
+				"--fs-mount",
+				logical + ":" + view,
 				"--exec-mount",
-				`/:${image}`,
+				"/:" + heldExec,
 				"--",
-				"/bin/false",
-			]);
-		} finally {
-			broker.close();
-		}
+				"/bin/sh",
+				"-c",
+				"./false",
+			],
+			42,
+		);
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
@@ -194,7 +172,7 @@ export async function installHeldExec(target = heldExec, config = DEFAULT_SPECUL
 	return installNative(
 		target,
 		sha256(
-			"static-pthread+shared-image+native-startup+authority-observer",
+			"static-pthread+native-startup+authority-observer",
 			await readFile(source),
 			await readFile(new URL("./linux-execution-domain.h", import.meta.url)),
 			JSON.stringify(definitions),
@@ -205,7 +183,7 @@ export async function installHeldExec(target = heldExec, config = DEFAULT_SPECUL
 			for (const [suffix, flags] of [
 				["", ["-static"]],
 				[".observer", ["-static", "-DPI_SPEC_AUTHORITY_ONLY=1"]],
-				[".so", ["-shared", "-fPIC"]],
+				[".node", ["-shared", "-fPIC"]],
 			])
 				await run(compiler, [
 					...definitions,
@@ -220,9 +198,8 @@ export async function installHeldExec(target = heldExec, config = DEFAULT_SPECUL
 					"-o",
 					temporary + suffix,
 				]);
-			await copyFile(`${temporary}.so`, `${temporary}.node`, fsConstants.COPYFILE_EXCL);
 		},
-		[".so", ".node", ".observer", ""],
+		[".node", ".observer", ""],
 	);
 }
 export async function installExecutionDomain(
@@ -281,23 +258,6 @@ async function qualifyHeldExec(binary) {
 		observer: `${binary}.observer`,
 		confined: true,
 	});
-}
-export async function installStrace() {
-	if (process.arch !== "x64") throw new Error("syscall observation requires x86-64 Linux");
-	return installArchive(ARCHIVES.strace, (binary) =>
-		run(binary, [
-			"--kill-on-exit",
-			"-f",
-			"-q",
-			"-e",
-			"trace=none",
-			"-o",
-			"/dev/null",
-			`--process-library=${heldExec}.so`,
-			"--",
-			"/bin/true",
-		]),
-	);
 }
 async function installFuseOverlayfs() {
 	await access("/dev/fuse", fsConstants.R_OK | fsConstants.W_OK);

@@ -2,7 +2,7 @@
 #define PI_EXECUTION_DOMAIN_H
 
 /* The collector owns observations; the application receives only read views. */
-#define PI_DOMAIN_ABI 17
+#define PI_DOMAIN_ABI 18
 /* Capacity definitions are supplied by config-schema.ts through the setup
  * compiler arguments. */
 enum pi_domain_operation {
@@ -62,6 +62,7 @@ struct pi_domain_state {
   unsigned long long namespace_inode;
   unsigned long long mount_namespace;
   unsigned long long uncertain;
+  unsigned long long recording;
   unsigned long long metadata_device;
   unsigned long long metadata_inode;
   unsigned long long metadata_lost;
@@ -70,6 +71,20 @@ struct pi_domain_state {
   unsigned int ancestor_count;
   struct pi_domain_inode roots[PI_DOMAIN_ROOTS];
   struct pi_domain_inode ancestors[PI_DOMAIN_ANCESTORS];
+};
+/* Every record belongs to one owned cgroup. The first thirteen kinds are the
+ * sealed Sandlock metadata/input ABI. All other records also use this header. */
+enum pi_execution_kind {
+  PI_FORK = 13, PI_EXEC, PI_EXIT, PI_CALL, PI_PATH, PI_PATH2,
+  PI_RETURN = 20, PI_OUTPUT, PI_UNIX_ADDRESS, PI_OPEN_FILE, PI_FD_USE, PI_EXEC_PROJECTION
+};
+struct pi_event_file {
+  unsigned long long inode;
+  unsigned int device;
+  unsigned short mode;
+  unsigned short reserved;
+  unsigned int flags;
+  unsigned int padding;
 };
 struct pi_domain_event {
   unsigned long long owner;

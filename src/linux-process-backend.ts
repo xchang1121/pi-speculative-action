@@ -6,7 +6,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { on, once } from "node:events";
 import type { BigIntStats } from "node:fs";
 import { constants as fsConstants, readFileSync } from "node:fs";
@@ -27,7 +27,6 @@ import {
 	stat,
 	writeFile,
 } from "node:fs/promises";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { finished } from "node:stream/promises";
@@ -92,7 +91,6 @@ import {
 	inheritedTracer,
 	inspectHeldExecProcess,
 	LinuxHeldExecBoundary,
-	listenUnixSocket,
 	resolveLinuxExecHelper,
 	writeProcessChannel,
 } from "./linux-held-exec.ts";
@@ -109,8 +107,6 @@ import {
 	digestObject,
 	errorMessage,
 	execHostText,
-	isRecord,
-	isSafeCount,
 	isMissing as missing,
 	containsFilesystemPath as pathContains,
 	relativeFilesystemPath,
@@ -141,7 +137,12 @@ import {
 	sameScope,
 	validateDynamicDependencyCertificate,
 } from "./process-reuse.ts";
-import { configureNativeFilesystem, nativeProcessLibrary, qualifyNativeStartup } from "./process-startup.mjs";
+import {
+	configureNativeFilesystem,
+	nativeProcessLibrary,
+	qualifyNativeStartup,
+	spawnControlled,
+} from "./process-startup.mjs";
 import type {
 	DependencyRole,
 	DynamicDependency,
@@ -168,13 +169,7 @@ import { ProvenanceCertificateStore } from "./reuse-store.ts";
 import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
 import { cause, zeroValidationMetrics, type ResourceValidation } from "./settlement.ts";
 import type { StraceObservation, TracedWrite, TraceTail } from "./strace-observer.ts";
-import {
-	nativeMetadataTrace,
-	observeStrace,
-	straceCommand,
-	traceTail,
-	writesWithin,
-} from "./strace-observer.ts";
+import { executionRecords, observeExecution, traceTail, writesWithin } from "./strace-observer.ts";
 import type { TimelineDependency } from "./task-timing.ts";
 import { TimelineInterval } from "./task-timing.ts";
 import type {
@@ -311,7 +306,6 @@ export async function inspectLinuxEnvironment(root = process.cwd()): Promise<Lin
 	lines.push("Installed components: locating an executable does not qualify its behavior.");
 	for (const [label, name, explicit, fallback] of [
 		["Sandlock", "pi-speculative-sandlock", process.env.PI_SPEC_SANDLOCK, "pi-speculative-sandlock"],
-		["Process tracer", "strace", process.env.PI_SPEC_STRACE, "pi-speculative-strace"],
 		["Execution domain launcher", "pi-speculative-domain", undefined, "pi-speculative-domain"],
 	] as const)
 		await check(label, () => program(name, [], [path.join(bin, fallback)], explicit));
@@ -420,7 +414,7 @@ export async function installLinuxDependencies(
 	if (
 		!(await ctx.ui.confirm(
 			"Install / update Linux dependencies?",
-			`${report.summary}\n\nDownload and build the packaged Sandlock, process helpers and strace, plus optional fuse-overlayfs, in ~/.local/bin. ` +
+			`${report.summary}\n\nDownload and build the packaged Sandlock and process helpers, plus optional fuse-overlayfs, in ~/.local/bin. ` +
 				"Requires Git, C/Rust toolchains, Clang, libbpf/libelf/zlib development files, make, tar and xz; FUSE needs fusermount and /dev/fuse. " +
 				"Missing prerequisites may leave individual components unavailable. System packages and permissions are not changed. Building may take several minutes.",
 		))
@@ -527,7 +521,6 @@ export interface LinuxProcessBackendOptions {
 	readonly storeRoot: string;
 	readonly store?: ProvenanceStoreOptions;
 	readonly sandlockBinary?: string;
-	readonly straceBinary?: string;
 	readonly heldExecBinary?: string;
 	readonly heldExecObserverBinary?: string;
 	/** Seal finished commands without capturing resumable process images. */
@@ -544,7 +537,6 @@ export interface LinuxProcessBackendStatus {
 	readonly detail: string;
 	readonly fingerprint?: string;
 	readonly sandlockBinary?: string;
-	readonly straceBinary?: string;
 }
 export type LinuxProcessReuseMetrics = WorldReuseMetrics;
 type CountedReuseMetric = Exclude<keyof WorldReuseMetrics, "lastError">;
@@ -583,13 +575,11 @@ interface SandboxMount extends ExecMount {
 	readonly readOnly: boolean;
 }
 interface DispatcherRequest extends Required<Pick<HeldExecSnapshot, "invocation" | "cwd" | "environment">> {
-	readonly token: string;
 	readonly argv0: string;
 	readonly args: readonly string[];
 	readonly context: ProcessExecutionContext;
 	/** The successfully installed image, held before its first user instruction. */
 	readonly pid: number;
-	readonly status?: number;
 	readonly descriptors?: readonly HeldFileDescriptor[];
 }
 type ProcessArguments = Pick<DispatcherRequest, "argv0" | "args" | "cwd" | "environment"> &
@@ -609,6 +599,7 @@ interface BufferedOutput {
 	readonly data: Buffer;
 }
 interface DispatcherResponse {
+	readonly held?: HeldExecDecision;
 	readonly kind: "hit" | "executed" | "bypass" | "continue";
 	readonly output?: readonly BufferedOutput[];
 	readonly exit?: ExitOutcome;
@@ -751,7 +742,6 @@ export class LinuxProcessReuseBackend {
 		this.configuration.bind(this);
 		this.options = {
 			sandlockBinary: process.env.PI_SPEC_SANDLOCK,
-			straceBinary: process.env.PI_SPEC_STRACE,
 			heldExecBinary: process.env.PI_SPEC_HELD_EXEC,
 			heldExecObserverBinary: process.env.PI_SPEC_HELD_EXEC_OBSERVER,
 			...options,
@@ -797,7 +787,6 @@ export class LinuxProcessReuseBackend {
 				detail: "Completed process provenance and result replay ready",
 				fingerprint: ready.fingerprint,
 				sandlockBinary: ready.sandlock,
-				straceBinary: ready.strace,
 			};
 		} catch (error) {
 			return { state: "unavailable", detail: errorMessage(error) };
@@ -1101,14 +1090,13 @@ export class LinuxProcessReuseBackend {
 		const invocation = options.invocation(request);
 		if (!invocation) return;
 		const channel = controlledSubcomputeChannel(request.environment);
-		let directory: string | undefined;
+		let recording: ReturnType<ReadyBackend["collector"]["open"]> | undefined;
 		let proof: ReturnType<typeof executionDomainProof> | undefined;
 		let output: SpawnOutcome | undefined;
 		let started = false;
 		try {
 			assertInvocationMatches(invocation, request);
 			const ready = await this.resolveReady();
-			directory = await mkdtemp(path.join(this.options.storeRoot, "actor-trace-"));
 			const projection = new ExecutionPathProjection({
 				sourceRoot: options.sourceRoot,
 				workspaceRoot: options.sourceRoot,
@@ -1123,38 +1111,35 @@ export class LinuxProcessReuseBackend {
 			// Watch from before execution; post-exit hashes alone cannot establish what the process read.
 			proof = executionDomainProof(ready.collector, options.sourceRoot);
 			if (proof.reason) throw new Error(proof.reason);
-			const trace = path.join(directory, "process");
-			const command = straceCommand(ready.strace, trace, [
-				invocation.shell,
-				...shellArguments(invocation, request.command),
-			]).filter((argument) => argument !== "--trace-children-only");
+			recording = ready.collector.open();
+			await using trace = traceTail(executionRecords(recording.trace()), request.cwd);
+			const command = recording.launch([invocation.shell, ...shellArguments(invocation, request.command)]);
 			const boundary = await this.heldBoundary();
 			const began = performance.now();
+			let outputEndpoints: readonly [string, string] | undefined;
 			output = await boundary.trace(
 				this.nativeObservation(options.sourceRoot, this.observations.getStore()?.scope, request.signal),
-				async (configuration, onSpawn) => {
-					const context = path.join(directory!, "actor-context");
-					await writeFile(context, configuration, { mode: 0o600 });
-					command.splice(
-						1,
-						0,
-						`--process-library=${ready.processLibrary}`,
-						`--actor-context-source=${context}`,
-					);
+				() => {
 					started = true;
-					return runSpawn(command as [string, ...string[]], {
+					return runSpawn([ready.dispatcher, "--output-channel=3", ...command], {
 						...request,
+						held: true,
 						streamBeyondCaptureLimit: true,
-						onSpawn,
+						onOutputEndpoints: (endpoints) => {
+							outputEndpoints = endpoints;
+						},
 						...(invocation.commandTransport === "stdin" ? { stdin: Buffer.from(request.command) } : {}),
 					});
 				},
 			);
 			const ended = performance.now();
-			let observation = await observeStrace(trace, invocation.shell, request.cwd, {
+			let observation = await observeExecution(trace, invocation.shell, request.cwd, {
+				captureOutput: true,
+				outputEndpoints,
 				controlledSocket: channel?.socket,
 				guardFilesystemSemanticsWithin: [options.sourceRoot],
 			});
+			observation = verifyProcessOutput(observation, output.output);
 			if (channel) observation = await channel.observe(observation);
 			if (
 				output.captureComplete === false ||
@@ -1171,7 +1156,7 @@ export class LinuxProcessReuseBackend {
 			const computation = new TimelineInterval(began, ended);
 			await this.store.withPublication(async () => {
 				const journal: OrderedEffectEvent[] = [];
-				for (const event of output!.output)
+				for (const event of observation.output ?? [])
 					journal.push({
 						sequence: journal.length,
 						kind: "output",
@@ -1184,7 +1169,7 @@ export class LinuxProcessReuseBackend {
 					prototype,
 					producer: {
 						observer: {
-							provider: "strace",
+							provider: "execution_domain",
 							fingerprint: ready.observerFingerprint,
 						},
 						execution: { authority: "actor" },
@@ -1214,7 +1199,7 @@ export class LinuxProcessReuseBackend {
 			if (started && !output) throw error;
 		} finally {
 			proof?.close();
-			if (directory) await rm(directory, { recursive: true, force: true });
+			recording?.close();
 		}
 		return output ? { exitCode: output.code } : undefined;
 	}
@@ -1228,8 +1213,7 @@ export class LinuxProcessReuseBackend {
 		},
 	): Promise<LinuxProcessSession> {
 		return this.withProducer(async (): Promise<LinuxProcessSession> => {
-			const { session, ready, readyAt, controller, server } = await this.allocateSession(input);
-			const { socketPath } = session;
+			const { session, ready, readyAt, controller } = await this.allocateSession(input);
 			let executionKind: "tool" | "operation" | undefined;
 			input.onOperationJoinable?.(
 				() => !session.signal.aborted && this.handoffs.hasJoinableWork(session.ownership),
@@ -1257,8 +1241,6 @@ export class LinuxProcessReuseBackend {
 							async (interposition) => {
 								session.signal?.throwIfAborted();
 								session.interposition = interposition;
-								await listenUnixSocket(server, socketPath);
-								await chmod(socketPath, 0o600);
 								const dispatch = new TimelineInterval(dispatchStartedAt, performance.now());
 								const computation = new TimelineInterval(
 									creation.startedAt,
@@ -1506,13 +1488,7 @@ export class LinuxProcessReuseBackend {
 						controller.abort(new Error("Linux process session closed"));
 						try {
 							await dispatch?.catch(() => undefined);
-							try {
-								await closeServer(server);
-							} finally {
-								// Final evidence still borrows the domain's read view. Keep a failed seal for its caller.
-								await seal().catch(() => undefined);
-								await rm(socketPath, { force: true }).catch(() => undefined);
-							}
+							await seal().catch(() => undefined);
 						} finally {
 							try {
 								session.releaseVersions?.();
@@ -1567,12 +1543,7 @@ export class LinuxProcessReuseBackend {
 		if (bound && bound.sourceRoot !== sourceRoot) throw new Error("bound process workspace changed");
 		const token = randomBytes(32).toString("hex");
 		const processRoot = await mkdtemp(path.join(input.workspace.processRoot, "session-"));
-		const candidateSocket = path.join(processRoot, `broker-${token.slice(0, 12)}.sock`);
-		// sockaddr_un has a byte limit even when the private workspace supports longer paths.
-		const socketPath =
-			Buffer.byteLength(candidateSocket) < 104
-				? candidateSocket
-				: path.join("/tmp", `pi-broker-${randomBytes(16).toString("hex")}.sock`);
+		const boundary = await this.heldBoundary();
 		const deniedPaths = sensitivePaths(this.options.storeRoot, this.options.deniedPaths).filter(
 			(target) =>
 				!pathContains(input.workspace.sandboxRoot, target) &&
@@ -1581,7 +1552,6 @@ export class LinuxProcessReuseBackend {
 		const producer = speculativeProducerProof(ready, deniedPaths, POLICY_ID);
 		const nestedProducer = speculativeProducerProof(ready, deniedPaths, LEAF_POLICY_ID);
 		const controller = new AbortController();
-		const server = net.createServer({ allowHalfOpen: true }, (socket) => this.serve(session, socket));
 		const gitDirectory = await lstat(path.join(sourceRoot, ".git")).then(
 			(info) => (info.isDirectory() ? path.join(sourceRoot, ".git") : undefined),
 			() => undefined,
@@ -1589,10 +1559,10 @@ export class LinuxProcessReuseBackend {
 		const domain = ready.collector.open();
 		const upper = path.join(processRoot, "private", "writes", "upper");
 		let workspaceDomain: typeof domain | undefined;
-		let metadata: ReturnType<typeof nativeMetadataTrace>;
+		let metadata: ReturnType<typeof executionRecords>;
 		let releaseVersions: (() => void) | undefined;
 		try {
-			metadata = nativeMetadataTrace(domain.trace(ready.sandlock), upper);
+			metadata = executionRecords(domain.trace(ready.sandlock), upper);
 			if (input.workspace.structure.retain) workspaceDomain = ready.collector.open();
 			await mkdir(upper, { recursive: true, mode: 0o700 });
 			if (input.workspace.metadataImage) {
@@ -1621,7 +1591,7 @@ export class LinuxProcessReuseBackend {
 			deniedPaths,
 			producer,
 			nestedProducer,
-			socketPath,
+			boundary,
 			// The workspace's own repository stays read-only instead of exposing the snapshot's repository.
 			...(gitDirectory ? { gitDirectory } : {}),
 			workspace: input.workspace,
@@ -1638,15 +1608,6 @@ export class LinuxProcessReuseBackend {
 			// One physical session setup, shared by every result that depended on it.
 			preparation: undefined as TimelineDependency | undefined,
 			incompleteReasons: new Set<string>(),
-			// Only images stopped by these owned tracers may request execution.
-			tracers: new Map<number, SessionWriter>(),
-			executions: new Map<
-				number,
-				Set<{
-					readonly finish: (status: number) => void;
-					readonly completed: Promise<DispatcherResponse>;
-				}>
-			>(),
 			// Concurrent writers retain their live trace or settled writes for ownership attribution.
 			writers: workspaceWriterRecords(input.workspace),
 			fileEvidence: new WeakMap<object, SessionWriter>(),
@@ -1681,7 +1642,7 @@ export class LinuxProcessReuseBackend {
 				domain,
 			),
 		};
-		return { session, ready, readyAt, controller, server };
+		return { session, ready, readyAt, controller };
 	}
 	dispose(): Promise<void> {
 		return (this.disposal ??= Promise.resolve().then(() => {
@@ -1707,40 +1668,22 @@ export class LinuxProcessReuseBackend {
 		if (!this.options.store?.reservedRoot)
 			await mkdir(this.options.storeRoot, { recursive: true, mode: 0o700 });
 		await chmod(this.options.storeRoot, 0o700);
-		const [sandlock, strace, dispatcher] = await Promise.all([
+		const [sandlock, dispatcher] = await Promise.all([
 			resolveHostExecutable(this.options.sandlockBinary, "pi-speculative-sandlock", [
 				path.join(os.homedir(), ".local", "bin", "pi-speculative-sandlock"),
-			]),
-			resolveHostExecutable(this.options.straceBinary, "strace", [
-				path.join(os.homedir(), ".local", "bin", "pi-speculative-strace"),
 			]),
 			resolveLinuxExecHelper(this.options.heldExecBinary),
 		]);
 		// The exact confinement and tracer builds, not their versions: a patched fix changes what their certificates mean.
-		const [sandlockCheck, sandlockBuild, straceBuild, platformFingerprint] = await Promise.all([
+		const [sandlockCheck, sandlockBuild, platformFingerprint] = await Promise.all([
 			execHostText(sandlock, ["check"]),
 			hashExecutableFile(sandlock),
-			hashExecutableFile(strace),
 			this.resolvePlatformFingerprint(),
 		]);
 		if (!sandlockCheck.includes("Status:         OK"))
 			throw new Error("Sandlock kernel protections are unavailable");
 		nativeProcessLibrary(dispatcher);
 		const collector = await executionDomainCollector(dispatcher);
-		const qualifyLibrary = (file: string) =>
-			execHostText(strace, [
-				"--kill-on-exit",
-				"-f",
-				"-q",
-				"-e",
-				"trace=none",
-				"-o",
-				"/dev/null",
-				`--process-library=${file}`,
-				"--",
-				"/bin/true",
-			]).then(() => file);
-		const processLibrary = await qualifyLibrary(`${dispatcher}.so`);
 		const mountProbe = await mkdtemp(path.join(os.tmpdir(), "pi-process-view-probe-"));
 		let executionContext: ProcessExecutionContext | undefined;
 		try {
@@ -1757,7 +1700,7 @@ export class LinuxProcessReuseBackend {
 			const metadataStat = await lstat(path.join(physicalRoot, "script-position"), { bigint: true });
 			const metadataRow = FILESYSTEM_METADATA_FIELDS.map((field) => String(metadataStat[field]));
 			await writeFile(metadataImage, JSON.stringify([[metadataRow, metadataRow, 0]]), { mode: 0o600 });
-			const command = straceCommand(strace, path.join(physicalRoot, "context"), [
+			const command: [string, ...string[]] = [
 				sandlock,
 				...sandboxPolicyArguments(
 					logicalRoot,
@@ -1786,42 +1729,34 @@ export class LinuxProcessReuseBackend {
 				"--probe-context",
 				logicalRoot,
 				path.join(logicalRoot, "script-position"),
-			]);
-			const outcome = await runSpawn(
-				[
-					strace,
-					`--process-library=${processLibrary}`,
-					`--exec-context-source=${launcher}`,
-					...command.slice(1),
-				],
-				{
-					cwd: physicalRoot,
-					environment: definedProcessEnvironment(process.env),
-					onControl: (channel) => {
-						const capture = (async () => {
-							let bytes = Buffer.alloc(0);
-							for await (const [chunk] of on(channel, "data", {
-								close: ["end", "close"],
-							})) {
-								bytes = Buffer.concat([bytes, chunk]);
-								if (bytes.length > 4) throw new Error("invalid context probe pid");
-								if (bytes.length < 4) continue;
-								const pid = bytes.readInt32LE();
-								executionContext = await captureProcessContext(
-									pid,
-									(await readdir(`/proc/${pid}/fd`)).filter((name) => /^[012]$/.test(name)),
-								);
-								await writeProcessChannel(channel, Buffer.from("R"));
-								channel.end();
-								return;
-							}
-							throw new Error("context probe closed before capture");
-						})();
-						void capture.catch(() => channel.destroy());
-						return () => capture;
-					},
+			];
+			const outcome = await runSpawn(command, {
+				cwd: physicalRoot,
+				environment: definedProcessEnvironment(process.env),
+				onControl: (channel) => {
+					const capture = (async () => {
+						let bytes = Buffer.alloc(0);
+						for await (const [chunk] of on(channel, "data", {
+							close: ["end", "close"],
+						})) {
+							bytes = Buffer.concat([bytes, chunk]);
+							if (bytes.length > 4) throw new Error("invalid context probe pid");
+							if (bytes.length < 4) continue;
+							const pid = bytes.readInt32LE();
+							executionContext = await captureProcessContext(
+								pid,
+								(await readdir(`/proc/${pid}/fd`)).filter((name) => /^[012]$/.test(name)),
+							);
+							await writeProcessChannel(channel, Buffer.from("R"));
+							channel.end();
+							return;
+						}
+						throw new Error("context probe closed before capture");
+					})();
+					void capture.catch(() => channel.destroy());
+					return () => capture;
 				},
-			);
+			});
 			if (outcome.signal || outcome.code !== 0)
 				throw new Error("process execution context probe did not finish");
 			if (!validProcessContext(executionContext))
@@ -1840,7 +1775,6 @@ export class LinuxProcessReuseBackend {
 			kernel: collector.fingerprint,
 			policy: POLICY_ID,
 			sandlock: sandlockBuild,
-			strace: straceBuild,
 			platformFingerprint,
 			executionContext: sha256Digest(executionContext.key),
 			arch: process.arch,
@@ -1848,68 +1782,36 @@ export class LinuxProcessReuseBackend {
 		});
 		return {
 			sandlock,
-			strace,
 			fingerprint,
 			platformFingerprint,
 			observerFingerprint,
 			executionContext,
 			dispatcher,
-			processLibrary,
 			collector,
 		};
 	}
-	private serve(session: ActiveSession, socket: net.Socket): void {
-		let body = "";
-		socket.setEncoding("utf8");
-		socket.on("data", (chunk) => {
-			body += chunk;
-			if (Buffer.byteLength(body) > speculativeConfig().processReuse.maxRequestBytes)
-				socket.destroy(new Error("request too large"));
-		});
-		socket.once("error", () => undefined);
-		socket.once(
-			"end",
-			AsyncLocalStorage.bind(() => {
-				void session.lifecycle.track(
-					Promise.resolve()
-						.then(() => this.handleWireRequest(session, body))
-						.then((response) => {
-							socket.end(wireResponse(response));
-						})
-						.catch((error) => {
-							this.setError(session, errorMessage(error));
-							session.incompleteReasons.add(`broker:${errorMessage(error)}`);
-							socket.end("f\n");
-						}),
-				);
-			}),
-		);
-	}
-	private async handleWireRequest(session: ActiveSession, body: string): Promise<DispatcherResponse> {
-		const received = parseDispatcherRequest(body);
-		if (!received || received.token !== session.token || session.lifecycle.sealed)
-			throw new Error("invalid dispatcher request");
-		session.signal?.throwIfAborted();
-		const status = await readFile(`/proc/${received.pid}/status`, "utf8");
-		const owner = session.tracers.get(Number(/^TracerPid:\s+(\d+)$/m.exec(status)?.[1]));
-		if (!owner || !/^State:\s+t\b/m.test(status)) throw new Error("process is not held by this session");
-		if (received.status !== undefined && received.status >= 0) {
-			const executions = [...(session.executions.get(received.pid) ?? [])];
-			for (const execution of executions) execution.finish(received.status);
-			await Promise.all(executions.map((execution) => execution.completed));
-			return { kind: "bypass" };
-		}
-		const route = (await readFile(`${session.interposition}.route.${received.pid}`, "utf8")).split("\0");
+	private async dispatchHeld(
+		session: ActiveSession,
+		owner: SessionWriter,
+		held: HeldExecProcess,
+	): Promise<HeldExecDecision> {
+		const native = { kind: "continue" } as const;
+		const source = owner.tail;
+		if (!source || session.lifecycle.sealed) return native;
+		const receipt = await readFile(session.interposition + ".route." + held.pid, "utf8").catch(ignoreMissing);
+		if (!receipt) return native;
+		const route = receipt.split("\0");
+		if (route[0] !== "B") return native;
 		const target = route[1];
 		if (
-			route.length < 7 ||
+			route.length !== 6 ||
 			route[0] !== "B" ||
 			route.at(-1) !== "" ||
 			!target?.startsWith("/") ||
 			!route.at(-2)?.startsWith("/")
 		)
 			throw new Error("invalid exec route");
-		const image = await open(`/proc/${received.pid}/exe`, "r");
+		const image = await open(`/proc/${held.pid}/exe`, "r");
 		try {
 			const imageSource = `/proc/${process.pid}/fd/${image.fd}`;
 			const actual = await readlink(imageSource);
@@ -1922,7 +1824,7 @@ export class LinuxProcessReuseBackend {
 			const executable = session.projection.toPhysical(
 				(await image.stat()).nlink ? target : target.replace(/ \(deleted\)$/, ""),
 			)!;
-			const snapshot = await inspectHeldExecProcess(received.pid, executable, "stdio");
+			const snapshot = await inspectHeldExecProcess(held.pid, executable, "stdio");
 			const cwd = session.projection.toPhysical(route.at(-2)!);
 			if (
 				!cwd ||
@@ -1931,7 +1833,8 @@ export class LinuxProcessReuseBackend {
 			)
 				throw new Error("exec context changed");
 			const request: DispatcherRequest = {
-				...received,
+				pid: held.pid,
+				descriptors: held.descriptors,
 				invocation: snapshot.invocation!,
 				argv0: snapshot.argv[0]!,
 				args: snapshot.argv.slice(1),
@@ -1947,25 +1850,20 @@ export class LinuxProcessReuseBackend {
 				: eligibleRequest(session, request, ready.executionContext);
 			if (typeof eligibility === "string") {
 				this.setError(session, `process_bypass:${eligibility}`, "bypasses");
-				return { kind: "bypass" };
+				return native;
 			}
 			const { argv0, args, environment, invocation } = request;
 			const resumed = Promise.withResolvers<void>();
 			const exited = Promise.withResolvers<number>();
-			const source = owner.tail;
-			const start = source && (await source.read()).journal(request.pid)?.length;
-			const domain =
-				source && start !== undefined
-					? {
-							pid: request.pid,
-							trace: traceTail(source, session.projection.toLogical(cwd), {
-								execution: { pid: request.pid, start },
-							}),
-							endpoints: request.context.outputEndpoints,
-							resume: resumed.resolve,
-							exit: exited.promise,
-						}
-					: undefined;
+			const start = (await source.read()).journal(held.pid)?.length;
+			if (start === undefined) return native;
+			const domain = {
+				pid: held.pid,
+				trace: traceTail(source, session.projection.toLogical(cwd), { execution: { pid: held.pid, start } }),
+				endpoints: request.context.outputEndpoints,
+				resume: resumed.resolve,
+				exit: exited.promise,
+			};
 			const completed = this.executeRequest(
 				session,
 				{
@@ -1986,19 +1884,25 @@ export class LinuxProcessReuseBackend {
 				undefined,
 				domain,
 			);
-			if (!domain) return await completed;
-			const execution = { finish: exited.resolve, completed };
-			const executions = session.executions.get(request.pid) ?? new Set<typeof execution>();
-			executions.add(execution);
-			session.executions.set(request.pid, executions);
-			const release = () => {
-				executions.delete(execution);
-				if (!executions.size) session.executions.delete(request.pid);
-			};
-			void session.lifecycle.track(completed).then(release, release);
+			const running = session.lifecycle.track(completed);
 			return await Promise.race([
-				completed,
-				resumed.promise.then((): DispatcherResponse => ({ kind: "continue" })),
+				running.then((result) => result.held ?? native),
+				resumed.promise.then(
+					(): HeldExecDecision => ({
+						kind: "continue",
+						observeCompletion: async (_, clock) => {
+							try {
+								const events = (await source.read()).journal(held.pid);
+								const status = events?.findLast((event) => event.name === "terminated")?.result;
+								if (!clock || status === undefined) throw new Error("process_exit_unproven");
+								exited.resolve(status);
+							} catch (error) {
+								exited.reject(error);
+							}
+							await running;
+						},
+					}),
+				),
 			]);
 		} finally {
 			await image.close();
@@ -2083,38 +1987,61 @@ export class LinuxProcessReuseBackend {
 								),
 							),
 						};
-						session.writers.add(writer);
-						await replayFilesystemEffects(
-							this.replayWorkspace,
-							this.store,
-							artifacts,
-							certificate.result.journal,
-							session.projection,
-							path.join(session.processRoot, "private"),
-						)
-							.then(
-								() => acquired.settle?.(true, true),
-								(error) => {
-									writer.observed = undefined;
-									acquired.settle?.(
-										!(error instanceof EffectCommitFailure && error.disposition === "recoverable"),
-									);
-									throw error;
-								},
+						const commit = async () => {
+							session.writers.add(writer);
+							await replayFilesystemEffects(
+								this.replayWorkspace,
+								this.store,
+								artifacts,
+								certificate.result.journal,
+								session.projection,
+								path.join(session.processRoot, "private"),
 							)
-							.finally(async () => {
-								writer.endedAt = Date.now();
-							});
-						if (outlet) this.add(session, "wholeCommandHits");
-						else this.recordHit(acquired.producer?.scope, acquired.joined, session);
-						recordProcessDependency(session, computation, inPlace);
-						const observed = certificate.result.observedProcessMs;
-						if (observed !== undefined)
-							this.add(session, outlet ? "wholeCommandReusedProcessMs" : "reusedProcessMs", observed);
-						if (!outlet && binding && this.handoffs.resolveBinding(binding, session.scope))
-							session.executionBindings.set(requestID, binding);
-						return { kind: "hit", output, exit: certificate.result.exit };
-					}).finally(() => acquired.settle?.(false));
+								.then(
+									() => acquired.settle?.(true, true),
+									(error) => {
+										writer.observed = undefined;
+										acquired.settle?.(
+											!(error instanceof EffectCommitFailure && error.disposition === "recoverable"),
+										);
+										throw error;
+									},
+								)
+								.finally(async () => {
+									writer.endedAt = Date.now();
+								});
+							if (outlet) this.add(session, "wholeCommandHits");
+							else this.recordHit(acquired.producer?.scope, acquired.joined, session);
+							recordProcessDependency(session, computation, inPlace);
+							const observed = certificate.result.observedProcessMs;
+							if (observed !== undefined)
+								this.add(session, outlet ? "wholeCommandReusedProcessMs" : "reusedProcessMs", observed);
+							if (!outlet && binding && this.handoffs.resolveBinding(binding, session.scope))
+								session.executionBindings.set(requestID, binding);
+						};
+						if (domain && certificate.result.exit?.kind === "code")
+							return {
+								kind: "hit",
+								held: {
+									kind: "replay",
+									validate: plan.validate,
+									output,
+									exitCode: certificate.result.exit.code,
+									commit,
+									settle: (consumed) => acquired.settle?.(consumed),
+								},
+							};
+						try {
+							if (domain || !plan.validate()) return { kind: "bypass" };
+							await commit();
+							return { kind: "hit", output, exit: certificate.result.exit };
+						} finally {
+							acquired.settle?.(false);
+						}
+					}).catch((error) => {
+						acquired.settle?.(false);
+						throw error;
+					});
 				}
 				if (acquired.kind !== "work") throw new Error("process work reservation failed");
 				this.add(session, outlet ? "wholeCommandMisses" : "misses");
@@ -2131,7 +2058,6 @@ export class LinuxProcessReuseBackend {
 					const ready = await this.resolveReady();
 					const started = performance.now();
 					const transaction = await session.workspace.transactions.begin();
-					let traceRoot: string | undefined;
 					let outcome: SpawnOutcome | undefined;
 					let reusable: boolean | undefined;
 					let transactionFinishing = false;
@@ -2155,18 +2081,19 @@ export class LinuxProcessReuseBackend {
 							taints: dependencyCertificate?.taints,
 						})}`;
 					try {
-						traceRoot = domain ? undefined : await mkdtemp(path.join(session.processRoot, "trace-"));
 						const privateBefore: PrivatePrestate = {
 							startedAt: Date.now(),
 							...(await privateBranch(path.join(session.processRoot, "private"))),
 						};
 						privateBefore.versions = await session.privateStructure.captureVersions();
-						const tracePrefix = path.join(traceRoot ?? session.processRoot, "process");
 						const image = session.projection.toLogical(executable);
-						const [invokedPath, comm] = observedPrototype.invocation!;
 						const dispatcher = session.interposition;
 						const launchPath = request.imageSource ?? image;
 						const logicalCwd = session.projection.toLogical(request.cwd);
+						let rootPid: number | undefined;
+						const tail =
+							domain?.trace ??
+							traceTail(session.metadata, logicalCwd, { rootPid: () => rootPid, launchPath });
 						const changedInput = async () => {
 							const changes = session.workspace.sourceChanges?.();
 							if (!changes?.paths.length || !transaction.readBefore) return false;
@@ -2180,11 +2107,11 @@ export class LinuxProcessReuseBackend {
 									continue;
 								inputs ??= new Set(
 									(
-										await observeStrace(domain?.trace ?? tracePrefix, image, logicalCwd, {
+										await observeExecution(tail, image, logicalCwd, {
 											controlledSocket: channel?.socket,
 											launchPath,
 											previewBytes: speculativeConfig().processReuse.tracePreviewBytes,
-											metadata: session.metadata,
+											dispatcherSocket: session.boundary.endpoint,
 										})
 									).paths
 										.filter((observed) => observed.role === "input")
@@ -2222,76 +2149,64 @@ export class LinuxProcessReuseBackend {
 										}))) && advance(),
 							);
 						releaseRunning = advancing();
-						const command = straceCommand(
-							ready.strace,
-							tracePrefix,
-							[
-								ready.sandlock,
-								// A nested child's own children are brokered as the top level's are: a build tool's compilers run in its trace otherwise.
-								...sandboxPolicyArguments(
-									logicalCwd,
-									[...session.deniedPaths, `${dispatcher}.configuration`],
-									[session.workspace.sandboxRoot, session.socketPath, ...(channel ? [channel.socket] : [])],
-									[
-										{
-											virtualPath: session.sourceRoot,
-											hostPath: session.workspace.sandboxRoot,
-											readOnly: false,
-										},
-										{
-											virtualPath: path.dirname(dispatcher),
-											hostPath: path.dirname(dispatcher),
-											readOnly: true,
-										},
-										...(session.gitDirectory
-											? [
-													{
-														virtualPath: session.gitDirectory,
-														hostPath: session.gitDirectory,
-														readOnly: true,
-													},
-												]
-											: []),
-									],
-									[
-										{ virtualPath: "/", hostPath: dispatcher },
-										{ virtualPath: dispatcher, hostPath: dispatcher },
-										...(request.imageSource ? [{ virtualPath: launchPath, hostPath: launchPath }] : []),
-									],
-									path.join(session.processRoot, "private"),
-								),
-								...(session.workspace.metadataImage
-									? ["--metadata-image", session.workspace.metadataImage]
-									: []),
-								...(outlet?.timeout !== undefined
-									? ["--timeout", String(Math.max(1, Math.ceil(outlet.timeout)))]
-									: []),
-								"--",
-								dispatcher,
-								request.closeStdin ? "--exec-closed-input" : "--exec",
-								outputRoute.join("") +
-									(request.stackLimit !== undefined ? `:${request.stackLimit}` : "") +
-									(request.outputFlags ? `,${request.outputFlags.join(",")}` : ""),
-								request.argv0,
-								launchPath,
-								...request.args,
-							],
-							false,
-							false,
-							true,
-						);
+						const command: [string, ...string[]] = [
+							ready.sandlock,
+							// A nested child's own children are brokered as the top level's are: a build tool's compilers run in its trace otherwise.
+							...sandboxPolicyArguments(
+								logicalCwd,
+								session.deniedPaths,
+								[session.workspace.sandboxRoot, ...(channel ? [channel.socket] : [])],
+								[
+									{
+										virtualPath: session.sourceRoot,
+										hostPath: session.workspace.sandboxRoot,
+										readOnly: false,
+									},
+									{
+										virtualPath: path.dirname(dispatcher),
+										hostPath: path.dirname(dispatcher),
+										readOnly: true,
+									},
+									...(session.gitDirectory
+										? [
+												{
+													virtualPath: session.gitDirectory,
+													hostPath: session.gitDirectory,
+													readOnly: true,
+												},
+											]
+										: []),
+								],
+								[
+									{ virtualPath: "/", hostPath: dispatcher },
+									{ virtualPath: dispatcher, hostPath: dispatcher },
+									...(request.imageSource ? [{ virtualPath: launchPath, hostPath: launchPath }] : []),
+								],
+								path.join(session.processRoot, "private"),
+							),
+							...(session.workspace.metadataImage
+								? ["--metadata-image", session.workspace.metadataImage]
+								: []),
+							...(outlet?.timeout !== undefined
+								? ["--timeout", String(Math.max(1, Math.ceil(outlet.timeout)))]
+								: []),
+							"--",
+							dispatcher,
+							request.closeStdin ? "--exec-closed-input" : "--exec",
+							outputRoute.join("") +
+								(request.stackLimit !== undefined ? `:${request.stackLimit}` : "") +
+								(request.outputFlags ? `,${request.outputFlags.join(",")}` : ""),
+							request.argv0,
+							launchPath,
+							...request.args,
+						];
 						const processStarted = performance.now();
 						session.writers.add(
 							(writer = {
 								id: `${session.token}:${requestID}`,
 								owner: session.token,
 								startedAt: Date.now(),
-								tail:
-									domain?.trace ??
-									traceTail(tracePrefix, logicalCwd, {
-										privateUpper: privateUpper(session),
-										metadata: session.metadata,
-									}),
+								tail,
 								...(inPlace !== undefined ? { pid: inPlace } : {}),
 							}),
 						);
@@ -2302,12 +2217,12 @@ export class LinuxProcessReuseBackend {
 						const observe = () =>
 							completedObservation
 								? Promise.resolve(completedObservation)
-								: observeStrace(writer!.tail!, image, logicalCwd, {
+								: observeExecution(writer!.tail!, image, logicalCwd, {
 										controlledSocket: channel?.socket,
 										launchPath,
 										brokeredWrites: (pid) => brokeredWrites(session, pid, writer),
 										privateUpper: privateUpper(session),
-										metadata: session.metadata,
+										dispatcherSocket: session.boundary.endpoint,
 										fileEvidence: (line) => {
 											const owner = session.fileEvidence.get(line);
 											if (!owner || owner === writer) return false;
@@ -2321,7 +2236,7 @@ export class LinuxProcessReuseBackend {
 													outputFlags: request.outputFlags ?? ([0, 0] as const),
 												}
 											: {}),
-										...(outputEndpoints ? { outputEndpoints } : {}),
+										...(outputEndpoints ? { outputEndpoints, captureOutput: true as const } : {}),
 										guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 									});
 						if (domain) {
@@ -2342,44 +2257,49 @@ export class LinuxProcessReuseBackend {
 								output: completedObservation.output ?? [],
 							};
 						} else {
-							const invocation: readonly [string, ...string[]] = [
-								ready.strace,
-								`--process-library=${ready.processLibrary}`,
-								`--exec-context-source=${dispatcher}`,
-								`--exec-context-name=${invokedPath}`,
-								`--exec-context-comm=${comm}`,
-								...command.slice(1),
-							];
-							outcome = await runSpawn(
-								[ready.dispatcher, "--output-channel=3", ...session.domain.launch(invocation)],
-								{
-									// The child writes to (and may query) these sockets; their identity lets its observation recognize them.
-									onTracer: (pid, active) => {
-										if (active) session.tracers.set(pid, writer!);
-										else session.tracers.delete(pid);
+							outcome = await session.boundary
+								.trace(
+									{
+										sourceRoot: session.sourceRoot,
+										scope: session.scope,
+										signal,
+										descriptors: false,
+										decide: (held) => this.dispatchHeld(session, writer!, held),
 									},
-									onOutputEndpoints: (endpoints) => {
-										session.nestedOutputEndpoints.add((outputEndpoints = endpoints));
-										if (captureWorkspace) session.topLevelOutputEndpoints = endpoints;
-									},
-									cwd: request.cwd,
-									environment: request.environment,
-									signal: AbortSignal.any([
-										session.signal,
-										work.signal,
-										...(outlet?.signal ? [outlet.signal] : []),
-									]),
-									onData: outlet?.onData,
-									timeout: outlet?.timeout,
-									...(outlet && session.invocation?.commandTransport === "stdin"
-										? { stdin: Buffer.from(outlet.command, "utf8") }
-										: {}),
-								},
-							).finally(() => {
-								writer!.endedAt = Date.now();
-							});
+									() =>
+										runSpawn([ready.dispatcher, "--output-channel=3", ...session.domain.launch(command)], {
+											held: true,
+											onSpawn: (child) => {
+												rootPid = child.pid;
+											},
+											onOutputEndpoints: (endpoints) => {
+												session.nestedOutputEndpoints.add((outputEndpoints = endpoints));
+												if (captureWorkspace) session.topLevelOutputEndpoints = endpoints;
+											},
+											cwd: request.cwd,
+											environment: request.environment,
+											signal: AbortSignal.any([
+												session.signal,
+												work.signal,
+												...(outlet?.signal ? [outlet.signal] : []),
+											]),
+											onData: outlet?.onData,
+											timeout: outlet?.timeout,
+											...(outlet && session.invocation?.commandTransport === "stdin"
+												? { stdin: Buffer.from(outlet.command, "utf8") }
+												: {}),
+										}),
+								)
+								.finally(() => {
+									writer!.endedAt = Date.now();
+								});
 						}
-						if (!domain && outputEndpoints) session.nestedOutputEndpoints.delete(outputEndpoints);
+						if (!domain && outputEndpoints) {
+							session.nestedOutputEndpoints.delete(outputEndpoints);
+							completedObservation = verifyProcessOutput(await observe(), outcome.output);
+							if (completedObservation.complete && completedObservation.output)
+								outcome = { ...outcome, output: completedObservation.output };
+						}
 						// Replays write each event to the target's own descriptor, whichever outlet this route gave it.
 						if (!domain)
 							outcome = {
@@ -2682,7 +2602,6 @@ export class LinuxProcessReuseBackend {
 							await writer.tail?.[Symbol.asyncDispose]();
 							writer.tail = undefined;
 						}
-						if (traceRoot) await rm(traceRoot, { recursive: true, force: true }).catch(() => undefined);
 					}
 				} finally {
 					this.handoffs.complete(weakKey, acquired.work);
@@ -3133,14 +3052,9 @@ export class LinuxProcessReuseBackend {
 	private async createProcessInterposition(session: ActiveSession, ready: ReadyBackend) {
 		const dispatcher = path.join(session.processRoot, "routing", "dispatcher");
 		session.signal?.throwIfAborted();
-		if (/[\r\n]/.test(session.socketPath + session.token))
-			throw new Error("dispatcher configuration cannot hold a line break");
 		await mkdir(path.dirname(dispatcher));
 		await copyFile(ready.dispatcher, dispatcher);
 		await chmod(dispatcher, 0o755);
-		await writeFile(`${dispatcher}.configuration`, `${session.socketPath}\n${session.token}\n`, {
-			mode: 0o600,
-		});
 		return dispatcher;
 	}
 	/** Retain the learned launch authority, then propose a separate input version shared by scheduling and execution. */
@@ -4217,12 +4131,6 @@ function workspaceWriterRecords(workspace: SandboxWorkspaceContext) {
 	workspaceWriters.set(workspace.transactions, writers);
 	return writers;
 }
-type WorkspaceWriterTransfer = Pick<
-	SessionWriter,
-	"id" | "owner" | "startedAt" | "endedAt" | "writes" | "closedPids"
-> & {
-	readonly trace?: readonly [string, string];
-};
 type WorkspaceWriteInquiry = {
 	readonly exclude: readonly string[];
 	readonly targets: ReadonlySet<string>;
@@ -4234,27 +4142,9 @@ type WorkspaceWriteInquiry = {
 /** The workspace owner can inspect caller-owned native traces even while that caller is blocked. */
 export async function observeWorkspaceWrites(
 	workspace: SandboxWorkspaceContext,
-	input:
-		| {
-				readonly writer: WorkspaceWriterTransfer;
-		  }
-		| WorkspaceWriteInquiry,
+	input: WorkspaceWriteInquiry,
 ): Promise<boolean> {
 	const writers = workspaceWriterRecords(workspace);
-	if ("writer" in input) {
-		const { writer } = input;
-		const current = [...writers].find((record) => record.id === writer.id) ?? {
-			...writer,
-		};
-		if (writer.trace || writer.writes) await current.tail?.[Symbol.asyncDispose]();
-		Object.assign(
-			current,
-			writer,
-			writer.trace ? { tail: traceTail(...writer.trace) } : writer.writes ? { tail: undefined } : {},
-		);
-		writers.add(current);
-		return false;
-	}
 	const completed = new Map<string, SessionWriter[]>();
 	for (const writer of writers)
 		if (writer.endedAt !== undefined && writer.endedAt < input.from)
@@ -4456,12 +4346,14 @@ async function privateInputImages(
 			target,
 			input
 				? [
-						...index.links.map(([path, target]): DynamicDependency => ({
-							kind: "symlink",
-							path,
-							target,
-							targetDigest: sha256Digest(target),
-						})),
+						...index.links.map(
+							([path, target]): DynamicDependency => ({
+								kind: "symlink",
+								path,
+								target,
+								targetDigest: sha256Digest(target),
+							}),
+						),
 						input,
 					]
 				: undefined,
@@ -4651,7 +4543,7 @@ function sandboxMountArgument(mount: SandboxMount | ExecMount) {
 }
 function speculativeProducerProof(ready: ReadyBackend, deniedPaths: readonly string[], policy = POLICY_ID) {
 	return Object.freeze({
-		observer: { provider: "strace", fingerprint: ready.observerFingerprint },
+		observer: { provider: "execution_domain", fingerprint: ready.observerFingerprint },
 		execution: {
 			authority: "speculative",
 			confinement: {
@@ -4661,13 +4553,31 @@ function speculativeProducerProof(ready: ReadyBackend, deniedPaths: readonly str
 		},
 	} satisfies ProcessProducerProof);
 }
+/** Compare the kernel journal with each actual pipe before publishing its cross-stream order. */
+function verifyProcessOutput(
+	observation: StraceObservation,
+	delivered: readonly BufferedOutput[],
+): StraceObservation {
+	const digests = (events: readonly BufferedOutput[]) => {
+		const hashes = [createHash("sha256"), createHash("sha256")];
+		for (const { fd, data } of events) hashes[fd - 1]!.update(data);
+		return hashes.map((hash) => hash.digest("hex"));
+	};
+	if (observation.output && stableEqual(digests(observation.output), digests(delivered))) return observation;
+	return {
+		...observation,
+		complete: false,
+		taints: [...new Set([...observation.taints, "trace_incomplete" as const])],
+		incompleteReasons: [...observation.incompleteReasons, "output_bytes_unproven"],
+	};
+}
 async function runSpawn(
 	[executable, ...args]: readonly [string, ...string[]],
 	options: Pick<ProcessExecutionRequest, "cwd" | "environment" | "signal" | "timeout"> & {
 		readonly stdin?: Buffer;
 		readonly streamBeyondCaptureLimit?: boolean;
+		readonly held?: boolean;
 		readonly onData?: (data: Buffer) => void;
-		readonly onTracer?: (pid: number, active: boolean) => void;
 		readonly onSpawn?: (child: ChildProcess) => void;
 		readonly onOutputEndpoints?: (endpoints: readonly [string, string]) => void;
 		readonly onControl?: (
@@ -4677,7 +4587,7 @@ async function runSpawn(
 	},
 ): Promise<SpawnOutcome> {
 	options.signal?.throwIfAborted();
-	const child = spawn(executable, args, {
+	const child = (options.held ? spawnControlled : spawn)(executable, args, {
 		cwd: options.cwd,
 		env: options.environment,
 		detached: true,
@@ -4690,7 +4600,6 @@ async function runSpawn(
 		],
 	});
 	options.onSpawn?.(child);
-	if (child.pid) options.onTracer?.(child.pid, true);
 	const output: BufferedOutput[] = [];
 	const limits = speculativeConfig().processReuse;
 	let capturedBytes = 0;
@@ -4785,44 +4694,9 @@ async function runSpawn(
 		await completed.catch(() => undefined);
 		throw error;
 	} finally {
-		if (child.pid) options.onTracer?.(child.pid, false);
 		clearTimeout(timeout);
 		options.signal?.removeEventListener("abort", terminate);
 		await releaseControl?.();
-	}
-}
-/** The native launcher's framing: output as "o<fd> <length>\n<bytes>", then "x <code>", "s <signal number>" or "b" (bypass in place). */
-function wireResponse(response: DispatcherResponse) {
-	const frames = [...(response.output ?? []).map((event) => ({ ...event, kind: "o" }))];
-	const exit = response.exit;
-	const end =
-		response.kind === "bypass"
-			? "b"
-			: response.kind === "continue"
-				? "c"
-				: exit?.kind === "signal"
-					? `s ${exit.signal}`
-					: `x ${exit?.kind === "code" ? exit.code : 125}`;
-	return Buffer.concat([
-		...frames.flatMap(({ fd, kind, data }) => [Buffer.from(`${kind}${fd} ${data.length}\n`), data]),
-		Buffer.from(`${end}\n`),
-	]);
-}
-function parseDispatcherRequest(body: string) {
-	try {
-		const value: unknown = JSON.parse(body.trim());
-		if (!isRecord(value)) return undefined;
-		const request = value as Partial<DispatcherRequest>;
-		return typeof request.token === "string" &&
-			isSafeCount(request.pid, 1) &&
-			(request.status === undefined ||
-				(Number.isSafeInteger(request.status) && request.status >= -1 && request.status <= 65535)) &&
-			(request.descriptors === undefined ||
-				(Array.isArray(request.descriptors) && request.descriptors.length === 0))
-			? (request as Pick<DispatcherRequest, "token" | "pid" | "descriptors" | "status">)
-			: undefined;
-	} catch {
-		return undefined;
 	}
 }
 function eligibleRequest(
@@ -4974,7 +4848,10 @@ async function captureActorDependencies(
 	return [...dependencies.values()];
 }
 function actorReplayProducer(producer: ProcessProducerProof, deniedPaths: readonly string[]) {
-	if (producer.observer.provider !== "strace" || producer.observer.fingerprint !== OBSERVER_FINGERPRINT)
+	if (
+		producer.observer.provider !== "execution_domain" ||
+		producer.observer.fingerprint !== OBSERVER_FINGERPRINT
+	)
 		return false;
 	const confinement = producer.execution.authority === "actor" ? undefined : producer.execution.confinement;
 	return (
@@ -4984,9 +4861,6 @@ function actorReplayProducer(producer: ProcessProducerProof, deniedPaths: readon
 				(policy) => confinement.fingerprint === digestObject({ policy, deniedPaths }),
 			))
 	);
-}
-function closeServer(server: net.Server): Promise<void> {
-	return new Promise((resolve) => server.close(() => resolve()));
 }
 function exitOutcome(outcome: SpawnOutcome): ExitOutcome {
 	if (!outcome.signal) return { kind: "code", code: outcome.code ?? 125 };

@@ -20,6 +20,7 @@ struct pt_regs {
   unsigned long cx;
   unsigned long r10;
   unsigned long r8;
+  unsigned long r9;
 } __attribute__((preserve_access_index));
 struct super_block {
   unsigned int s_dev;
@@ -81,7 +82,32 @@ struct mnt_namespace {
 struct nsproxy {
   struct mnt_namespace *mnt_ns;
 } __attribute__((preserve_access_index));
+struct fdtable {
+  unsigned int max_fds;
+  struct file **fd;
+} __attribute__((preserve_access_index));
+struct files_struct {
+  struct fdtable *fdt;
+} __attribute__((preserve_access_index));
+struct pid_namespace {
+  struct ns_common ns;
+} __attribute__((preserve_access_index));
+struct upid {
+  int nr;
+  struct pid_namespace *ns;
+} __attribute__((preserve_access_index));
+struct pid {
+  unsigned int level;
+  struct upid numbers[1];
+} __attribute__((preserve_access_index));
+struct fs_struct;
 struct task_struct {
+  struct pid *thread_pid;
+  struct files_struct *files;
+  struct fs_struct *fs;
+  int tgid;
+  int exit_code;
+  unsigned long long self_exec_id;
   struct nsproxy *nsproxy;
   struct task_struct *group_leader;
   struct task_struct *real_parent;
@@ -159,9 +185,11 @@ struct metadata_call {
   __u64 owner;
   __u64 task;
   __u64 id;
-  __u64 arguments[5];
+  __u64 arguments[6];
   __u32 number;
   __u32 secure;
+  __u32 layout;
+  __u32 output;
 };
 struct metadata_notification {
   __u64 owner;
@@ -187,6 +215,12 @@ struct {
   __type(value, struct metadata_call);
 } metadata_calls SEC(".maps");
 struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, PI_DOMAIN_RECORDS);
+  __type(key, __u64);
+  __type(value, __u32);
+} exec_tids SEC(".maps");
+struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(map_flags, BPF_F_NO_PREALLOC);
   __uint(max_entries, PI_DOMAIN_RECORDS);
@@ -204,12 +238,13 @@ struct {
   __type(value, struct pi_domain_event);
 } metadata_scratch SEC(".maps");
 struct linux_binprm {
+  const char *filename;
   struct file *file;
 } __attribute__((preserve_access_index));
 
 static struct pi_domain_state *metadata_state(__u64 *owner) {
   struct pi_domain_state *state = current_domain(owner);
-  return state && state->metadata_inode ? state : 0;
+  return state && state->recording ? state : 0;
 }
 static __u64 metadata_task(struct pi_domain_state *state) {
   struct bpf_pidns_info process;
@@ -248,8 +283,7 @@ static void metadata_emit(struct pi_domain_event *event, struct pi_domain_state 
 }
 static int metadata_number(unsigned long number) {
   return number == __NR_stat || number == __NR_lstat || number == __NR_fstat ||
-         number == __NR_newfstatat || number == __NR_statx || number == __NR_pread64 ||
-         number == __NR_pwrite64;
+         number == __NR_newfstatat || number == __NR_statx;
 }
 static int metadata_tracee(__u64 owner) {
   struct task_struct *leader =
@@ -259,9 +293,392 @@ static int metadata_tracee(__u64 owner) {
   return !role || role->owner != owner || role->task != (__u64)leader ||
          role->started != BPF_CORE_READ(leader, start_boottime);
 }
+static __always_inline struct pi_event_file event_file(struct file *file) {
+  struct pi_event_file result = {};
+  if (file) {
+    struct inode *inode = BPF_CORE_READ(file, f_inode);
+    result.inode = BPF_CORE_READ(inode, i_ino);
+    result.device = BPF_CORE_READ(inode, i_sb, s_dev);
+    result.mode = BPF_CORE_READ(inode, i_mode);
+    result.flags = BPF_CORE_READ(file, f_flags);
+  }
+  return result;
+}
+
+static __always_inline struct file *task_fd(unsigned fd) {
+  struct task_struct *task = (void *)bpf_get_current_task_btf();
+  struct fdtable *table = BPF_CORE_READ(task, files, fdt);
+  if (!table || fd >= BPF_CORE_READ(table, max_fds))
+    return 0;
+  struct file **files = BPF_CORE_READ(table, fd);
+  struct file *file = 0;
+  bpf_probe_read_kernel(&file, sizeof(file), &files[fd]);
+  return file;
+}
+
+struct fd_use_key {
+  __u64 owner, task_birth, image, file, inode;
+  __u32 fd, write;
+};
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, PI_DOMAIN_RECORDS);
+  __type(key, struct fd_use_key);
+  __type(value, __u32);
+} descriptor_uses SEC(".maps");
+struct fd_use {
+  struct fd_use_key key;
+  struct pi_event_file image;
+};
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+  __uint(max_entries, PI_DOMAIN_RECORDS);
+  __type(key, __u64);
+  __type(value, struct fd_use);
+} pending_uses SEC(".maps");
+struct stream_key { __u64 owner, inode; __u32 device, pad; };
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, PI_DOMAIN_RECORDS);
+  __type(key, struct stream_key);
+  __type(value, __u32);
+} output_objects SEC(".maps");
+static __noinline int stream_object(__u64 owner, struct file *file, int remember) {
+  if (!file)
+    return 0;
+  struct pi_event_file image = event_file(file);
+  unsigned mode = image.mode & 0170000;
+  if (mode != 0010000 && mode != 0140000)
+    return 0;
+  struct stream_key key = {owner, image.inode, image.device, 0};
+  if (remember) {
+    __u32 one = 1;
+    return !bpf_map_update_elem(&output_objects, &key, &one, BPF_ANY);
+  }
+  return bpf_map_lookup_elem(&output_objects, &key) != 0;
+}
+static __noinline void descriptor_use(struct pi_domain_state *state, __u64 owner, struct file *file,
+                                       unsigned fd, unsigned write) {
+  if (!file)
+    return;
+  struct task_struct *task = (void *)bpf_get_current_task_btf();
+  struct pi_event_file image = event_file(file);
+  struct fd_use_key key = {owner, BPF_CORE_READ(task, start_boottime), BPF_CORE_READ(task, self_exec_id),
+                           (__u64)file, image.inode, fd, write};
+  if (bpf_map_lookup_elem(&descriptor_uses, &key))
+    return;
+  __u64 tid = bpf_get_current_pid_tgid();
+  struct fd_use use = {key, image};
+  if (bpf_map_update_elem(&pending_uses, &tid, &use, BPF_ANY))
+    __sync_fetch_and_or(&state->metadata_lost, 16);
+}
+static __noinline void finish_descriptor_use(struct pi_domain_state *state, __u64 owner, long result) {
+  __u64 tid = bpf_get_current_pid_tgid();
+  struct fd_use *use = bpf_map_lookup_elem(&pending_uses, &tid);
+  if (!use || use->key.owner != owner)
+    return;
+  if (result >= 0 && (result || !use->key.write)) {
+    __u32 one = 1;
+    if (bpf_map_update_elem(&descriptor_uses, &use->key, &one, BPF_ANY))
+      __sync_fetch_and_or(&state->metadata_lost, 16);
+    struct pi_domain_event *event = metadata_begin(owner, next_file(), PI_FD_USE, state);
+    if (event) {
+      struct { struct pi_event_file file; __u32 fd, write; } data = {use->image, use->key.fd, use->key.write};
+      __builtin_memcpy(event->bytes, &data, sizeof(data));
+      event->size = sizeof(data);
+      metadata_emit(event, state);
+    }
+  }
+  bpf_map_delete_elem(&pending_uses, &tid);
+}
+
+/* Positions are one-based; zero means that the operand is absent. Absolute
+ * pathnames ignore their dirfd. The decoder retains both names for rename/link. */
+#define PI_LAYOUT(path1, path2, fd1, fd2) (1U | (path1)<<4 | (path2)<<8 | (fd1)<<12 | (fd2)<<16)
+static __always_inline unsigned descriptor_io(unsigned long nr) {
+  switch (nr) {
+  case __NR_read:
+  case __NR_readv:
+  case __NR_pread64:
+  case __NR_preadv:
+  case __NR_preadv2:
+    return 1;
+  case __NR_write:
+  case __NR_writev:
+  case __NR_pwrite64:
+  case __NR_pwritev:
+  case __NR_pwritev2:
+    return 2;
+  default:
+    return 0;
+  }
+}
+static __always_inline unsigned call_layout(unsigned long nr) {
+  if (descriptor_io(nr))
+    return PI_LAYOUT(0, 0, 1, 0);
+  switch (nr) {
+  case __NR_access:
+  case __NR_chdir:
+  case __NR_chmod:
+  case __NR_chown:
+  case __NR_lchown:
+  case __NR_creat:
+  case __NR_execve:
+  case __NR_getxattr:
+  case __NR_lgetxattr:
+  case __NR_listxattr:
+  case __NR_llistxattr:
+  case __NR_mkdir:
+  case __NR_mknod:
+  case __NR_open:
+  case __NR_readlink:
+  case __NR_removexattr:
+  case __NR_lremovexattr:
+  case __NR_rmdir:
+  case __NR_setxattr:
+  case __NR_lsetxattr:
+  case __NR_truncate:
+  case __NR_unlink:
+  case __NR_utime:
+  case __NR_utimes:
+  case __NR_stat:
+  case __NR_lstat:
+  case __NR_statfs:
+    return PI_LAYOUT(1, 0, 0, 0);
+  case __NR_rename:
+  case __NR_link:
+  case __NR_mount:
+    return PI_LAYOUT(1, 2, 0, 0);
+  case __NR_symlink:
+    return PI_LAYOUT(2, 0, 0, 0);
+  case __NR_openat:
+  case __NR_openat2:
+  case __NR_mkdirat:
+  case __NR_mknodat:
+  case __NR_unlinkat:
+  case __NR_faccessat:
+  case __NR_faccessat2:
+  case __NR_fchmodat:
+#ifdef __NR_fchmodat2
+  case __NR_fchmodat2:
+#endif
+  case __NR_fchownat:
+  case __NR_newfstatat:
+  case __NR_readlinkat:
+  case __NR_statx:
+  case __NR_execveat:
+  case __NR_utimensat:
+  case __NR_futimesat:
+    return PI_LAYOUT(2, 0, 1, 0);
+  case __NR_renameat:
+  case __NR_renameat2:
+  case __NR_linkat:
+    return PI_LAYOUT(2, 4, 1, 3);
+  case __NR_symlinkat:
+    return PI_LAYOUT(3, 0, 2, 0);
+  case __NR_fchdir:
+  case __NR_fstat:
+  case __NR_fstatfs:
+  case __NR_ftruncate:
+  case __NR_fchmod:
+  case __NR_fchown:
+  case __NR_fallocate:
+  case __NR_fcntl:
+  case __NR_flock:
+  case __NR_ioctl:
+  case __NR_fsetxattr:
+  case __NR_fgetxattr:
+  case __NR_flistxattr:
+  case __NR_fremovexattr:
+  case __NR_getdents:
+  case __NR_getdents64:
+  case __NR_lseek:
+  case __NR_sendfile:
+  case __NR_close:
+  case __NR_dup:
+  case __NR_dup2:
+  case __NR_dup3:
+  case __NR_connect:
+  case __NR_bind:
+  case __NR_listen:
+  case __NR_accept:
+  case __NR_accept4:
+  case __NR_shutdown:
+  case __NR_sendto:
+  case __NR_recvfrom:
+  case __NR_sendmsg:
+  case __NR_recvmsg:
+  case __NR_sendmmsg:
+  case __NR_recvmmsg:
+  case __NR_getsockname:
+  case __NR_getpeername:
+  case __NR_setsockopt:
+  case __NR_getsockopt:
+  case __NR_vmsplice:
+    return PI_LAYOUT(0, 0, 1, 0);
+  case __NR_mmap:
+    return PI_LAYOUT(0, 0, 5, 0);
+  case __NR_copy_file_range:
+  case __NR_splice:
+    return PI_LAYOUT(0, 0, 1, 3);
+  case __NR_tee:
+    return PI_LAYOUT(0, 0, 1, 2);
+  case __NR_pipe:
+  case __NR_pipe2:
+  case __NR_socket:
+  case __NR_socketpair:
+  case __NR_close_range:
+  case __NR_prlimit64:
+  case __NR_getrlimit:
+  case __NR_setrlimit:
+  case __NR_prctl:
+  case __NR_capget:
+  case __NR_capset:
+  case __NR_unshare:
+  case __NR_setns:
+  case __NR_setuid:
+  case __NR_setgid:
+  case __NR_setreuid:
+  case __NR_setregid:
+  case __NR_setresuid:
+  case __NR_setresgid:
+  case __NR_setgroups:
+  case __NR_setfsuid:
+  case __NR_setfsgid:
+  case __NR_open_tree:
+  case __NR_fsopen:
+  case __NR_fsconfig:
+  case __NR_fsmount:
+  case __NR_fspick:
+  case __NR_mount_setattr:
+  case __NR_seccomp:
+  case __NR_ptrace:
+  case __NR_process_vm_readv:
+  case __NR_process_vm_writev:
+  case __NR_io_uring_setup:
+  case __NR_io_uring_enter:
+  case __NR_io_uring_register:
+  case __NR_io_setup:
+  case __NR_io_submit:
+  case __NR_open_by_handle_at:
+  case __NR_name_to_handle_at:
+  case __NR_personality:
+  case __NR_bpf:
+  case __NR_userfaultfd:
+  case __NR_perf_event_open:
+  case __NR_pivot_root:
+  case __NR_chroot:
+  case __NR_umount2:
+  case __NR_move_mount:
+  case __NR_swapon:
+  case __NR_swapoff:
+  case __NR_reboot:
+  case __NR_sethostname:
+  case __NR_setdomainname:
+  case __NR_kexec_load:
+  case __NR_init_module:
+  case __NR_finit_module:
+  case __NR_delete_module:
+  case __NR_keyctl:
+  case __NR_add_key:
+  case __NR_request_key:
+  case __NR_quotactl:
+  case __NR_acct:
+  case __NR_lookup_dcookie:
+  case __NR_msgget:
+  case __NR_msgsnd:
+  case __NR_msgrcv:
+  case __NR_msgctl:
+  case __NR_semget:
+  case __NR_semctl:
+  case __NR_semop:
+  case __NR_semtimedop:
+  case __NR_shmat:
+  case __NR_shmget:
+  case __NR_shmdt:
+  case __NR_shmctl:
+  case __NR_mq_open:
+  case __NR_mq_timedsend:
+  case __NR_mq_timedreceive:
+  case __NR_kill:
+  case __NR_tkill:
+  case __NR_tgkill:
+  case __NR_pidfd_open:
+  case __NR_pidfd_getfd:
+  case __NR_pidfd_send_signal:
+  case __NR_clone:
+  case __NR_fork:
+  case __NR_clone3:
+  case __NR_vfork:
+    return PI_LAYOUT(0, 0, 0, 0);
+  default:
+    return 0;
+  }
+}
+
+static __always_inline unsigned long operand(const struct metadata_call *call, unsigned pos) {
+  return pos && pos <= 6 ? call->arguments[(pos - 1) & 7] : 0;
+}
+static __always_inline void execution_path(__u64 owner, const struct metadata_call *call,
+                                           struct pi_domain_state *state, unsigned pos, unsigned kind) {
+  if (!pos)
+    return;
+  struct pi_domain_event *event = metadata_begin(owner, call->id, kind, state);
+  if (!event)
+    return;
+  const void *user = (void *)operand(call, pos);
+  if (user) {
+    long n = bpf_probe_read_user_str(event->bytes, sizeof(event->bytes), user);
+    if (n <= 0 || n >= (long)sizeof(event->bytes))
+      event->error = n < 0 ? n : -36;
+    else
+      event->size = n;
+  }
+  metadata_emit(event, state);
+}
+
+/* getname may fault in a pathname after the entry tracepoint. Use the same
+ * kernel-owned copy that pathname lookup consumed, including failed lookups. */
+struct filename {
+  const char *name;
+  const char *uptr;
+} __attribute__((preserve_access_index));
+SEC("fentry/putname")
+int execution_filename(unsigned long long *context) {
+  __u64 owner = 0;
+  struct pi_domain_state *state = metadata_state(&owner);
+  if (!state)
+    return 0;
+  __u32 pid = (__u32)metadata_task(state);
+  struct metadata_call *call = bpf_map_lookup_elem(&metadata_calls, &pid);
+  if (!call || call->owner != owner || call->task != (__u64)bpf_get_current_task_btf())
+    return 0;
+  struct filename *file = (void *)context[0];
+  unsigned long user = (unsigned long)BPF_CORE_READ(file, uptr);
+  if (!user)
+    return 0;
+  for (int i = 0; i < 2; i++) {
+    unsigned pos = (call->layout >> (4 + i * 4)) & 15;
+    if (!pos || operand(call, pos) != user)
+      continue;
+    struct pi_domain_event *event = metadata_begin(owner, call->id, PI_PATH + i, state);
+    if (!event)
+      break;
+    long n = bpf_probe_read_kernel_str(event->bytes, sizeof(event->bytes), BPF_CORE_READ(file, name));
+    if (n <= 0 || n >= (long)sizeof(event->bytes))
+      event->error = n < 0 ? n : -36;
+    else
+      event->size = n;
+    metadata_emit(event, state);
+  }
+  return 0;
+}
+
 static int metadata_enter(struct pt_regs *registers, unsigned secure) {
   unsigned long number = BPF_CORE_READ(registers, orig_ax);
-  if (!metadata_number(number))
+  unsigned layout = call_layout(number);
+  if (!layout)
     return 0;
   __u64 owner = 0;
   struct pi_domain_state *state = metadata_state(&owner);
@@ -270,36 +687,88 @@ static int metadata_enter(struct pt_regs *registers, unsigned secure) {
   __u32 pid = (__u32)metadata_task(state);
   __u64 task = (__u64)bpf_get_current_task_btf();
   struct metadata_call *previous = bpf_map_lookup_elem(&metadata_calls, &pid);
-  if (previous && !secure && previous->secure && previous->task == task &&
-      previous->number == number)
+  if (previous && !secure && previous->secure && previous->task == task && previous->number == number)
     return 0;
+  struct metadata_call call = {
+    .owner = owner, .task = task, .number = number, .secure = secure, .layout = layout,
+    .arguments = {BPF_CORE_READ(registers, di), BPF_CORE_READ(registers, si),
+                  BPF_CORE_READ(registers, dx), BPF_CORE_READ(registers, r10),
+                  BPF_CORE_READ(registers, r8), BPF_CORE_READ(registers, r9)}
+  };
+  if (number == __NR_mmap && (!(call.arguments[2] & 2) || !(call.arguments[3] & 1) ||
+                              (call.arguments[3] & 0x20)))
+    return 0;
+  unsigned fd1 = (layout >> 12) & 15, fd2 = (layout >> 16) & 15;
+  struct file *first = fd1 ? task_fd(operand(&call, fd1)) : 0;
+  unsigned io = descriptor_io(number);
+  if (io || number == __NR_sendmsg || number == __NR_sendto) {
+    unsigned type = first ? BPF_CORE_READ(first, f_inode, i_mode) & 0170000 : 0;
+    int stream_write = number == __NR_write || number == __NR_writev || !io;
+    if (stream_write && (type == 0010000 || type == 0140000) &&
+        (first == task_fd(1) || first == task_fd(2) || stream_object(owner, first, 0)))
+      call.output = 1;
+    else if (io) {
+      descriptor_use(state, owner, first, call.arguments[0], io == 2);
+      return 0;
+    }
+  }
   if (previous)
     __sync_fetch_and_or(&state->metadata_lost, 8);
-  struct metadata_call call = {
-      .owner = owner,
-      .task = task,
-      .id = next_file(),
-      .number = number,
-      .secure = secure,
-      .arguments = {BPF_CORE_READ(registers, di), BPF_CORE_READ(registers, si),
-                    BPF_CORE_READ(registers, dx), BPF_CORE_READ(registers, r10),
-                    BPF_CORE_READ(registers, r8)}};
+  call.id = next_file();
   if (!call.id || bpf_map_update_elem(&metadata_calls, &pid, &call, BPF_ANY)) {
     __sync_fetch_and_or(&state->metadata_lost, 16);
     return 0;
   }
-  struct pi_domain_event *event = metadata_begin(owner, call.id, 8, state);
+  if ((number == __NR_execve || number == __NR_execveat) &&
+      bpf_map_update_elem(&exec_tids, &task, &pid, BPF_ANY))
+    __sync_fetch_and_or(&state->metadata_lost, 16);
+  struct pi_domain_event *event = metadata_begin(owner, call.id, PI_CALL, state);
   if (!event)
     return 0;
   struct {
-    __u64 reserved;
-    __u64 number;
-    __u64 arguments[5];
-  } entry = {.number = number};
-  __builtin_memcpy(entry.arguments, call.arguments, sizeof(entry.arguments));
-  __builtin_memcpy(event->bytes, &entry, sizeof(entry));
-  event->size = sizeof(entry);
+    __u32 number, layout;
+    __u64 args[6];
+    struct pi_event_file first, second;
+  } head = {.number = number, .layout = layout, .first = event_file(first)};
+  __builtin_memcpy(head.args, call.arguments, sizeof(head.args));
+  if (fd2)
+    head.second = event_file(task_fd(operand(&call, fd2)));
+  if (number == __NR_clone3 && bpf_probe_read_user(&head.args[0], 8, (void *)call.arguments[0]))
+    event->error = -14;
+  if (number == __NR_openat2 && bpf_probe_read_user(&head.args[2], 8, (void *)call.arguments[2]))
+    event->error = -14;
+  if (number == __NR_sendmsg) {
+    struct { void *name; unsigned long name_size; void *vectors; unsigned long count;
+             void *control; unsigned long control_size; } message;
+    head.args[5] = bpf_probe_read_user(&message, sizeof(message), (void *)call.arguments[1]) ||
+                   message.name || message.control_size;
+  }
+  __builtin_memcpy(event->bytes, &head, sizeof(head));
+  event->size = sizeof(head);
   metadata_emit(event, state);
+  execution_path(owner, &call, state, (layout >> 4) & 15, PI_PATH);
+  execution_path(owner, &call, state, (layout >> 8) & 15, PI_PATH2);
+  return 0;
+}
+/* Classify the address the kernel accepted, after copying it from the caller. */
+SEC("fentry/security_socket_connect")
+int execution_connect(unsigned long long *context) {
+  __u64 owner = 0;
+  struct pi_domain_state *state = metadata_state(&owner);
+  if (!state)
+    return 0;
+  __u32 pid = (__u32)metadata_task(state);
+  struct metadata_call *call = bpf_map_lookup_elem(&metadata_calls, &pid);
+  if (!call || call->owner != owner || call->number != __NR_connect ||
+      call->task != (__u64)bpf_get_current_task_btf())
+    return 0;
+  struct pi_domain_event *event = metadata_begin(owner, call->id, PI_UNIX_ADDRESS, state);
+  if (event) {
+    unsigned size = context[2] < 110 ? context[2] : 110;
+    event->size = size;
+    event->error = bpf_probe_read_kernel(event->bytes, size, (void *)context[1]);
+    metadata_emit(event, state);
+  }
   return 0;
 }
 SEC("fentry/__secure_computing")
@@ -311,26 +780,153 @@ SEC("raw_tp/sys_enter")
 int metadata_ordinary(struct bpf_raw_tracepoint_args *context) {
   return metadata_enter((void *)context->args[0], 0);
 }
+/* Only a pipe/socket that is one of this image's output descriptions reaches
+ * this path. The return value, rather than the requested count, bounds bytes. */
+struct output_copy {
+  __u64 owner, id, left;
+  const unsigned char *buffer;
+  const struct output_vector { const unsigned char *base; unsigned long len; } *vectors;
+  __u64 available;
+  unsigned index, count;
+  struct pi_domain_state *state;
+};
+static long output_chunk(__u32 iteration, void *context) {
+  (void)iteration;
+  struct output_copy *copy = context;
+  if (!copy->left)
+    return 1;
+  if (!copy->available) {
+    struct output_vector vector;
+    if (copy->index >= copy->count ||
+        bpf_probe_read_user(&vector, sizeof(vector), &copy->vectors[copy->index++]))
+      return 1;
+    copy->buffer = vector.base;
+    copy->available = vector.len;
+    if (!copy->available)
+      return 0;
+  }
+  unsigned long size = copy->left < copy->available ? copy->left : copy->available;
+  if (size > PI_DOMAIN_EVENT_BYTES)
+    size = PI_DOMAIN_EVENT_BYTES;
+  struct pi_domain_event *event = metadata_begin(copy->owner, copy->id, PI_OUTPUT, copy->state);
+  if (!event)
+    return 1;
+  event->size = size;
+  event->error = bpf_probe_read_user(event->bytes, size, copy->buffer);
+  metadata_emit(event, copy->state);
+  copy->buffer += size;
+  copy->available -= size;
+  copy->left -= size;
+  return event->error ? 1 : 0;
+}
+static int capture_output(struct metadata_call *call, long result, struct pi_domain_state *state) {
+  struct output_copy copy = {.owner = call->owner, .id = call->id, .left = result, .state = state};
+  if (call->number == __NR_writev) {
+    copy.vectors = (void *)call->arguments[1];
+    copy.count = call->arguments[2];
+  } else if (call->number == __NR_sendmsg) {
+    struct { void *name; unsigned long name_size; void *vectors; unsigned long count;
+             void *control; unsigned long control_size; } msg;
+    if (bpf_probe_read_user(&msg, sizeof(msg), (void *)call->arguments[1]) ||
+        msg.name || msg.control_size || msg.count > 1024)
+      return -1;
+    copy.vectors = msg.vectors;
+    copy.count = msg.count;
+  } else {
+    copy.buffer = (void *)call->arguments[1];
+    copy.available = call->arguments[2];
+  }
+  if (copy.count > 1024 || result > PI_DOMAIN_TRACE_BYTES)
+    return -1;
+  long done = bpf_loop(1024 + PI_DOMAIN_TRACE_BYTES / PI_DOMAIN_EVENT_BYTES + 2, output_chunk, &copy, 0);
+  return done < 0 || copy.left ? -1 : 0;
+}
+
 SEC("raw_tp/sys_exit")
 int metadata_return(struct bpf_raw_tracepoint_args *context) {
   struct pt_regs *registers = (void *)context->args[0];
   unsigned long number = BPF_CORE_READ(registers, orig_ax);
-  if (!metadata_number(number))
+  if (!call_layout(number))
     return 0;
   __u64 owner = 0;
   struct pi_domain_state *state = metadata_state(&owner);
   if (!state || !metadata_tracee(owner))
     return 0;
+  if (descriptor_io(number))
+    finish_descriptor_use(state, owner, context->args[1]);
   __u32 pid = (__u32)metadata_task(state);
   struct metadata_call *call = bpf_map_lookup_elem(&metadata_calls, &pid);
   if (!call || call->owner != owner || call->task != (__u64)bpf_get_current_task_btf() ||
       call->number != number) {
-    __sync_fetch_and_or(&state->metadata_lost, 32);
+    /* Pure I/O, private mappings and tasks first entering this cgroup have no pair. */
     return 0;
   }
+  long value = context->args[1];
+  if (value < 0 && (number == __NR_execve || number == __NR_execveat)) {
+    __u64 task_key = (__u64)bpf_get_current_task_btf();
+    bpf_map_delete_elem(&exec_tids, &task_key);
+  }
+  int output_error = call->output && value > 0 ? capture_output(call, value, state) : 0;
   struct pi_domain_event *event = metadata_begin(owner, call->id, 6, state);
   if (!event)
     return 0;
+  if (!metadata_number(number)) {
+    struct {
+      __s64 result;
+      struct pi_event_file first, second;
+      __s32 lock;
+      __u32 pad;
+    } done = {.result = context->args[1], .lock = -1};
+    if (done.result >= 0) {
+      if (number == __NR_open || number == __NR_openat || number == __NR_openat2 ||
+          number == __NR_creat || number == __NR_socket || number == __NR_accept || number == __NR_accept4)
+        done.first = event_file(task_fd(done.result));
+      if (number == __NR_pipe || number == __NR_pipe2 || number == __NR_socketpair) {
+        int ends[2];
+        void *address = (void *)call->arguments[number == __NR_socketpair ? 3 : 0];
+        if (bpf_probe_read_user(ends, sizeof(ends), address))
+          event->error = -14;
+        else {
+          done.first = event_file(task_fd(ends[0]));
+          done.second = event_file(task_fd(ends[1]));
+        }
+      }
+      if (number == __NR_ioctl || number == __NR_fcntl) {
+        struct file *file = task_fd(call->arguments[0]);
+        if (file)
+          done.pad = BPF_CORE_READ(file, f_flags);
+      }
+      if (number == __NR_capget) {
+        __u32 header[2], capabilities[6] = {};
+        if (!bpf_probe_read_user(header, sizeof(header), (void *)call->arguments[0])) {
+          unsigned bytes = header[0] == 0x19980330 ? 12 :
+                           header[0] == 0x20080522 || header[0] == 0x20071026 ? 24 : 0;
+          if (bytes && !bpf_probe_read_user(capabilities, bytes, (void *)call->arguments[1]) &&
+              !(capabilities[0] | capabilities[1] | capabilities[2] | capabilities[3] |
+                capabilities[4] | capabilities[5])) {
+            done.lock = 0;
+            done.pad = header[1];
+          }
+        }
+      }
+      if (number == __NR_fcntl && ((call->arguments[1] >= 5 && call->arguments[1] <= 7) ||
+                                  (call->arguments[1] >= 36 && call->arguments[1] <= 38))) {
+        short type;
+        if (bpf_probe_read_user(&type, sizeof(type), (void *)call->arguments[2]))
+          event->error = -14;
+        else
+          done.lock = type;
+      }
+    }
+    if (output_error)
+      event->error = -7;
+    event->kind = PI_RETURN;
+    __builtin_memcpy(event->bytes, &done, sizeof(done));
+    event->size = sizeof(done);
+    metadata_emit(event, state);
+    bpf_map_delete_elem(&metadata_calls, &pid);
+    return 0;
+  }
   struct returned {
     __s64 number;
     __s64 result;
@@ -344,9 +940,7 @@ int metadata_return(struct bpf_raw_tracepoint_args *context) {
   result->result = context->args[1];
   result->pad = 0;
   result->address = call->arguments[number == __NR_newfstatat ? 2 : number == __NR_statx ? 4 : 1];
-  result->size = result->result < 0 || number == __NR_pread64 || number == __NR_pwrite64 ? 0
-                 : number == __NR_statx                                                  ? 256
-                                                                                         : 144;
+  result->size = result->result < 0 ? 0 : number == __NR_statx ? 256 : 144;
   event->size = 32 + result->size;
   if (result->size)
     event->error = bpf_probe_read_user(result->bytes, result->size, (void *)result->address);
@@ -362,10 +956,7 @@ int metadata_descriptor(unsigned long long *context) {
     return 0;
   __u32 pid = (__u32)metadata_task(state);
   struct metadata_call *call = bpf_map_lookup_elem(&metadata_calls, &pid);
-  if (!call || call->owner != owner ||
-      (call->number != __NR_fstat &&
-       !(call->number == __NR_newfstatat && (call->arguments[3] & 0x1000)) &&
-       !(call->number == __NR_statx && (call->arguments[2] & 0x1000))))
+  if (!call || call->owner != owner || !metadata_number(call->number))
     return 0;
   struct pi_domain_event *event = metadata_begin(owner, call->id, 7, state);
   if (!event)
@@ -378,6 +969,68 @@ int metadata_descriptor(unsigned long long *context) {
   metadata_emit(event, state);
   return 0;
 }
+SEC("fentry/security_file_open")
+int execution_open(unsigned long long *context) {
+  __u64 owner = 0;
+  struct pi_domain_state *state = metadata_state(&owner);
+  if (!state || !metadata_tracee(owner))
+    return 0;
+  __u32 pid = (__u32)metadata_task(state);
+  struct metadata_call *call = bpf_map_lookup_elem(&metadata_calls, &pid);
+  if (!call || call->owner != owner)
+    return 0;
+  struct file *file = (void *)context[0];
+  struct pi_domain_event *event = metadata_begin(owner, call->id, PI_OPEN_FILE, state);
+  if (event) {
+    struct pi_event_file head = event_file(file);
+    __builtin_memcpy(event->bytes, &head, sizeof(head));
+    long n = bpf_d_path(&file->f_path, (char *)event->bytes + sizeof(head), sizeof(event->bytes) - sizeof(head));
+    if (n < 0)
+      event->error = n;
+    else
+      event->size = sizeof(head) + n;
+    metadata_emit(event, state);
+  }
+  return 0;
+}
+/* Tracepoint task_struct IDs are in the initial namespace. All journal IDs use
+ * the collector's PID namespace, including children born below it. */
+static __noinline __u32 domain_tid(struct task_struct *task, struct pi_domain_state *state) {
+  struct pid *pid = BPF_CORE_READ(task, thread_pid);
+  unsigned level = BPF_CORE_READ(pid, level);
+  for (int i = 0; i <= 32 && i <= level; i++) {
+    struct upid entry = {};
+    const struct upid *numbers = __builtin_preserve_access_index(&pid->numbers[0]);
+    if (bpf_probe_read_kernel(&entry, sizeof(entry), numbers + i))
+      break;
+    if (BPF_CORE_READ(entry.ns, ns.inum) == state->namespace_inode)
+      return entry.nr;
+  }
+  __sync_fetch_and_or(&state->metadata_lost, 1);
+  return 0;
+}
+SEC("raw_tp/sched_process_fork")
+int execution_fork(struct bpf_raw_tracepoint_args *context) {
+  __u64 owner = 0;
+  struct pi_domain_state *state = metadata_state(&owner);
+  if (!state)
+    return 0;
+  struct task_struct *parent = (void *)context->args[0];
+  struct task_struct *child = (void *)context->args[1];
+  struct pi_domain_event *event = metadata_begin(owner, next_file(), PI_FORK, state);
+  if (event) {
+    struct { __u32 tid, tgid, shared_fs, shared_files; } birth = {
+      domain_tid(child, state), domain_tid(BPF_CORE_READ(child, group_leader), state),
+      BPF_CORE_READ(parent, fs) == BPF_CORE_READ(child, fs),
+      BPF_CORE_READ(parent, files) == BPF_CORE_READ(child, files)
+    };
+    __builtin_memcpy(event->bytes, &birth, sizeof(birth));
+    event->size = sizeof(birth);
+    metadata_emit(event, state);
+  }
+  return 0;
+}
+
 SEC("raw_tp/sched_process_exec")
 int metadata_exec(struct bpf_raw_tracepoint_args *context) {
   __u64 owner = 0;
@@ -410,15 +1063,62 @@ int metadata_exec(struct bpf_raw_tracepoint_args *context) {
       __sync_fetch_and_or(&state->metadata_lost, 64);
   } else if (role && role->broker)
     bpf_map_delete_elem(&metadata_roles, &pid);
+  stream_object(owner, task_fd(1), 1);
+  stream_object(owner, task_fd(2), 1);
+  struct linux_binprm *image = (void *)context->args[2];
+  __u64 task_key = (__u64)task;
+  __u32 *prior_tid = bpf_map_lookup_elem(&exec_tids, &task_key);
+  __u32 current_tid = metadata_task(state);
+  __u32 previous = prior_tid ? *prior_tid : current_tid;
+  if (context->args[1] != pid && !prior_tid)
+    __sync_fetch_and_or(&state->metadata_lost, 1);
+  bpf_map_delete_elem(&exec_tids, &task_key);
+  struct pi_domain_event *event = metadata_begin(owner, next_file(), PI_EXEC, state);
+  if (event) {
+    struct { struct pi_event_file file; __u32 previous, broker; } head = {
+      .file = event_file(BPF_CORE_READ(image, file)), .previous = previous,
+      .broker = !metadata_tracee(owner),
+    };
+    __builtin_memcpy(event->bytes, &head, sizeof(head));
+    long n = bpf_probe_read_kernel_str(event->bytes + sizeof(head),
+                                       sizeof(event->bytes) - sizeof(head), BPF_CORE_READ(image, filename));
+    if (n <= 0 || n >= (long)(sizeof(event->bytes) - sizeof(head)))
+      event->error = -36;
+    else
+      event->size = sizeof(head) + n;
+    metadata_emit(event, state);
+  }
+  /* de_thread transfers the leader's TID to this task. Its old key never gets
+   * a sys_exit; the successful image installation closes that call instead. */
+  if (previous != current_tid) {
+    struct metadata_call *call = bpf_map_lookup_elem(&metadata_calls, &previous);
+    if (call && call->owner == owner && call->task == task_key) {
+      struct pi_domain_event *end = metadata_begin(owner, call->id, 9, state);
+      if (end)
+        metadata_emit(end, state);
+      bpf_map_delete_elem(&metadata_calls, &previous);
+    }
+  }
   return 0;
 }
 SEC("raw_tp/sched_process_exit") int metadata_exit(void *context) {
   (void)context;
   __u32 pid = (__u32)bpf_get_current_pid_tgid();
   bpf_map_delete_elem(&metadata_roles, &pid);
+  __u64 tid = bpf_get_current_pid_tgid();
+  bpf_map_delete_elem(&pending_uses, &tid);
+  __u64 task_key = (__u64)bpf_get_current_task_btf();
+  bpf_map_delete_elem(&exec_tids, &task_key);
   __u64 owner = 0;
   struct pi_domain_state *state = metadata_state(&owner);
   if (state) {
+    struct pi_domain_event *exit = metadata_begin(owner, next_file(), PI_EXIT, state);
+    if (exit) {
+      __u32 code = BPF_CORE_READ((struct task_struct *)bpf_get_current_task_btf(), exit_code);
+      __builtin_memcpy(exit->bytes, &code, sizeof(code));
+      exit->size = sizeof(code);
+      metadata_emit(exit, state);
+    }
     pid = (__u32)metadata_task(state);
     struct metadata_call *call = bpf_map_lookup_elem(&metadata_calls, &pid);
     if (call && call->owner == owner) {
@@ -493,7 +1193,7 @@ SEC("uprobe") int metadata_broker(struct pt_regs *registers) {
       __sync_fetch_and_or(&state->metadata_lost, 128);
       return 0;
     }
-    if (!metadata_number(number))
+    if (!call_layout(number))
       return 0;
     struct metadata_call *call = bpf_map_lookup_elem(&metadata_calls, &target);
     if (!call || call->owner != owner || call->number != number)
@@ -718,7 +1418,7 @@ int permission(unsigned long long *args) {
     __u32 pid = (__u32)metadata_task(state);
     struct metadata_call *call = bpf_map_lookup_elem(&metadata_calls, &pid);
     if (call && call->owner == owner && call->task == (__u64)bpf_get_current_task_btf() &&
-        (call->number == __NR_pread64 || call->number == __NR_pwrite64)) {
+        (call->number == __NR_getdents || call->number == __NR_getdents64)) {
       struct pi_domain_event *event = metadata_begin(owner, call->id, 7, state);
       if (event) {
         long length = bpf_d_path(&((struct file *)args[0])->f_path, (char *)event->bytes,
@@ -987,7 +1687,8 @@ SEC("raw_tp/sched_process_exit") int task_exit(void *context) {
 SEC("raw_tp/sys_exit") int observe(struct bpf_raw_tracepoint_args *context) {
   completed(0, (long)context->args[1]);
   unsigned long call = BPF_CORE_READ((struct pt_regs *)context->args[0], orig_ax);
-  if (call != __NR_getpid && call != __NR_getppid && call != __NR_getsid && call != __NR_getpgid)
+  if (call != __NR_getpid && call != __NR_getppid && call != __NR_gettid &&
+      call != __NR_getpgrp && call != __NR_getsid && call != __NR_getpgid)
     return 0;
   __u64 owner = 0;
   struct pi_domain_state *state = metadata_state(&owner);
@@ -1247,10 +1948,14 @@ static int metadata_record(void *context, void *data, size_t bytes) {
 static int metadata_open(struct domain *group, const char *name, struct pi_domain_state *state) {
   if (group->events)
     return EALREADY;
-  int file = open(name, O_PATH | O_CLOEXEC);
+  int file = -1;
   int error = 0;
   int writable = -1;
-  struct stat info;
+  struct stat info = {};
+  char descriptor[64];
+  if (!*name)
+    goto allocate;
+  file = open(name, O_PATH | O_CLOEXEC);
   if (file < 0)
     return errno;
   if (fstat(file, &info) || !S_ISREG(info.st_mode)) {
@@ -1263,7 +1968,6 @@ static int metadata_open(struct domain *group, const char *name, struct pi_domai
       group->broker = &metadata_binaries[index];
       break;
     }
-  char descriptor[64];
   if (!group->broker) {
     /* The collector owns probes; executions only borrow them. Reuse a vacant
      * slot or retire an idle binary when the bounded table is full. */
@@ -1295,6 +1999,7 @@ static int metadata_open(struct domain *group, const char *name, struct pi_domai
     file = -1;
   }
   group->broker->references++;
+allocate:
   writable = memfd_create("pi-execution-records", MFD_CLOEXEC | MFD_ALLOW_SEALING);
   if (writable < 0 || ftruncate(writable, PI_DOMAIN_TRACE_BYTES)) {
     error = errno;
@@ -1317,6 +2022,8 @@ static int metadata_open(struct domain *group, const char *name, struct pi_domai
     error = errno;
     goto done;
   }
+  group->observing = !*name;
+  state->recording = 1;
   state->metadata_device = ((uint64_t)major(info.st_dev) << 20) | minor(info.st_dev);
   state->metadata_inode = info.st_ino;
   if (bpf_map_update_elem(domain_map, &group->id, state, BPF_EXIST))
@@ -1501,7 +2208,7 @@ static int respond(struct pi_domain_packet *message, const struct ucred *peer, p
     if (active || message->count || !descendant(peer->pid, group->owner) ||
         peer->pid == group->owner)
       return EACCES;
-    if (group->events) {
+    if (group->broker) {
       struct {
         uint64_t owner;
         uint64_t task;
