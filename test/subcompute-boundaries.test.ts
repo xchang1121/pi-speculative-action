@@ -1,8 +1,12 @@
+import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import * as evidence from "../src/filesystem-evidence.ts";
 import { writeFile } from "node:fs/promises";
 import { connect } from "node:net";
 import path from "node:path";
 import { createInterface } from "node:readline";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { Type } from "typebox";
 import { subcomputeEnvironment } from "../src/index.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
@@ -25,11 +29,9 @@ test("disconnecting during computation releases the controlled channel busy coun
 			const channel = controlledSubcomputeChannel(environment)!;
 			const peer = client(environment);
 			peer.send({
-				protocol: 1,
 				op: "compute",
 				context: environment.PI_SUBCOMPUTE_CONTEXT,
 				namespace: "abandoned",
-				version: "1",
 				key: "work",
 			});
 			try {
@@ -77,18 +79,16 @@ test("one protocol connection reuses steps, revalidates snapshots and omits larg
 			const peer = client(environment);
 			const compute = async (key: string, includeInputContent?: boolean) => {
 				peer.send({
-					protocol: 1,
 					op: "compute",
 					context: environment.PI_SUBCOMPUTE_CONTEXT,
 					namespace: "sequential",
-					version: "1",
 					key,
 					includeInputContent,
 					inputResources: [{ path: "large.bin", scope: "content" }],
 				});
 				const initial = await peer.read();
 				if (initial.state === "miss") {
-					peer.send({ op: "publish", durationMs: 1, value: { encoding: "json", value: key } });
+					peer.send({ op: "publish", token: initial.token, durationMs: 1, value: { encoding: "json", value: key } });
 					expect(await peer.read()).toMatchObject({ state: "published", value: { value: key } });
 				}
 				return initial;
@@ -109,7 +109,7 @@ test("one protocol connection reuses steps, revalidates snapshots and omits larg
 				});
 				expect(await compute("bytes", true)).toMatchObject({ state: "hit" });
 				const other = await subcomputeEnvironment();
-				peer.send({ protocol: 1, op: "compute", context: other.PI_SUBCOMPUTE_CONTEXT });
+				peer.send({ op: "compute", context: other.PI_SUBCOMPUTE_CONTEXT });
 				expect(await peer.read()).toMatchObject({ state: "error", error: "subcompute_context_changed" });
 				return { content: [], details: { checked: true } };
 			} finally {
@@ -134,6 +134,122 @@ test("one protocol connection reuses steps, revalidates snapshots and omits larg
 		await host.dispose();
 	}
 }, 30000);
+
+test("JavaScript and Python observe a discovered include, share the result and invalidate on edit", async () => {
+	const cwd = await directories.create();
+	const store = new ProvenanceCertificateStore(await directories.create());
+	const service = new SubcomputeService(cwd, store, () => 1024 * 1024);
+	const header = path.join(cwd, "header.inc");
+	await writeFile(path.join(cwd, "input.bin"), "header.inc");
+	await writeFile(header, "one");
+	try {
+		const env = { ...process.env, ...(await service.environment()) };
+		const run = async (language: "py" | "mjs") => {
+			const script = fileURLToPath(new URL("./subcompute-client." + language, import.meta.url));
+			const exe = language === "mjs" ? process.execPath : process.platform === "win32" ? "python" : "python3";
+			const output = await promisify(execFile)(exe, [script, "include", "--include"], { cwd, env });
+			const { hit, value } = JSON.parse(output.stdout);
+			return { hit, text: Buffer.from(value.value, "base64").toString() };
+		};
+		expect(await run("mjs")).toEqual({ hit: false, text: "one" });
+		expect(await run("py")).toEqual({ hit: true, text: "one" });
+		await writeFile(header, "two");
+		expect(await run("py")).toEqual({ hit: false, text: "two" });
+		expect(await run("mjs")).toEqual({ hit: true, text: "two" });
+		const steps = service.drainMetrics()["cross-language.reverse"]!;
+		expect(steps).toMatchObject({ hits: 2, misses: 2 });
+		expect(steps.reusedMs).toBeGreaterThan(0);
+	} finally {
+		await service.dispose();
+		await store.dispose();
+	}
+});
+
+test("publish validates trailing, repeated and out-of-workspace observations and consumes its token", async () => {
+	const cwd = await directories.create();
+	const store = new ProvenanceCertificateStore(await directories.create());
+	const service = new SubcomputeService(cwd, store, () => 1024 * 1024);
+	const file = path.join(cwd, "dynamic");
+	await writeFile(file, "A");
+	const open = async (key: string) => {
+		const env = await service.environment();
+		const peer = client(env);
+		peer.send({ op: "compute", context: env.PI_SUBCOMPUTE_CONTEXT, namespace: "frontend", key });
+		const reply = await peer.read();
+		return { peer, reply };
+	};
+	const reads = [{ path: "dynamic", scope: "content" }];
+	const value = { encoding: "json", value: 3 };
+	try {
+		const { peer, reply } = await open("tail");
+		expect(reply.state).toBe("miss");
+		peer.send({ op: "publish", token: reply.token, durationMs: 2, value, reads });
+		expect(await peer.read()).toMatchObject({ state: "published" });
+		peer.close();
+		const warm = await open("tail");
+		expect(warm.reply).toMatchObject({ state: "hit", value });
+		warm.peer.close();
+		await writeFile(file, "B");
+		const stale = await open("tail");
+		expect(stale.reply.state).toBe("miss");
+		stale.peer.close();
+		for (const violation of ["change", "escape", "token", "publish"]) {
+			const { peer, reply } = await open(violation);
+			const token = reply.token;
+			peer.send({ op: "observe", token, reads: [...reads, ...reads] });
+			expect(await peer.read()).toEqual({ state: "observed", token });
+			if (violation === "change" || violation === "publish") await writeFile(file, violation);
+			if (violation === "publish") peer.send({ op: "publish", token, durationMs: 2, value });
+			else peer.send({
+				op: "observe", token: violation === "token" ? "other" : token,
+				reads: violation === "escape" ? [{ path: "../escape", scope: "content" }] : reads,
+			});
+			expect(await peer.read()).toMatchObject({ state: "error" });
+			peer.close();
+			const retry = await open(violation);
+			expect(retry.reply.state).toBe("miss");
+			retry.peer.close();
+		}
+	} finally {
+		await service.dispose();
+		await store.dispose();
+	}
+});
+
+test("different step keys borrow the same signed file token until a write or explicit invalidation", async () => {
+	const cwd = await directories.create();
+	const store = new ProvenanceCertificateStore(await directories.create());
+	const service = new SubcomputeService(cwd, store, () => 1024 * 1024);
+	const target = path.join(cwd, "source");
+	await writeFile(target, "initial");
+	const capture = vi.spyOn(evidence, "captureStableFile");
+	const reads = () => capture.mock.calls.filter(([file]) => file === target).length;
+	try {
+		const env = await service.environment();
+		const peer = client(env);
+		try {
+			for (let key = 0; key < 5; key++) {
+				if (key === 3) await writeFile(target, "updated");
+				if (key === 4) service.invalidate([target]);
+				peer.send({
+					op: "compute", context: env.PI_SUBCOMPUTE_CONTEXT, namespace: "cache", key,
+					inputResources: [{ path: "source", scope: "content" }],
+				});
+				const reply = await peer.read();
+				expect(reply.state).toBe("miss");
+				peer.send({ op: "publish", token: reply.token, value: { encoding: "json", value: key }, durationMs: 1 });
+				expect(await peer.read()).toMatchObject({ state: "published" });
+				expect(reads()).toBe(key < 3 ? 1 : key - 1);
+			}
+		} finally {
+			peer.close();
+		}
+	} finally {
+		capture.mockRestore();
+		await service.dispose();
+		await store.dispose();
+	}
+});
 
 test("shutdown prevents late channel creation and concurrent callers share its completion", async () => {
 	const cwd = await directories.create();
@@ -194,11 +310,9 @@ test("public protocol rejects abandoned and oversized work and revalidates chang
 					return { content: [], details: { disconnected: true } };
 				}
 				peer.send({
-					protocol: 1,
 					op: "compute",
 					context: environment.PI_SUBCOMPUTE_CONTEXT,
 					namespace: "boundary",
-					version: "1",
 					key,
 					inputResources: [{ path: "input.bin", scope: "content" }],
 					includeInputContent: true,
@@ -210,6 +324,7 @@ test("public protocol rejects abandoned and oversized work and revalidates chang
 				if (mode === "mutate") await writeFile(path.join(cwd, "input.bin"), "after");
 				peer.send({
 					op: "publish",
+					token: initial.token,
 					durationMs: 1,
 					value: {
 						encoding: "base64",
@@ -266,11 +381,9 @@ test("public protocol rejects abandoned and oversized work and revalidates chang
 		const expired = client(leaked);
 		try {
 			expired.send({
-				protocol: 1,
 				op: "compute",
 				context: leaked.PI_SUBCOMPUTE_CONTEXT,
 				namespace: "boundary",
-				version: "1",
 				key: "late",
 			});
 			expect(await expired.read()).toMatchObject({

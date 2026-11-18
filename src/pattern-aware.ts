@@ -1278,7 +1278,7 @@ export function patternAwareAnalyzerKey(settings: PatternAwareSettings): string 
 		maxFutureGap: settings.maxFutureGap,
 		decayHalfLifeEvents: settings.decayHalfLifeEvents,
 		minOccurrences: settings.minOccurrences,
-		bindingModel: "structured-fields-v1",
+		bindingModel: "structured-fields",
 		maxPatterns: settings.maxPatterns,
 	});
 }

@@ -9,7 +9,7 @@ import {
 	captureStableFile,
 	hashExecutableFile,
 } from "../src/filesystem-evidence.ts";
-import { executionRecords, observeExecution, traceTail, writesWithin } from "../src/strace-observer.ts";
+import { executionRecords, observeExecution, traceTail, writesWithin } from "../src/execution-observer.ts";
 import { temporaryDirectories } from "./filesystem.ts";
 import { effectCommitFailure } from "../src/execution-world.ts";
 import {
@@ -45,7 +45,7 @@ test("rejects malformed process exit outcomes at the public certificate boundary
 		).toThrow("invalid process exit outcome");
 });
 
-function processTrace() {
+function executionTrace() {
 	const frames: Buffer[] = [];
 	const native = executionRecords(() => Buffer.concat(frames.splice(0)), "/private");
 	const tail = traceTail(native, "/work");
@@ -101,10 +101,105 @@ function processTrace() {
 	return { frame, tail, begin, finish, image, exit };
 }
 
+test("attributes domain-interned syscalls to each image that uses them", async () => {
+	const { tail, frame, image, exit } = executionTrace();
+	image("/tools/launcher");
+	const number = Buffer.alloc(8);
+	for (const nr of [10, 329, 70000]) {
+		number.writeBigUInt64LE(BigInt(nr));
+		frame(26, nr, number);
+	}
+	image("/tools/child", 102);
+	await using child = traceTail(tail, "/work", { execution: { pid: 102, start: 0 } });
+	expect((await child.read()).unsafe).toBe(false);
+	for (const id of [10, 70000, 70001]) frame(27, id, Buffer.alloc(0), 102);
+	number.writeBigUInt64LE(70001n);
+	frame(26, 70001, number);
+	exit(102);
+	expect((await child.read()).unsafe).toBe(true);
+	const result = await observeExecution(child, "/tools/child", "/work");
+	expect(result.complete, result.incompleteReasons.join(",")).toBe(true);
+	expect(result.taints).toContain("unsupported_syscall");
+	expect(result.unsupportedSyscalls).toEqual(["mprotect", "syscall_70000", "syscall_70001"]);
+});
+
+test("matches the observed uname bytes against the replay platform", async () => {
+	const { tail, frame, image, begin, exit } = executionTrace();
+	image("/tools/shell");
+	const uts = Buffer.alloc(390);
+	uts.write("Linux");
+	const returned = Buffer.alloc(32 + uts.length);
+	returned.writeBigUInt64LE(63n);
+	returned.writeUInt32LE(uts.length, 24);
+	uts.copy(returned, 32);
+	frame(6, begin(63, 1, [0], []), returned);
+	exit();
+	const observe = (platformFingerprint: string) =>
+		observeExecution(tail, "/tools/shell", "/work", { platformFingerprint });
+	expect((await observe(sha256Digest(uts))).taints).not.toContain("unsupported_syscall");
+	uts[65] = 1;
+	expect((await observe(sha256Digest(uts))).unsupportedSyscalls).toEqual(["uname"]);
+});
+
+test.for([false, true])("resolves fd writes when the broker confirms the open later (read early=%s)", async (early) => {
+	const { tail, frame, image, begin, finish, exit } = executionTrace();
+	image("/tools/writer");
+	const opening = begin(257, 0x1021, [-100, 0, 0], ["marker"]);
+	const request = Buffer.alloc(80);
+	request.writeUInt32LE(101, 8);
+	request.writeInt32LE(257, 16);
+	frame(0, opening, request);
+	finish(opening, 7, 101, 71, 0x8000);
+	await tail.read();
+	const use = Buffer.alloc(32);
+	use.writeBigUInt64LE(71n);
+	use.writeUInt16LE(0x8000, 12);
+	use.writeUInt32LE(7, 24);
+	use.writeUInt32LE(1, 28);
+	frame(24, 100, use);
+	if (early) await tail.read();
+	const reply = Buffer.alloc(24);
+	reply.writeBigInt64LE(7n, 8);
+	frame(4, opening, reply);
+	exit();
+	const observation = await observeExecution(tail, "/tools/writer", "/work", {
+		guardFilesystemSemanticsWithin: ["/work"],
+	});
+	expect(observation.complete, observation.incompleteReasons.join(",")).toBe(true);
+	expect(observation.written).toEqual(["marker"]);
+	expect(observation.taints).not.toContain("untracked_fd");
+});
+
+test.for([
+	[77, "ftruncate"], [91, "fchmod"], [93, "fchown"], [280, "utimensat"], [9, "mmap"],
+] as const)("requires a resolved path for a successful inherited fd mutation (%s)", async ([nr]) => {
+	const { tail, image, begin, finish, exit } = executionTrace();
+	image("/tools/writer");
+	const layout = nr === 9 ? 0x5001 : nr === 280 ? 0x1021 : 0x1001;
+	const args = nr === 9 ? [0, 4096, 2, 1, 7, 0] : [7, 0, 0, 0];
+	const operands = nr === 280 ? [""] : [];
+	const inherited = { mode: 0x8000, inode: 71 };
+	finish(begin(nr, layout, args, operands, inherited), -9);
+	finish(begin(nr, layout, args, operands, { mode: 0x1000, inode: 72 }), 0);
+	finish(begin(257, 0x1021, [-100, 0, 0], ["known"]), 8, 101, 73, 0x8000);
+	finish(begin(nr, layout, args, operands, { mode: 0x8000, inode: 73 }), 0);
+	const options = { guardFilesystemSemanticsWithin: ["/work"] };
+	const before = await observeExecution(tail, "/tools/writer", "/work", options);
+	expect(before.incompleteReasons).not.toContain("unresolved_fd_write");
+	expect(before.taints).not.toContain("untracked_fd");
+	expect(before.written).toEqual(["known"]);
+	finish(begin(nr, layout, args, operands, inherited), 0);
+	exit();
+	const after = await observeExecution(tail, "/tools/writer", "/work", options);
+	expect(after.complete).toBe(false);
+	expect(after.taints).toContain("untracked_fd");
+	expect(after.incompleteReasons).toEqual(["unresolved_fd_write"]);
+});
+
 test.for([undefined, "/tmp/other/socket", "/tmp/pi-step-test/socket"])(
 	"only the authenticated subcompute endpoint bypasses socket taint (%s)",
 	async (controlledSocket) => {
-		const { frame, tail, begin, finish, image, exit } = processTrace();
+		const { frame, tail, begin, finish, image, exit } = executionTrace();
 		image("/tools/client");
 		finish(begin(41, 1, [1, 1], []), 3);
 		const connect = begin(42, 0x1001, [3], [], 31);
@@ -124,7 +219,7 @@ test.for([undefined, "/tmp/other/socket", "/tmp/pi-step-test/socket"])(
 );
 
 test("distinguishes adding a sibling from removing and restoring a pathname binding", async () => {
-	const { tail, begin, finish, image, frame, exit } = processTrace();
+	const { tail, begin, finish, image, frame, exit } = executionTrace();
 	finish(begin(257, 0x1021, [-100, 0, 0], ["input"]), 3);
 	finish(begin(257, 0x1021, [-100, 0, 65], ["output"]), 4);
 	expect((await tail.read()).unsafe).toBe(false);
@@ -170,7 +265,7 @@ test.each([
 ])(
 	"retains incomplete traces and metadata conflicts for transaction qualification ($reason)",
 	async ({ reason, metadata }) => {
-		const { tail, frame, image, begin, finish, exit } = processTrace();
+		const { tail, frame, image, begin, finish, exit } = executionTrace();
 		image("/tools/worker");
 		for (const result of [-512, -2]) finish(begin(262, 0x1021, [-100, 0, 0, 0], ["/tools/missing"]), result);
 		if (metadata) {
@@ -209,7 +304,7 @@ test.each([
 );
 
 test("keeps lookup errno, cwd and the forked child's exit proof in one journal", async () => {
-	const { frame, tail, begin, finish, image, exit } = processTrace();
+	const { frame, tail, begin, finish, image, exit } = executionTrace();
 	image("/tools/walk");
 	finish(begin(80, 0x11, [], ["/work/inside"]), 0);
 	finish(begin(257, 0x1021, [-100], ["subdirectory"]), 3, 101, 41, 0x4000);
@@ -234,7 +329,7 @@ test("keeps lookup errno, cwd and the forked child's exit proof in one journal",
 });
 
 test("marks a successful unmodeled file ioctl as unsupported even when it returns a value", async () => {
-	const { tail, begin, finish, image, exit } = processTrace();
+	const { tail, begin, finish, image, exit } = executionTrace();
 	image("/tools/device");
 	finish(begin(16, 0x1001, [3, 0x1234], [], { inode: 51, mode: 0x8000 }), 1);
 	exit();
@@ -245,7 +340,7 @@ test("marks a successful unmodeled file ioctl as unsupported even when it return
 });
 
 test("uses the kernel order and returned length for writes through output aliases", async () => {
-	const { frame, tail, begin, finish, image, exit } = processTrace();
+	const { frame, tail, begin, finish, image, exit } = executionTrace();
 	image("/tools/emit");
 	for (const [socket, fd, bytes] of [
 		[21, 7, "one"],

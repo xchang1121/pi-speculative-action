@@ -1,7 +1,6 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Static, TSchema } from "@earendil-works/pi-ai";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { bindResourceOperation } from "./agent-execution-world.ts";
 import type { ToolInvocation } from "./execution-world.ts";
@@ -10,7 +9,7 @@ import {
 	UNRESTRICTED_PROCESS_EFFECTS,
 	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "./execution-world.ts";
-import { asRecord, relativeFilesystemPath } from "./primitives.ts";
+import { asRecord, digestObject, relativeFilesystemPath } from "./primitives.ts";
 import {
 	computeStepInView,
 	snapshotPreparation,
@@ -22,7 +21,6 @@ declare const stepTypes: unique symbol;
 /** An immutable definition, not a cached value. Share this definition between tools to share work. */
 export interface SpeculativeStep<Input, Output> {
 	readonly id: string;
-	readonly version: string;
 	readonly [stepTypes]: {
 		readonly input: Input;
 		readonly output: Output;
@@ -64,15 +62,12 @@ export type SpeculativeToolContext<Dependencies extends Steps, Effect extends Sp
 	readonly fs: Effect extends "observation" ? SpeculativeFiles : SpeculativeWritableFiles;
 };
 type StepDefinition = {
-	readonly contract: Readonly<Record<string, { readonly id: string; readonly version: string }>>;
+	readonly contract: Readonly<Record<string, string>>;
 	readonly dependencies: Steps;
 	readonly run: (context: SpeculativeStepContext, input: any) => Promise<unknown> | unknown;
 };
 const stepDefinitions = new WeakMap<object, StepDefinition>();
 const toolInvocations = new WeakMap<Function, (cwd: string) => ToolInvocation>();
-const versioned = (id: string, version: string) => {
-	if (!id?.trim() || !version?.trim()) throw new Error("Speculative definitions require an id and version");
-};
 const dependencies = (steps: Steps): Steps => {
 	const snapshot = Object.freeze({ ...steps });
 	for (const step of Object.values(snapshot))
@@ -94,24 +89,18 @@ const targetPath = (cwd: string, target: string) => {
  * declared children or fs reads; external library/configuration changes require a new definition. */
 export function defineSpeculativeStep<Input, Output, Dependencies extends Steps = {}>(definition: {
 	readonly id: string;
-	readonly version: string;
 	readonly dependencies: Dependencies;
 	readonly run: (
 		context: SpeculativeStepContext<Dependencies>,
 		input: Readonly<Input>,
 	) => Output | Promise<Output>;
 }): SpeculativeStep<Input, Output> {
-	versioned(definition.id, definition.version);
-	const step = Object.freeze({
-		id: definition.id,
-		version: definition.version,
-	}) as SpeculativeStep<Input, Output>;
+	if (!definition.id?.trim()) throw new Error("Speculative step requires an id");
+	const step = Object.freeze({ id: definition.id }) as SpeculativeStep<Input, Output>;
 	const children = dependencies(definition.dependencies);
 	stepDefinitions.set(step, {
 		contract: Object.freeze(
-			Object.fromEntries(
-				Object.entries(children).map(([name, child]) => [name, { id: child.id, version: child.version }]),
-			),
+			Object.fromEntries(Object.entries(children).map(([name, child]) => [name, child.id])),
 		),
 		dependencies: children,
 		run: definition.run as StepDefinition["run"],
@@ -177,7 +166,6 @@ function context(
 				view,
 				{
 					namespace: step.id,
-					version: step.version,
 					key: { cwd, input: owned.value, dependencies: definition.contract },
 				},
 				(inputs, sharedSignal) =>
@@ -196,7 +184,7 @@ export function defineSpeculativeTool<
 	Effect extends SpeculativeToolEffect,
 >(
 	definition: Omit<ToolDefinition<Parameters, Details>, "execute"> & {
-		readonly version: string;
+		readonly identity?: unknown;
 		readonly effect: Effect;
 		readonly steps: Dependencies;
 		/** Pure ordering hints only. Actual reads, not these paths, authorize adoption. */
@@ -207,12 +195,16 @@ export function defineSpeculativeTool<
 		) => Promise<AgentToolResult<Details>>;
 	},
 ): ToolDefinition<Parameters, Details> {
-	const { version, effect, steps, resources, execute, ...tool } = definition;
-	versioned(tool.name, version);
+	const { identity: explicitIdentity, effect, steps, resources, execute, ...tool } = definition;
+	if (!tool.name?.trim()) throw new Error("Speculative tool requires a name");
 	if (!["observation", "workspace_mutation", "actor"].includes(effect))
 		throw new Error("Unknown speculative tool effect");
 	const selected = dependencies(steps);
-	const identity = Object.freeze({ definition: randomUUID(), version });
+	const identity = digestObject({
+		tool: tool.name,
+		parameters: tool.parameters ?? null,
+		identity: explicitIdentity,
+	});
 	const invocation = (directory: string): ToolInvocation => {
 		const cwd = path.resolve(directory);
 		const filesystem: NonNullable<ToolInvocation["filesystem"]> = async (view, request) => {
@@ -234,7 +226,7 @@ export function defineSpeculativeTool<
 			...(effect === "actor" ? { authoritativeOnly: true as const } : {}),
 			semantics: {
 				tool: tool.name,
-				epoch: `pi.speculative-tool:${version}`,
+				epoch: `pi.speculative-tool:${tool.name}`,
 				effect: effect === "actor" ? "unbounded" : effect,
 				requirements:
 					effect === "observation"

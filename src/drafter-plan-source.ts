@@ -722,11 +722,11 @@ function observationContext(
 	observations: readonly ToolResultMessage[],
 ): Context {
 	const candidates = missing.map(({ call, action }) => {
-		const { version, content = OBSERVATION_CONTENT } = toolObservationContract(action);
+		const { content = OBSERVATION_CONTENT } = toolObservationContract(action);
 		return {
 			call,
 			tool: batch.context.tools?.find((tool) => tool.name === call.name),
-			observation: { version, content },
+			observation: { content },
 		};
 	});
 	return {

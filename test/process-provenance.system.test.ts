@@ -5,8 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
+import { nativeBuildDefinitions } from "../src/config-schema.ts";
 import { executionDomainCollector, resolveLinuxExecHelper } from "../src/linux-held-exec.ts";
-import { executionRecords, observeExecution, traceTail } from "../src/strace-observer.ts";
+import { executionRecords, observeExecution, traceTail } from "../src/execution-observer.ts";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { expect, test } from "vitest";
 import {
@@ -94,6 +95,78 @@ int main(int argc, char **argv) {
 		} finally {
 			await host.dispose();
 			await fixture.dispose();
+		}
+	},
+);
+
+test.skipIf(process.platform !== "linux")(
+	"isolates domain quotas, attributes unsupported calls across fork and detects inherited fd writes",
+	async () => {
+		const binary = await resolveLinuxExecHelper(process.env.PI_SPEC_HELD_EXEC);
+		const collector = await executionDomainCollector(binary);
+		const root = await mkdtemp(path.join(os.homedir(), "pi-domain-observer-"));
+		const probe = path.join(root, "probe");
+		try {
+			execFileSync("cc", [
+				...nativeBuildDefinitions(resolveSpeculativeConfig({ nativeBuild: { domainTraceBytes: 104 } })),
+				'-DPI_DOMAIN_BUILD="' + "0".repeat(64) + '"',
+				"-O2",
+				"-ffunction-sections",
+				"-fdata-sections",
+				fileURLToPath(new URL("./execution-observer-fixture.c", import.meta.url)),
+				"-Wl,--gc-sections",
+				"-o",
+				probe,
+			]);
+			execFileSync(probe, ["quota"]);
+			await using inherited = await open(path.join(root, "inherited"), "w+");
+			for (const mode of ["read", "write", "write", "fd"]) {
+				const domain = collector.open();
+				try {
+					const read = domain.trace();
+					const [launch, ...args] = domain.launch([probe, mode]);
+					execFileSync(launch, args, { stdio: ["ignore", "pipe", "pipe", inherited.fd] });
+					const definitions: number[] = [];
+					const numbers = [10, 329, 254, 301, 241, 244, 129, 297, 444, 70000];
+					const records = executionRecords(() => {
+						const bytes = read();
+						for (let offset = 0; offset < bytes.length; ) {
+							const size = bytes.readUInt32LE(offset + 40);
+							if (bytes.readBigUInt64LE(offset + 32) === 26n)
+								definitions.push(Number(bytes.readBigUInt64LE(offset + 48)));
+							offset += (48 + size + 7) & ~7;
+						}
+						return bytes;
+					});
+					await using tail = traceTail(records, root);
+					const observation = await observeExecution(tail, probe, root);
+					expect(new Set(definitions).size).toBe(definitions.length);
+					if (mode === "fd") {
+						expect(observation.complete).toBe(false);
+						expect(observation.taints).toContain("untracked_fd");
+						expect(observation.incompleteReasons).toContain("unresolved_fd_write");
+						continue;
+					}
+					expect(observation.complete, observation.incompleteReasons.join(",")).toBe(true);
+					if (mode === "read") {
+						expect(observation.taints).not.toContain("unsupported_syscall");
+					} else {
+						expect(definitions).toEqual(expect.arrayContaining(numbers));
+						expect(observation.taints).toContain("unsupported_syscall");
+						expect(observation.unsupportedSyscalls).toEqual(expect.arrayContaining([
+							"mprotect", "pkey_mprotect", "syscall_70000",
+						]));
+						for (const pid of observation.pids!) {
+							const uses = records.journal.filter((r) => r.pid === pid && r.unsupported?.name === "syscall_70000");
+							expect(uses).toHaveLength(1);
+						}
+					}
+				} finally {
+					domain.close();
+				}
+			}
+		} finally {
+			await rm(root, { recursive: true, force: true });
 		}
 	},
 );

@@ -28,11 +28,11 @@ export default function extension(pi) {
   registerSpeculativeTool(pi, defineSpeculativeTool({
     name: "count_bytes", label: "Count bytes", description: "Count bytes in a file",
     parameters: Type.Object({ path: Type.String() }),
-    version: "1", effect: "observation", steps: {},
+    effect: "observation", steps: {},
     execute: async ({ computeStep, cwd }, input) => {
       const file = path.resolve(cwd, input.path);
       const count = await computeStep({
-        namespace: "example.byte-count", version: "1", key: input.path,
+        namespace: "example.byte-count", key: input.path,
         inputResources: [{ path: file, scope: "content" }],
       }, async view => (await view.readFile(file)).length);
       return { content: [{ type: "text", text: String(count) }], details: { count } };
@@ -41,7 +41,7 @@ export default function extension(pi) {
 }
 ```
 
-`computeStep` 接受同步或异步计算，返回结构化数据、`Buffer` 或 `Uint8Array`。结果按序列化后的真实字节数计费。实现或依赖库变化时更新 `version`；文件通过传入视图读取，其他输入放入 `key` 或声明的环境键。
+`computeStep` 接受同步或异步计算，返回结构化数据、`Buffer` 或 `Uint8Array`。结果按序列化后的真实字节数计费。实现与依赖库的变化通过显式 `key` 区分；文件通过传入视图读取，其他输入放入 `key` 或声明的环境键。
 
 分层计算继续使用 `defineSpeculativeStep`；见[工具模板](docs/speculative-tool-template.md)和[报表示例](examples/speculative-tool.ts)。修改类工具的视图提供 `prepare`、`computeStep`、`stat`、`readdir`。外层工作区分支回滚后，仅依赖基线只读输入的步骤仍可供后续调用采用。
 
@@ -74,6 +74,8 @@ export default function extension(pi) {
 
 环境契约支持 `exact`、`allowlist`、`denylist`、`isolated`。投影列表由 `environmentKeys` 提供，隔离环境由 `isolatedEnvironment` 提供。默认比较完整业务环境；`PI_SUBCOMPUTE_SOCKET`、`PI_SUBCOMPUTE_CONTEXT` 两个协议句柄排除在环境摘要之外，受控通道读取的输入纳入进程证书。`replayAcceptedTaints` 默认空列表；用户可显式允许负载所需的 `clock`、`random`、`pid_observation`、`descriptor_observation` 等标记。
 
+Linux 进程证据按执行域记录未知系统调用，并标记实际调用它的进程映像。未知调用和请求写权限的 `mprotect`、`pkey_mprotect` 会产生 `unsupported_syscall`。对继承文件描述符的写操作若无法定位到文件路径，证书会记录 `unresolved_fd_write`，由原生进程执行该命令。
+
 运行时服务共享随设置更新的配置引用，后台回收使用当前策略。ext4、XFS、Btrfs、F2FS 默认使用 100 ms 文件静置窗，其他文件系统保留 2000 ms 默认值。Windows 对象租约助手默认空闲保活 30 秒，可通过 `filesystem.objectLeaseIdleMs` 调整；解释器启动失败进入重试冷却期，文件工具继续正常执行。
 
 `nativeBuild` 容量用于编译 Linux 助手。调整后将同一份 `config` 对象保存为 JSON，执行 `npm run setup:linux -- --config /path/to/config.json`，再重启执行域。运行时核对源码和编译配置指纹。
@@ -85,14 +87,17 @@ export default function extension(pi) {
 每个连接使用换行分隔的 JSON，可在同一调用令牌有效期内顺序执行多个步骤，共享输入会话。每个步骤执行一次查询，未命中时再发布结果：
 
 ```json
-{"protocol":1,"op":"compute","context":"调用令牌","namespace":"example.transform","version":"1","key":"job","inputResources":[{"path":"input.bin","scope":"content"}],"envKeys":["MODE"],"environment":{"MODE":"fast"}}
+{"op":"compute","context":"调用令牌","namespace":"example.transform","key":"job","inputResources":[{"path":"input.bin","scope":"content"}],"envKeys":["MODE"],"environment":{"MODE":"fast"}}
 ```
 
-命中返回 `state: "hit"` 和 `value`。未命中返回 `state: "miss"` 及输入快照的路径和元数据。`includeInputContent` 默认 `false`；需要响应携带文件内容时，在查询中显式设置 `includeInputContent: true`，内容以 Base64 返回。外部程序完成计算后发送：
+命中返回 `state: "hit"` 和 `value`。未命中返回 `state: "miss"` 、步骤令牌 `token` 及输入快照的路径和元数据。`includeInputContent` 默认 `false`；需要响应携带文件内容时，在查询中显式设置 `includeInputContent: true`，内容以 Base64 返回。外部程序发现新的输入时，先发送观测请求。收到 `{"state":"observed","token":"步骤令牌"}` 后读取该输入。计算完成后用同一个令牌发布结果。
 
 ```json
-{"op":"publish","value":{"encoding":"base64","value":"YWJj"},"durationMs":12.5}
+{"op":"observe","token":"步骤令牌","reads":[{"path":"include/config.h","scope":"content"}]}
+{"op":"publish","token":"步骤令牌","value":{"encoding":"base64","value":"YWJj"},"durationMs":12.5}
 ```
+
+发布帧也可用 `reads` 声明最后一批依赖。发布时会重新验证所有已观测输入，同一步内资源发生变化会返回错误。后续相同查询会验证已保存的动态依赖。
 
 结构化输出使用 `{"encoding":"json","value":...}`。发布完成返回 `state: "published"`；错误返回 `state: "error"`。令牌随工具调用结束或超时撤销。示例见 [JavaScript 客户端](test/subcompute-client.mjs)和 [Python 客户端](test/subcompute-client.py)。
 

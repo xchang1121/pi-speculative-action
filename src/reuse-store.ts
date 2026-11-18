@@ -4,7 +4,6 @@ import { readSync } from "node:fs";
 import {
 	mkdir,
 	open,
-	readFile,
 	readdir,
 	rename,
 	rm,
@@ -56,7 +55,6 @@ import {
 	type ProvenanceTaint,
 } from "./provenance-certificate.ts";
 import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
-import { type SerializedTimelineComputation } from "./task-timing.ts";
 /** maxCertificates is the shared metadata-record limit, including persistent input versions. */
 export interface ProvenanceStoreLimits {
 	readonly maxCertificates: number;
@@ -89,28 +87,23 @@ export interface ProvenanceStoreGCResult {
 export interface StoredInputVersion {
 	readonly id: Sha256Digest;
 	readonly createdAt: number;
-	readonly schema: 1;
 	readonly payload: unknown;
 	readonly artifacts: readonly ArtifactReference[];
 }
-/** A restart candidate carries evidence, never the old callback's live authority. */
-export interface StoredProcessCheckpoint {
-	readonly schema: 1;
-	readonly id: Sha256Digest;
-	readonly ticket: string;
-	readonly createdAt: number;
-	readonly sessionID: string;
-	readonly sourceRoot: string;
-	readonly physicalRoot: string;
-	readonly context: Sha256Digest;
-	readonly producer: {
-		readonly pid: number;
-		readonly start: string;
-	};
-	readonly certificate: ProcessProvenanceCertificate;
-	readonly computation: SerializedTimelineComputation;
-	readonly image: ArtifactReference;
-}
+const metadataDDL = {
+	changes: "CREATE TABLE changes(path TEXT PRIMARY KEY, revision INTEGER NOT NULL)",
+	certificates: "CREATE TABLE certificates(id TEXT PRIMARY KEY, value TEXT NOT NULL, weakKey TEXT NOT NULL, executable TEXT NOT NULL, createdAt REAL NOT NULL)",
+	candidates: "CREATE INDEX candidates ON certificates(executable, weakKey, createdAt DESC, id DESC)",
+	input_versions: "CREATE TABLE input_versions(id TEXT PRIMARY KEY, root TEXT NOT NULL, value TEXT NOT NULL)",
+	input_versions_root: "CREATE INDEX input_versions_root ON input_versions(root)",
+	input_preparations: `CREATE TABLE input_preparations(
+		root TEXT NOT NULL, binding TEXT NOT NULL, prep_key TEXT NOT NULL,
+		input_id TEXT NOT NULL REFERENCES input_versions(id) ON DELETE CASCADE, updated_at INTEGER NOT NULL,
+		PRIMARY KEY (root, binding, prep_key, input_id)
+	) WITHOUT ROWID`,
+	input_preparations_recent: "CREATE INDEX input_preparations_recent ON input_preparations(root, binding, prep_key, updated_at DESC, input_id DESC)",
+	input_preparations_owner: "CREATE INDEX input_preparations_owner ON input_preparations(input_id)",
+};
 /** Immutable effects; use store.artifacts to participate in a shared store's publication and retention lifecycle. */
 export class ArtifactCAS {
 	readonly root: string;
@@ -583,45 +576,12 @@ export class ProvenanceCertificateStore {
 	get(id: Sha256Digest, signal?: AbortSignal): Promise<ProcessProvenanceCertificate | undefined> {
 		return this.record("certificates", id, decodeCertificate, signal);
 	}
-	/** @deprecated Running process images are no longer retained. */
-	issueProcessCheckpoint(): Promise<string> {
-		return Promise.reject(new Error("running process checkpoints are unsupported"));
-	}
-	async putProcessCheckpoint(
-		_ticket: string,
-		_input: Omit<StoredProcessCheckpoint, "schema" | "id" | "createdAt" | "ticket">,
-	): Promise<StoredProcessCheckpoint> {
-		throw new Error("running process checkpoints are unsupported");
-	}
-	async mayHaveProcessCheckpoints(
-		_sessionID: string,
-		_executablePath?: string,
-		signal?: AbortSignal,
-	): Promise<boolean> {
-		signal?.throwIfAborted();
-		return false;
-	}
-	async *processCheckpoints(
-		_weakKey: Sha256Digest,
-		_executablePath: string,
-		_sessionID: string,
-		signal?: AbortSignal,
-	): AsyncGenerator<StoredProcessCheckpoint> {
-		signal?.throwIfAborted();
-	}
-	async claimProcessCheckpoint(
-		_ticket: string,
-		_certificate: Sha256Digest,
-	): Promise<((consumed: boolean) => Promise<void>) | undefined> {
-		return undefined;
-	}
 	/** Input metadata shares certificate publication, retention, and crash recovery; it grants no execution authority. */
 	async putInputVersion(
 		payload: unknown,
 		artifacts: readonly ArtifactReference[],
 	): Promise<StoredInputVersion> {
 		const body = {
-			schema: 1 as const,
 			createdAt: Date.now(),
 			payload,
 			artifacts,
@@ -630,24 +590,49 @@ export class ProvenanceCertificateStore {
 		const record = decodeInputVersion(stableStringify({ ...body, id }));
 		if (!record) throw new Error("invalid persistent input version");
 		return this.publishRoot(`input:${id}`, record.artifacts, (database) => {
-			database
-				.prepare("INSERT OR REPLACE INTO input_versions VALUES (?, ?)")
-				.run(id, stableStringify(record));
+			const input = record.payload as { root: string; preparations: readonly { binding: string; key: string }[] };
+			if (typeof input?.root !== "string" || !Array.isArray(input.preparations))
+				throw new Error("invalid persistent input scope");
+			database.prepare("INSERT OR REPLACE INTO input_versions(id, root, value) VALUES (?, ?, ?)")
+				.run(id, input.root, stableStringify(record));
+			const index = database.prepare("INSERT OR IGNORE INTO input_preparations VALUES (?, ?, ?, ?, ?)");
+			for (const { binding, key } of input.preparations) {
+				if (typeof binding !== "string" || typeof key !== "string") throw new Error("invalid preparation key");
+				index.run(input.root, binding, digestObject(key), id, record.createdAt);
+			}
 			return record;
 		});
 	}
 	getInputVersion(id: Sha256Digest, signal?: AbortSignal): Promise<StoredInputVersion | undefined> {
 		return this.record("input_versions", id, decodeInputVersion, signal);
 	}
+	async findPreparedInputCandidates(query: {
+		root: string;
+		binding: string;
+		prepKey: string;
+		limit?: number;
+	}, signal?: AbortSignal): Promise<readonly StoredInputVersion[]> {
+		const limit = query.limit ?? this.configuration.current.filesystem.maxHistoryEntries;
+		if (!isSafeCount(limit, 1, this.configuration.current.filesystem.maxHistoryEntries))
+			throw new Error("invalid input discovery limit");
+		const candidates: StoredInputVersion[] = [];
+		for await (const record of this.records(
+			`SELECT i.id, i.value FROM input_preparations p JOIN input_versions i ON i.id = p.input_id
+			 WHERE p.root = ? AND p.binding = ? AND p.prep_key = ?
+			 ORDER BY p.updated_at DESC, p.input_id DESC LIMIT ?`,
+			[query.root, query.binding, query.prepKey, limit], decodeInputVersion, "input_preparations", signal,
+		)) candidates.push(record);
+		return candidates;
+	}
 	/** Finite discovery hints, newest publication first; every row still needs current input and CAS validation. */
-	async *candidatesInputVersions(limit: number, signal?: AbortSignal): AsyncGenerator<StoredInputVersion> {
-		if (!Number.isSafeInteger(limit) || limit < 1 || limit > speculativeConfig().filesystem.maxHistoryEntries)
+	async *candidatesInputVersions(root: string, limit: number, signal?: AbortSignal): AsyncGenerator<StoredInputVersion> {
+		if (!isSafeCount(limit, 1, this.configuration.current.filesystem.maxHistoryEntries))
 			throw new Error("invalid input discovery limit");
 		yield* this.records(
-			"SELECT id, value FROM input_versions ORDER BY rowid DESC LIMIT ?",
-			[limit],
+			"SELECT id, value FROM input_versions WHERE root = ? ORDER BY rowid DESC LIMIT ?",
+			[root, limit],
 			decodeInputVersion,
-			false,
+			"input_versions",
 			signal,
 		);
 	}
@@ -672,7 +657,7 @@ export class ProvenanceCertificateStore {
 			"SELECT id, value FROM certificates WHERE weakKey = ? AND executable = ? ORDER BY createdAt DESC, id DESC",
 			[weakKey, executablePath],
 			decodeCertificate,
-			true,
+			"certificates",
 			signal,
 		))
 			if (certificate.weakKey === weakKey && !excludedCertificates?.has(certificate.id)) yield certificate;
@@ -687,7 +672,7 @@ export class ProvenanceCertificateStore {
 							? "SELECT 1 FROM certificates LIMIT 1"
 							: "SELECT 1 FROM certificates WHERE executable = ? LIMIT 1",
 						executablePath === undefined ? [] : [executablePath],
-						true,
+						"certificates",
 						signal,
 					)
 				).length,
@@ -720,7 +705,7 @@ export class ProvenanceCertificateStore {
 			this.lifecycle
 				.admit(async () => {
 					const revision = Number(
-						(await this.query("SELECT revision FROM changes WHERE path = ''", [], true))[0]?.revision ?? 0,
+						(await this.query("SELECT revision FROM changes WHERE path = ''", [], "changes"))[0]?.revision ?? 0,
 					);
 					return this.collect(await this.inventory(), revision);
 				})
@@ -849,11 +834,12 @@ export class ProvenanceCertificateStore {
 		return result;
 	}
 	private async inventory(control?: DatabaseSync): Promise<StoreInventory> {
-		const read = (sql: string) =>
-			control ? Promise.resolve(control.prepare(sql).all()) : this.query(sql, [], true);
+		const read = (sql: string, table: keyof typeof metadataDDL) =>
+			control ? Promise.resolve(control.prepare(sql).all()) : this.query(sql, [], table);
 		const records: StoredRoot[] = (
 			await read(
 				"SELECT 'certificate' AS kind, id, value FROM certificates UNION ALL SELECT 'input', id, value FROM input_versions",
+				"input_versions",
 			)
 		).map(({ kind: storedKind, id, value }) => {
 			const kind = storedKind === "certificate" ? "certificate" : "input";
@@ -878,7 +864,7 @@ export class ProvenanceCertificateStore {
 				references,
 			};
 		});
-		const keys = await read("SELECT path FROM changes WHERE path NOT IN ('', '.clear')");
+		const keys = await read("SELECT path FROM changes WHERE path NOT IN ('', '.clear')", "changes");
 		const roots = await this.payloadRoots();
 		const paths = (await mapFilesystem(roots, filesUnder)).flat();
 		const artifacts = new Map<Sha256Digest, StoredFile>();
@@ -911,7 +897,7 @@ export class ProvenanceCertificateStore {
 	private async payloadRoots(): Promise<readonly string[]> {
 		return [
 			this.artifacts.root,
-			...(await readdir(this.root))
+			...((await readdir(this.root).catch(ignoreMissing)) ?? [])
 				.filter((name) => /^\.clear-[0-9a-f-]{36}$/.test(name))
 				.map((name) => path.join(this.root, name)),
 		];
@@ -949,7 +935,7 @@ export class ProvenanceCertificateStore {
 	): Promise<T | undefined> {
 		digestHex(id);
 		const value = (
-			await this.query(`SELECT value FROM ${table} WHERE id = ?`, [id], table === "certificates", signal)
+			await this.query(`SELECT value FROM ${table} WHERE id = ?`, [id], table, signal)
 		)[0]?.value;
 		const record = decode(value);
 		if (value !== undefined && record?.id !== id) throw new Error(`record integrity check failed for ${id}`);
@@ -964,32 +950,27 @@ export class ProvenanceCertificateStore {
 		sql: string,
 		parameters: SQLInputValue[],
 		decode: (value: unknown) => T | undefined,
-		migrate: boolean,
+		table: keyof typeof metadataDDL,
 		signal?: AbortSignal,
 	): AsyncGenerator<T> {
-		for (const { id, value } of await this.query(sql, parameters, migrate, signal)) {
+		for (const { id, value } of await this.query(sql, parameters, table, signal)) {
 			signal?.throwIfAborted();
 			this.signal.throwIfAborted();
 			const record = decode(value);
 			if (record?.id === id) yield record;
 		}
 	}
-	/** Every committed read owns fresh SQLite state. Legacy migration remains an explicit writer operation. */
+	/** A lookup opens existing metadata read-only. */
 	private query(
 		sql: string,
 		parameters: SQLInputValue[],
-		migrate: boolean,
+		table: keyof typeof metadataDDL,
 		signal?: AbortSignal,
 	): Promise<Record<string, SQLOutputValue>[]> {
 		return this.read(async (signal) => {
 			const publication = this.publication.getStore();
 			if (publication?.active) return publication.database.prepare(sql).all(...parameters);
-			let rows = await this.queryReadonly(sql, parameters, signal);
-			if (rows === undefined && migrate) {
-				await this.exclusive(async () => {}, [], false, signal);
-				rows = await this.queryReadonly(sql, parameters, signal);
-				if (rows === undefined) throw new Error("provenance store metadata is unavailable");
-			}
+			const rows = await this.queryReadonly(sql, parameters, table, signal);
 			signal.throwIfAborted();
 			return rows ?? [];
 		}, signal);
@@ -997,6 +978,7 @@ export class ProvenanceCertificateStore {
 	private async queryReadonly(
 		sql: string,
 		parameters: SQLInputValue[],
+		table: keyof typeof metadataDDL,
 		signal: AbortSignal,
 	): Promise<Record<string, SQLOutputValue>[] | undefined> {
 		const target = path.join(this.root, "metadata.sqlite");
@@ -1005,10 +987,8 @@ export class ProvenanceCertificateStore {
 		signal.throwIfAborted();
 		const database = new DatabaseSync(target, { readOnly: true });
 		try {
-			const version = Number(database.prepare("PRAGMA user_version").get()?.user_version);
-			if (version < 3) return;
-			if (version !== 3 && version !== 4 && version !== 5)
-				throw new Error(`unsupported provenance store version ${version}`);
+			if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table))
+				return;
 			database.exec("PRAGMA query_only=ON");
 			const rows: Record<string, SQLOutputValue>[] = [];
 			let bytes = 0;
@@ -1026,7 +1006,6 @@ export class ProvenanceCertificateStore {
 	private async exclusive<T>(
 		operation: (database: DatabaseSync) => Promise<T>,
 		touched: readonly string[] = [],
-		mutate = true,
 		signal?: AbortSignal,
 	): Promise<T> {
 		const publication = this.publication.getStore();
@@ -1045,10 +1024,6 @@ export class ProvenanceCertificateStore {
 			admission.throwIfAborted();
 			const database = (this.control ??= await this.open(admission));
 			this.maintain();
-			if (!mutate) {
-				admission.throwIfAborted();
-				return operation(database);
-			}
 			await sqliteReady(() => {
 				database.exec("BEGIN IMMEDIATE");
 				admitted = true;
@@ -1082,42 +1057,20 @@ export class ProvenanceCertificateStore {
 		if (!this.reservedRoot) await mkdir(this.root, { recursive: true });
 		const database = new DatabaseSync(path.join(this.root, "metadata.sqlite"));
 		try {
-			database.exec("PRAGMA synchronous=NORMAL");
-			const version = Number(
-				await sqliteReady(() => database.prepare("PRAGMA user_version").get()?.user_version, signal),
-			);
-			if (version === 5) return database;
-			if (version > 5) throw new Error(`unsupported provenance store version ${version}`);
 			await sqliteReady(() => database.exec("PRAGMA auto_vacuum=FULL; PRAGMA journal_mode=WAL"), signal);
+			database.exec("PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON");
 			await sqliteReady(() => database.exec("BEGIN IMMEDIATE"), signal);
-			database.exec(
-				"CREATE TABLE IF NOT EXISTS changes(path TEXT PRIMARY KEY, revision INTEGER NOT NULL); INSERT OR IGNORE INTO changes VALUES ('', 0); CREATE TABLE IF NOT EXISTS certificates(id TEXT PRIMARY KEY, value TEXT NOT NULL, weakKey TEXT NOT NULL, executable TEXT NOT NULL, createdAt REAL NOT NULL); CREATE INDEX IF NOT EXISTS candidates ON certificates(executable, weakKey, createdAt DESC, id DESC)",
-			);
-			if (database.prepare("PRAGMA user_version").get()?.user_version === 0) {
-				const root = path.join(this.root, "certificates");
-				for (const file of await filesUnder(root)) {
-					const value = await readFile(file, "utf8").catch(() => undefined);
-					const certificate = decodeCertificate(value);
-					if (
-						certificate &&
-						path.relative(root, file).split(path.sep).join("") === `${digestHex(certificate.id)}.json`
-					)
-						writeCertificate(database, certificate);
-				}
-				database.exec("PRAGMA user_version=1");
+			const objects = database.prepare("SELECT name, sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'").all();
+			for (const { name, sql } of objects) {
+				if (!Object.hasOwn(metadataDDL, String(name)) || metadataDDL[name as keyof typeof metadataDDL] !== sql)
+					throw new Error("incompatible provenance store schema: " + name);
 			}
-			database.exec("COMMIT"); // Imported metadata is durable before any legacy file is removed.
-			if (database.prepare("PRAGMA user_version").get()?.user_version === 1) {
-				await sqliteReady(() => database.exec("BEGIN IMMEDIATE"), signal);
-				await mapFilesystem(["certificates", "indexes"], (segment) =>
-					rm(path.join(this.root, segment), { recursive: true, force: true }),
-				);
-				database.exec("PRAGMA user_version=2; COMMIT");
+			for (const [name, ddl] of Object.entries(metadataDDL)) {
+				if (objects.length && ddl.startsWith("CREATE TABLE") && !objects.some((row) => row.name === name))
+					throw new Error("incompatible provenance store schema: missing " + name);
+				database.exec(ddl.replace(/^(CREATE (?:TABLE|INDEX)) /, "$1 IF NOT EXISTS "));
 			}
-			await sqliteReady(() => database.exec("BEGIN IMMEDIATE"), signal);
-			database.exec(
-				"CREATE TABLE IF NOT EXISTS input_versions(id TEXT PRIMARY KEY, value TEXT NOT NULL); DROP TABLE IF EXISTS process_checkpoints; DROP TABLE IF EXISTS checkpoint_owner; PRAGMA user_version=5; COMMIT",
-			);
+			database.exec("INSERT OR IGNORE INTO changes VALUES ('', 0); COMMIT");
 			return database;
 		} catch (error) {
 			database.close();
@@ -1251,7 +1204,7 @@ function decodeInputVersion(value: unknown): StoredInputVersion | undefined {
 		const record = JSON.parse(value) as StoredInputVersion;
 		const { id, ...body } = record;
 		if (
-			record.schema !== 1 ||
+			Object.keys(record).some((key) => !["id", "createdAt", "payload", "artifacts"].includes(key)) ||
 			!Number.isFinite(record.createdAt) ||
 			!isSha256Digest(id) ||
 			digestObject(body) !== id ||

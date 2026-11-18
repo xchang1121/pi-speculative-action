@@ -5105,6 +5105,7 @@ export function makeSpeculativeActionRuntime<
 		const paths = (adopted || effect === "workspace_mutation" ? changed : []).filter((resource) =>
 			path.isAbsolute(resource),
 		);
+		if (paths.length) adapter.onResourceWrites?.(paths);
 		// A native unbounded call names no write set; its neighbours validate at adoption.
 		const unbounded = !adopted && effect === "unbounded";
 		const candidates = candidateStore.values(session.id);

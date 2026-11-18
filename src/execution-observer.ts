@@ -5,8 +5,11 @@ import {
 	type FilesystemObservationField,
 	filesystemObservationDigest,
 } from "./filesystem-evidence.ts";
-import { type Sha256Digest, containsLogicalPath, stableEqual } from "./primitives.ts";
+import { type Sha256Digest, containsLogicalPath, sha256Digest, stableEqual } from "./primitives.ts";
 import { type DependencyRole, type ProvenanceTaint } from "./provenance-certificate.ts";
+// Linux new_utsname contains six 65-byte fields, including their padding.
+export const UTSNAME_BYTES = 6 * 65;
+
 export type ObservedProcessPath =
 	/** `listed` when its entries reached the run: it read them, or a removal or rename found some. */
 	| {
@@ -22,7 +25,7 @@ export type ObservedProcessPath =
 			readonly followSymlinks: boolean;
 			readonly afterWrite?: true;
 	  } & StatObservation);
-export interface StraceObservation {
+export interface ExecutionObservation {
 	readonly streamMetadataObserved?: boolean;
 	readonly output?: readonly {
 		readonly fd: 1 | 2;
@@ -50,10 +53,11 @@ export interface StraceObservation {
 		readonly exclusive: boolean;
 	}[];
 }
-export interface StraceObservationOptions {
+export interface ExecutionObservationOptions {
 	/** Authenticated host subcomputation channel; its input evidence is imported by the caller. */
 	readonly controlledSocket?: string;
 	readonly dispatcherSocket?: string;
+	readonly platformFingerprint?: string;
 	/** A native exec boundary in this trace; the original execution owns all records. */
 	readonly execution?: {
 		readonly pid: number;
@@ -84,18 +88,18 @@ export interface StraceObservationOptions {
 // Each row starts at its first Linux x86-64 syscall number. Gaps have no entry.
 const syscallNames: Readonly<Record<number, string>> = Object.fromEntries(
 	`0 read write open close stat fstat lstat
-8 lseek mmap
+8 lseek mmap mprotect
 16 ioctl pread64 pwrite64 readv writev access pipe
 29 shmget shmat shmctl dup dup2
 39 getpid sendfile socket connect accept sendto recvfrom sendmsg recvmsg
 48 shutdown bind listen getsockname getpeername socketpair setsockopt getsockopt
 56 clone fork vfork execve
-62 kill
+61 wait4 kill uname
 64 semget semop semctl shmdt msgget msgsnd msgrcv msgctl fcntl flock
 76 truncate ftruncate getdents
 80 chdir fchdir rename mkdir rmdir creat link unlink symlink readlink chmod
 91 fchmod chown fchown lchown
-97 getrlimit
+97 getrlimit getrusage sysinfo
 101 ptrace
 105 setuid setgid
 110 getppid getpgrp
@@ -116,11 +120,12 @@ const syscallNames: Readonly<Record<number, string>> = Object.fromEntries(
 186 gettid
 188 setxattr lsetxattr fsetxattr getxattr lgetxattr fgetxattr listxattr
 195 llistxattr flistxattr removexattr lremovexattr fremovexattr tkill
+204 sched_getaffinity
 206 io_setup
 209 io_submit
 212 lookup_dcookie
 217 getdents64
-220 semtimedop
+220 semtimedop fadvise64
 234 tgkill utimes
 240 mq_open
 242 mq_timedsend mq_timedreceive
@@ -144,7 +149,7 @@ const syscallNames: Readonly<Record<number, string>> = Object.fromEntries(
 316 renameat2 seccomp
 321 bpf execveat userfaultfd
 326 copy_file_range
-327 preadv2 pwritev2
+327 preadv2 pwritev2 pkey_mprotect
 332 statx
 424 pidfd_send_signal io_uring_setup io_uring_enter io_uring_register open_tree
 429 move_mount fsopen fsconfig fsmount fspick pidfd_open clone3 close_range
@@ -221,6 +226,8 @@ type BinaryRecord = {
 	returned?: boolean;
 	virtual?: string;
 	descriptorPath?: string;
+	unsupported?: { name?: string };
+	utsFingerprint?: Sha256Digest;
 	beforeExec?: BinaryRecord;
 	exec?: boolean;
 };
@@ -254,6 +261,7 @@ function appendGrouped<K, V>(map: Map<K, V[]>, key: K, value: V) {
 }
 export function executionRecords(read: () => Buffer, privateUpper?: string) {
 	const journal: BinaryRecord[] = [];
+	const unsupportedCalls = new Map<bigint, { name?: string }>();
 	const calls = new Map<bigint, BinaryRecord>();
 	const executing = new Map<number, BinaryRecord>();
 	const inputs = new Map<
@@ -385,6 +393,18 @@ export function executionRecords(read: () => Buffer, privateUpper?: string) {
 						journal.push(record);
 						return record;
 					};
+					if (kind === 26 || kind === 27) {
+						if (error || size !== (kind === 26 ? 8 : 0)) throw new Error("invalid unsupported syscall record");
+						let call = unsupportedCalls.get(id);
+						if (!call) unsupportedCalls.set(id, (call = {}));
+						if (kind === 26) {
+							if (call.name) throw new Error("duplicate unsupported syscall definition");
+							const nr = body.readBigUInt64LE();
+							call.name = syscallNames[Number(nr)] ?? "syscall_" + nr;
+						}
+						append("unsupported_syscall").unsupported = call;
+						continue;
+					}
 					if (kind === 24 && !error && size === 32) {
 						const record = append(body.readUInt32LE(28) ? "descriptor_write" : "descriptor_read");
 						record.anchors = [identity(body, 0)];
@@ -506,6 +526,10 @@ export function executionRecords(read: () => Buffer, privateUpper?: string) {
 						body.readUInt32LE(24) === size - 32
 					) {
 						record.result = Number(body.readBigInt64LE(8));
+						if (record.result === 0 && record.name === "uname") {
+							if (size !== 32 + UTSNAME_BYTES) throw new Error("invalid uname result");
+							record.utsFingerprint = sha256Digest(body.subarray(32));
+						}
 						if (record.result === 0 && isStat(record.name)) {
 							const stat = body.subarray(32);
 							const extended = record.name === "statx";
@@ -747,7 +771,8 @@ export function traceTail(
 				...(record.name === "mmap" ? { mapped: true } : {}),
 			});
 		}
-		unsafe ||= !!record.incomplete || (ok && (fileIoctl(record) || unsafeCalls.has(record.name)));
+		unsafe ||=
+			!!record.unsupported || !!record.incomplete || (ok && (fileIoctl(record) || unsafeCalls.has(record.name)));
 	}
 	async function advance() {
 		if (closed) throw new Error("execution trace closed");
@@ -772,6 +797,7 @@ export function traceTail(
 		}
 		const owner = options.rootPid?.();
 		if (owner && !positions.has(owner)) positions.set(owner, 0);
+		const ready: BinaryRecord[] = [];
 		for (const record of fresh) {
 			if (owner && !positions.has(record.pid)) continue;
 			if (owner && record.child) positions.set(record.child, 0);
@@ -787,14 +813,15 @@ export function traceTail(
 				if (record.child) members.add(record.child);
 			}
 			appendGrouped(files, record.pid, record);
-			if (!record.pending) consume(record);
+			if (!record.pending) ready.push(record);
 			else pending.add(record);
 		}
 		for (const record of pending)
 			if (!record.pending) {
 				pending.delete(record);
-				consume(record);
+				ready.push(record);
 			}
+		for (const record of ready.sort((a, b) => a.order - b.order)) consume(record);
 		return tail;
 	}
 	const tail: TraceTail = {
@@ -856,8 +883,8 @@ export async function observeExecution(
 	source: TraceTail,
 	executable: string,
 	cwd: string,
-	options: StraceObservationOptions = {},
-): Promise<StraceObservation> {
+	options: ExecutionObservationOptions = {},
+): Promise<ExecutionObservation> {
 	const { records } = await source.read();
 	const parents = new Map<number, number>();
 	const byPid = new Map(records.map((file) => [file.pid, file.lines]));
@@ -936,7 +963,7 @@ export async function observeExecution(
 	const metadata = new Map<string, Extract<ObservedProcessPath, { role: "metadata" }>>();
 	const locks = new Map<string, boolean>();
 	const privateChannels = new Set<string>();
-	const opened = new Set<string>();
+	const opened = new Map<string, string | undefined>();
 	const output: { fd: 1 | 2; data: Buffer }[] = [];
 	let outputBytes = 0;
 	let lastOutputEnd = -Infinity;
@@ -955,6 +982,11 @@ export async function observeExecution(
 	for (const record of ordered) {
 		const { name, args, pid, result, anchors } = record;
 		const ok = result !== undefined && result >= 0;
+		if (record.unsupported) {
+			if (!record.unsupported.name) incomplete.add("unresolved_syscall_reference");
+			unsupported(record.unsupported.name ?? "unresolved_syscall_reference");
+			continue;
+		}
 		if (record.pathErrors && (!record.virtual || record.layout & 0xf00))
 			incomplete.add("unreadable_path:" + name);
 		if (record.incomplete || (record.pending && !record.exec)) {
@@ -971,6 +1003,18 @@ export async function observeExecution(
 		}
 		const fd = Number(BigInt.asIntN(32, args[0] ?? 0n));
 		const file = anchors[0];
+		// A broker can confirm an earlier open after a live reader has consumed the fd use.
+		const writes = writesFile(record);
+		const bound =
+			writes && !isOpen(name) && !record.operands.some(Boolean) && opened.get(objectKey(file) ?? "");
+		const paths = record.paths?.length || !bound ? record.paths : [bound];
+		if (ok && (writes || (name === "descriptor_write" && paths?.length))) {
+			if (!paths?.length && !endpoint(file)) {
+				taints.add("untracked_fd");
+				incomplete.add("unresolved_fd_write");
+			}
+			for (const target of paths ?? []) mutation(target);
+		}
 		const channel = endpoint(file) ?? (isStat(name) ? record.descriptorPath : undefined);
 		const destination = channel ? (options.outputEndpoints?.indexOf(channel) ?? -1) : -1;
 		if (name === "descriptor_read" || name === "descriptor_write") {
@@ -978,20 +1022,18 @@ export async function observeExecution(
 				taints.add((file!.mode & 0xf000) === 0xc000 ? "network" : "ipc");
 			} else if (file && (file.mode & 0xf000) === 0x8000 && !opened.has(objectKey(file)!)) {
 				taints.add("untracked_fd");
-				if (name === "descriptor_write" && !record.paths?.length) incomplete.add("unresolved_fd_write");
 			}
-			if (name === "descriptor_write") for (const path of record.paths ?? []) mutation(path);
 			continue;
 		}
 		const socketQuery = ["getsockname", "getpeername", "getsockopt"].includes(name);
 		if (
 			(destination >= 0 || (!options.outputEndpoints && (fd === 1 || fd === 2))) &&
-			(isStat(name) || ["ioctl", "fcntl", "lseek", "setsockopt"].includes(name) || socketQuery)
+			(isStat(name) || ["ioctl", "fcntl", "lseek", "setsockopt", "fadvise64"].includes(name) || socketQuery)
 		)
 			streamMetadataObserved = true;
 		if (isOpen(name) && ok) {
 			const key = objectKey(record.file);
-			if (key) opened.add(key);
+			if (key) opened.set(key, paths?.[0]);
 		}
 		if ((name === "pipe" || name === "pipe2" || name === "socketpair") && ok)
 			for (const file of [record.file, record.second]) {
@@ -1031,6 +1073,28 @@ export async function observeExecution(
 			taints.add("confinement_observation");
 		if (["getpid", "getppid", "gettid", "getpgrp", "getsid", "getpgid", "pidfd_open", "pidfd_getfd"].includes(name))
 			taints.add("pid_observation");
+		if (name === "wait4" && ok && result > 0) {
+			taints.add("pid_observation");
+			if (!selected.has(result)) taints.add("ipc");
+		}
+		if (
+			name === "uname" &&
+			ok &&
+			(!options.platformFingerprint || record.utsFingerprint !== options.platformFingerprint)
+		)
+			unsupported(name);
+		// The same live memory, load and CPU counters are exposed through procfs and sysfs.
+		if (name === "sysinfo" || name === "getrusage" || name === "sched_getaffinity") taints.add("clock");
+		if (name === "sched_getaffinity" && args[0] !== 0n) {
+			taints.add("pid_observation");
+			if (!selected.has(Number(args[0]))) taints.add("ipc");
+		}
+		if (
+			name === "fadvise64" &&
+			!opened.has(objectKey(file) ?? "") &&
+			!(channel && (fd <= 2 || privateChannels.has(channel)))
+		)
+			taints.add("untracked_fd");
 		if (record.capabilityTarget && record.capabilityTarget !== pid) taints.add("pid_observation");
 		if (name === "io_uring_setup" && result === -1) continue;
 		if (
@@ -1043,7 +1107,6 @@ export async function observeExecution(
 		)
 			taints.add("confinement_observation");
 		if (unmodeled.has(name) || fileIoctl(record)) unsupported(name);
-		const paths = record.paths;
 		if (
 			roots.length &&
 			[-18, -95, -38].includes(result ?? 0) &&
@@ -1110,7 +1173,6 @@ export async function observeExecution(
 			}
 			continue;
 		}
-		if (ok && writesFile(record)) for (const target of paths ?? []) mutation(target);
 		if (options.fileEvidence?.(record)) continue;
 		if (isStat(name) && ok) {
 			if (

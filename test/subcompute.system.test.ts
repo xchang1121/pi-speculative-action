@@ -8,6 +8,8 @@ import { Type } from "typebox";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { afterEach, expect, test } from "vitest";
 import { defineSpeculativeTool, subcomputeEnvironment } from "../src/index.ts";
+import { speculativeToolInvocation } from "../src/speculative-tool.ts";
+import { summarizeSpeculativeTrace } from "../src/task-timing.ts";
 import { systemHost } from "./agent-system-fixture.ts";
 import { temporaryDirectories } from "./filesystem.ts";
 
@@ -17,24 +19,39 @@ const exec = promisify(execFile);
 const javascript = fileURLToPath(new URL("./subcompute-client.mjs", import.meta.url));
 const python = fileURLToPath(new URL("./subcompute-client.py", import.meta.url));
 
+test("tool identity depends on the name, parameter schema and explicit identity", () => {
+	const identity = (name: string, rule?: object, count = false) => {
+		const tool = defineSpeculativeTool({
+			name, label: name, description: name, identity: rule,
+			parameters: Type.Object({ value: count ? Type.Number() : Type.String() }),
+			effect: "observation", steps: {}, execute: async () => ({ content: [], details: {} }),
+		});
+		return speculativeToolInvocation(tool.execute, process.cwd())!;
+	};
+	const first = identity("count", { a: 1, b: 2 });
+	expect(first.semantics?.epoch).toBe("pi.speculative-tool:count");
+	expect(identity("count", { b: 2, a: 1 }).identity).toBe(first.identity);
+	expect(identity("count", { a: 2, b: 2 }).identity).not.toBe(first.identity);
+	expect(identity("count", { a: 1, b: 2 }, true).identity).not.toBe(first.identity);
+	expect(identity("other", { a: 1, b: 2 }).identity).not.toBe(first.identity);
+});
+
 test("public tool calls share binary steps across processes, languages and host restarts", async () => {
 	const cwd = await directories.create();
 	const storeRoot = await directories.create();
 	await writeFile(path.join(cwd, "input.bin"), Buffer.from([0, 255, 12, 72]));
 	let tsBuilds = 0;
-	const inProcess = defineSpeculativeTool({
+	const inProcess = () => defineSpeculativeTool({
 		name: "typescript_transform",
 		label: "TypeScript transform",
 		description: "Share the declared transform",
 		parameters: Type.Object({ mode: Type.String() }),
-		version: "1",
 		effect: "actor",
 		steps: {},
 		execute: async ({ computeStep }, args) => {
 			const value = await computeStep(
 				{
 					namespace: "cross-language.reverse",
-					version: "1",
 					key: "shared",
 					inputResources: [{ path: "input.bin", scope: "content" }],
 					envKeys: ["TRANSFORM_MODE"],
@@ -77,10 +94,11 @@ test("public tool calls share binary steps across processes, languages and host 
 			};
 		},
 	};
+	const toolName = inProcess().name;
 	const open = () =>
 		systemHost(
 			cwd,
-			[tool, inProcess as unknown as AgentTool],
+			[tool, inProcess() as unknown as AgentTool],
 			{
 				executionWorlds: [],
 				resolveInvocation: () => undefined,
@@ -107,13 +125,16 @@ test("public tool calls share binary steps across processes, languages and host 
 			mode: "reverse",
 		});
 		expect(warm.details).toEqual({ ...(cold.details as object), hit: true });
-		expect((await host.execute(inProcess.name, { mode: "reverse" })).details).toEqual(
+		expect((await host.execute(toolName, { mode: "reverse" })).details).toEqual(
 			(cold.details as { value: unknown }).value,
 		);
 		expect(tsBuilds).toBe(0);
 		expect(host.actors.at(-1)?.computation?.subcomputationHits).toBeGreaterThan(0);
 		expect(host.actors.at(-1)?.computation?.reusedComputeMs).toBeGreaterThan(0);
 		await host.finish(true);
+		const metrics = summarizeSpeculativeTrace(host.events).subcomputations?.["cross-language.reverse"];
+		expect(metrics).toMatchObject({ hits: 2, misses: 1, hitRate: 2 / 3 });
+		expect(metrics!.reusedMs).toBeGreaterThan(0);
 		await host.dispose();
 		host = open();
 		await host.start();
@@ -122,6 +143,8 @@ test("public tool calls share binary steps across processes, languages and host 
 			mode: "reverse",
 		});
 		expect(restored.details).toEqual(warm.details);
+		await host.execute(toolName, { mode: "reverse" });
+		expect(tsBuilds).toBe(0);
 		expect(host.actors.at(-1)?.computation?.reusedComputeMs).toBeGreaterThan(0);
 		await writeFile(path.join(cwd, "input.bin"), Buffer.from([1, 2, 3]));
 		const changed = await host.execute(tool.name, {
@@ -142,7 +165,7 @@ test("public tool calls share binary steps across processes, languages and host 
 			mode: "other",
 		});
 		expect(warmEnvironment.details).toMatchObject({ hit: true });
-		await host.execute(inProcess.name, { mode: "typescript-produced" });
+		await host.execute(toolName, { mode: "typescript-produced" });
 		expect(tsBuilds).toBe(1);
 		expect(
 			(

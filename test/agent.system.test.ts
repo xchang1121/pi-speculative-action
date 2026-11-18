@@ -529,7 +529,7 @@ test.for([
 					? await consume(await count(read, actual))
 					: await view.prepare!(
 							(mode.includes("binding") && index) || index === 2 ? definitions[index]! : shared,
-							mode === "calculation-key" && index ? "next" : "lines:v1",
+							mode === "calculation-key" && index ? "next" : "lines",
 							build,
 							consume,
 							pure ? undefined : file,

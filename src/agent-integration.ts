@@ -234,7 +234,7 @@ export function sdkCallbackTool(tool: AgentTool): AgentTool {
 				identity: { callback: randomUUID() },
 				semantics: {
 					tool: tool.name,
-					epoch: "pi.sdk.callback:1",
+					epoch: "pi.sdk.callback",
 					effect: "unbounded",
 					requirements: {
 						capabilities: ["invocation.host_function", ...UNRESTRICTED_PROCESS_EFFECTS.capabilities],
@@ -460,7 +460,7 @@ export function createAgentExecutionHost(
 			},
 		});
 	const host = withSpeculativeConfig(config, () =>
-		assembleAgentExecutionHost(sessionID, options, store, admission),
+		assembleAgentExecutionHost(sessionID, options, store, service, admission),
 	);
 	return bind({
 		...host,
@@ -483,6 +483,7 @@ function assembleAgentExecutionHost(
 	sessionID: string,
 	options: CreateSpeculativeActionHostOptions,
 	store: ProvenanceCertificateStore,
+	service: SubcomputeService,
 	admission?: (
 		world: AgentExecutionWorld,
 		operation: "speculation" | "observation" | "observeOperations",
@@ -872,7 +873,11 @@ function assembleAgentExecutionHost(
 		rejectCandidateOutput: ({ output }) =>
 			output.isError && output.exitCode === undefined ? "tool_error_result" : undefined,
 		projectionRules,
-		onEvent: options.onEvent,
+		onResourceWrites: (paths) => service.invalidate(paths),
+		onEvent: options.onEvent && ((event) => {
+			const subcomputations = service.drainMetrics();
+			return options.onEvent!(Object.keys(subcomputations).length ? { ...event, subcomputations } : event);
+		}),
 	});
 	const disconnect = [
 		patternPlans.connect(runtime),

@@ -192,7 +192,7 @@ describe("persisted computation evidence", () => {
 		const invalid = [
 			null,
 			{},
-			{ ...graph, version: 999 },
+			{ ...graph, extra: true },
 			{ ...graph, root: "absent" },
 			...[
 				[{ ...root, spans: [{ startedAt: 0, completedAt: 20 }] }],

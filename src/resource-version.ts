@@ -58,18 +58,18 @@ import {
 	isSafeCount,
 	isSha256Digest,
 	relativeFilesystemPath,
-	sha256Digest,
+	digestObject,
 	type Sha256Digest,
-	stableStringify,
 	releaseOnce,
 } from "./primitives.ts";
 import { ensureNativeFilesystem, nativeFilesystem } from "./process-startup.mjs";
-import type { ProvenanceCertificateStore } from "./reuse-store.ts";
+import type { ProvenanceCertificateStore, StoredInputVersion } from "./reuse-store.ts";
 import { WorkspaceStructureCapture } from "./workspace-sandbox.ts";
 import { RuntimeLifecycleLane, SharedAbortScope, waitForCompletion } from "./runtime-lifecycle.ts";
 import type { ValidationMetrics } from "./settlement.ts";
 import {
 	normalizeTimelineComputation,
+	subcomputeTiming,
 	type SerializedTimelineComputation,
 	TimelineInterval,
 } from "./task-timing.ts";
@@ -113,20 +113,33 @@ export interface ToolFilesystemOperations {
 			readonly dispose: () => void | Promise<void>;
 			readonly cacheable?: boolean;
 		}>,
-		consume: (value: Value) => Promise<Result>,
+		consume: (value: Value, computation?: TimelineInterval) => Promise<Result>,
 		resource?: string,
 		signal?: AbortSignal,
 	) => Promise<Result>;
 }
 export interface ComputeStepRequest {
 	readonly namespace: string;
-	readonly version: string;
 	readonly key: unknown;
 	readonly inputResources?: readonly ResourceDependency[];
 	readonly envKeys?: readonly string[];
 	readonly environment?: Readonly<Record<string, string | undefined>>;
 	/** Include captured file bytes in protocol misses; local computeStep always reads through its view. */
 	readonly includeInputContent?: boolean;
+}
+/** Observe the declared scope without materializing file contents in the caller. */
+export async function observeStepInput(inputs: ToolFilesystemOperations, resource: ResourceDependency): Promise<void> {
+	if (resource.scope === "content") await inputs.readFile(resource.path, 0);
+	else if (resource.scope === "names" || resource.scope === "entries")
+		await inputs.readdir!(resource.path);
+	else if (resource.scope === "exists") await inputs.exists!(resource.path);
+	else if (resource.scope === "type" || resource.scope === "stat" || resource.scope === "entry")
+		await inputs.stat!(
+			resource.path,
+			resource.scope === "entry" ? "entry" : "type",
+			resource.scope !== "type",
+		);
+	else throw new Error("Unsupported explicit input resource scope: " + resource.scope);
 }
 /** The caller versions every dependency other than the explicitly captured resources and environment. */
 export async function computeStepInView<Value>(
@@ -135,32 +148,19 @@ export async function computeStepInView<Value>(
 	calculate: (view: ToolFilesystemOperations, signal: AbortSignal) => Value | Promise<Value>,
 	signal: AbortSignal = new AbortController().signal,
 ): Promise<Value> {
-	if (!request.namespace.trim() || !request.version.trim())
-		throw new Error("A compute step requires namespace and version");
+	if (!request.namespace.trim()) throw new Error("A compute step requires a namespace");
 	signal.throwIfAborted();
 	const environment = request.environment ?? process.env;
 	const selectedEnvironment = () => (request.envKeys ?? []).map((key) => [key, environment[key]]);
 	const input = snapshotPreparation([request.key, request.inputResources ?? [], selectedEnvironment()]);
 	if (!input) throw new Error("compute_step_input_budget_exceeded");
 	const key = hash("sha256", input.data);
-	const binding = createSerializablePreparationBinding(
-		{ namespace: request.namespace, version: request.version },
-		() => true,
-	);
+	const binding = createSerializablePreparationBinding({ namespace: request.namespace }, () => true);
+	let built = false;
 	const build = async (inputs: ToolFilesystemOperations, sharedSignal: AbortSignal) => {
-		for (const resource of request.inputResources ?? []) {
-			if (resource.scope === "content") await inputs.readFile(resource.path);
-			else if (resource.scope === "names" || resource.scope === "entries")
-				await inputs.readdir!(resource.path);
-			else if (resource.scope === "exists") await inputs.exists!(resource.path);
-			else if (resource.scope === "type" || resource.scope === "stat" || resource.scope === "entry")
-				await inputs.stat!(
-					resource.path,
-					resource.scope === "entry" ? "entry" : "type",
-					resource.scope !== "type",
-				);
-			else throw new Error("Unsupported explicit input resource scope: " + resource.scope);
-		}
+		built = true;
+		subcomputeTiming.getStore()?.(request.namespace, false);
+		for (const resource of request.inputResources ?? []) await observeStepInput(inputs, resource);
 		const result = await calculate(inputs, sharedSignal);
 		sharedSignal.throwIfAborted();
 		if (!serialize([request.key, request.inputResources ?? [], selectedEnvironment()]).equals(input.data))
@@ -169,12 +169,16 @@ export async function computeStepInView<Value>(
 		if (!owned) throw new Error("compute_step_result_budget_exceeded");
 		return { value: owned.data, bytes: owned.data.length, dispose: () => {} };
 	};
-	const consume = async (bytes: Buffer): Promise<Value> => deserialize(Buffer.from(bytes)) as Value;
+	const consume = async (bytes: Buffer, computation?: TimelineInterval): Promise<Value> => {
+		const result = deserialize(Buffer.from(bytes)) as Value;
+		if (!built) subcomputeTiming.getStore()?.(request.namespace, true, computation);
+		return result;
+	};
 	if (view.prepare)
 		return view.prepare(binding, key, build, consume, request.inputResources?.[0]?.path, signal);
 	const measured = await TimelineInterval.measure(() => build(view, signal));
 	TimelineInterval.own(measured.computation);
-	return consume(measured.output.value);
+	return consume(measured.output.value, measured.computation);
 }
 export type ResourceDependency = {
 	readonly path: string;
@@ -221,6 +225,11 @@ export type ResourceChangeSet = {
 	readonly paths: ReadonlyArray<string>;
 };
 export interface ResourceInputPersistence {
+	/** Resolve a local file token using the lstat already taken in the current filesystem view. */
+	readonly inputs?: (
+		dependency: ResourceDependency,
+		stat: BigIntStats,
+	) => Promise<ResourceVersionToken | undefined>;
 	readonly store: ProvenanceCertificateStore;
 	readonly limits?: Partial<ContentChunkLimits>;
 	/** Explicit internal state: this cache and its aliases are outside the source-unchanged guarantee. */
@@ -386,7 +395,7 @@ const preparationBindings = new WeakMap<
 		readonly accepts: (value: unknown) => boolean;
 	}
 >();
-/** Identity is an explicit versioned implementation contract supplied by the adapter. */
+/** Identity is an explicit implementation contract supplied by the adapter. */
 export function createSerializablePreparationBinding(
 	implementation: unknown,
 	accepts: (value: unknown) => boolean,
@@ -394,7 +403,7 @@ export function createSerializablePreparationBinding(
 	const binding = Object.freeze({});
 	preparationBindings.set(binding, {
 		accepts,
-		id: sha256Digest(stableStringify({ implementation, codec: "prepared-binary-v2" })),
+		id: digestObject(implementation),
 	});
 	return binding;
 }
@@ -611,9 +620,10 @@ function parsePersistentResourcePayload(value: unknown, root: string): Persisten
 		preparations,
 	};
 }
+type PreparationLookup = { readonly binding?: string; readonly key: string };
 type ResourceInputLookup = (
 	target?: string,
-	preparationsOnly?: boolean,
+	preparation?: PreparationLookup,
 ) => Iterable<ResourceInputSource> | AsyncIterable<ResourceInputSource>;
 type PreparedResource = {
 	readonly cancellation: SharedAbortScope;
@@ -989,6 +999,20 @@ export class ResourceReadView {
 		if (entry.type !== "file" || entry.content === undefined) return this.unproven(target);
 		return readContent(entry.content, offset, length);
 	};
+	/** Borrow immutable bytes or directory names from a stat-verified local input token. */
+	snapshotInput(target: string, consumer?: ResourceReadView): ResourceInput | undefined {
+		const entry = this.entries.get(filesystemPathKey(target));
+		if (entry?.type === "directory" && entry.entries)
+			return { names: entry.entries, computation: entry.computation };
+		if (entry?.type !== "file" || !entry.content) return;
+		if (entry.content instanceof ChunkedContent && consumer && !consumer.verifyingInputs)
+			consumer.retainContentPool(entry.content.pool);
+		return { content: entry.content, computation: entry.computation };
+	}
+	async validateObserved(): Promise<void> {
+		const proofs = [...(this.observed?.(this.dependencies, false) ?? []), ...(this.collectProofs?.values() ?? [])];
+		if ((await validateResourceVersion(proofs, true)).expired) throw new Error("subcompute_inputs_changed");
+	}
 	/** A process borrows the same captured kernel object without inheriting the tool's OFD offset. */
 	async borrowObject<T>(
 		target: string,
@@ -1132,7 +1156,7 @@ export class ResourceReadView {
 								this.onForeignInputs?.(true);
 							} else if (source) this.observeSource(source)(sourceDependencies);
 							const evaluation = await TimelineInterval.measure(() =>
-								consume(cached.value as Parameters<typeof consume>[0]),
+								consume(cached.value as Parameters<typeof consume>[0], cached.computation),
 							);
 							TimelineInterval.own(evaluation.computation);
 							return TimelineInterval.outside(() => {
@@ -1161,7 +1185,7 @@ export class ResourceReadView {
 				};
 				const reused = cached && compatible(cached) && (await use(cached));
 				if (reused) return reused.value;
-				for await (const source of this.lookup?.(target, true) ?? []) {
+				for await (const source of this.lookup?.(target, { binding: registration?.id, key }) ?? []) {
 					const cached = source.view.prepared?.bindings.get(identity)?.get(key);
 					if (
 						source.view.entries === this.entries ||
@@ -2010,8 +2034,6 @@ export class ResourceVersionManager {
 			readonly onIdle?: () => void;
 			/** Private snapshot entries only; filtered tokens cannot authorize input views or host execution windows. */
 			readonly snapshotExcludes?: readonly string[];
-			/** @deprecated Content snapshots use the shared CAS. */
-			readonly gitObjects?: boolean;
 			/** Linux input content uses the existing CAS; live kernel objects and prepared callbacks remain ephemeral. */
 			readonly persistentInputs?: ResourceInputPersistence;
 		} = {},
@@ -2143,7 +2165,7 @@ export class ResourceVersionManager {
 	}
 	/** Cold recovery grants a new input lease only after content integrity and current query validation. */
 	async restore(
-		id: Sha256Digest,
+		record: StoredInputVersion,
 		retainBytes: number,
 		signal?: AbortSignal,
 	): Promise<ResourceVersionToken | undefined> {
@@ -2152,8 +2174,6 @@ export class ResourceVersionManager {
 		await this.assertPersistentStore();
 		const { store, limits } = this.persistentInputs;
 		return store.read(async (signal) => {
-			const record = await store.getInputVersion(id, signal);
-			if (!record) return;
 			const payload = parsePersistentResourcePayload(record.payload, this.root);
 			const proofBytes = payload.observations.reduce(
 				(sum, entry) => sum + observationBytes(dependencyKey(entry), entry),
@@ -2235,14 +2255,14 @@ export class ResourceVersionManager {
 			}
 		}, signal);
 	}
-	/** Discover existing input closures without a separate ID index. The caller owns every yielded token. */
+	/** Discover current input closures by workspace or exact preparation. The caller owns every yielded token. */
 	async *recover(
 		retainBytes: number | (() => number),
 		options: {
 			readonly maxCandidates?: number;
 			readonly signal?: AbortSignal;
 			readonly target?: string;
-			readonly preparationsOnly?: boolean;
+			readonly preparation?: PreparationLookup;
 		} = {},
 	): AsyncGenerator<{
 		readonly id: Sha256Digest;
@@ -2261,20 +2281,27 @@ export class ResourceVersionManager {
 		const target =
 			options.target === undefined ? undefined : filesystemPathKey(path.resolve(this.root, options.target));
 		signal?.throwIfAborted();
+		const binding = options.preparation?.binding;
+		if (options.preparation ? !binding || !store.findPreparedInputCandidates : this.persistentInputs.inputs) return;
 		await this.assertPersistentStore();
-		for await (const record of store.candidatesInputVersions(
-			options.maxCandidates ??
-				Math.min(store.limits.maxCertificates, speculativeConfig().filesystem.maxHistoryEntries),
-			signal,
-		)) {
+		const limit = options.maxCandidates ?? Math.min(store.limits.maxCertificates, speculativeConfig().filesystem.maxHistoryEntries);
+		const preparation = options.preparation;
+		const candidates = preparation
+			? await store.findPreparedInputCandidates(
+					{ root: this.root, binding: binding!, prepKey: digestObject(preparation.key), limit },
+					signal,
+				)
+			: store.candidatesInputVersions(this.root, limit, signal);
+		for await (const record of candidates) {
 			signal?.throwIfAborted();
 			store.signal.throwIfAborted();
 			if (!this.open) throw new Error("persistent input owner changed");
 			const payload = record.payload as Partial<PersistentResourcePayload> | null;
 			if (payload?.root !== this.root) continue;
-			if (options.preparationsOnly && Array.isArray(payload.preparations) && !payload.preparations.length)
-				continue;
+			if (preparation && !payload.preparations?.some((item) =>
+				item.binding === preparation.binding && item.key === preparation.key)) continue;
 			if (
+				!preparation &&
 				target !== undefined &&
 				Array.isArray(payload.entries) &&
 				Array.isArray(payload.preparations) &&
@@ -2294,7 +2321,7 @@ export class ResourceVersionManager {
 				continue;
 			let token: ResourceVersionToken | undefined;
 			try {
-				token = await this.restore(record.id, budget(), signal);
+				token = await this.restore(record, budget(), signal);
 				signal?.throwIfAborted();
 				store.signal.throwIfAborted();
 				if (!this.open) throw new Error("persistent input owner changed");
@@ -2397,6 +2424,7 @@ export class ResourceVersionManager {
 					view,
 					observing && !this.snapshotExcludes.size ? { root: this.root, observations } : undefined,
 					providedInputs,
+					this.persistentInputs?.inputs,
 				))
 					observations.set(dependencyKey(observation), observation);
 			};
@@ -2494,8 +2522,8 @@ export class ResourceVersionManager {
 		return pending ? pending.then(finish) : finish();
 	}
 	/** Adoption waits on these few checks, so their I/O never queues behind a whole-tree scan's waiters. */
-	async validate(token: ResourceVersionToken): Promise<ResourceVersionValidation> {
-		return priorityIO.run(true, () => this.inspect(token, false));
+	async validate(token: ResourceVersionToken, checkStamps = false): Promise<ResourceVersionValidation> {
+		return priorityIO.run(true, () => this.inspect(token, false, undefined, checkStamps));
 	}
 	async seal(token: ResourceVersionToken): Promise<ResourceVersionValidation> {
 		return this.inspect(token, true);
@@ -2504,6 +2532,7 @@ export class ResourceVersionManager {
 		token: ResourceVersionToken,
 		sealing: boolean,
 		restoredInputs?: ResourceReadView,
+		checkStamps = sealing,
 	): Promise<ResourceVersionValidation> {
 		if (!this.open || token.manager !== this || token.root !== this.root)
 			return validation("resource_version_owner_changed");
@@ -2527,6 +2556,7 @@ export class ResourceVersionManager {
 				token.physicalRoot,
 				this.snapshotExcludes,
 				restoredInputs,
+				undefined, undefined, this.persistentInputs?.inputs,
 			);
 			if (sealing) await watcherTurn();
 			const lateFailure = this.invalidation(token, sealing);
@@ -2536,7 +2566,7 @@ export class ResourceVersionManager {
 					const captured = token.observations.get(dependencyKey(entry));
 					return (
 						entry.fingerprint !== captured?.fingerprint ||
-						(sealing && (!entry.stamp || !captured?.stamp || entry.stamp !== captured.stamp))
+						(checkStamps && (!entry.stamp || !captured?.stamp || entry.stamp !== captured.stamp))
 					);
 				})
 				.map(dependencyKey);
@@ -2735,12 +2765,12 @@ export class ResourceInputSession {
 		root: string,
 		signal: AbortSignal,
 		target?: string,
-		preparationsOnly?: boolean,
+		preparation?: PreparationLookup,
 	): AsyncGenerator<ResourceVersionToken> {
 		for await (const { token } of this.root(root).recover(() => this.remainingBytes, {
 			signal,
 			target,
-			preparationsOnly,
+			preparation,
 		})) {
 			this.lifecycle.own({ dispose: token.release });
 			yield token;
@@ -2837,12 +2867,12 @@ function resourceManager(root: string, persistence?: ResourceInputPersistence): 
 	}
 	return manager;
 }
-export async function validateResourceVersion(token: unknown): Promise<ResourceVersionValidation> {
+export async function validateResourceVersion(token: unknown, checkStamps = false): Promise<ResourceVersionValidation> {
 	if (!Array.isArray(token))
 		return isResourceVersionToken(token)
-			? token.manager.validate(token)
+			? token.manager.validate(token, checkStamps)
 			: validation("resource_version_missing");
-	if (token.length === 1) return validateResourceVersion(token[0]);
+	if (token.length === 1) return validateResourceVersion(token[0], checkStamps);
 	const checked: ResourceVersionValidation[] = [];
 	const groups = new Map<
 		ResourceVersionManager,
@@ -2860,13 +2890,14 @@ export async function validateResourceVersion(token: unknown): Promise<ResourceV
 			if (group.root !== source.root || group.physicalRoot !== source.physicalRoot)
 				throw new Error("resource_version_conflict");
 			for (const [key, entry] of source.observations) {
-				if (group.observations.has(key) && group.observations.get(key)!.fingerprint !== entry.fingerprint)
+				const previous = group.observations.get(key);
+				if (previous && (previous.fingerprint !== entry.fingerprint || (checkStamps && previous.stamp !== entry.stamp)))
 					throw new Error("resource_version_conflict");
 				group.observations.set(key, entry);
 			}
 		}
 		await withFilesystemReadView(undefined, async () => {
-			for (const group of groups.values()) checked.push(await group.manager.validate(group));
+			for (const group of groups.values()) checked.push(await group.manager.validate(group, checkStamps));
 		});
 		const expired = checked.find((result) => result.expired);
 		if (expired)
@@ -2927,7 +2958,7 @@ export function isResourceVersionToken(value: unknown): value is ResourceVersion
 		token.manager instanceof ResourceVersionManager
 	);
 }
-const dependencyKey = (dependency: ResourceDependency) =>
+export const dependencyKey = (dependency: ResourceDependency) =>
 	`${dependency.scope}:${filesystemPathKey(dependency.path)}`;
 function affects(dependency: ResourceDependency, event: ResourceEvent, preciseContent: ReadonlySet<string>) {
 	if (dependency.scope === "binding")
@@ -2955,6 +2986,9 @@ type FingerprintResult = {
 	readonly bytesRead: number;
 	readonly filesRead: number;
 };
+export function resourceStatSignature(stat: BigIntStats, target: string): string {
+	return stat.isDirectory() ? digest([statStamp(stat), []]) : digest(["file", statStamp(stat), filesystemPathKey(target)]);
+}
 function fingerprintFile(content: StableFilesystemCapture) {
 	return {
 		value: {
@@ -2964,7 +2998,7 @@ function fingerprintFile(content: StableFilesystemCapture) {
 			hash: content.hash,
 			resolved: filesystemPathKey(content.realPath),
 		},
-		stamp: digest(["file", statStamp(content.stat), filesystemPathKey(content.realPath)]),
+		stamp: resourceStatSignature(content.stat, content.realPath),
 	};
 }
 function fingerprintDirectory(
@@ -3007,6 +3041,7 @@ async function fingerprintDependencies(
 		readonly observations: Map<string, ResourceObservation>;
 	},
 	providedInputs?: ReadonlyMap<string, ResourceInput>,
+	inputs?: ResourceInputPersistence["inputs"],
 	filesystem?: FilesystemReadView,
 ): Promise<
 	(ResourceObservation & {
@@ -3016,7 +3051,7 @@ async function fingerprintDependencies(
 > {
 	if (!filesystem)
 		return withFilesystemReadView(undefined, (active) =>
-			fingerprintDependencies(dependencies, realRoot, excludes, view, bindings, providedInputs, active),
+			fingerprintDependencies(dependencies, realRoot, excludes, view, bindings, providedInputs, inputs, active),
 		);
 	const files = new Map<string, Promise<FingerprintResult>>();
 	const nearestExisting = missingResourceResolver(realRoot, filesystem);
@@ -3136,15 +3171,6 @@ async function fingerprintDependencies(
 			};
 		}
 		const { info, link } = captured;
-		const supplied = providedInputs?.get(filesystemPathKey(target));
-		const suppliedContent = inputContent(supplied);
-		if (
-			providedInputs &&
-			!(suppliedContent
-				? info.isFile()
-				: supplied && ("type" in supplied ? specialFileType(info) === supplied.type : info.isDirectory()))
-		)
-			throw new Error(suppliedContent ? "resource_input_not_regular" : "resource_input_type_changed");
 		const realTarget = info.isSymbolicLink()
 			? path.join(
 					parentReal ?? (await fingerprintIO(() => filesystem!.realpath(path.dirname(target)))),
@@ -3156,6 +3182,18 @@ async function fingerprintDependencies(
 		// An entry name joined to a walked directory stays where the directory was proven to be.
 		if (parentReal === undefined) assertInside(realRoot, realTarget);
 		const identity = filesystemPathKey(realTarget);
+		const cacheable = (scope === "content" && info.isFile()) || (scope === "names" && info.isDirectory());
+		const token = !providedInputs && cacheable ? await inputs?.({ path: realTarget, scope }, info) : undefined;
+		const hot = token?.view?.snapshotInput(realTarget, view);
+		const supplied = providedInputs?.get(filesystemPathKey(target)) ?? hot;
+		const suppliedContent = inputContent(supplied);
+		if (
+			providedInputs &&
+			!(suppliedContent
+				? info.isFile()
+				: supplied && ("type" in supplied ? specialFileType(info) === supplied.type : info.isDirectory()))
+		)
+			throw new Error(suppliedContent ? "resource_input_not_regular" : "resource_input_type_changed");
 		const metadata = { dependency, computation: captured.computation };
 		const retainEntry = (entry: CapturedResource, reserved = 0) =>
 			view?.capture(target, { realPath: realTarget, ...metadata, metadata, ...entry }, reserved);
@@ -3260,7 +3298,8 @@ async function fingerprintDependencies(
 						? contentMemory(provided)
 						: Number(info.size);
 				const retain = !view?.verifyingInputs && (view?.reserve(reserved) ?? false);
-				if ((provided || chunked) && !retain) throw new Error("resource_snapshot_budget_exceeded");
+				if (!retain && (chunked || (provided && (!hot || (view && !view.verifyingInputs)))))
+					throw new Error("resource_snapshot_budget_exceeded");
 				const bytes = provided && (provided instanceof ChunkedContent ? provided : Buffer.from(provided));
 				// Supplied bytes own data, never a host observation window; adoption validates them exactly.
 				// A file unchanged since an earlier read of it, by the racy-git rule, needs no read unless its bytes are retained.
@@ -3300,7 +3339,7 @@ async function fingerprintDependencies(
 				retainEntry(
 					{
 						type: "file",
-						content: streamed ? streamed.content : (bytes ?? content.content),
+						content: view?.verifyingInputs ? undefined : streamed ? streamed.content : (bytes ?? content.content),
 						computation: content.computation,
 						version: view?.verifyingInputs ? { hash: content.hash, size: content.bytesRead } : undefined,
 						object:

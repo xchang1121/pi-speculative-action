@@ -161,7 +161,7 @@ export function resolvePiToolInvocation(
 		};
 		return {
 			executor,
-			identity: { executor, cwd, version: VERSION, autoResizeImages, modelSupportsImages },
+			identity: { executor, cwd, autoResizeImages, modelSupportsImages },
 			...(typeof requested === "string" ? { filesystemResources: [resolvePiToolPath(requested, cwd)] } : {}),
 			...bindResourceOperation(
 				filesystem,
@@ -275,8 +275,7 @@ async function settleFilesystemOperation<Result>(
 }
 export async function createClosedSearchProfile(cwd: string) {
 	const profile = {
-		id: "pi.captured-search.explicit-v3",
-		pi: VERSION,
+		id: "pi.captured-search",
 		platform: process.platform,
 		limits: speculativeConfig().search,
 	};
@@ -598,7 +597,7 @@ async function prepareGrepEngine() {
 			flags,
 		};
 		const matchesBinding = createSerializablePreparationBinding(
-			{ engine: identity, namespace: "pi.captured-grep", version: "3" },
+			{ engine: identity, namespace: "pi.captured-grep" },
 			acceptsGrepMatches,
 		);
 		return { root, identity, matchesBinding, execute, release, jj };

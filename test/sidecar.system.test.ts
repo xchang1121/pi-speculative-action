@@ -134,6 +134,7 @@ test.each(["valid", "low confidence", "HTTP failure"])(
 				request_id: "actor-request",
 				context: { provider_payload: payload },
 			});
+			expect(requests.map(({ body }) => Object.hasOwn(body, "version"))).not.toContain(true);
 			expect(requests.every((request) => request.auth === "Bearer test-only-token")).toBe(true);
 			expect(requests.at(-1)).toMatchObject({
 				path: settings.clearPath,

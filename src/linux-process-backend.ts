@@ -139,6 +139,7 @@ import {
 } from "./process-reuse.ts";
 import {
 	configureNativeFilesystem,
+	nativeFilesystem,
 	nativeProcessLibrary,
 	qualifyNativeStartup,
 	spawnControlled,
@@ -168,8 +169,8 @@ import type { ProvenanceStoreOptions, VerifiedArtifactClosure } from "./reuse-st
 import { ProvenanceCertificateStore } from "./reuse-store.ts";
 import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
 import { cause, zeroValidationMetrics, type ResourceValidation } from "./settlement.ts";
-import type { StraceObservation, TracedWrite, TraceTail } from "./strace-observer.ts";
-import { executionRecords, observeExecution, traceTail, writesWithin } from "./strace-observer.ts";
+import type { ExecutionObservation, TracedWrite, TraceTail } from "./execution-observer.ts";
+import { executionRecords, observeExecution, traceTail, UTSNAME_BYTES, writesWithin } from "./execution-observer.ts";
 import type { TimelineDependency } from "./task-timing.ts";
 import { TimelineInterval } from "./task-timing.ts";
 import type {
@@ -492,7 +493,7 @@ export async function installLinuxDependencies(
 const OBSERVER_FINGERPRINT = digestObject(
 	[
 		"linux-process-backend",
-		"strace-observer",
+		"execution-observer",
 		"process-reuse",
 		"reuse-store",
 		"provenance-certificate",
@@ -623,7 +624,7 @@ interface SessionWriter {
 	descendants?: readonly SessionWriter[];
 	observed?: ReadonlyMap<string, number>;
 	evidence?: DynamicDependencyCertificate;
-	observation?: StraceObservation;
+	observation?: ExecutionObservation;
 }
 interface DomainExecution {
 	readonly pid: number;
@@ -725,7 +726,6 @@ export class LinuxProcessReuseBackend {
 	readonly storage: ExecutionWorldStorageControl;
 	private readonly options: LinuxProcessBackendOptions;
 	private ready?: Promise<ReadyBackend>;
-	private platformFingerprint?: Promise<Sha256Digest>;
 	private heldExec?: {
 		readonly controller: AbortController;
 		readonly ready: Promise<LinuxHeldExecBoundary>;
@@ -1106,7 +1106,7 @@ export class LinuxProcessReuseBackend {
 				request,
 				definedProcessEnvironment(request.environment),
 				projection,
-				ready.platformFingerprint,
+				await this.resolvePlatformFingerprint(),
 			);
 			// Watch from before execution; post-exit hashes alone cannot establish what the process read.
 			proof = executionDomainProof(ready.collector, options.sourceRoot);
@@ -1134,6 +1134,7 @@ export class LinuxProcessReuseBackend {
 			);
 			const ended = performance.now();
 			let observation = await observeExecution(trace, invocation.shell, request.cwd, {
+				platformFingerprint: prototype.platformFingerprint,
 				captureOutput: true,
 				outputEndpoints,
 				controlledSocket: channel?.socket,
@@ -1399,16 +1400,15 @@ export class LinuxProcessReuseBackend {
 								!pathContains(session.workspace.sandboxRoot, physicalCwd)
 							)
 								throw new Error("process cwd is unmapped");
-							const ready = await this.resolveReady();
 							const environment = definedProcessEnvironment(request.environment);
 							const { output: prototype, computation: preparation } = await TimelineInterval.outside(() =>
-								TimelineInterval.measure(() =>
+								TimelineInterval.measure(async () =>
 									topLevelProcessPrototype(
 										invocation,
 										request,
 										environment,
 										session.projection,
-										ready.platformFingerprint,
+										await this.resolvePlatformFingerprint(),
 									),
 								),
 							);
@@ -1657,11 +1657,12 @@ export class LinuxProcessReuseBackend {
 		this.ready ??= TimelineInterval.collect(() => this.probe()).then((result) => result.output);
 		return this.ready;
 	}
-	private resolvePlatformFingerprint(): Promise<Sha256Digest> {
-		this.platformFingerprint ??= execHostText("uname", ["-srm"]).then((kernel) =>
-			digestObject({ kernel: kernel.trim(), arch: process.arch }),
-		);
-		return this.platformFingerprint;
+	private async resolvePlatformFingerprint(): Promise<Sha256Digest> {
+		const native =
+			nativeFilesystem ?? nativeProcessLibrary(await resolveLinuxExecHelper(this.options.heldExecBinary));
+		const uts = Buffer.alloc(UTSNAME_BYTES);
+		if (native(-16, uts) !== 0) throw new Error("cannot read the kernel UTS identity");
+		return sha256Digest(uts);
 	}
 	private async probe() {
 		if (process.platform !== "linux") throw new Error("Linux host required");
@@ -1675,6 +1676,7 @@ export class LinuxProcessReuseBackend {
 			resolveLinuxExecHelper(this.options.heldExecBinary),
 		]);
 		// The exact confinement and tracer builds, not their versions: a patched fix changes what their certificates mean.
+		nativeProcessLibrary(dispatcher);
 		const [sandlockCheck, sandlockBuild, platformFingerprint] = await Promise.all([
 			execHostText(sandlock, ["check"]),
 			hashExecutableFile(sandlock),
@@ -1682,7 +1684,6 @@ export class LinuxProcessReuseBackend {
 		]);
 		if (!sandlockCheck.includes("Status:         OK"))
 			throw new Error("Sandlock kernel protections are unavailable");
-		nativeProcessLibrary(dispatcher);
 		const collector = await executionDomainCollector(dispatcher);
 		const mountProbe = await mkdtemp(path.join(os.tmpdir(), "pi-process-view-probe-"));
 		let executionContext: ProcessExecutionContext | undefined;
@@ -1783,7 +1784,6 @@ export class LinuxProcessReuseBackend {
 		return {
 			sandlock,
 			fingerprint,
-			platformFingerprint,
 			observerFingerprint,
 			executionContext,
 			dispatcher,
@@ -2066,7 +2066,7 @@ export class LinuxProcessReuseBackend {
 					let stage = "capture";
 					let dependencyCertificate: DynamicDependencyCertificate | undefined;
 					let certificateID: Sha256Digest | undefined;
-					let unattributed: StraceObservation | undefined;
+					let unattributed: ExecutionObservation | undefined;
 					let writer: SessionWriter | undefined;
 					const failureDetail = (error: unknown) =>
 						`${errorMessage(error)}; process=${JSON.stringify({
@@ -2108,6 +2108,7 @@ export class LinuxProcessReuseBackend {
 								inputs ??= new Set(
 									(
 										await observeExecution(tail, image, logicalCwd, {
+											platformFingerprint: observedPrototype.platformFingerprint,
 											controlledSocket: channel?.socket,
 											launchPath,
 											previewBytes: speculativeConfig().processReuse.tracePreviewBytes,
@@ -2212,12 +2213,13 @@ export class LinuxProcessReuseBackend {
 						);
 						stage = "execution";
 						let outputEndpoints = domain?.endpoints;
-						let completedObservation: StraceObservation | undefined;
+						let completedObservation: ExecutionObservation | undefined;
 						const proofOwners = new Set<SessionWriter>();
 						const observe = () =>
 							completedObservation
 								? Promise.resolve(completedObservation)
 								: observeExecution(writer!.tail!, image, logicalCwd, {
+										platformFingerprint: observedPrototype.platformFingerprint,
 										controlledSocket: channel?.socket,
 										launchPath,
 										brokeredWrites: (pid) => brokeredWrites(session, pid, writer),
@@ -3092,7 +3094,7 @@ export class LinuxProcessReuseBackend {
 			},
 			projection,
 			digest,
-			ready.platformFingerprint,
+			await this.resolvePlatformFingerprint(),
 		);
 	}
 }
@@ -3301,7 +3303,7 @@ export async function imageInterpreter(file: string): Promise<string | undefined
 async function captureDependencies(
 	session: ActiveSession,
 	snapshot: WorkspaceStructureSnapshot,
-	observations: readonly StraceObservation[],
+	observations: readonly ExecutionObservation[],
 	effects: WorkspaceTransactionDiff,
 	external: Awaited<ReturnType<typeof privateCommits>>,
 	runs: readonly DynamicDependencyCertificate[] = [],
@@ -4555,9 +4557,9 @@ function speculativeProducerProof(ready: ReadyBackend, deniedPaths: readonly str
 }
 /** Compare the kernel journal with each actual pipe before publishing its cross-stream order. */
 function verifyProcessOutput(
-	observation: StraceObservation,
+	observation: ExecutionObservation,
 	delivered: readonly BufferedOutput[],
-): StraceObservation {
+): ExecutionObservation {
 	const digests = (events: readonly BufferedOutput[]) => {
 		const hashes = [createHash("sha256"), createHash("sha256")];
 		for (const { fd, data } of events) hashes[fd - 1]!.update(data);
@@ -4784,7 +4786,7 @@ async function topLevelProcessPrototype(
 	});
 }
 async function captureActorDependencies(
-	observation: StraceObservation,
+	observation: ExecutionObservation,
 	signal?: AbortSignal,
 ): Promise<DynamicDependency[]> {
 	const dependencies = new Map<string, DynamicDependency>();

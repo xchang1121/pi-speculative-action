@@ -40,7 +40,8 @@ const cases = [
 		command: "python3 -I -S -B check.py",
 		output: "tests passed\n",
 	},
-	{ kind: "script", command: "node report.mjs", output: "report:6\n" },
+	{ kind: "script", command: "python3 -I -S -B report.py", output: "report:6\n" },
+	{ kind: "node", command: "node report.mjs", output: "report:6\n" },
 ];
 
 processTest.for(
@@ -62,6 +63,14 @@ processTest.for(
 			"check.py":
 				'import json\nwith open("data.json") as f: values = json.load(f)\nassert sum(values) == 6\nassert sorted(values) == [1,2,3]\nprint("tests passed")\n',
 			"data.json": "[3,1,2]\n",
+			"report.py": [
+				"import json, os",
+				'with open("data.json") as f: total = sum(json.load(f))',
+				'fd = os.open("report.txt", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)',
+				"os.write(fd, str(total).encode())",
+				"os.close(fd)",
+				'print(f"report:{total}")',
+			].join("\n"),
 			"report.mjs":
 				'import fs from "node:fs"; const values=JSON.parse(fs.readFileSync("data.json", "utf8")); const sum=values.reduce((a,b)=>a+b,0); fs.writeFileSync("report.txt", String(sum)); console.log("report:"+sum);\n',
 		};
@@ -71,6 +80,7 @@ processTest.for(
 			compile: "main.o",
 			build: "app",
 			script: "report.txt",
+			node: "report.txt",
 		};
 		const artifact = artifacts[kind];
 		const expectedArtifact = artifact && (await readFile(path.join(f.workspace, artifact)));
@@ -105,10 +115,10 @@ processTest.for(
 			await h.ready();
 			expect(await snapshot(), "public producer changed the source").toEqual(before);
 			expect(textOutput(await h.execute("bash", { command })), JSON.stringify(h.events)).toBe(output);
-			expect(h.fallbacks, JSON.stringify(h.events)).toEqual([]);
+			expect(h.fallbacks, JSON.stringify(h.events)).toEqual(kind === "node" ? ["bash"] : []);
 			if (artifact) expect(await readFile(path.join(f.workspace, artifact))).toEqual(expectedArtifact);
 			expect(textOutput(await h.execute("bash", { command }))).toBe(output);
-			expect(h.fallbacks).toEqual(["bash"]);
+			expect(h.fallbacks).toEqual(kind === "node" ? ["bash", "bash"] : ["bash"]);
 			await h.finish();
 			return;
 		}
@@ -120,6 +130,14 @@ processTest.for(
 		expect(await snapshot(), "producer changed the source").toEqual(before);
 		expect(textOutput(branch.output.result), JSON.stringify(f.backend.metrics())).toBe(output);
 		const validation = await branch.validate!();
+		if (kind === "node") {
+			expect(validation).toMatchObject({
+				status: "indeterminate",
+				cause: { detail: expect.stringContaining("unsupported_syscall") },
+			});
+			expect(f.backend.metrics().lastError).toContain("mprotect");
+			return;
+		}
 		expect(validation, JSON.stringify({ validation, metrics: f.backend.metrics() })).toMatchObject({
 			status: "valid",
 		});

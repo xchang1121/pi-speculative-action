@@ -193,14 +193,12 @@ test("public computeStep retains async binary results above one MiB using the co
 		label: "Large step",
 		description: "Explicit binary result",
 		parameters: Type.Object({ tag: Type.String() }),
-		version: "1",
 		effect: "actor",
 		steps: {},
 		execute: async ({ computeStep }, args) => {
 			const value = await computeStep(
 				{
 					namespace: "large.binary",
-					version: "1",
 					key: "shared",
 					inputResources: [{ path: "data/rows.json", scope: "content" }],
 				},
@@ -249,7 +247,6 @@ test.for([
 		let computeBuilds = 0;
 		const step = defineSpeculativeStep({
 			id: "transaction.read-written",
-			version: "1",
 			dependencies: {},
 			run: async ({ fs }, input: { path: string }) => {
 				stepBuilds++;
@@ -261,7 +258,6 @@ test.for([
 			label: "Read pending write",
 			description: "Read the current transaction through both step APIs",
 			parameters: Type.Object({ text: Type.String(), output: Type.String() }),
-			version: "1",
 			effect: "workspace_mutation",
 			steps: { step },
 			execute: async ({ fs, step, computeStep }, args) => {
@@ -271,7 +267,6 @@ test.for([
 				const second = await computeStep(
 					{
 						namespace: "transaction.compute-written",
-						version: "1",
 						key: target,
 						inputResources: [{ path: target, scope: "content" }],
 					},
@@ -313,7 +308,6 @@ test("a rejected outer mutation retains baseline steps after unrelated private w
 		label: "Rollback step",
 		description: "Keep baseline computation",
 		parameters: Type.Object({ output: Type.String() }),
-		version: "1",
 		effect: "workspace_mutation",
 		steps: {},
 		execute: async ({ computeStep, fs }, args) => {
@@ -321,7 +315,6 @@ test("a rejected outer mutation retains baseline steps after unrelated private w
 			const result = await computeStep(
 				{
 					namespace: "rollback.rows",
-					version: "1",
 					key: "sum",
 					inputResources: [
 						{ path: "data/rows.json", scope: "content" },
@@ -367,7 +360,6 @@ test.each(["parent", "sibling"])("a dirty %s preserves clean nested steps after 
 	let releaseDirty = Promise.withResolvers<void>();
 	const clean = defineSpeculativeStep({
 		id: "rollback.clean-child",
-		version: "1",
 		dependencies: {},
 		run: async ({ fs }) => {
 			cleanBuilds++;
@@ -376,7 +368,6 @@ test.each(["parent", "sibling"])("a dirty %s preserves clean nested steps after 
 	});
 	const dirty = defineSpeculativeStep({
 		id: "rollback.dirty-child",
-		version: "1",
 		dependencies: {},
 		run: async ({ fs }) => {
 			const value = (await fs.readFile("scratch.txt")).toString();
@@ -387,7 +378,6 @@ test.each(["parent", "sibling"])("a dirty %s preserves clean nested steps after 
 	});
 	const parent = defineSpeculativeStep({
 		id: "rollback.parent",
-		version: "1",
 		dependencies: { clean, dirty },
 		run: async ({ fs, step }) => {
 			parentBuilds++;
@@ -412,7 +402,6 @@ test.each(["parent", "sibling"])("a dirty %s preserves clean nested steps after 
 		label: "Nested rollback",
 		description: "Retain only clean children",
 		parameters: Type.Object({ output: Type.String() }),
-		version: "1",
 		effect: "workspace_mutation",
 		steps: { parent },
 		execute: async ({ fs, step }, args) => {
@@ -443,7 +432,6 @@ test("registered templates share declared asynchronous children across tools", a
 	let effects = 0;
 	const rows = defineSpeculativeStep({
 		id: "example.rows",
-		version: "1",
 		dependencies: {},
 		run: async ({ fs }, input: { path: string }) => {
 			loads++;
@@ -452,7 +440,6 @@ test("registered templates share declared asynchronous children across tools", a
 	});
 	const index = defineSpeculativeStep({
 		id: "example.index",
-		version: "1",
 		dependencies: { rows },
 		run: async ({ step }, input: { path: string; factor: number }) => {
 			indexes++;
@@ -461,7 +448,6 @@ test("registered templates share declared asynchronous children across tools", a
 	});
 	const report = defineSpeculativeStep({
 		id: "example.report",
-		version: "1",
 		dependencies: { index },
 		run: async ({ step }, input: { path: string; factor: number; label: string }) => {
 			reports++;
@@ -477,7 +463,6 @@ test("registered templates share declared asynchronous children across tools", a
 			label: name,
 			description: name,
 			parameters,
-			version: "1",
 			effect: "actor",
 			steps: { report },
 			resources: (args) => [args.path],
@@ -571,7 +556,6 @@ test("cancelled registered work publishes no result and leaves subsequent calls 
 	let effects = 0;
 	const value = defineSpeculativeStep({
 		id: "cancel.value",
-		version: "1",
 		dependencies: {},
 		run: async ({ signal }, input: { value: number }) => {
 			if (++builds === 1) {
@@ -588,7 +572,6 @@ test("cancelled registered work publishes no result and leaves subsequent calls 
 		name: "template_cancel",
 		label: "Cancel",
 		description: "Cancel",
-		version: "1",
 		effect: "actor",
 		parameters: Type.Object({ value: Type.Number() }),
 		steps: { value },
@@ -666,7 +649,6 @@ test.each(["observation", "workspace_mutation", "actor"] as const)(
 		let runs = 0;
 		const calculated = defineSpeculativeStep({
 			id: "boundary.value",
-			version: "1",
 			dependencies: {},
 			run: async ({ fs }, input: { path: string }) => {
 				builds++;
@@ -678,7 +660,6 @@ test.each(["observation", "workspace_mutation", "actor"] as const)(
 			label: effect,
 			description: effect,
 			parameters: Type.Object({ path: Type.String() }),
-			version: "1",
 			effect,
 			steps: { calculated },
 			resources: (args) => [args.path],

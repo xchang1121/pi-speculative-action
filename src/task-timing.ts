@@ -1,5 +1,4 @@
 export interface SerializedTimelineComputation {
-	readonly version: 1 | 2 | 3;
 	readonly root: string;
 	readonly nodes: readonly SerializedTimelineNode[];
 }
@@ -23,7 +22,7 @@ export interface SerializedTimelineNode {
 	readonly timeOrigin?: number;
 	readonly startedAt: number;
 	readonly completedAt: number;
-	/** Explicit calculation segments; absence preserves historical continuous computation. */
+	/** Explicit calculation segments; absence denotes continuous computation. */
 	readonly spans?: readonly {
 		readonly startedAt: number;
 		readonly completedAt: number;
@@ -56,7 +55,7 @@ export function normalizeTimelineComputation(value: unknown): SerializedTimeline
 	try {
 		if (
 			!record(value) ||
-			![1, 2, 3].includes(value.version as number) ||
+			Object.keys(value).some((key) => key !== "root" && key !== "nodes") ||
 			!identity(value.root) ||
 			!Array.isArray(value.nodes) ||
 			!value.nodes.length
@@ -156,7 +155,6 @@ export function normalizeTimelineComputation(value: unknown): SerializedTimeline
 		);
 		if (!ordered || ordered.length !== byID.size) return undefined;
 		return Object.freeze({
-			version: value.version as 1 | 2 | 3,
 			root: value.root,
 			nodes: Object.freeze(ordered),
 		});
@@ -562,7 +560,6 @@ export class TimelineInterval {
 			});
 		}
 		return normalizeTimelineComputation({
-			version: 3,
 			root: computationIdentity(computation),
 			nodes,
 		});
@@ -1053,7 +1050,24 @@ function unionDuration(intervals: readonly TimelineInterval[]): number {
 	}
 	return total;
 }
-type SubcomputationSummary = "actionHitRate" | "subcomputationHits" | "reusedComputeMs";
+export type SubcomputeCounts = { hits: number; misses: number; reusedMs: number };
+export type SubcomputeMetrics = Readonly<Record<string, Readonly<SubcomputeCounts>>>;
+export function summarizeSubcomputations(groups: Iterable<SubcomputeMetrics | undefined>) {
+	const totals = new Map<string, SubcomputeCounts>();
+	for (const group of groups)
+		for (const [name, delta] of Object.entries(group ?? {})) {
+			const counts = totals.get(name) ?? { hits: 0, misses: 0, reusedMs: 0 };
+			counts.hits += delta.hits;
+			counts.misses += delta.misses;
+			counts.reusedMs += delta.reusedMs;
+			totals.set(name, counts);
+		}
+	return Object.fromEntries(Array.from(totals, ([name, counts]) => [
+		name, { ...counts, hitRate: counts.hits / (counts.hits + counts.misses || 1) },
+	] as const));
+}
+export const subcomputeTiming = new AsyncLocalStorage<(namespace: string, hit: boolean, receipt?: TimelineInterval) => void>();
+type SubcomputationSummary = "actionHitRate" | "subcomputationHits" | "reusedComputeMs" | "subcomputations";
 export type SpeculativeTraceSummary = Readonly<
 	Omit<ReturnType<typeof emptySpeculativeTraceSummary>, SubcomputationSummary> &
 		Partial<Pick<ReturnType<typeof emptySpeculativeTraceSummary>, SubcomputationSummary>>
@@ -1120,6 +1134,7 @@ export function emptySpeculativeTraceSummary(
 		hitRate: 0,
 		actionHitRate: 0,
 		subcomputationHits: 0,
+		subcomputations: {} as ReturnType<typeof summarizeSubcomputations>,
 		reusedComputeMs: 0,
 		actorCandidateRejections: {} as Readonly<Record<string, number>>,
 		tasks: 0,
@@ -1145,6 +1160,8 @@ export function reduceSpeculativeTrace<SessionID>(
 		reusedComputeMs: current.reusedComputeMs ?? 0,
 		cache: { ...event.cache },
 	};
+	if (event.subcomputations)
+		next.subcomputations = summarizeSubcomputations([current.subcomputations, event.subcomputations]);
 	// Prediction support and execution ownership are different: shared work is charged to its producer only.
 	if (
 		(event.type === "prediction" || event.type === "operation_prediction") &&

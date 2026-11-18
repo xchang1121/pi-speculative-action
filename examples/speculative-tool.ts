@@ -9,7 +9,6 @@ import {
 // Share these immutable definitions between tools. Keep configuration in step inputs.
 export const rows = defineSpeculativeStep({
 	id: "example.dataset.rows",
-	version: "1",
 	dependencies: {},
 	run: async ({ fs }, input: { path: string }) => {
 		const bytes = await fs.readFile(input.path, 1024 * 1024 + 1);
@@ -25,7 +24,6 @@ export const rows = defineSpeculativeStep({
 });
 export const summary = defineSpeculativeStep({
 	id: "example.dataset.summary",
-	version: "1",
 	dependencies: { rows },
 	run: async ({ step }, input: { path: string; multiplier: number }) => {
 		const values = await step("rows", { path: input.path });
@@ -37,7 +35,6 @@ export const summary = defineSpeculativeStep({
 });
 export const report = defineSpeculativeStep({
 	id: "example.dataset.report",
-	version: "1",
 	dependencies: { summary },
 	run: async ({ step }, input: { path: string; multiplier: number; title: string }) => {
 		const value = await step("summary", {
@@ -61,7 +58,6 @@ export const inspectDataset = defineSpeculativeTool({
 	label: "Inspect dataset",
 	description: "Summarize a JSON array of numbers in the workspace.",
 	parameters: Type.Object(fields),
-	version: "1",
 	effect: "observation",
 	steps: { report },
 	resources: (input) => [input.path],
@@ -75,7 +71,6 @@ export const writeDatasetReport = defineSpeculativeTool({
 	label: "Write dataset report",
 	description: "Write a dataset summary to a workspace file.",
 	parameters: Type.Object({ ...fields, output: Type.String() }),
-	version: "1",
 	effect: "workspace_mutation",
 	steps: { report },
 	resources: (input) => [input.path, input.output],

@@ -10,7 +10,15 @@ import { evaluateResourceQuery } from "./agent-execution-world.ts";
 import { currentSpeculativeConfiguration, withSpeculativeConfig } from "./config-schema.ts";
 import {
 	computeStepInView,
+	dependencyKey,
+	observeStepInput,
 	ResourceInputSession,
+	ResourceReadView,
+	ResourceVersionManager,
+	resourceProofBytes,
+	resourceStatSignature,
+	type ResourceDependency,
+	type ResourceInputPersistence,
 	validateResourceVersion,
 	type ResourceVersionToken,
 	type ComputeStepRequest,
@@ -18,8 +26,9 @@ import {
 } from "./resource-version.ts";
 import { ProvenanceCertificateStore } from "./reuse-store.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
-import { TimelineInterval } from "./task-timing.ts";
-import type { ObservedProcessPath, StraceObservation } from "./strace-observer.ts";
+import { containsFilesystemPath, filesystemPathKey } from "./primitives.ts";
+import { subcomputeTiming, TaskTimeline, TimelineInterval, type SubcomputeCounts } from "./task-timing.ts";
+import type { ObservedProcessPath, ExecutionObservation } from "./execution-observer.ts";
 type WireValue =
 	| {
 			readonly encoding: "json";
@@ -30,14 +39,25 @@ type WireValue =
 			readonly value: string;
 	  };
 type Begin = ComputeStepRequest & {
-	readonly protocol: 1;
 	readonly op: "compute";
 	readonly context: string;
 };
+type Observation = {
+	readonly op: "observe";
+	readonly token: string;
+	readonly reads: readonly ResourceDependency[];
+};
 type Publication = {
 	readonly op: "publish";
+	readonly token: string;
+	readonly reads?: readonly ResourceDependency[];
 	readonly value: WireValue;
 	readonly durationMs: number;
+};
+const fields = {
+	compute: ["op", "context", "namespace", "key", "inputResources", "envKeys", "environment", "includeInputContent"],
+	observe: ["op", "token", "reads"],
+	publish: ["op", "token", "reads", "durationMs", "value"],
 };
 const endpoint = new AsyncLocalStorage<SubcomputeService>();
 type SubcomputeScope = {
@@ -65,7 +85,7 @@ export function controlledSubcomputeChannel(environment: Readonly<Record<string,
 			)
 				throw new Error("subcompute_process_inputs_unproven");
 		},
-		async observe(observation: StraceObservation): Promise<StraceObservation> {
+		async observe(observation: ExecutionObservation): Promise<ExecutionObservation> {
 			await this.validate();
 			const paths: ObservedProcessPath[] = [];
 			for (const proof of scope.proofs)
@@ -96,15 +116,94 @@ export class SubcomputeService {
 	private readonly clients = new Map<Socket, AbortController>();
 	private readonly scopes = new Map<string, SubcomputeScope>();
 	private readonly owners = new AsyncLocalStorage<Set<string>>();
+	private readonly inputManager: ResourceVersionManager;
+	private readonly files = new Map<
+		string,
+		{ statSig: string; token: Promise<ResourceVersionToken>; bytes: number }
+	>();
+	private cacheBytes = 0;
+	private readonly counts = new Map<string, SubcomputeCounts>();
 	private readonly cwd: string;
 	private readonly store: ProvenanceCertificateStore;
 	private readonly maxBytes: () => number;
 	constructor(cwd: string, store: ProvenanceCertificateStore, maxBytes: () => number) {
 		this.cwd = cwd;
 		this.store = store;
+		this.inputManager = new ResourceVersionManager(cwd, { watch: false, persistentInputs: { store } });
 		this.maxBytes = maxBytes;
 		this.configuration.bind(this);
 	}
+	drainMetrics() {
+		const metrics = Object.fromEntries(this.counts);
+		this.counts.clear();
+		return metrics;
+	}
+	private readonly record = (namespace: string, hit: boolean, computation?: TimelineInterval) => {
+		const counts = this.counts.get(namespace) ?? { hits: 0, misses: 0, reusedMs: 0 };
+		if (hit) {
+			counts.hits++;
+			if (computation) {
+				const now = performance.now();
+				counts.reusedMs += new TaskTimeline(now).recordTool(computation, now, true).toolComputeMs ?? 0;
+			}
+		} else counts.misses++;
+		this.counts.set(namespace, counts);
+	};
+	private evict(key: string): void {
+		const entry = this.files.get(key);
+		if (!entry) return;
+		this.files.delete(key);
+		this.cacheBytes -= entry.bytes;
+		this.lifetime.track(entry.token.then((token) => token.release(), () => {}));
+	}
+	invalidate(paths: readonly string[]): void {
+		for (const key of this.files.keys())
+			if (paths.some((target) => containsFilesystemPath(target, key) || containsFilesystemPath(key, target)))
+				this.evict(key);
+	}
+	private readonly inputs: NonNullable<ResourceInputPersistence["inputs"]> = async (dependency, stat) => {
+		const key = filesystemPathKey(dependency.path);
+		const budget = this.maxBytes();
+		if (stat.isFile() && stat.size > budget) return;
+		const statSig = resourceStatSignature(stat, key);
+		let entry = this.files.get(key);
+		if (entry && entry.statSig !== statSig) {
+			this.evict(key);
+			entry = undefined;
+		}
+		if (!entry) {
+			const capture = async () => {
+				const token = await this.inputManager.capture(undefined, this.maxBytes());
+				try {
+					await observeStepInput(token.view!, dependency);
+					token.view!.seal();
+					if (token.observations.get(dependencyKey(dependency))?.stamp !== statSig)
+						throw new Error("subcompute_inputs_changed");
+					return token;
+				} catch (error) {
+					await token.release();
+					throw error;
+				}
+			};
+			entry = { statSig, token: capture(), bytes: 0 };
+		}
+		this.files.delete(key);
+		this.files.set(key, entry);
+		while (this.files.size > 2048) this.evict(this.files.keys().next().value!);
+		try {
+			const token = await entry.token;
+			if (this.files.get(key) !== entry) return;
+			if (!entry.bytes) {
+				entry.bytes = token.view!.bytes + (token.view!.contents?.storedBytes ?? 0) + resourceProofBytes([token]);
+				this.cacheBytes += entry.bytes;
+			}
+			while (this.cacheBytes > budget && this.files.size) this.evict(this.files.keys().next().value!);
+			if (this.files.get(key) === entry) return token;
+		} catch (error) {
+			if (this.files.get(key) === entry) this.evict(key);
+			throw error;
+		}
+	};
 	run<T>(operation: () => T): T {
 		const tokens = new Set<string>();
 		const finish = () => {
@@ -113,7 +212,7 @@ export class SubcomputeService {
 		return endpoint.run(this, () =>
 			this.owners.run(tokens, () => {
 				try {
-					const output = operation();
+					const output = subcomputeTiming.run(this.record, operation);
 					if (output instanceof Promise) return output.finally(finish) as T;
 					finish();
 					return output;
@@ -136,7 +235,7 @@ export class SubcomputeService {
 		);
 		timer.unref();
 		const scope: SubcomputeScope = {
-			run: AsyncLocalStorage.snapshot(),
+			run: subcomputeTiming.run(this.record, () => AsyncLocalStorage.snapshot()),
 			timer,
 			clients: new Set(),
 			socket,
@@ -196,7 +295,6 @@ export class SubcomputeService {
 						if (!socket.destroyed)
 							socket.end(
 								JSON.stringify({
-									protocol: 1,
 									state: "error",
 									error: String(error.message ?? error),
 								}) + "\n",
@@ -214,6 +312,18 @@ export class SubcomputeService {
 		});
 		if (this.lifetime.sealed) throw new Error("subcompute_service_closed");
 		return address;
+	}
+	private resources(reads?: readonly ResourceDependency[]): ResourceDependency[] | undefined {
+		if (reads === undefined) return;
+		if (!Array.isArray(reads)) throw new Error("invalid_subcompute_resource");
+		return reads.map((resource) => {
+			if (!resource || typeof resource.path !== "string" || resource.path.includes("\0") ||
+				!["content", "entries", "names", "exists", "stat", "entry", "type"].includes(resource.scope))
+				throw new Error("invalid_subcompute_resource");
+			const target = path.resolve(this.cwd, resource.path);
+			if (!containsFilesystemPath(this.cwd, target)) throw new Error("resource dependency escapes workspace");
+			return { path: target, scope: resource.scope };
+		});
 	}
 	private async serve(socket: Socket, signal: AbortSignal): Promise<void> {
 		const limit = () => this.configuration.current.subcomputation.socketRequestBytes;
@@ -244,33 +354,63 @@ export class SubcomputeService {
 			if (next.done) return undefined;
 			frames--;
 			if (Buffer.byteLength(next.value) > limit()) throw new Error("subcompute_request_budget_exceeded");
-			return JSON.parse(next.value) as unknown;
+			const frame = JSON.parse(next.value) as Begin | Observation | Publication;
+			if (!frame || !Object.hasOwn(fields, frame.op) || Object.keys(frame).some((key) => !fields[frame.op].includes(key)))
+				throw new Error("invalid_subcompute_frame");
+			return frame;
 		};
 		const send = async (message: object) => {
 			signal.throwIfAborted();
-			const frame = JSON.stringify({ protocol: 1, ...message }) + "\n";
+			const frame = JSON.stringify(message) + "\n";
 			if (Buffer.byteLength(frame) > limit()) throw new Error("subcompute_response_budget_exceeded");
 			await new Promise<void>((resolve, reject) =>
 				socket.write(frame, (error) => (error ? reject(error) : resolve())),
 			);
 		};
-		const session = new ResourceInputSession({ store: this.store }, this.maxBytes());
+		const publish = async (view: ResourceReadView, contract: ComputeStepRequest) => {
+			const token = randomUUID();
+			const seen = new Set(contract.inputResources?.map(dependencyKey));
+			const inputResources = await captureDeclaredInputs(view, contract);
+			const publication = await TimelineInterval.outside(async () => {
+				await send({ state: "miss", token, inputResources });
+				for (;;) {
+					const frame = await read();
+					if (!frame || frame.op === "compute" || frame.token !== token) throw new Error("invalid_subcompute_token");
+					if (frame.op === "observe" && !Array.isArray(frame.reads)) throw new Error("invalid_subcompute_resource");
+					let repeated = false;
+					for (const resource of this.resources(frame.reads) ?? []) {
+						const key = dependencyKey(resource);
+						if (seen.has(key)) repeated = true;
+						else {
+							await observeStepInput(view, resource);
+							seen.add(key);
+						}
+					}
+					if (repeated || frame.op === "publish") await view.validateObserved();
+					if (frame.op === "publish") return frame;
+					await send({ state: "observed", token });
+				}
+			});
+			if (!Number.isFinite(publication.durationMs) || publication.durationMs < 0)
+				throw new Error("invalid_subcompute_publication");
+			TimelineInterval.own(TimelineInterval.retained(randomUUID(), publication.durationMs));
+			return decodeValue(publication.value);
+		};
+		const session = new ResourceInputSession({ store: this.store, inputs: this.inputs }, this.maxBytes());
 		let scope: SubcomputeScope | undefined;
 		try {
 			for (;;) {
-				const request = (await read()) as Begin;
+				const request = await read();
 				if (request === undefined) break;
-				const requestedScope = request && this.scopes.get(request.context);
+				if (request.op !== "compute") throw new Error("invalid_subcompute_request");
+				const requestedScope = this.scopes.get(request.context);
 				if (scope && scope !== requestedScope) throw new Error("subcompute_context_changed");
 				scope = requestedScope;
 				if (!scope) throw new Error("subcompute_context_unavailable");
 				scope.clients.add(socket);
 				if (
-					!request ||
-					request.protocol !== 1 ||
-					request.op !== "compute" ||
+					!Object.hasOwn(request, "key") ||
 					typeof request.namespace !== "string" ||
-					typeof request.version !== "string" ||
 					(request.includeInputContent !== undefined && typeof request.includeInputContent !== "boolean") ||
 					(request.envKeys !== undefined &&
 						(!Array.isArray(request.envKeys) ||
@@ -281,24 +421,10 @@ export class SubcomputeService {
 							Array.isArray(request.environment) ||
 							Object.values(request.environment).some(
 								(value) => value !== undefined && (typeof value !== "string" || value.includes("\0")),
-							))) ||
-					(request.inputResources !== undefined && !Array.isArray(request.inputResources))
+							)))
 				)
 					throw new Error("invalid_subcompute_request");
-				const contract: ComputeStepRequest = {
-					...request,
-					inputResources: request.inputResources?.map((resource) => {
-						if (
-							!resource ||
-							typeof resource.path !== "string" ||
-							resource.path.includes("\0") ||
-							!["content", "entries", "names", "exists", "stat", "entry", "type"].includes(resource.scope)
-						)
-							throw new Error("invalid_subcompute_resource");
-						const target = path.resolve(this.cwd, resource.path);
-						return { ...resource, path: target };
-					}),
-				};
+				const contract = { ...request, inputResources: this.resources(request.inputResources) };
 				let produced = false;
 				scope.busy++;
 				try {
@@ -314,20 +440,7 @@ export class SubcomputeService {
 										contract,
 										async (inputs) => {
 											produced = true;
-											const captured = await captureDeclaredInputs(inputs, contract);
-											const publication = await TimelineInterval.outside(async () => {
-												await send({ state: "miss", inputResources: captured });
-												return (await read()) as Publication;
-											});
-											if (
-												!publication ||
-												publication.op !== "publish" ||
-												!Number.isFinite(publication.durationMs) ||
-												publication.durationMs < 0
-											)
-												throw new Error("invalid_subcompute_publication");
-											TimelineInterval.own(TimelineInterval.retained(randomUUID(), publication.durationMs));
-											return decodeValue(publication.value);
+											return publish(inputs as ResourceReadView, contract);
 										},
 										signal,
 									),
@@ -379,6 +492,9 @@ export class SubcomputeService {
 					this.server!.close((error) => (error ? reject(error) : resolve())),
 				);
 			await this.lifetime.drain();
+			for (const key of this.files.keys()) this.evict(key);
+			await this.lifetime.drain();
+			this.inputManager.close();
 			if (this.directory) await rm(this.directory, { recursive: true, force: true });
 		});
 	}
@@ -408,7 +524,8 @@ async function captureDeclaredInputs(
 					...resource,
 					content: encodeValue(await view.readFile(resource.path)),
 				};
-			if (resource.scope === "content") return { ...resource, size: (await view.stat!(resource.path)).size };
+			if (resource.scope === "content")
+				return { ...resource, size: (await view.stat!(resource.path)).size };
 			if (resource.scope === "entries" || resource.scope === "names")
 				return { ...resource, names: await view.readdir!(resource.path) };
 			if (resource.scope === "exists") return { ...resource, exists: await view.exists!(resource.path) };

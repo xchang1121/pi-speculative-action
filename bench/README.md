@@ -37,7 +37,7 @@ npm run bench:suite -- --suite swe_smoke --paired --repeats 1 --max-turns 32 --t
 
 正确性检查完整输入输出、后续模型 payload、thinking、工具批次、预算、usage、逐步文件效果、最终回复、一次执行与零残留。乱序用例暂停前驱，确认独立后继提前完成、依赖写入保持私有，错误观测只撤销依赖预测；Pattern 使用真实批次顺序进入 Store。模型任务结束后在独立副本验证原始基线和补丁的 `FAIL_TO_PASS/PASS_TO_PASS`；`patchCandidate` 只表示运行结束、补丁干净且文件有交集。
 
-`T = toolComputeMs` 包含调用实际消费的执行、首次证明与封存，以及生产者在 Actor 发出调用后完成的部分。`H = hiddenComputeMs` 是其中实际复用且在调用发出前已完成的部分，包含跨轮次缓存命中。同一计算按身份去重，并行父子区间取并集。采纳当次的验新、拷贝与交付计入等待。按 `ΣT / Σ(T-H)` 汇总已测量的 `toolSpeedup`；T=H>0 记 `fullyHidden`、比值为 null，T=H=0 显示 n/a。`hiddenComputeIncomplete` 单独标记缺失证据。报告同时记录 `actionHitRate`、`subcomputationHits` 与 `reusedComputeMs`。
+`T = toolComputeMs` 包含调用实际消费的执行、首次证明与封存，以及生产者在 Actor 发出调用后完成的部分。`H = hiddenComputeMs` 是其中实际复用且在调用发出前已完成的部分，包含跨轮次缓存命中。同一计算按身份去重，并行父子区间取并集。采纳当次的验新、拷贝与交付计入等待。按 `ΣT / Σ(T-H)` 汇总已测量的 `toolSpeedup`；T=H>0 记 `fullyHidden`、比值为 null，T=H=0 显示 n/a。`hiddenComputeIncomplete` 单独标记缺失证据。报告同时记录 `actionHitRate`、`subcomputationHits` 与 `reusedComputeMs`。`subcomputations` 按 namespace 汇总步骤的 `hits`、`misses`、`hitRate` 和 `reusedMs`。套件报告按各次运行的命中数与调用数计算汇总命中率。
 
 `toolWaitMs` 为 Actor 调用区间的并集，覆盖准备至结算；`adoptionWaitMs` 扣除已消费的执行区间，表示纯协调等待。开关两臂都从实际事件记录计算、复用与回退，关闭预测不把已发生的复用记为零；缺少任务事件时，计算时长保持未知。任务时间从 Host 初始化前到终态回收完成；数据集下载、checkout、依赖安装及结束后的补丁验证不计入。CPU、反事实开销及端到端净收益须独立测量。
 

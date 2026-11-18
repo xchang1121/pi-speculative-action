@@ -1,4 +1,4 @@
-import { toolSpeedup } from "../src/task-timing.ts";
+import { summarizeSubcomputations, toolSpeedup, type SubcomputeMetrics } from "../src/task-timing.ts";
 
 export interface SuiteBenchmarkSummary {
 	readonly actualEndToEndMs: number;
@@ -10,6 +10,7 @@ export interface SuiteBenchmarkSummary {
 	readonly hiddenComputeIncomplete?: true;
 	readonly actorActions: number;
 	readonly speculativeHits: number;
+	readonly subcomputations?: SubcomputeMetrics;
 	readonly actorCost: number;
 	readonly drafterCost: number;
 	readonly patchCandidate: boolean;
@@ -72,6 +73,7 @@ export function summarizeSuite(runs: readonly SuiteBenchmarkRun[]) {
 		unmeasuredRuns: runs.length - measured.length,
 		// Incomplete denominators must not hide known hidden calculation or actual waits.
 		diagnostics: {
+			subcomputations: summarizeSubcomputations(runs.map((run) => run.summary?.subcomputations)),
 			adoptionWaitMeasuredRuns: adoption.length,
 			adoptionWaitMs: total(adoption),
 			toolWaitMeasuredRuns: toolWaits.length,

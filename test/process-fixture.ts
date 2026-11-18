@@ -1,7 +1,6 @@
 import {
 	createExecPrototype,
 	sealProcessCertificate,
-	type ProcessProvenanceCertificate,
 } from "../src/provenance-certificate.ts";
 import { sha256Digest } from "../src/primitives.ts";
 import { spawn } from "node:child_process";
@@ -51,15 +50,8 @@ export function storeMetadata<T>(root: string, run: (database: DatabaseSync) => 
 	}
 }
 
-/** A separate process exercises checkpoint ownership and artifact collection. */
-export function storePeer(
-	root: string,
-	certificate?: ProcessProvenanceCertificate,
-	checkpoint?: {
-		readonly ticket: string;
-		readonly action: "hold" | "consume" | "release";
-	},
-) {
+/** Run collection in an independent process. */
+export function storePeer(root: string) {
 	const child = spawn(
 		process.execPath,
 		[
@@ -67,16 +59,10 @@ export function storePeer(
 			"--eval",
 			`
 		const { ProvenanceCertificateStore } = await import("@earendil-works/pi-speculative-action/process-reuse");
-		const { root, certificate, checkpoint } = await new Promise(resolve => process.once('message', resolve));
+		const { root } = await new Promise(resolve => process.once('message', resolve));
 		const alive = setInterval(() => {}, 1000), store = new ProvenanceCertificateStore(root);
-		let notice = 'collected';
-		if (checkpoint) {
-			const claim = await store.claimProcessCheckpoint(checkpoint.ticket, certificate.id);
-			if (claim && checkpoint.action === 'hold') { process.send('claimed'); await new Promise(() => {}); }
-			if (claim) await claim(checkpoint.action === 'consume');
-			notice = claim ? 'claimed' : 'miss';
-		} else await store.gc();
-		await store.dispose(); clearInterval(alive); process.send(notice); process.disconnect();
+		await store.gc();
+		await store.dispose(); clearInterval(alive); process.send('collected'); process.disconnect();
 	`,
 		],
 		{ stdio: ["ignore", "pipe", "pipe", "ipc"] },
@@ -96,6 +82,6 @@ export function storePeer(
 	]);
 	void completed.catch(() => undefined);
 	void noticed.catch(() => undefined);
-	child.send({ root, certificate, checkpoint });
+	child.send({ root });
 	return { child, noticed, completed };
 }

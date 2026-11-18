@@ -126,7 +126,7 @@ test("admits registered providers through qualification, freshness and retiremen
 				checks.push(operation);
 				if (!available) throw new Error("provider retired");
 				return {
-					fingerprint: "bound-resource-provider:1",
+					fingerprint: "bound-resource-provider",
 					externalEffects: "excluded",
 				};
 			},
@@ -275,7 +275,7 @@ test("an independently qualified observation entry is visible and wraps the actu
 			operations: ["observeOperations"],
 			verify: async ({ operation }) => {
 				expect(operation).toBe("observeOperations");
-				return { fingerprint: "observer:1", externalEffects: "excluded" };
+				return { fingerprint: "observer", externalEffects: "excluded" };
 			},
 		},
 	);

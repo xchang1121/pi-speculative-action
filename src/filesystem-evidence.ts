@@ -523,7 +523,6 @@ export type StableFilesystemCapture = {
 	readonly shared?: true;
 	/** Optional real open file description, owned by the input version rather than its pathname. */
 	readonly object?: CapturedFilesystemObject;
-	/** Git's object id for exactly these bytes, when the caller stages them. */
 };
 export interface FilesystemObjectTransfer {
 	readonly fd: number;

@@ -235,6 +235,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Execution routing: admitted providers ${onOff(settings.executionRouting.primary)}; local routes ${onOff(settings.executionRouting.nativeFallback)}; Actor always available`,
 		`Search execution: ${searchExecutionLabel(settings.searchExecution)}`,
 		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial, ${metrics.inputReuseHits} inputs`,
+		...formatSubcomputations(metrics),
 		...(hasProcessReuse(metrics.actorProcessReuse)
 			? [`Bash Actor reuse: ${formatActorProcessReuse(metrics.actorProcessReuse)}`]
 			: []),
@@ -1340,6 +1341,11 @@ const capabilityLabels: Record<ExecutionWorldHealthState, string> = {
 	registered: "Check",
 	unavailable: "Unavailable",
 };
+function formatSubcomputations(metrics: SpeculativeTraceSummary): string[] {
+	return Object.entries(metrics.subcomputations ?? {}).map(([name, { hits, misses, reusedMs }]) =>
+		"Step " + name + " " + formatRatio(hits, hits + misses) + " hits, " + formatDuration(reusedMs) + " reused",
+	);
+}
 function formatSpeculativeFooter(
 	settings: EffectiveSpeculativeActionSettings,
 	metrics: SpeculativeActionMetrics,
@@ -1358,6 +1364,7 @@ function formatSpeculativeFooter(
 		`spec: ${settings.enabled ? "on" : "off"}, reuse: ${settings.reuseEnabled ? "on" : "off"}`,
 		metrics.tasks > 0 ? `${formatSpeedup(metrics)}; ${formatHiddenCompute(metrics)}` : "Tool SpeedUp n/a",
 		`tools reused ${formatRatio(metrics.speculativeHits, metrics.actorActions)}`,
+		...formatSubcomputations(metrics),
 		...(hasProcessReuse(reuse) ? [`Bash Actor ${formatActorProcessFooter(reuse)}`] : []),
 		`live results ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
 		...(storageWorlds.length ? [`reuse history ${storedEntries} entries (${formatBytes(storedBytes)})`] : []),

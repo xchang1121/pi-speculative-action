@@ -47,27 +47,24 @@ export async function resolveLinuxExecHelper(binary) {
 /** Linux source capture cannot fall back to ordinary reads before a backend happens to initialize. */
 export async function ensureNativeFilesystem() {
 	if (process.platform !== "linux") return undefined;
-	const qualify = () => {
-		if (!nativeFilesystem || nativeFilesystem(-11) !== 3)
-			throw new Error("qualified native filesystem reader unavailable; rebuild the Linux backend");
-		return nativeFilesystem;
-	};
-	if (nativeFilesystem) return qualify();
+	if (nativeFilesystem) return nativeFilesystem;
 	return (filesystemInitialization ??= resolveLinuxExecHelper(
 		configuredFilesystemBinary ?? process.env.PI_SPEC_HELD_EXEC,
 	)
-		.then((binary) => {
-			if (!nativeFilesystem) nativeProcessLibrary(binary);
-			return qualify();
-		})
+		.then((binary) => nativeFilesystem ?? nativeProcessLibrary(binary))
 		.finally(() => {
 			filesystemInitialization = undefined;
 		}));
 }
-/** @param {string} binary */
+/** @param {string} binary
+ * @returns {NonNullable<typeof nativeFilesystem>}
+ */
 export function nativeProcessLibrary(binary) {
 	const startup = requireNative(`${binary}.node`);
-	if (startup(-1, Buffer.alloc(24)) !== -9) throw new Error("native directory reader unavailable");
+	const invalidDescriptor = Buffer.alloc(8);
+	invalidDescriptor.writeInt32LE(-1);
+	if (startup(-1, Buffer.alloc(24)) !== -9 || startup(-14, invalidDescriptor) !== -9)
+		throw new Error("qualified native filesystem reader unavailable; rebuild the Linux backend");
 	nativeFilesystem = startup;
 	return startup;
 }

@@ -41,6 +41,7 @@
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/user.h>
+#include <sys/utsname.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -273,6 +274,10 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
       value = fields[1] ? fcntl(fd, F_ADD_SEALS, seals) : fcntl(fd, F_GET_SEALS);
       if (value >= 0)
         value = fields[1] || (value & seals) == seals;
+    } else if (operation == -16) {
+      if (length != sizeof(struct utsname))
+        return NULL;
+      value = uname(bytes);
     } else if (operation == -15) {
       if (length <= sizeof(struct pi_domain_packet) ||
           strnlen((char *)bytes + sizeof(struct pi_domain_packet),
@@ -317,9 +322,6 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
     }
     if (value < 0)
       value = -errno;
-  } else if (operation == -11) {
-    value = 3; /* Filesystem ABI: synchronous adoption, ext4 read-only root,
-                  sealed content images. */
   } else if (!operation && startup_gate[0] < 0) {
     if (!socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, startup_gate))
       value = startup_gate[1];

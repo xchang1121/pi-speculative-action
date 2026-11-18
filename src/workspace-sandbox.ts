@@ -1535,7 +1535,7 @@ export class WorkspaceSandboxService {
 	}
 	private async resolveDriver(options: WorkspaceSandboxOptions): Promise<QualifiedWorkspaceSandboxDriver> {
 		if (options.driver !== "overlayfs")
-			return { driver: "in_memory", fingerprint: "immutable-cas-workspace:1" };
+			return { driver: "in_memory", fingerprint: "immutable-cas-workspace" };
 		const capability = await this.overlayfsCapabilities.capability(options);
 		if (!capability.available) throw new Error(capability.detail);
 		return {

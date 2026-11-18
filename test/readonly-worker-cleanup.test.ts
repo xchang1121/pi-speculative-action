@@ -27,7 +27,6 @@ test
           Atomics.wait(waiting, 0, 1);
         };
         const adopt = fd => openSync("/proc/self/fd/" + fd, 0x200000);
-        if (native(-11) !== 3) throw new Error("synchronous descriptor adoption unavailable");
         if (workerData.mode === "throw") {
           let descriptor, caught = false;
           try { native(-5, Buffer.alloc(0), fd => { descriptor = fd; throw new Error("adoption interrupted"); }); }

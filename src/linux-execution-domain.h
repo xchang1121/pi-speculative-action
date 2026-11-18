@@ -2,7 +2,6 @@
 #define PI_EXECUTION_DOMAIN_H
 
 /* The collector owns observations; the application receives only read views. */
-#define PI_DOMAIN_ABI 18
 /* Capacity definitions are supplied by config-schema.ts through the setup
  * compiler arguments. */
 enum pi_domain_operation {
@@ -76,7 +75,8 @@ struct pi_domain_state {
  * sealed Sandlock metadata/input ABI. All other records also use this header. */
 enum pi_execution_kind {
   PI_FORK = 13, PI_EXEC, PI_EXIT, PI_CALL, PI_PATH, PI_PATH2,
-  PI_RETURN = 20, PI_OUTPUT, PI_UNIX_ADDRESS, PI_OPEN_FILE, PI_FD_USE, PI_EXEC_PROJECTION
+  PI_RETURN = 20, PI_OUTPUT, PI_UNIX_ADDRESS, PI_OPEN_FILE, PI_FD_USE, PI_EXEC_PROJECTION,
+  PI_UNSUPPORTED_SYSCALL, PI_UNSUPPORTED_USE
 };
 struct pi_event_file {
   unsigned long long inode;

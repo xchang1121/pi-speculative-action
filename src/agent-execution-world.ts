@@ -380,7 +380,7 @@ export async function evaluateResourceQuery<Output>(
 						execute,
 						(dependencies, commit) => observeOwner(versions, dependencies, commit),
 						root,
-						async function* (target, preparationsOnly) {
+						async function* (target, preparation) {
 							const owners = [
 								versions,
 								...[...(lookup?.(target) ?? [])].map((source) => resourceVersions.get(source)?.() ?? []),
@@ -395,7 +395,7 @@ export async function evaluateResourceQuery<Output>(
 													? [observe(token, dependencies, commit)]
 													: observeOwner(tokens, undefined, commit),
 										};
-							for await (const token of session?.recover(root, signal, target, preparationsOnly) ?? [])
+							for await (const token of session?.recover(root, signal, target, preparation) ?? [])
 								if (token.view)
 									yield {
 										view: token.view.readOnly(),

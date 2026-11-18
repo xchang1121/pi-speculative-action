@@ -1,12 +1,13 @@
 import { afterEach, expect, test, vi } from "vitest";
 import { execFile } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import { mkdir, mkdtemp, open, lstat, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ArtifactReference } from "../src/content-chunks.ts";
-import type { Sha256Digest } from "../src/primitives.ts";
+import { digestObject, type Sha256Digest } from "../src/primitives.ts";
 import { CONTENT_CHUNK_BYTES } from "../src/content-chunks.ts";
 import { FILESYSTEM_METADATA_FIELDS } from "../src/filesystem-evidence.ts";
 import {
@@ -15,7 +16,7 @@ import {
 	type ResourceVersionToken,
 } from "../src/resource-version.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
-import { storePeer } from "./process-fixture.ts";
+import { storeMetadata, storePeer } from "./process-fixture.ts";
 
 vi.mock("node:fs/promises", { spy: true });
 afterEach(() => vi.restoreAllMocks());
@@ -66,6 +67,67 @@ const searchFixture = async (f: Awaited<ReturnType<typeof fixture>>, mode: strin
 		).stdout,
 	);
 
+test("preparation lookup uses ordered SQLite keys, exact scopes, and cascading eviction", async () => {
+	const f = await fixture();
+	try {
+		const put = (root: string, binding: string, key: string, generation: number) =>
+			f.store.putInputVersion({ root, preparations: [{ binding, key }], generation }, []);
+		const clock = vi.spyOn(Date, "now");
+		const now = Date.now();
+		clock.mockReturnValue(now);
+		const earlier = await put(f.root, "transform", "same", 1);
+		await put(f.root, "other", "same", 2);
+		await put(f.root, "transform", "different", 3);
+		await put(f.root + "-other", "transform", "same", 4);
+		clock.mockReturnValue(now + 1);
+		const latest = await put(f.root, "transform", "same", 5);
+		clock.mockRestore();
+		const query = { root: f.root, binding: "transform", prepKey: digestObject("same") };
+		const queries = vi.spyOn(DatabaseSync.prototype, "prepare");
+		expect(await f.store.findPreparedInputCandidates(query)).toEqual([latest, earlier]);
+		expect(await f.store.findPreparedInputCandidates({ ...query, limit: 1 })).toEqual([latest]);
+		for await (const candidate of f.store.candidatesInputVersions(f.root, 1)) expect(candidate).toEqual(latest);
+		const statements = queries.mock.calls.map(([sql]) => sql);
+		queries.mockRestore();
+		const join = statements.find((sql) => sql.includes("JOIN input_versions"));
+		const byRoot = statements.find((sql) => sql.includes("FROM input_versions WHERE root"));
+		expect(join).toBeDefined();
+		expect(byRoot).toBeDefined();
+		storeMetadata(f.cache, (db) => {
+			const plan = db.prepare("EXPLAIN QUERY PLAN " + join).all(f.root, "transform", query.prepKey, 1)
+				.map((row) => row.detail).join("\n");
+			expect(plan).toMatch(/SEARCH p USING COVERING INDEX input_preparations_recent/);
+			expect(plan).toMatch(/SEARCH i USING INDEX/);
+			expect(plan).not.toMatch(/SCAN|TEMP B-TREE/);
+			expect(db.prepare("EXPLAIN QUERY PLAN " + byRoot).get(f.root, 1)?.detail).toContain("input_versions_root");
+		});
+		const collector = new ProvenanceCertificateStore(f.cache, { maxCertificates: 1 });
+		try {
+			expect((await collector.gc()).removedInputVersions).toBe(4);
+			expect(await f.store.findPreparedInputCandidates(query)).toEqual([latest]);
+			await collector.clear();
+			expect(await f.store.findPreparedInputCandidates(query)).toEqual([]);
+			expect(storeMetadata(f.cache, (db) => db.prepare("SELECT COUNT(*) AS n FROM input_preparations").get()?.n)).toBe(0);
+		} finally {
+			await collector.dispose();
+		}
+	} finally {
+		await f.close();
+	}
+});
+
+test("opening incompatible metadata preserves the existing database and refuses publication", async () => {
+	const f = await fixture();
+	try {
+		await mkdir(f.cache);
+		storeMetadata(f.cache, (db) => db.exec("CREATE TABLE input_versions(id TEXT); INSERT INTO input_versions VALUES ('keep')"));
+		await expect(f.store.putInputVersion({ root: f.root, preparations: [] }, [])).rejects.toThrow(/incompatible.*schema/);
+		expect(storeMetadata(f.cache, (db) => db.prepare("SELECT id FROM input_versions").get()?.id)).toBe("keep");
+	} finally {
+		await f.close();
+	}
+});
+
 linux("stops persistent recovery after a consumed input and releases its lease", async () => {
 	const f = await fixture();
 	const session = new ResourceInputSession({ store: f.store }, memoryBudget);
@@ -95,7 +157,7 @@ linux("stops persistent recovery after a consumed input and releases its lease",
 		}
 		expect(restore).toHaveBeenCalledTimes(1);
 		restore.mockClear();
-		for await (const _token of session.recover(f.root, new AbortController().signal, undefined, true))
+		for await (const _token of session.recover(f.root, new AbortController().signal, undefined, { key: "absent" }))
 			throw new Error("no prepared values were stored");
 		expect(restore).not.toHaveBeenCalled();
 	} finally {
@@ -123,7 +185,16 @@ linux("rejects incomplete, corrupt, over-budget and stale persistent preparation
 			}[];
 		};
 		const preparation = (record.payload as Payload).preparations[0]!;
-		expect(preparation).toBeDefined();
+		const getAgain = vi.spyOn(f.store, "getInputVersion");
+		const enumerate = vi.spyOn(f.store, "candidatesInputVersions");
+		const recovered = [];
+		for await (const { id, token } of f.manager.recover(8 * 1024 * 1024, { preparation })) {
+			recovered.push(id);
+			await token.release();
+		}
+		expect(recovered).toEqual([record.id]);
+		expect(getAgain).not.toHaveBeenCalled();
+		expect(enumerate).not.toHaveBeenCalled();
 		expect(record.artifacts).toContainEqual(preparation.value);
 		await storePeer(f.cache).completed;
 		expect(await f.store.artifacts.get(preparation.value)).toBeDefined();
@@ -142,12 +213,12 @@ linux("rejects incomplete, corrupt, over-budget and stale persistent preparation
 				}
 			}
 			const proposed = await f.store.putInputVersion(payload, artifacts);
-			await expect(f.manager.restore(proposed.id, 8 * 1024 * 1024), field).rejects.toThrow(
+			await expect(f.manager.restore(proposed, 8 * 1024 * 1024), field).rejects.toThrow(
 				/closure|data_invalid/,
 			);
 		}
-		await expect(f.manager.restore(captured.id, 1024)).rejects.toThrow(/budget/);
-		const restored = (await f.manager.restore(captured.id, 8 * 1024 * 1024))!;
+		await expect(f.manager.restore(record, 1024)).rejects.toThrow(/budget/);
+		const restored = (await f.manager.restore(record, 8 * 1024 * 1024))!;
 		f.tokens.push(restored);
 		expect(restored.view!.hasPreparedInputs).toBe(true);
 		await expect(
@@ -156,7 +227,7 @@ linux("rejects incomplete, corrupt, over-budget and stale persistent preparation
 		const artifact = f.store.artifacts.artifactPath(preparation.value.digest);
 		const original = (await f.store.artifacts.get(preparation.value))!;
 		await writeFile(artifact, Buffer.alloc(original.length, 32));
-		await expect(f.manager.restore(captured.id, 8 * 1024 * 1024)).rejects.toThrow(/integrity/);
+		await expect(f.manager.restore(record, 8 * 1024 * 1024)).rejects.toThrow(/integrity/);
 		const oversized = await open(artifact, "r+");
 		try {
 			await oversized.truncate(64 * CONTENT_CHUNK_BYTES);
@@ -169,7 +240,7 @@ linux("rejects incomplete, corrupt, over-budget and stale persistent preparation
 			peak = Math.max(peak, process.memoryUsage().rss);
 		}, 1);
 		try {
-			await expect(f.manager.restore(captured.id, 8 * 1024 * 1024)).rejects.toThrow(/integrity/);
+			await expect(f.manager.restore(record, 8 * 1024 * 1024)).rejects.toThrow(/integrity/);
 		} finally {
 			clearInterval(sample);
 		}
@@ -183,10 +254,10 @@ linux("rejects incomplete, corrupt, over-budget and stale persistent preparation
 		);
 		expect(growth).toBeLessThan(32 * CONTENT_CHUNK_BYTES);
 		await rm(artifact);
-		await expect(f.manager.restore(captured.id, 8 * 1024 * 1024)).rejects.toThrow(/missing/);
+		await expect(f.manager.restore(record, 8 * 1024 * 1024)).rejects.toThrow(/missing/);
 		await f.store.artifacts.put(original);
 		await writeFile(file, "changed source\n");
-		expect(await f.manager.restore(captured.id, 8 * 1024 * 1024)).toBeUndefined();
+		expect(await f.manager.restore(record, 8 * 1024 * 1024)).toBeUndefined();
 		expect((await f.manager.validate(restored)).expired).toBe(true);
 		await restored.release();
 		expect(restored.view!.hasPreparedInputs).toBe(false);
@@ -216,7 +287,7 @@ linux("recovers actual input bytes, names, aliases and current proofs in a cold 
 			import { ProvenanceCertificateStore } from './src/reuse-store.ts';
 			const [root, cache, id] = process.argv.slice(2), store = new ProvenanceCertificateStore(cache);
 			const manager = new ResourceVersionManager(root, { watch: false, persistentInputs: { store } });
-			const token = await manager.restore(id, 262144);
+			const token = await manager.restore(await store.getInputVersion(id), 262144);
 			if (!token) throw new Error('cold input restore missed');
 			try { console.log(JSON.stringify({ value: (await token.view.readFile(root + '/alias')).toString(),
 				names: await token.view.readdir(root), expired: (await manager.validate(token)).expired,
@@ -279,9 +350,9 @@ linux(
 				else if (field === "omitted") payload.entries = payload.entries.filter(([name]) => name !== alias);
 				else payload.entries.push([path.join(f.root, "invented"), { ...entry(file) }]);
 				const proposed = await f.store.putInputVersion(payload, artifacts);
-				expect(await f.manager.restore(proposed.id, memoryBudget), field).toBeUndefined();
+				expect(await f.manager.restore(proposed, memoryBudget), field).toBeUndefined();
 			}
-			const restored = await f.manager.restore(record.id, memoryBudget);
+			const restored = await f.manager.restore(record, memoryBudget);
 			f.tokens.push(restored!);
 			expect((await restored!.view!.readFile(alias)).toString()).toBe("original content");
 		} finally {

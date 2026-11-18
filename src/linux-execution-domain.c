@@ -4,13 +4,20 @@
 #define PI_ENTRY_OPERATIONS(X) X(mkdir) X(mknod) X(rmdir) X(unlink) X(symlink)
 #define PI_INODE_OPERATIONS(X) X(setattr) X(setxattr) X(removexattr) X(set_acl) X(remove_acl)
 
+struct unknown_key { unsigned long long owner, number, tid, started, image; };
+
 #ifdef PI_BPF_OBJECT
 #include <linux/bpf.h>
 
+#include <asm/prctl.h>
 #include <asm/unistd.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
+#include <linux/errno.h>
 #include <linux/fs.h>
+#include <linux/futex.h>
+#include <linux/mman.h>
+#include <linux/utsname.h>
 
 struct pt_regs {
   unsigned long orig_ax;
@@ -316,6 +323,53 @@ static __always_inline struct file *task_fd(unsigned fd) {
   return file;
 }
 
+/* A zero task key interns the number once per domain. Each task image that
+ * uses it gets one reference, even when a launcher or sibling saw it first. */
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+  __uint(max_entries, PI_DOMAIN_RECORDS);
+  __type(key, struct unknown_key);
+  __type(value, __u64);
+} unknown_calls SEC(".maps");
+
+static __noinline void unsupported_syscall(struct pi_domain_state *state, __u64 owner, __u64 number) {
+  struct task_struct *task = (void *)bpf_get_current_task_btf();
+  struct unknown_key key = {owner, number, bpf_get_current_pid_tgid(),
+                            BPF_CORE_READ(task, start_boottime), BPF_CORE_READ(task, self_exec_id)};
+  if (bpf_map_lookup_elem(&unknown_calls, &key))
+    return;
+  struct unknown_key domain = {owner, number};
+  __u64 *known = bpf_map_lookup_elem(&unknown_calls, &domain);
+  __u64 id = 0;
+  unsigned kind = PI_UNSUPPORTED_USE;
+  if (!known) {
+    id = next_file();
+    if (!id)
+      goto lost;
+    long error = bpf_map_update_elem(&unknown_calls, &domain, &id, BPF_NOEXIST);
+    if (!error)
+      kind = PI_UNSUPPORTED_SYSCALL;
+    else if (error != -EEXIST || !(known = bpf_map_lookup_elem(&unknown_calls, &domain)))
+      goto lost;
+  }
+  if (known)
+    id = *known;
+  if (bpf_map_update_elem(&unknown_calls, &key, &id, BPF_NOEXIST))
+    goto lost;
+  struct pi_domain_event *event = metadata_begin(owner, id, kind, state);
+  if (event) {
+    if (kind == PI_UNSUPPORTED_SYSCALL) {
+      __builtin_memcpy(event->bytes, &number, sizeof(number));
+      event->size = sizeof(number);
+    }
+    metadata_emit(event, state);
+  }
+  return;
+lost:
+  __sync_fetch_and_or(&state->metadata_lost, 1024);
+}
+
 struct fd_use_key {
   __u64 owner, task_birth, image, file, inode;
   __u32 fd, write;
@@ -414,6 +468,44 @@ static __always_inline unsigned descriptor_io(unsigned long nr) {
     return 0;
   }
 }
+/* These calls need no entry record. PID queries have a separate return hook;
+ * clock and random observations are already charged to every execution. */
+static __always_inline int pure_syscall(unsigned long nr) {
+  switch (nr) {
+  case __NR_brk:
+  case __NR_munmap:
+  case __NR_exit:
+  case __NR_exit_group:
+  case __NR_set_tid_address:
+  case __NR_set_robust_list:
+  case __NR_rseq:
+  case __NR_rt_sigaction:
+  case __NR_rt_sigprocmask:
+  case __NR_rt_sigreturn:
+  case __NR_sigaltstack:
+  case __NR_getpid:
+  case __NR_gettid:
+  case __NR_getppid:
+  case __NR_getpgrp:
+  case __NR_getpgid:
+  case __NR_getsid:
+  case __NR_clock_gettime:
+  case __NR_gettimeofday:
+  case __NR_time:
+  case __NR_getrandom:
+  case __NR_getcwd:
+  case __NR_getuid:
+  case __NR_geteuid:
+  case __NR_getgid:
+  case __NR_getegid:
+  case __NR_getgroups:
+  case __NR_umask:
+  case __NR_sched_yield:
+    return 1;
+  default:
+    return 0;
+  }
+}
 static __always_inline unsigned call_layout(unsigned long nr) {
   if (descriptor_io(nr))
     return PI_LAYOUT(0, 0, 1, 0);
@@ -484,6 +576,7 @@ static __always_inline unsigned call_layout(unsigned long nr) {
   case __NR_fchmod:
   case __NR_fchown:
   case __NR_fallocate:
+  case __NR_fadvise64:
   case __NR_fcntl:
   case __NR_flock:
   case __NR_ioctl:
@@ -529,6 +622,11 @@ static __always_inline unsigned call_layout(unsigned long nr) {
   case __NR_socket:
   case __NR_socketpair:
   case __NR_close_range:
+  case __NR_wait4:
+  case __NR_uname:
+  case __NR_sysinfo:
+  case __NR_getrusage:
+  case __NR_sched_getaffinity:
   case __NR_prlimit64:
   case __NR_getrlimit:
   case __NR_setrlimit:
@@ -678,12 +776,27 @@ int execution_filename(unsigned long long *context) {
 static int metadata_enter(struct pt_regs *registers, unsigned secure) {
   unsigned long number = BPF_CORE_READ(registers, orig_ax);
   unsigned layout = call_layout(number);
-  if (!layout)
+  if (!layout && (pure_syscall(number) ||
+                  ((number == __NR_mprotect || number == __NR_pkey_mprotect) &&
+                   !(BPF_CORE_READ(registers, dx) & PROT_WRITE)) ||
+                  (number == __NR_arch_prctl && BPF_CORE_READ(registers, di) == ARCH_SET_FS)))
     return 0;
+  if (number == __NR_futex) {
+    unsigned op = BPF_CORE_READ(registers, si) & ~FUTEX_CLOCK_REALTIME;
+    if (op == FUTEX_WAIT_PRIVATE || op == FUTEX_WAKE_PRIVATE ||
+        op == FUTEX_WAIT_BITSET_PRIVATE || op == FUTEX_WAKE_BITSET_PRIVATE)
+      return 0;
+  }
   __u64 owner = 0;
   struct pi_domain_state *state = metadata_state(&owner);
   if (!state || !metadata_tracee(owner))
     return 0;
+  /* Normal, random and sequential fadvise affect only the open description's
+   * read-ahead policy. Other advice can change the shared page cache. */
+  if (!layout || (number == __NR_fadvise64 && BPF_CORE_READ(registers, r10) > 2)) {
+    unsupported_syscall(state, owner, number);
+    return 0;
+  }
   __u32 pid = (__u32)metadata_task(state);
   __u64 task = (__u64)bpf_get_current_task_btf();
   struct metadata_call *previous = bpf_map_lookup_elem(&metadata_calls, &pid);
@@ -870,7 +983,7 @@ int metadata_return(struct bpf_raw_tracepoint_args *context) {
   struct pi_domain_event *event = metadata_begin(owner, call->id, 6, state);
   if (!event)
     return 0;
-  if (!metadata_number(number)) {
+  if (!metadata_number(number) && number != __NR_uname) {
     struct {
       __s64 result;
       struct pi_event_file first, second;
@@ -933,16 +1046,20 @@ int metadata_return(struct bpf_raw_tracepoint_args *context) {
     __u64 address;
     __u32 size;
     __u32 pad;
-    unsigned char bytes[256];
+    unsigned char bytes[sizeof(struct new_utsname)];
   };
   struct returned *result = (void *)event->bytes;
   result->number = number;
   result->result = context->args[1];
   result->pad = 0;
-  result->address = call->arguments[number == __NR_newfstatat ? 2 : number == __NR_statx ? 4 : 1];
-  result->size = result->result < 0 ? 0 : number == __NR_statx ? 256 : 144;
+  unsigned address = number == __NR_newfstatat ? 2 : number == __NR_statx ? 4 : 1;
+  result->address = call->arguments[number == __NR_uname ? 0 : address];
+  unsigned bytes = number == __NR_uname ? sizeof(struct new_utsname) : number == __NR_statx ? 256 : 144;
+  result->size = result->result < 0 ? 0 : bytes;
   event->size = 32 + result->size;
-  if (result->size)
+  if (event->size > sizeof(event->bytes))
+    event->error = -E2BIG;
+  else if (result->size)
     event->error = bpf_probe_read_user(result->bytes, result->size, (void *)result->address);
   metadata_emit(event, state);
   bpf_map_delete_elem(&metadata_calls, &pid);
@@ -1769,7 +1886,7 @@ static int role_map = -1;
 static int metadata_call_map = -1;
 static int metadata_notification_map = -1;
 static uint64_t domain_sequence;
-static size_t trace_bytes;
+static int unknown_call_map = -1;
 static struct bpf_program *task_query_program;
 static struct bpf_program *broker_query;
 static struct bpf_program *input_query;
@@ -1890,28 +2007,30 @@ static int retire(struct domain *group) {
       (void)write_value(group->path, "cgroup.freeze", "0");
     return error;
   }
-  /* Pending notifications can outlive a killed task; they never outlive their
-   * execution owner. Both map values begin with that owner's unique identity.
-   */
-  for (unsigned map = 0; map < 2; map++) {
-    int file = map ? metadata_notification_map : metadata_call_map;
+  /* The first two maps carry the owner in their value, unknown calls in their key. */
+  const int maps[] = {metadata_call_map, metadata_notification_map, unknown_call_map};
+  for (unsigned map = 0; map < 3; map++) {
+    int file = maps[map];
     int have = 0;
-    uint64_t key[3];
-    uint64_t next[3];
+    union {
+      uint32_t pid;
+      uint64_t notification[3];
+      struct unknown_key unknown;
+    } key = {}, next = {};
     uint64_t value[16];
-    size_t key_size = map ? 24 : 4;
     for (unsigned count = 0; count < PI_DOMAIN_RECORDS; count++) {
-      if (bpf_map_get_next_key(file, have ? key : NULL, next))
+      if (bpf_map_get_next_key(file, have ? &key : NULL, &next))
         break;
-      if (!bpf_map_lookup_elem(file, next, value) && value[0] == group->id)
-        bpf_map_delete_elem(file, next);
+      int owned = map == 2 ? next.unknown.owner == group->id :
+                  !bpf_map_lookup_elem(file, &next, value) && value[0] == group->id;
+      if (owned)
+        bpf_map_delete_elem(file, &next);
       else {
-        memcpy(key, next, key_size);
+        key = next;
         have = 1;
       }
     }
   }
-  trace_bytes -= group->event_bytes;
   if (group->events)
     munmap(group->events, PI_DOMAIN_TRACE_BYTES);
   if (group->trace >= 0)
@@ -1932,13 +2051,12 @@ static int metadata_record(void *context, void *data, size_t bytes) {
     if (group->id != event->owner)
       continue;
     size_t length = (bytes + 7) & ~(size_t)7;
-    if (!group->events || length > PI_DOMAIN_TRACE_BYTES - trace_bytes) {
+    if (!group->events || length > PI_DOMAIN_TRACE_BYTES - group->event_bytes) {
       group->event_lost = 1;
       return 0;
     }
     memcpy(group->events + group->event_bytes, event, bytes);
     group->event_bytes += length;
-    trace_bytes += length;
     group->event_count++;
     return 0;
   }
@@ -2138,7 +2256,6 @@ static int respond(struct pi_domain_packet *message, const struct ucred *peer, p
   if (message->operation == PI_DOMAIN_HELLO) {
     if (message->count || message->domain)
       return EINVAL;
-    message->domain = PI_DOMAIN_ABI;
     message->count = 8;
     memcpy(message->values, PI_DOMAIN_BUILD, 64);
     return 0;
@@ -2501,6 +2618,7 @@ int main(int argc, char **argv) {
   role_map = bpf_object__find_map_fd_by_name(object, "metadata_roles");
   metadata_call_map = bpf_object__find_map_fd_by_name(object, "metadata_calls");
   metadata_notification_map = bpf_object__find_map_fd_by_name(object, "metadata_notifications");
+  unknown_call_map = bpf_object__find_map_fd_by_name(object, "unknown_calls");
   broker_query = bpf_object__find_program_by_name(object, "metadata_broker");
 #define ENTRY_SYMBOL(name) "security_path_" #name,
 #define INODE_SYMBOL(name) "security_inode_" #name,

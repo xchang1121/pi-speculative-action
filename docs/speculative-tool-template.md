@@ -12,7 +12,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { defineSpeculativeStep, defineSpeculativeTool, registerSpeculativeTool } from "@earendil-works/pi-speculative-action";
 
 const count = defineSpeculativeStep({
-  id: "my-package.count", version: "1", dependencies: {},
+  id: "my-package.count", dependencies: {},
   run: async ({ fs }, input: { path: string }) => {
     const text = (await fs.readFile(input.path)).toString("utf8");
     return text.split("\n").length;
@@ -23,7 +23,7 @@ export default function register(pi: ExtensionAPI) {
   registerSpeculativeTool(pi, defineSpeculativeTool({
     name: "count_lines", label: "Count lines", description: "Count newline-separated segments.",
     parameters: Type.Object({ path: Type.String() }),
-    version: "1", effect: "observation", steps: { count },
+    effect: "observation", steps: { count },
     resources: input => [input.path],
     execute: async ({ step }, input) => {
       const value = await step("count", input);
@@ -39,8 +39,10 @@ export default function register(pi: ExtensionAPI) {
 - `dependencies` 声明直接子步骤；通过 `step("name", input)` 调用它们。每个子步骤只接收实际影响自己的参数，例如标题不应传给解析数据的步骤。依赖定义创建后不可修改，未知步骤名会被拒绝；静态定义自然形成无环图。
 - 输入和输出支持普通对象、数组、字符串、布尔、`null`、有限数字，以及 `Buffer`/`Uint8Array`。循环、访问器、函数和资源句柄会被拒绝。每个消费者获得独立结果副本。
 - 容量由顶层配置的 `subcomputation.maxStepResultBytes/maxStepObjectNodes/maxStepObjectDepth` 控制；缓存按真实序列化字节数计费。默认结果上限为 16 MiB。配置示例见 [README](../README.md)。
-- `id`、`version` 标识计算契约；相同契约及参数可以共享持久化结果。修改实现、依赖库或固定配置时更新版本。文件读取必须经过受控视图，其他影响结果的值应显式放入参数。
+- `id` 标识计算契约；相同契约及参数可以共享持久化结果。影响结果的实现、依赖库或配置变化应纳入步骤的输入键。文件读取必须经过受控视图，其他影响结果的值应显式放入参数。
 - 遵守 `signal`，异步长任务应响应取消，循环应主动检查 `signal.throwIfAborted()`；不要把取消状态当成业务输入，也不要启动脱离调用生命周期的后台任务。
+
+同名工具在不同 Host 实例中使用同一份参数 schema 即可获得同一身份。工具定义可以显式提供确定性的 `identity`，例如业务规则的内容摘要。
 
 ## 工具的效果边界
 

@@ -26,7 +26,7 @@ import {
 } from "./primitives.ts";
 import { waitForCompletion } from "./runtime-lifecycle.ts";
 import type { HardwareResources } from "./system-resources.ts";
-import type { SpeculativeTaskTiming, ToolComputationTiming } from "./task-timing.ts";
+import type { SpeculativeTaskTiming, SubcomputeMetrics, ToolComputationTiming } from "./task-timing.ts";
 import { TimelineInterval } from "./task-timing.ts";
 export type ResolutionStage =
 	| "source"
@@ -554,6 +554,7 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly output: Output;
 		readonly candidate: SpeculativeCandidate;
 	}) => string | undefined;
+	readonly onResourceWrites?: (paths: readonly string[]) => void;
 	readonly onEvent?: (event: SpeculativeActionEvent<SessionID>) => MaybePromise<void>;
 }
 /** One execution owns its reuse result and exactly-once fallback settlement, independent of caller IDs. */
@@ -659,6 +660,7 @@ export type CandidateExecutionProjection =
 			}
 	  >;
 interface EventEnvelope<SessionID> {
+	readonly subcomputations?: SubcomputeMetrics;
 	readonly sessionID: SessionID;
 	readonly turnID: string;
 	readonly timestamp: number; // Epoch milliseconds from performance.timeOrigin + performance.now().

@@ -20,8 +20,8 @@ int main(void) {
   if (!stream)
     return 4;
   fprintf(stream,
-          "{\"protocol\":1,\"op\":\"compute\",\"context\":\"%s\","
-          "\"namespace\":\"process-input\",\"version\":\"1\",\"key\":\"input\","
+          "{\"op\":\"compute\",\"context\":\"%s\","
+          "\"namespace\":\"process-input\",\"key\":\"input\","
           "\"inputResources\":[{\"path\":\"input.txt\",\"scope\":\"content\"}],"
           "\"includeInputContent\":true}\n",
           context);
@@ -31,6 +31,10 @@ int main(void) {
   if (getline(&line, &size, stream) < 0)
     return 5;
   int miss = strstr(line, "\"state\":\"miss\"") != NULL;
+  char token[37];
+  char *id = strstr(line, "\"token\":\"");
+  if (miss && (!id || sscanf(id, "\"token\":\"%36[0-9a-f-]", token) != 1))
+    return 6;
   char *value = strstr(line, "\"value\":\"");
   if (!value)
     return 6;
@@ -41,9 +45,9 @@ int main(void) {
   *end = 0;
   if (miss) {
     fprintf(stream,
-            "{\"op\":\"publish\",\"durationMs\":1,"
+            "{\"op\":\"publish\",\"token\":\"%s\",\"durationMs\":1,"
             "\"value\":{\"encoding\":\"base64\",\"value\":\"%s\"}}\n",
-            value);
+            token, value);
     fflush(stream);
   }
   const char *alphabet =

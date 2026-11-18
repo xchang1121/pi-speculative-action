@@ -645,7 +645,6 @@ export class SelfSpeculationCoordinator {
 				: this.post(
 						settings.forkPath,
 						{
-							version: 1,
 							request_id: state.requestID,
 							model: modelPayload(state.model),
 							context: {
@@ -771,7 +770,7 @@ export class SelfSpeculationCoordinator {
 		);
 		const cleanup = Promise.allSettled(pending)
 			.then(() =>
-				this.post(state.settings.clearPath, { version: 1, request_id: state.requestID }, state.settings),
+				this.post(state.settings.clearPath, { request_id: state.requestID }, state.settings),
 			)
 			.then((receipt) => this.recordVerification(receipt, state));
 		this.background.track(cleanup);
@@ -881,7 +880,6 @@ export class SelfSpeculationCoordinator {
 			const receipt = await this.post(
 				settings.candidatePath,
 				{
-					version: 2,
 					request_id: state.requestID,
 					model: modelPayload(state.model),
 					max_draft_tokens: settings.maxDraftTokens,
@@ -1053,7 +1051,6 @@ function providerPayload(
 	return {
 		...identified,
 		self_speculation: {
-			version: 2,
 			fork: settings.forkEnabled,
 			fork_transport: settings.forkTransport,
 			...fork,
@@ -1088,7 +1085,6 @@ function candidatePayload(
 	return {
 		id: candidate.id,
 		action_identity: {
-			version: 1,
 			predicted_action_id: candidate.id,
 			execution_action_id: candidate.executionID,
 			projected: candidate.key !== candidate.executionKey,

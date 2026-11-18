@@ -84,13 +84,10 @@ export async function executionDomainCollector(binary: string) {
 			Buffer.from(JSON.stringify(nativeBuildDefinitions())),
 		]),
 	);
+	const expectedBuild = Buffer.from(fingerprint.slice(7), "ascii");
 	const check = (root?: string): void => {
 		const hello = request(0);
-		if (
-			hello.readBigUInt64LE(8) !== 18n ||
-			hello.readUInt32LE(4) !== 8 ||
-			hello.toString("ascii", 16, 80) !== fingerprint.slice(7)
-		)
+		if (hello.readUInt32LE(4) !== 8 || !hello.subarray(16, 80).equals(expectedBuild))
 			throw new Error("execution domain collector changed; rebuild the Linux backend");
 		if (root !== undefined) {
 			const domain = collector.open();

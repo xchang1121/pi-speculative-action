@@ -477,17 +477,14 @@ export interface ToolSettlement<TDetails = unknown> {
 	readonly exitCode?: number;
 }
 export interface ToolObservationContract {
-	readonly version: string;
 	/** Model-visible content schema; defaults to text/image blocks. */
 	readonly content?: TSchema;
-	/** Pure, binding-owned normalization; changing these rules requires a new version. */
+	/** Pure, binding-owned normalization. */
 	readonly canonicalize?: (
 		content: ToolSettlement["result"]["content"],
 	) => ToolSettlement["result"]["content"];
 }
-export const EXACT_TOOL_OBSERVATION: ToolObservationContract = Object.freeze({
-	version: "model-visible/1",
-});
+export const EXACT_TOOL_OBSERVATION: ToolObservationContract = Object.freeze({});
 export const toolObservationContract = (action?: ActionKey): ToolObservationContract =>
 	(action?.executionContext as ToolInvocation | undefined)?.observation ?? EXACT_TOOL_OBSERVATION;
 /** Normalization affects prediction ancestry only; it never changes the Actor's output or execution proofs. */
@@ -506,7 +503,7 @@ export function canonicalToolObservation(output: ToolSettlement, action?: Action
 		: original;
 	return {
 		content,
-		key: stableValueHash([contract.version, contract.content, content, output.isError, output.exitCode]),
+		key: stableValueHash([contract.content, content, output.isError, output.exitCode]),
 	};
 }
 export function toolErrorSettlement(error: unknown): ToolSettlement {
