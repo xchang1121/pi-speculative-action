@@ -13,13 +13,15 @@ import { nativeProcessLibrary, spawnControlled } from "../src/process-startup.mj
 import { sha256Digest } from "../src/primitives.ts";
 import { WorkspaceStructureCapture } from "../src/workspace-sandbox.ts";
 
-test.skipIf(process.platform !== "linux").each([false, true])(
-	"settles the staged native handoff (cancel=%s)",
+test.skipIf(process.platform !== "linux").each(["replay", "cancel", "extra-fd"])(
+	"settles the staged native handoff (%s)",
 	{ timeout: 30_000 },
-	async (cancel) => {
+	async (mode) => {
+		const cancel = mode === "cancel";
 		const root = await mkdtemp(path.join(os.homedir(), "pi-staged-cancel-"));
 		const controller = new AbortController();
 		const settlements: boolean[] = [];
+		let offers = 0;
 		let validated = false;
 		let commits = 0;
 		let output = "";
@@ -35,29 +37,32 @@ test.skipIf(process.platform !== "linux").each([false, true])(
 					{
 						sourceRoot: root,
 						signal: controller.signal,
-						decide: async () => ({
-							kind: "replay",
-							exitCode: 0,
-							output: [{ fd: 1, data: Buffer.from("cached") }],
-							validate: () => {
-								validated = true;
-								if (cancel) controller.abort(new Error("cancelled after staging"));
-								return true;
-							},
-							commit: async () => {
-								commits++;
-							},
-							settle: (consumed) => {
-								settlements.push(consumed);
-							},
-						}),
+						decide: async () => {
+							offers++;
+							return {
+								kind: "replay",
+								exitCode: 0,
+								output: [{ fd: 1, data: Buffer.from("cached") }],
+								validate: () => {
+									validated = true;
+									if (cancel) controller.abort(new Error("cancelled after staging"));
+									return true;
+								},
+								commit: async () => {
+									commits++;
+								},
+								settle: (consumed) => {
+									settlements.push(consumed);
+								},
+							};
+						},
 					},
 					() =>
 						new Promise<void>((resolve, reject) => {
 							const child = spawnControlled("/bin/printf", ["native"], {
 								cwd: root,
 								signal: controller.signal,
-								stdio: ["ignore", "pipe", "pipe"],
+								stdio: mode === "extra-fd" ? ["ignore", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
 							});
 							child.stdout!.on("data", (bytes) => {
 								output += bytes;
@@ -69,6 +74,13 @@ test.skipIf(process.platform !== "linux").each([false, true])(
 				.catch((error) => {
 					failure = error;
 				});
+			if (mode === "extra-fd") {
+				expect({ offers, output, commits, settlements, failure }).toEqual({
+					offers: 0, output: "native", commits: 0, settlements: [], failure: undefined,
+				});
+				return;
+			}
+			expect(offers).toBe(1);
 			expect(validated).toBe(true);
 			expect(commits).toBe(Number(!cancel));
 			if (cancel) expect(output).not.toContain("cached");

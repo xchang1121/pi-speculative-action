@@ -10,10 +10,9 @@
 #include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <inttypes.h>
+#include <stdint.h>
 #include <limits.h>
 #include <linux/kcmp.h>
-#include <linux/magic.h>
 #include <linux/mount.h>
 #include <linux/openat2.h>
 #include <poll.h>
@@ -25,9 +24,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
-#include <sys/eventfd.h>
-#include <sys/file.h>
-#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
@@ -42,7 +38,6 @@
 #include <sys/un.h>
 #include <sys/user.h>
 #include <sys/utsname.h>
-#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -355,9 +350,7 @@ napi_value napi_register_module_v1(napi_env env, napi_value exports) {
 
 struct output_event {
   unsigned fd;
-  unsigned kind;
   size_t length;
-  size_t requested;
   unsigned char *data;
 };
 
@@ -375,7 +368,6 @@ struct decision_job {
   struct output_event *events;
   unsigned count;
   int release_barrier;
-  char *context;
 };
 
 struct traced_process {
@@ -451,39 +443,31 @@ static FILE *process_file(pid_t pid, const char *name) {
   return fopen(path, "re");
 }
 
-static int descriptor_numbers(pid_t pid, int minimum, int *fds, unsigned capacity) {
+static int extra_descriptors(pid_t pid) {
   char path[64];
   snprintf(path, sizeof(path), "/proc/%ld/fd", (long)pid);
   DIR *directory = opendir(path);
   if (!directory)
     return -1;
-  unsigned count = 0;
-  int error = 0;
+  int found;
   int scanner = pid == getpid() ? dirfd(directory) : -1;
   for (;;) {
     errno = 0;
     struct dirent *entry = readdir(directory);
     if (!entry) {
-      error = errno;
+      found = errno ? -1 : 0;
       break;
     }
     char *end;
     long fd = strtol(entry->d_name, &end, 10);
-    if (!*entry->d_name || *end || fd < minimum || fd > INT_MAX || fd == scanner)
-      continue;
-    if (count == capacity) {
-      error = E2BIG;
+    if (!*end && fd >= 3 && fd <= INT_MAX && fd != scanner) {
+      found = 1;
       break;
     }
-    fds[count++] = (int)fd;
   }
   closedir(directory);
-  if (error)
-    errno = error;
-  return error ? -1 : (int)count;
+  return found;
 }
-
-/* Read installed state, never a tracee's mutable result/control buffer. */
 
 /* Read credentials only for the held child of this observer. */
 
@@ -567,22 +551,14 @@ static int duplicate_tracee_fd(struct decision_job *job, unsigned fd) {
   return -1;
 }
 
-static void free_events(struct output_event *events, unsigned count) {
-  if (!events)
-    return;
-  for (unsigned index = 0; index < count; index++)
-    free(events[index].data);
-  free(events);
-}
-
-static int has_unmodeled_descriptors(int minimum) {
+static int has_unmodeled_descriptors(void) {
   /* A closed standard stream would be filled by the first file opened; bypass
    * before any is. */
   for (int fd = 0; fd < 3; fd++) {
     if (fcntl(fd, F_GETFD) < 0)
       return errno == EBADF ? 1 : -1;
   }
-  return descriptor_numbers(getpid(), minimum, NULL, 0) < 0 ? (errno == E2BIG ? 1 : -1) : 0;
+  return extra_descriptors(getpid());
 }
 
 static int reset_signals(void) {
@@ -654,7 +630,7 @@ static int request_tracer(struct decision_job *job, unsigned code) {
  */
 
 static int actor_decision(struct decision_job *job) {
-  if (descriptor_numbers(job->pid, 3, NULL, 0) != 0)
+  if (extra_descriptors(job->pid) != 0)
     return -1;
   int connection = job->connection = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (connection < 0)
@@ -667,8 +643,7 @@ static int actor_decision(struct decision_job *job) {
     return -1;
   char line[PI_HELD_LINE_BYTES];
   int length = snprintf(line, sizeof(line),
-                        "{\"token\":\"%s\",\"execution\":\"%s\",\"pid\":%ld,\"tracer\":%"
-                        "ld,\"descriptors\":[]}\n",
+                        "{\"token\":\"%s\",\"execution\":\"%s\",\"pid\":%ld,\"tracer\":%ld}\n",
                         job->token, job->execution_id, (long)job->pid, (long)getpid());
   if (length <= 0 || length >= (int)sizeof(line) ||
       transfer(connection, line, (size_t)length, 1) < 0 ||
@@ -681,16 +656,11 @@ static int actor_decision(struct decision_job *job) {
   if (!strcmp(line, "O"))
     return connection;
   unsigned code;
-  unsigned positions;
-  unsigned resources;
-  unsigned physical;
-  unsigned source;
   size_t total;
-  size_t image;
-  if (sscanf(line, "P2 %u %u %zu %u %u %zu %u %u", &code, &job->count, &total, &positions,
-             &resources, &image, &physical, &source) != 8 ||
-      code > 255 || positions || resources || image || physical || source ||
-      job->count > PI_HELD_OUTPUT_EVENTS || total > PI_HELD_OUTPUT_BYTES)
+  char trailing;
+  if (strncmp(line, "P ", 2) ||
+      sscanf(line + 2, "%u %u %zu%c", &code, &job->count, &total, &trailing) != 3 ||
+      code > 255 || job->count > PI_HELD_OUTPUT_EVENTS || total > PI_HELD_OUTPUT_BYTES)
     goto decline;
   job->events = calloc(job->count + 1, sizeof(*job->events));
   if (!job->events)
@@ -761,7 +731,11 @@ static void free_job(struct decision_job *job) {
   close(job->pidfd);
   for (unsigned fd = 1; fd <= 2; fd++)
     close(job->outputs[fd]);
-  free_events(job->events, job->count);
+  if (job->events) {
+    for (unsigned index = 0; index < job->count; index++)
+      free(job->events[index].data);
+    free(job->events);
+  }
   free(job);
 }
 
@@ -1239,16 +1213,43 @@ fatal:
   return 125;
 }
 
-/* Reproduce a complete inherited FD table at the existing sandboxed native
- * outlet. The supervisor alone keeps the pins, and drains descendants before
- * reporting offsets. */
-
-static int execute_descriptors(const char *manifest, const char *report, char *executable,
-                               char **command, const char *route, unsigned closed_input,
-                               const int *output_flags, const rlim_t *stack_limit) {
-  (void)report;
-  if (manifest || route[2])
-    return 65;
+static int execute_stdio(char *route, char **command, int closed_input) {
+  int output_flags[2] = {-1, -1};
+  /* ",<stdout>,<stderr>": status flags the target's outputs carry natively,
+   * its parent's own (make's O_APPEND). */
+  char *suffix = strchr(route, ',');
+  if (suffix &&
+      (*suffix++ = 0, sscanf(suffix, "%d,%d", &output_flags[0], &output_flags[1]) != 2 ||
+                          output_flags[0] < 0 || output_flags[1] < 0))
+    return 64;
+  char *stack = strchr(route, ':');
+  rlim_t stack_limit = 0;
+  if (stack) {
+    *stack++ = 0;
+    char *end = stack + strlen(stack);
+    errno = 0;
+    stack_limit = !strcmp(stack, "unlimited") ? RLIM_INFINITY : strtoull(stack, &end, 10);
+    if ((!isdigit((unsigned char)*stack) && strcmp(stack, "unlimited")) || *end || errno)
+      return 64;
+  }
+  if (strspn(route, "012") != 2 || route[2])
+    return 64;
+  /* Save stdout's source before changing either endpoint, including swapped
+   * routes. Route 0 discards into /dev/null; Node fills vacant stdio, so the
+   * device opens above it.
+   */
+  int discard = memchr(route, '0', 2) ? open("/dev/null", O_WRONLY | O_CLOEXEC) : -1;
+  int output = fcntl(route[0] == '0' ? discard : route[0] - '0', F_DUPFD_CLOEXEC, 3);
+  if (output < 0)
+    return 70;
+  int routed =
+      dup2(route[1] == '0' ? discard : route[1] - '0', 2) >= 0 && dup2(output, 1) >= 0;
+  close(output);
+  close(discard);
+  if (!routed)
+    return 70;
+  if (reset_signals() < 0)
+    return 70;
   if (closed_input && close(0) < 0 && errno != EBADF)
     return 70;
   for (int fd = 1; fd <= 2; fd++) {
@@ -1260,15 +1261,17 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
                                (output_flags[fd - 1] & (O_APPEND | O_NONBLOCK))) < 0)
       return 70;
   }
-  if (stack_limit) {
+  if (stack) {
     struct rlimit limit;
     if (getrlimit(RLIMIT_STACK, &limit) < 0)
       return 70;
-    limit.rlim_cur = *stack_limit;
+    limit.rlim_cur = stack_limit;
     if (setrlimit(RLIMIT_STACK, &limit) < 0)
       return 70;
   }
-  execv(executable, command);
+  char *executable = command[1];
+  command[1] = command[0];
+  execv(executable, command + 1);
   return errno == ENOENT ? 127 : 126;
 }
 
@@ -1340,61 +1343,12 @@ int main(int argc, char **argv) {
     return trace(socket, token, id, probe, probe ? (unsigned)atoi(argv[2]) : 0,
                  descriptors && !strcmp(descriptors, "1"), !!skip);
   }
-  if (argc >= 2 && (!strcmp(argv[1], "--exec") || !strcmp(argv[1], "--exec-closed-input") ||
-                    !strcmp(argv[1], "--exec-fds"))) {
-    int descriptors = !strcmp(argv[1], "--exec-fds");
-    int name = descriptors ? 5 : 3;
-    int output_flags[2] = {-1, -1};
-    /* ",<stdout>,<stderr>": status flags the target's outputs carry natively,
-     * its parent's own (make's O_APPEND). */
-    char *suffix = argc > 2 ? strchr(argv[2], ',') : NULL;
-    if (suffix &&
-        (*suffix++ = 0, sscanf(suffix, "%d,%d", &output_flags[0], &output_flags[1]) != 2 ||
-                            output_flags[0] < 0 || output_flags[1] < 0))
-      return 64;
-    char *stack = argc > 2 ? strchr(argv[2], ':') : NULL;
-    rlim_t stack_limit = 0;
-    if (stack) {
-      *stack++ = 0;
-      char *end = stack + strlen(stack);
-      errno = 0;
-      stack_limit = !strcmp(stack, "unlimited") ? RLIM_INFINITY : strtoull(stack, &end, 10);
-      if ((!isdigit((unsigned char)*stack) && strcmp(stack, "unlimited")) || *end || errno)
-        return 64;
-    }
-    if (argc < name + 2 || strspn(argv[2], "012") != 2 ||
-        (strlen(argv[2]) != 2 &&
-         (!descriptors || strlen(argv[2]) != 4 || strspn(argv[2] + 2, "ps") != 2 ||
-          (argv[2][0] == argv[2][1] && argv[2][2] != argv[2][3]))))
-      return 64;
-    /* Save stdout's source before changing either endpoint, including swapped
-     * routes. Route 0 discards into /dev/null; Node fills vacant stdio, so the
-     * device opens above it.
-     */
-    int discard = memchr(argv[2], '0', 2) ? open("/dev/null", O_WRONLY | O_CLOEXEC) : -1;
-    int output = fcntl(argv[2][0] == '0' ? discard : argv[2][0] - '0', F_DUPFD_CLOEXEC, 3);
-    if (output < 0)
-      return 70;
-    int routed =
-        dup2(argv[2][1] == '0' ? discard : argv[2][1] - '0', 2) >= 0 && dup2(output, 1) >= 0;
-    close(output);
-    close(discard);
-    if (!routed)
-      return 70;
-    if (reset_signals() < 0)
-      return 70;
-    char *executable = argv[name + 1];
-    char *manifest = descriptors ? argv[3] : NULL;
-    char *report = descriptors ? argv[4] : NULL;
-    argv[name + 1] = argv[name];
-    return execute_descriptors(manifest, report, executable, argv + name + 1, argv[2],
-                               !strcmp(argv[1], "--exec-closed-input"), output_flags,
-                               stack ? &stack_limit : NULL);
-  }
+  if (argc >= 5 && (!strcmp(argv[1], "--exec") || !strcmp(argv[1], "--exec-closed-input")))
+    return execute_stdio(argv[2], argv + 3, !strcmp(argv[1], "--exec-closed-input"));
   if (argc == 4 && !strcmp(argv[1], "--probe-context"))
     return probe_context(argv[2], argv[3]);
   if (argc == 2 && !strcmp(argv[1], "--probe-clean-fds")) {
-    int extra = has_unmodeled_descriptors(3);
+    int extra = has_unmodeled_descriptors();
     return extra < 0 ? 70 : extra ? 65 : 0;
   }
   return 64;

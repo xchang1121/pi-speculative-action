@@ -51,14 +51,6 @@ export interface ProvenanceValidationContext {
 	readonly signal?: AbortSignal;
 	/** Map a stable logical path from the certificate into the current physical execution world. */
 	readonly resolvePath?: (logicalPath: string) => string | undefined;
-	/** Current inherited readable-FD content identities. Missing entries fail closed. */
-	readonly fileDescriptors?: ReadonlyMap<
-		number,
-		{
-			readonly contentDigest: Sha256Digest;
-			readonly eof: boolean;
-		}
-	>;
 	readonly maxFileBytes?: number;
 	/** Borrow only a view owned by the current execution world; other paths use this validation's source view. */
 	readonly readView?: FilesystemReadView | ((physicalPath: string) => FilesystemReadView | undefined);
@@ -84,21 +76,10 @@ export type DynamicDependencyValidation = (
 	readonly filesRead: number;
 	readonly bytesRead: number;
 };
-export type ProvenanceValidation =
-	| (Extract<
-			DynamicDependencyValidation,
-			{
-				status: "valid";
-			}
-	  > & {
-			readonly strongKey: Sha256Digest;
-	  })
-	| Exclude<
-			DynamicDependencyValidation,
-			{
-				status: "valid";
-			}
-	  >;
+type ValidatedProcessInputs = Extract<DynamicDependencyValidation, { status: "valid" }> & {
+	readonly strongKey: Sha256Digest;
+};
+export type ProvenanceValidation = ValidatedProcessInputs | Exclude<DynamicDependencyValidation, { status: "valid" }>;
 /** One lookup, one projection: share current observations, never a previous certificate's validity or a previous lookup's inputs. */
 export function observeProcessInputs(
 	weakKey: Sha256Digest,
@@ -127,12 +108,7 @@ export function observeProcessInputs(
 		evidence.complete ? observe(evidence) : Promise.resolve(undefined);
 }
 type DependencyField = {
-	[Kind in DynamicDependency["kind"]]: keyof Extract<
-		DynamicDependency,
-		{
-			kind: Kind;
-		}
-	>;
+	[Kind in DynamicDependency["kind"]]: keyof DependencyOf<Kind>;
 }[DynamicDependency["kind"]];
 const OBSERVATION_FIELDS = [
 	"contentDigest",
@@ -143,7 +119,6 @@ const OBSERVATION_FIELDS = [
 	"targetDigest",
 	"target",
 	"digest",
-	"eof",
 	"exclusive",
 ] satisfies readonly DependencyField[];
 /** Validate reusable dynamic evidence without requiring a persisted process result. */
@@ -164,10 +139,9 @@ export async function validateDynamicDependencyCertificate(
 	const acceptedTaints = new Set(context.acceptedTaints ?? []);
 	const blockingTaints = certificate.taints.filter((taint) => !acceptedTaints.has(taint));
 	if (blockingTaints.length) return indeterminate(`tainted:${blockingTaints.join(",")}`);
-	const paths = certificate.dependencies.some((dependency) => dependency.kind !== "fd");
 	const borrowed = typeof context.readView === "function" ? undefined : context.readView;
 	return withFilesystemReadView(
-		paths ? borrowed : FilesystemReadView.ambient(),
+		certificate.dependencies.length ? borrowed : FilesystemReadView.ambient(),
 		async (source): Promise<DynamicDependencyValidation> => {
 			const current: DynamicDependency[] = [];
 			const changed: string[] = [];
@@ -179,22 +153,8 @@ export async function validateDynamicDependencyCertificate(
 			const list = sharedWalk((target) => captureFilesystemEntry(target, "directory", readView(target)));
 			const checks = await mapFilesystem(
 				expectations,
-				async (
-					expected,
-				): Promise<
-					| {
-							observed?: DynamicDependency;
-							missing?: true;
-					  }
-					| string
-				> => {
+				async (expected): Promise<DynamicDependency | string | undefined> => {
 					try {
-						if (expected.kind === "fd") {
-							const descriptor = context.fileDescriptors?.get(expected.fd);
-							return descriptor
-								? { observed: { kind: "fd", fd: expected.fd, ...descriptor } }
-								: `fd_unavailable:${expected.fd}`;
-						}
 						const physicalPath = context.resolvePath
 							? context.resolvePath(expected.path)
 							: path.isAbsolute(expected.path)
@@ -214,68 +174,57 @@ export async function validateDynamicDependencyCertificate(
 								});
 								filesRead += captured.filesRead;
 								bytesRead += captured.bytesRead;
-								return { observed: captured.dependency };
+								return captured.dependency;
 							}
 							case "directory":
-								return {
-									observed: await captureDirectoryDependency(
-										physicalPath,
-										expected.path,
-										expected.metadataDigest !== undefined,
-										expected.excludedEntries,
-										expected.entriesDigest !== undefined,
-										list,
-										view,
-									),
-								};
+								return await captureDirectoryDependency(
+									physicalPath,
+									expected.path,
+									expected.metadataDigest !== undefined,
+									expected.excludedEntries,
+									expected.entriesDigest !== undefined,
+									list,
+									view,
+								);
 							case "absence":
-								return {
-									observed: await captureAbsenceDependency(
-										physicalPath,
-										expected.path,
-										expected.parentEntriesDigest !== undefined,
-										expected.parentExcludedEntries,
-										list,
-										view,
-									),
-								};
+								return await captureAbsenceDependency(
+									physicalPath,
+									expected.path,
+									expected.parentEntriesDigest !== undefined,
+									expected.parentExcludedEntries,
+									list,
+									view,
+								);
 							case "symlink":
-								return {
-									observed: await captureSymlinkDependency(physicalPath, expected.path, view),
-								};
+								return await captureSymlinkDependency(physicalPath, expected.path, view);
 							case "metadata":
-								return {
-									observed: await captureMetadataDependency(
-										physicalPath,
-										expected.path,
-										expected.followSymlinks,
-										expected.fields,
-										view,
-									),
-								};
+								return await captureMetadataDependency(
+									physicalPath,
+									expected.path,
+									expected.followSymlinks,
+									expected.fields,
+									view,
+								);
 							case "lock":
-								return {
-									observed: await probeLock(physicalPath, expected.path, expected.exclusive, view),
-								};
+								return await probeLock(physicalPath, expected.path, expected.exclusive, view);
 						}
 					} catch (error) {
 						context.signal?.throwIfAborted();
-						if (missing(error)) return { missing: true };
-						return `validation_error:${expected.kind === "fd" ? expected.fd : expected.path}:${errorMessage(error)}`;
+						if (missing(error)) return undefined;
+						return `validation_error:${expected.path}:${errorMessage(error)}`;
 					}
 				},
 				context.signal,
 			);
-			for (const [index, check] of checks.entries()) {
-				if (typeof check === "string") return indeterminate(check);
+			for (const [index, observed] of checks.entries()) {
+				if (typeof observed === "string") return indeterminate(observed);
 				const expected = expectations[index]!;
-				const { observed } = check;
 				if (observed) current.push(observed);
 				if (
 					!observed ||
 					OBSERVATION_FIELDS.some((field) => Reflect.get(observed, field) !== Reflect.get(expected, field))
 				) {
-					changed.push(expected.kind === "fd" ? `fd:${expected.fd}` : expected.path);
+					changed.push(expected.path);
 				}
 			}
 			await borrowed?.verify();
@@ -467,8 +416,6 @@ export interface ReplayObservationContract {
 	readonly sink: "buffered" | "pipe" | "tty" | "interactive";
 	readonly orderedJournal: boolean;
 	readonly transactionalEffects: boolean;
-	/** Only a held native exec can consume a same-scope continuation. */
-	readonly continuation?: true;
 }
 export interface ProcessReuseRequest {
 	readonly signal?: AbortSignal;
@@ -507,26 +454,17 @@ export interface ProcessReuseLookupMetrics {
 	readonly artifactsLoaded: number;
 	readonly artifactBytesRead: number;
 }
-interface ReadyProcessPlan {
+interface CompletedProcessPlan {
+	readonly kind: "completed_replay";
 	readonly source: "live" | "l2";
 	readonly weakKey: Sha256Digest;
 	readonly certificate: ProcessProvenanceCertificate;
-	readonly validation: Extract<
-		ProvenanceValidation,
-		{
-			status: "valid";
-		}
-	>;
+	readonly validation: ValidatedProcessInputs;
 	readonly artifacts: VerifiedArtifactClosure;
 	readonly lookup: ProcessReuseLookupMetrics;
 }
 export type ProcessReusePlan =
-	| (ReadyProcessPlan & {
-			readonly kind: "completed_replay";
-	  })
-	| (ReadyProcessPlan & {
-			readonly kind: "running_resume";
-	  })
+	| CompletedProcessPlan
 	| {
 			readonly kind: "miss";
 			readonly weakKey: Sha256Digest;
@@ -629,9 +567,8 @@ export class ProcessReusePlanner {
 			}
 			metrics.artifactsLoaded += artifacts.artifacts;
 			metrics.artifactBytesRead += artifacts.bytes;
-			const kind = "completed_replay";
 			return {
-				kind,
+				kind: "completed_replay",
 				source: live.length ? "live" : "l2",
 				weakKey,
 				certificate,
@@ -945,13 +882,13 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				record.state.status === "completed" &&
 				record.state.result &&
 				record.scope?.sessionID === scope.sessionID
-					? (this.certificate(record) ?? [])
+					? record.state.result.candidate
 					: [],
 			);
 	}
 	bindings(scope: ExecutionScope): readonly ProcessExecutionBinding[] {
 		return Object.freeze(
-			[...this.records()].flatMap((record) =>
+			[...this.executions.values()].flatMap((record) =>
 				record.binding?.scope.sessionID === scope.sessionID ? [record.binding] : [],
 			),
 		);
@@ -967,17 +904,17 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 	/** Conservative availability hint; scope, ownership and evidence still decide acquisition. */
 	get hasResults(): boolean {
-		for (const record of this.records()) if (record.state.status !== "retained") return true;
+		for (const record of this.executions.values()) if (record.state.status !== "retained") return true;
 		return false;
 	}
 	hasJoinableWork(ownership: ProcessHandoffOwnership): boolean {
-		for (const record of this.records())
+		for (const record of this.executions.values())
 			if (record.ownership === ownership && !record.signal.aborted && record.advance) return true;
 		return false;
 	}
 	/** Retrieval hint for both running and completed records; it grants no adoption authority. */
 	mayHaveExecutable(executablePath: string): boolean {
-		for (const record of this.records())
+		for (const record of this.executions.values())
 			if (record.state.status !== "retained" && record.executablePath === executablePath) return true;
 		return false;
 	}
@@ -1035,8 +972,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				});
 				const state = completed?.state;
 				const result = state?.status !== "running" ? state?.result : undefined;
-				const candidate = completed && this.certificate(completed);
-				if (completed && !candidate) continue;
+				const candidate = result?.candidate;
 				if (candidate || !historyChecked) {
 					// Preserve live producer attribution without waiting for unfinished work ahead of history.
 					historyChecked ||= !candidate;
@@ -1139,7 +1075,6 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		key: Sha256Digest,
 		handoff: ProcessHandoff,
 		input: ProcessCertificateInput,
-		_continuation?: never,
 		computation?: TimelineInterval,
 		source?: ArtifactSource,
 		signal = handoff.signal,
@@ -1159,22 +1094,16 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			},
 		});
 		const metadata = Buffer.byteLength(JSON.stringify(candidate));
-		if (metadata > this.maxRetainedBytes) {
-			this.complete(key, handoff);
-			return false;
-		}
-		const artifacts = await this.store.loadArtifacts(
-			referencedArtifacts(candidate),
-			AbortSignal.any([handoff.signal, signal]),
-			source,
-		);
-		if (!artifacts) {
-			this.complete(key, handoff);
-			return false;
-		}
-		const bytes = metadata + artifacts.memoryBytes;
-		if (bytes > this.maxRetainedBytes) {
-			await artifacts.dispose();
+		const artifacts = metadata <= this.maxRetainedBytes
+			? await this.store.loadArtifacts(
+					referencedArtifacts(candidate),
+					AbortSignal.any([handoff.signal, signal]),
+					source,
+				)
+			: undefined;
+		const bytes = metadata + (artifacts?.memoryBytes ?? 0);
+		if (!artifacts || bytes > this.maxRetainedBytes) {
+			if (artifacts) await artifacts.dispose();
 			this.complete(key, handoff);
 			return false;
 		}
@@ -1215,13 +1144,13 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		return true;
 	}
 	clearCompleted(): void {
-		for (const record of this.records()) if (record.state.status !== "running") this.remove(record);
+		for (const record of this.executions.values()) if (record.state.status !== "running") this.remove(record);
 	}
 	dispose(): Promise<void> {
 		if (this.lifetime.sealed) return this.lifetime.dispose();
 		const closing = this.lifetime.dispose();
 		for (const key of this.waiters.keys()) this.wake(key);
-		for (const record of this.records()) {
+		for (const record of this.executions.values()) {
 			if (record.state.status === "running") record.controller.abort(new Error("process handoff disposed"));
 			if (!this.complete(record.key, record)) this.remove(record);
 		}
@@ -1261,9 +1190,6 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		this.byKey.delete(key);
 		return record;
 	}
-	private records(): IterableIterator<HandoffRecord> {
-		return this.executions.values();
-	}
 	private record(key: Sha256Digest, handoff: ProcessHandoff): HandoffRecord | undefined {
 		const record = this.executions.get(handoff);
 		return record?.key === key ? record : undefined;
@@ -1274,9 +1200,6 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			this.byKey.get(key) ?? [...this.executions.values()].filter((record) => record.key === key);
 		if (records.length) this.byKey.set(key, records);
 		return records;
-	}
-	private certificate(record: HandoffRecord): ProcessProvenanceCertificate | undefined {
-		return record.state.status === "running" ? undefined : record.state.result?.candidate;
 	}
 	private wake(key: Sha256Digest): void {
 		for (const waiter of this.waiters.get(key) ?? []) waiter();
@@ -1295,7 +1218,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		this.byKey.delete(record.key);
 	}
 	private trim(limit = this.maxCompleted): void {
-		const records = [...this.records()];
+		const records = [...this.executions.values()];
 		let stored = records.reduce(
 			(sum, record) =>
 				sum + (record.state.status === "running" ? 0 : (record.state.result?.artifacts.bytes ?? 0)),

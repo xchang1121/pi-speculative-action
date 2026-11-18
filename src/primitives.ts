@@ -103,7 +103,8 @@ export function incrementCounts(
 	for (const key of keys) counts[key]!++;
 	return counts;
 }
-export const slash = (value: string): string => (path.sep === "/" ? value : value.replaceAll(path.sep, "/"));
+export const slash = (value: string, separator = path.sep): string =>
+	separator === "/" ? value : value.replaceAll(separator, "/");
 /** Normalize a logical resource without folding case. */
 export function normalizeLogicalPath(value: string): string {
 	const normalized = path.posix.normalize(slash(value));

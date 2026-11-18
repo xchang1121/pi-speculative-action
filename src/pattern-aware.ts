@@ -1,4 +1,3 @@
-import { hash as cryptoHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -22,6 +21,9 @@ import {
 	isSafeCount,
 	nonNegativeCount,
 	relativeFilesystemPath,
+	sha256Digest,
+	slash,
+	stableValueHash,
 	stableEqual as sameValue,
 	stableStringify,
 } from "./primitives.ts";
@@ -761,10 +763,8 @@ export class PatternAwareStore {
 					applied.input,
 					pattern.targetSchemaHash ?? schemaHashes[pattern.targetTool],
 				);
-				const actionIdentity = hash(
-					stableStringify(
-						action ? { actionKey: action.key } : { tool: pattern.targetTool, input: applied.input },
-					),
+				const actionIdentity = stableValueHash(
+					action ? { actionKey: action.key } : { tool: pattern.targetTool, input: applied.input },
 				);
 				const conditionalProbability = clampProbability(
 					(ppm.get(pattern.targetTool) ?? 0) * precision * applied.probability,
@@ -1033,15 +1033,13 @@ export class PatternAwareStore {
 				!hasSufficientBindingProvenance(bindings, support, constantSupport)
 			)
 				continue;
-			const id = hash(
-				stableStringify({
-					context: signatures,
-					targetTool: target.tool,
-					bindings: bindings,
-					targetSchemaHash: target.schemaHash,
-					gap,
-				}),
-			);
+			const id = stableValueHash({
+				context: signatures,
+				targetTool: target.tool,
+				bindings,
+				targetSchemaHash: target.schemaHash,
+				gap,
+			});
 			if (retained.has(id)) continue;
 			retained.add(id);
 			const { dependencies } = analyzeBindings(bindings);
@@ -1239,7 +1237,7 @@ export async function acquirePatternAwareStore(
 	const poolKey = `${file}\0${analyzerKey}\0${semanticsKey}\0${reservedRoot}`;
 	let pooled = stores.get(poolKey);
 	if (!pooled) {
-		const portable = path.join(path.dirname(file), `portable.${hash(analyzerKey).slice(0, 12)}.json`);
+		const portable = path.join(path.dirname(file), `portable.${sha256Digest(analyzerKey).slice(7, 19)}.json`);
 		const store = Promise.resolve(
 			new PatternAwareStore(settings, file, actionSemantics, portable, reservedRoot),
 		).then(async (value) => {
@@ -1298,7 +1296,7 @@ function configuredPersistenceFile(file: string, analyzerKey: string, semanticsK
 	const parsed = path.parse(file);
 	return path.join(
 		parsed.dir,
-		`${parsed.name}.${hash(`${semanticsKey}\0${analyzerKey}`).slice(0, 12)}${parsed.ext}`,
+		`${parsed.name}.${sha256Digest(`${semanticsKey}\0${analyzerKey}`).slice(7, 19)}${parsed.ext}`,
 	);
 }
 export function patternAwareSettings(value: unknown): PatternAwareSettings {
@@ -1312,7 +1310,7 @@ export function patternAwarePersistenceFile(workspace: string, stateDirectory?: 
 			: process.platform === "win32"
 				? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "pi")
 				: path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "pi");
-	return path.join(root, "pattern-aware", `${hash(path.resolve(workspace))}.json`);
+	return path.join(root, "pattern-aware", `${sha256Digest(path.resolve(workspace)).slice(7, 39)}.json`);
 }
 export function projectPatternAwareObservation(
 	output: unknown,
@@ -1544,9 +1542,8 @@ function structuredOutput(value: unknown): unknown {
 }
 function normalizeResourcePath(value: string, resourceRoot?: string) {
 	if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return value;
-	if (!resourceRoot || !path.isAbsolute(value)) return normalizePath(value);
-	const relative = relativeFilesystemPath(resourceRoot, value);
-	return relative === undefined ? normalizePath(value) : normalizePath(relative || ".");
+	const relative = resourceRoot && path.isAbsolute(value) ? relativeFilesystemPath(resourceRoot, value) : undefined;
+	return slash(path.normalize(relative ?? value), "\\");
 }
 function* uniqueBy<Value>(values: Iterable<Value>, keyFor: (value: Value) => string): Generator<Value> {
 	const seen = new Set<string>();
@@ -1731,7 +1728,7 @@ function semanticOutputShape(value: unknown, errorClass?: string) {
 	};
 	visit(value);
 	if (!discriminants.length) return;
-	return hash(stableStringify(discriminants.sort()));
+	return stableValueHash(discriminants.sort());
 }
 
 function patternRank(pattern: MutablePattern, clock: number, halfLife: number) {
@@ -1911,7 +1908,7 @@ function patternPoolKey(
 	targetSchemaHash: string | undefined,
 	gap: number,
 ) {
-	return hash(stableStringify({ context, targetTool, targetSchemaHash, gap }));
+	return stableValueHash({ context, targetTool, targetSchemaHash, gap });
 }
 function patternPoolSampleLimit(settings: Pick<PatternAwareSettings, "minOccurrences" | "maxContextLength">) {
 	return (
@@ -1978,19 +1975,13 @@ function parsePath(value: string): PatternAwarePath | undefined {
 function uniqueStrings(values: ReadonlyArray<string>) {
 	return [...new Set(values.filter((value) => value.length > 0))];
 }
-function normalizePath(value: string) {
-	return path.normalize(value).replaceAll("\\", "/");
-}
-function hash(value: string) {
-	return cryptoHash("sha256", value).slice(0, 32);
-}
 /** Keeps a digest of an oversized string and a list's head; an action whose input was shortened is context only, never predicted. */
 function boundedEventPayload(event: PatternAwareEventInput): PatternAwareEventInput {
 	let shortened = false;
 	const bound = (value: unknown): unknown => {
 		if (typeof value === "string" && value.length > speculativeConfig().prediction.maxValueCharacters) {
 			shortened = true;
-			return `sha256:${hash(value)}`;
+			return sha256Digest(value).slice(0, 39);
 		}
 		if (Array.isArray(value)) {
 			shortened ||= value.length > speculativeConfig().prediction.maxValueItems;

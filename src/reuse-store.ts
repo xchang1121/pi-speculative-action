@@ -577,7 +577,6 @@ export class ProvenanceCertificateStore {
 		this.maintain();
 	}
 	async put(certificate: ProcessProvenanceCertificate): Promise<boolean> {
-		if (certificate.result.continuation) return false;
 		const owned = parseProcessCertificate(certificate);
 		if (!owned) throw new Error("invalid process provenance certificate");
 		return this.publishRoot(`certificate:${owned.id}`, referencedArtifacts(owned), (database) => {

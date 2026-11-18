@@ -28,10 +28,9 @@ const descriptorTypes = new Map([
  */
 export async function captureProcessContext(pid, inheritedDescriptors) {
 	if (
-		inheritedDescriptors.some((name) => !/^\d+$/.test(name)) ||
+		inheritedDescriptors.some((name) => !/^\d+$/.test(name) || Number(name) > 2) ||
 		!inheritedDescriptors.includes("1") ||
-		!inheritedDescriptors.includes("2") ||
-		inheritedDescriptors.some((name) => Number(name) > 2)
+		!inheritedDescriptors.includes("2")
 	) {
 		throw new Error("held process has unmodeled inherited descriptors");
 	}
@@ -46,51 +45,34 @@ export async function captureProcessContext(pid, inheritedDescriptors) {
 				]),
 			)
 		);
-	const [status, limits, processStat, shell, reported] = await Promise.all([
+	/** @type {[string, string]} */
+	const outputEndpoints = ["", ""];
+	const [status, limits, processStat, shell, descriptors] = await Promise.all([
 		readFile(`${root}/status`, "utf8"),
 		readFile(`${root}/limits`, "utf8"),
 		readFile(`${root}/stat`, "utf8"),
 		stat("/bin/sh", { bigint: true }),
-		Promise.all(
-			[...new Set(inheritedDescriptors.map(Number))]
-				.sort((a, b) => a - b)
-				.map(async (fd) => {
-					const [metadata, endpoint, fdinfo] = await Promise.all([
-						stat(`${root}/fd/${fd}`, { bigint: true }),
-						readlink(`${root}/fd/${fd}`),
-						readFile(`${root}/fdinfo/${fd}`, "utf8"),
-					]);
-					return { fd, stat: fields(metadata), endpoint, fdinfo };
-				}),
-		),
-	]);
-	const descriptors = [...(reported[0]?.fd === 0 ? [] : [undefined]), ...reported].map((item) => {
-		if (!item)
+		Promise.all([0, 1, 2].map(async (fd) => {
+			if (fd === 0 && !inheritedDescriptors.some((name) => Number(name) === 0))
+				return { fd, type: /** @type {DescriptorType} */ ("closed"), flags: 0, alias: "closed:0" };
+			const [metadata, endpoint, fdinfo] = await Promise.all([
+				stat(`${root}/fd/${fd}`, { bigint: true }),
+				readlink(`${root}/fd/${fd}`),
+				readFile(`${root}/fdinfo/${fd}`, "utf8"),
+			]);
+			const flags = /^flags:\s*([0-7]+)/m.exec(fdinfo)?.[1];
+			if (!flags) throw new Error(`held descriptor ${fd} flags unavailable`);
+			const type = descriptorTypes.get(metadata.mode & 0o170000n) ?? "other";
+			if (fd) outputEndpoints[fd - 1] = endpoint;
 			return {
-				fd: 0,
-				endpoint: undefined,
-				type: /** @type {DescriptorType} */ ("closed"),
-				identity: "closed:0",
-				flags: 0,
+				fd,
+				type,
+				flags: Number.parseInt(flags, 8) & ~0o2000000,
+				alias: type === "device" && endpoint === "/dev/null" ? endpoint : `${metadata.dev}:${metadata.ino}`,
+				...(type === "device" ? { endpoint } : {}),
 			};
-		const { fd, stat: metadata, endpoint, fdinfo: info } = item;
-		const format = BigInt(metadata.mode) & 0o170000n;
-		const flags = /^flags:\s*([0-7]+)/m.exec(info)?.[1];
-		if (!flags) throw new Error(`held descriptor ${fd} flags unavailable`);
-		const type = descriptorTypes.get(format) ?? "other";
-		return {
-			fd,
-			endpoint,
-			type,
-			// Unproven null devices share one identity: a sandbox may serve its own /dev/null inode.
-			identity:
-				type === "device" && endpoint === "/dev/null" ? "/dev/null" : `${metadata.dev}:${metadata.ino}`,
-			flags: Number.parseInt(flags, 8) & ~0o2000000,
-		};
-	});
-	const [, output, error] = descriptors;
-	if (!output || output.fd !== 1 || !error || error.fd !== 2)
-		throw new Error("reported process lacks its output streams");
+		})),
+	]);
 	/** @param {string} name */
 	const field = (name) => {
 		const value = new RegExp(`^${name}:\\s*(.*)$`, "m").exec(status)?.[1];
@@ -135,21 +117,12 @@ export async function captureProcessContext(pid, inheritedDescriptors) {
 			cpus: field("Cpus_allowed_list"),
 			memoryNodes: field("Mems_allowed_list"),
 		},
-		descriptors: descriptors.map(({ endpoint, identity, ...descriptor }) => {
-			// routedProcessIdentity reproduces this key order, including its /dev/null discard outlet.
-			return {
-				fd: descriptor.fd,
-				type: descriptor.type,
-				flags: descriptor.flags,
-				alias: identity,
-				...(descriptor.type === "device" ? { endpoint } : {}),
-			};
-		}),
+		descriptors,
 	};
 	return {
 		...contextKeys(semantic),
 		umask: Number.parseInt(field("Umask"), 8),
-		outputEndpoints: [output.endpoint ?? "", error.endpoint ?? ""],
+		outputEndpoints,
 	};
 }
 /** Status flags a launcher sets again on a target's routed outputs (its parent's own, like make's O_APPEND); the rest pin the stream. */
@@ -316,7 +289,7 @@ function contextKeys(semantic) {
 		key: JSON.stringify(semantic),
 		launchKey: JSON.stringify(launch),
 		descriptorTypes: /** @type {[DescriptorType, DescriptorType, DescriptorType]} */ (
-			semantic.descriptors.slice(0, 3).map(({ type }) => type)
+			semantic.descriptors.map(({ type }) => type)
 		),
 	};
 }

@@ -19,7 +19,6 @@ import { immutableSnapshot, isSafeCount, sha256Digest } from "./primitives.ts";
 import {
 	captureProcessContext,
 	processLaunchOptions,
-	validProcessContext,
 	type ProcessExecutionContext,
 	type ProcessLaunchOptions,
 } from "./process-context.mjs";
@@ -30,7 +29,7 @@ import {
 	resolveLinuxExecHelper,
 	startupScope,
 } from "./process-startup.mjs";
-import { type DynamicDependency, type OFDPosition } from "./provenance-certificate.ts";
+import type { DynamicDependency } from "./provenance-certificate.ts";
 import { PendingTasks } from "./runtime-lifecycle.ts";
 export { resolveLinuxExecHelper } from "./process-startup.mjs";
 /** Kernel collection shares the execution owner's lifetime, not its privileges. */
@@ -307,7 +306,6 @@ export function executionDomainProof(
 			};
 			try {
 				for (const input of dependencies) {
-					if (input.kind === "fd") continue;
 					if (input.kind === "lock") {
 						reason = "unobserved_lock";
 						supported = false;
@@ -390,26 +388,9 @@ export interface HeldExecProcess {
 	readonly sequence: number;
 	readonly pid: number;
 	readonly tracerPid: number;
-	/** Unprivileged owner of queued-only snapshot pins, retired before native validation. */
-	readonly holderPid?: number;
 	readonly sourceRoot: string;
 	readonly scope?: ExecutionScope;
 	readonly signal?: AbortSignal;
-	/** Native KCMP_FILE groups. Owned entries are captured with the launch tree stopped.
-	 * `owned` proves creation in the traced tree with no observed export; it does not
-	 * authorize content reuse or cover an external debugger duplicating its handles. */
-	readonly descriptors?: readonly HeldFileDescriptor[];
-}
-export interface HeldFileDescriptor {
-	readonly fd: number;
-	readonly alias: number;
-	readonly device: string;
-	readonly inode: string;
-	readonly flags: number;
-	readonly offset: OFDPosition;
-	readonly capacity?: number;
-	readonly eof?: boolean;
-	readonly queueHex?: string;
 }
 export interface HeldExecSnapshot extends Partial<ProcessLaunchOptions> {
 	readonly executable: string;
@@ -466,7 +447,7 @@ export interface LinuxHeldExecOptions {
 	readonly observerBinary?: string;
 	readonly signal?: AbortSignal;
 }
-type ActiveExecution = ReturnType<LinuxHeldExecBoundary["registerExecution"]>;
+type ActiveExecution = ReturnType<LinuxHeldExecBoundary["createAttachment"]>;
 export interface HeldObservation {
 	readonly sourceRoot: string;
 	readonly scope?: ExecutionScope;
@@ -485,8 +466,6 @@ interface WireRequest {
 	readonly execution: string;
 	readonly pid: number;
 	readonly tracer: number;
-	readonly holder?: number;
-	readonly descriptors?: readonly HeldFileDescriptor[];
 }
 /** A two-phase held-exec transport: arm the exit stub before committing reusable effects. */
 export class LinuxHeldExecBoundary {
@@ -550,7 +529,7 @@ export class LinuxHeldExecBoundary {
 						`pi-held-${process.getuid?.() ?? 0}-${process.pid}-${randomBytes(6).toString("hex")}.sock`,
 					);
 		const boundary = new LinuxHeldExecBoundary(socketPath, native);
-		await listenUnixSocket(boundary.server, socketPath);
+		await once(boundary.server.listen(socketPath), "listening");
 		try {
 			await chmod(socketPath, 0o600);
 			options.signal?.throwIfAborted();
@@ -569,10 +548,7 @@ export class LinuxHeldExecBoundary {
 	async observe<Value>(options: HeldObservation, execute: () => Promise<Value>): Promise<Value> {
 		if (this.closing || options.signal?.aborted) return execute();
 		const controller = new AbortController();
-		const launches = new Set<{
-			readonly child: ChildProcess;
-			readonly attachment: HeldExecAttachment;
-		}>();
+		const launches = new Map<ChildProcess, HeldExecAttachment>();
 		const signal = AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]);
 		const snapshot = {
 			...options,
@@ -583,76 +559,49 @@ export class LinuxHeldExecBoundary {
 		const call = { controller, ...Promise.withResolvers<void>() };
 		this.calls.add(call);
 		try {
-			const available = () => !closed && !signal.aborted;
 			return await startupScope.run(
 				{
 					skipRoot: options.skipRoot,
 					launch: (start) => {
-						if (!available()) return start();
+						if (closed || signal.aborted) return start();
+						let gate = -1;
+						let attachment: HeldExecAttachment | undefined;
+						try {
+							gate = this.startup(0);
+							if (!Number.isInteger(gate) || gate < 0) throw new Error("native startup gate unavailable");
+							attachment = this.attach({ ...snapshot, skipRoot: startupScope.getStore()?.skipRoot }, gate);
+							if (!attachment.pid || this.startup(attachment.pid) !== 0)
+								throw new Error("native observer unavailable");
+						} catch {
+							if (gate >= 0) this.startup(-1);
+							try {
+								attachment?.retire();
+							} catch {
+								/* The native launch still owns its result. */
+							}
+							return start();
+						}
 						let child: ChildProcess | undefined;
-						return this.start(
-							(gate) => {
-								const attachment = this.attach(
-									{ ...snapshot, skipRoot: startupScope.getStore()?.skipRoot },
-									gate,
-								);
-								return {
-									pid: attachment.pid,
-									finish: () => {
-										if (child?.pid) launches.add({ child, attachment });
-										else attachment.retire();
-									},
-								};
-							},
-							() => {
-								child = start();
-								return child;
-							},
-						);
+						try {
+							child = start();
+							return child;
+						} finally {
+							this.startup(-1);
+							if (child?.pid) launches.set(child, attachment);
+							else attachment.retire();
+						}
 					},
 				},
 				execute,
 			);
 		} finally {
 			closed = true;
-			for (const { child, attachment } of launches)
-				if (!child.pid || (child.exitCode === null && child.signalCode === null)) attachment.retire();
-			const settled = await Promise.allSettled([...launches].map((launch) => launch.attachment.completion));
+			for (const [child, attachment] of launches)
+				if (child.exitCode === null && child.signalCode === null) attachment.retire();
+			const settled = await Promise.allSettled([...launches.values()].map((attachment) => attachment.completion));
 			this.calls.delete(call);
 			call.resolve();
 			for (const result of settled) if (result.status === "rejected") throw result.reason;
-		}
-	}
-	private start<Value>(
-		attach: (gate: number) => {
-			readonly pid?: number;
-			readonly finish: () => void;
-		},
-		start: () => Value,
-	): Value {
-		let attachment: ReturnType<typeof attach> | undefined;
-		let gate = -1;
-		try {
-			gate = this.startup(0);
-			if (!Number.isInteger(gate) || gate < 0) throw new Error("native startup gate unavailable");
-			attachment = attach(gate);
-			if (!attachment.pid || this.startup(attachment.pid) !== 0)
-				throw new Error("native observer unavailable");
-		} catch {
-			if (gate >= 0) this.startup(-1);
-			try {
-				attachment?.finish();
-			} catch {
-				/* No authoritative child was started. */
-			}
-			attachment = undefined;
-		}
-		// Never catch the authoritative spawn: its synchronous failure must not rerun it.
-		try {
-			return start();
-		} finally {
-			if (gate >= 0) this.startup(-1);
-			attachment?.finish();
 		}
 	}
 	/** The gate belongs to the launching thread; an observer may serve it from another worker. */
@@ -689,29 +638,13 @@ export class LinuxHeldExecBoundary {
 				}
 			});
 		});
-		return this.registerExecution(options, observer, execution, controller, done, () =>
-			observer.stdin?.end(),
-		);
-	}
-	/** Attach at the controlled launch gate before the kernel installs its first image. */
-	trace<Value>(options: HeldObservation, execute: () => Promise<Value>): Promise<Value> {
-		return this.observe({ ...options, skipRoot: true }, execute);
-	}
-	private registerExecution(
-		options: HeldObservation,
-		observer: ChildProcess,
-		execution: string,
-		controller: AbortController,
-		done: Promise<void>,
-		stop: () => void,
-	) {
 		const signal: AbortSignal = AbortSignal.any([
 			controller.signal,
 			...(options.signal ? [options.signal] : []),
 		]);
 		const retire = (): void => {
 			if (!controller.signal.aborted) controller.abort(new Error("native observation retired"));
-			stop();
+			observer.stdin?.end();
 			for (const socket of active.sockets) socket.destroy();
 		};
 		const active = {
@@ -736,6 +669,10 @@ export class LinuxHeldExecBoundary {
 		this.active.set(execution, active);
 		signal.addEventListener("abort", retire, { once: true });
 		return active;
+	}
+	/** Attach at the controlled launch gate before the kernel installs its first image. */
+	trace<Value>(options: HeldObservation, execute: () => Promise<Value>): Promise<Value> {
+		return this.observe({ ...options, skipRoot: true }, execute);
 	}
 	close(): Promise<void> {
 		return (this.closing ??= Promise.resolve().then(async () => {
@@ -770,19 +707,17 @@ export class LinuxHeldExecBoundary {
 			if (!request || !active || !(await heldBy(request, active.observer))) {
 				return void socket.end("C\n");
 			}
-			active.signal?.throwIfAborted();
+			active.signal.throwIfAborted();
 			decision = await active.decide({
 				id: `${request.execution}:${++active.sequence}`,
 				sequence: active.sequence,
 				pid: request.pid,
 				tracerPid: request.tracer,
-				...(request.holder ? { holderPid: request.holder } : {}),
 				sourceRoot: active.sourceRoot,
 				scope: active.scope,
-				...(active.signal ? { signal: active.signal } : {}),
-				...(request.descriptors ? { descriptors: request.descriptors } : {}),
+				signal: active.signal,
 			});
-			active.signal?.throwIfAborted();
+			active.signal.throwIfAborted();
 			if (decision.kind === "continue") {
 				completedAt = performance.now();
 				outcome = "continued";
@@ -800,31 +735,22 @@ export class LinuxHeldExecBoundary {
 				decision.output.some((event) => ![1, 2].includes(event.fd) || !Buffer.isBuffer(event.data))
 			)
 				return void socket.end("C\n");
-			await writeProcessChannel(
-				socket,
-				Buffer.from(`P2 ${code} ${decision.output.length} ${total} 0 0 0 0 0\n`),
-			);
+			await writeProcessChannel(socket, Buffer.from(`P ${code} ${decision.output.length} ${total}\n`));
 			for (const event of decision.output) {
 				await writeProcessChannel(socket, Buffer.from(`O ${event.fd} ${event.data.length}\n`));
 				await writeProcessChannel(socket, event.data);
 			}
 			const acknowledgement = await readLine(socket);
-			if (acknowledgement === "N") {
-				prepared = false;
-				return void socket.end();
-			}
+			if (acknowledgement === "N") return void socket.end();
 			if (acknowledgement !== "S") throw new Error("held-exec staging was not acknowledged");
-			if (!(await decision.validate())) {
-				outcome = "declined";
-				return void socket.end("C\n");
-			}
-			active.signal?.throwIfAborted();
+			if (!(await decision.validate())) return void socket.end("C\n");
+			active.signal.throwIfAborted();
 			// This grant owns the observed snapshot. Later source changes cannot alter the staged bytes.
 			// From this point a lost ACK may mean the peer has already armed its exit stub.
 			prepared = true;
 			await writeProcessChannel(socket, Buffer.from("G\n"));
 			if ((await readLine(socket)) !== "A") throw new Error("held-exec adoption was not acknowledged");
-			active.signal?.throwIfAborted();
+			active.signal.throwIfAborted();
 			await decision.commit();
 			committedAt = performance.now();
 			await writeProcessChannel(socket, Buffer.from("R\n"));
@@ -895,16 +821,8 @@ async function observeCompletion(
 	}
 	return clock;
 }
-/** Inspect the installed, stopped image; stdio mode leaves extra descriptors to the broker capture. */
-export async function inspectHeldExecProcess(
-	pid: number,
-	executable: string,
-	descriptors?: readonly HeldFileDescriptor[] | "stdio",
-): Promise<
-	HeldExecSnapshot & {
-		readonly context: ProcessExecutionContext;
-	}
-> {
+/** Inspect the installed, stopped image and its complete inherited descriptor table. */
+export async function inspectHeldExecProcess(pid: number, executable: string) {
 	const root = `/proc/${pid}`;
 	const [cwd, command, environmentBytes, descriptorNames] = await Promise.all([
 		readlink(`${root}/cwd`),
@@ -912,14 +830,7 @@ export async function inspectHeldExecProcess(
 		readFile(`${root}/environ`),
 		readdir(`${root}/fd`),
 	]);
-	const evidence = descriptors === "stdio" ? undefined : (descriptors ?? []);
-	if (!validDescriptors(evidence)) throw new Error("invalid native descriptor context");
-	const context = await captureProcessContext(
-		pid,
-		descriptors === "stdio" ? descriptorNames.filter((name) => /^[012]$/.test(name)) : descriptorNames,
-	);
-	if (descriptors !== "stdio" && !validProcessContext(context))
-		throw new Error("held process descriptors are not replayable");
+	const context = await captureProcessContext(pid, descriptorNames);
 	const argv = decodeNullFields(command);
 	if (!argv.length) throw new Error("held process argv is empty");
 	const environment: Record<string, string> = Object.create(null);
@@ -930,28 +841,26 @@ export async function inspectHeldExecProcess(
 		environment[entry.slice(0, separator)] = entry.slice(separator + 1);
 	}
 	let invokedPath: string | undefined;
-	{
-		const auxiliary = await readFile(`${root}/auxv`);
-		const memory = await open(`${root}/mem`, "r");
-		try {
-			for (let at = 0; at + 16 <= auxiliary.length; at += 16)
-				if (auxiliary.readBigUInt64LE(at) === 31n) {
-					const bytes = Buffer.alloc(speculativeConfig().processReuse.invocationPathBytes);
-					const { bytesRead } = await memory.read(
-						bytes,
-						0,
-						bytes.length,
-						Number(auxiliary.readBigUInt64LE(at + 8)),
-					);
-					const end = bytes.subarray(0, bytesRead).indexOf(0);
-					if (end >= 0) invokedPath = bytes.subarray(0, end).toString();
-					break;
-				}
-		} finally {
-			await memory.close();
-		}
-		if (!invokedPath) throw new Error("held process invocation name is unavailable");
+	const auxiliary = await readFile(`${root}/auxv`);
+	const memory = await open(`${root}/mem`, "r");
+	try {
+		for (let at = 0; at + 16 <= auxiliary.length; at += 16)
+			if (auxiliary.readBigUInt64LE(at) === 31n) {
+				const bytes = Buffer.alloc(speculativeConfig().processReuse.invocationPathBytes);
+				const { bytesRead } = await memory.read(
+					bytes,
+					0,
+					bytes.length,
+					Number(auxiliary.readBigUInt64LE(at + 8)),
+				);
+				const end = bytes.subarray(0, bytesRead).indexOf(0);
+				if (end >= 0) invokedPath = bytes.subarray(0, end).toString();
+				break;
+			}
+	} finally {
+		await memory.close();
 	}
+	if (!invokedPath) throw new Error("held process invocation name is unavailable");
 	return {
 		executable,
 		...processLaunchOptions(context),
@@ -959,7 +868,7 @@ export async function inspectHeldExecProcess(
 		cwd,
 		environment,
 		context,
-		invocation: [invokedPath, (await readFile(`${root}/comm`, "utf8")).replace(/\n$/, "")],
+		invocation: [invokedPath, (await readFile(`${root}/comm`, "utf8")).replace(/\n$/, "")] as const,
 	};
 }
 function decodeNullFields(bytes: Buffer): string[] {
@@ -975,16 +884,12 @@ function parseRequest(line: string): WireRequest | undefined {
 			/^[0-9a-f]{48}$/.test(value.execution ?? "") &&
 			isSafeCount(value.pid, 1) &&
 			isSafeCount(value.tracer, 1) &&
-			(value.holder === undefined || isSafeCount(value.holder)) &&
-			validDescriptors(value.descriptors)
+			Object.keys(value).length === 4
 			? immutableSnapshot(value as WireRequest)
 			: undefined;
 	} catch {
 		return undefined;
 	}
-}
-function validDescriptors(descriptors: WireRequest["descriptors"]): boolean {
-	return descriptors === undefined || (Array.isArray(descriptors) && descriptors.length === 0);
 }
 export async function inheritedTracer(): Promise<string> {
 	const tracer = /^TracerPid:\s*([1-9]\d*)$/m.exec(
@@ -992,24 +897,11 @@ export async function inheritedTracer(): Promise<string> {
 	)?.[1];
 	return tracer ? `: processes here are already traced by pid ${tracer}` : "";
 }
-async function heldBy({ pid, tracer, holder }: WireRequest, observer: ChildProcess): Promise<boolean> {
+async function heldBy({ pid, tracer }: WireRequest, observer: ChildProcess): Promise<boolean> {
 	const alive = () => observer.pid === tracer && observer.exitCode === null && observer.signalCode === null;
 	if (!alive()) return false;
 	try {
 		const status = await readFile(`/proc/${pid}/status`, "utf8");
-		if (holder) {
-			const owner = await readFile(`/proc/${holder}/status`, "utf8");
-			if (
-				!new RegExp(`^PPid:\\s*${tracer}$`, "m").test(owner) ||
-				!/^NoNewPrivs:\s+1$/m.test(owner) ||
-				!["Prm", "Eff", "Inh", "Amb"].every((kind) => new RegExp(`^Cap${kind}:\\s+0+$`, "m").test(owner)) ||
-				![
-					["Uid", process.getuid!()],
-					["Gid", process.getgid!()],
-				].every(([kind, id]) => new RegExp(`^${kind}:(?:\\s+${id}){4}$`, "m").test(owner))
-			)
-				return false;
-		}
 		return (
 			alive() && new RegExp(`^TracerPid:\\s*${tracer}$`, "m").test(status) && /^State:\s+t\b/m.test(status)
 		);
@@ -1038,7 +930,4 @@ export function writeProcessChannel(channel: NodeJS.WritableStream, data: Buffer
 	return new Promise((resolve, reject) =>
 		channel.write(data, (error) => (error ? reject(error) : resolve())),
 	);
-}
-export async function listenUnixSocket(server: net.Server, socketPath: string): Promise<void> {
-	await once(server.listen(socketPath), "listening");
 }

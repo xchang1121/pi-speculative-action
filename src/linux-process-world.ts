@@ -206,6 +206,7 @@ export function createRestorableProcessExecutionWorld(options: HostProcessWorldO
 export interface LinuxProcessExecutionWorldOptions
 	extends LinuxProcessBackendOptions, WorkspaceSandboxOptions {
 	readonly coordinator: ProcessExecutionCoordinator;
+	readonly completedOnly?: boolean;
 	/** Tools whose complete process outlet is bound by this host, not all process-shaped effect contracts. */
 	readonly tools: readonly string[];
 	readonly backend?: LinuxProcessReuseBackend;
@@ -419,7 +420,7 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 												return {
 													result: {
 														content: [],
-														details: result.suspended ? { suspended: true } : { exit: result.exit },
+														details: { exit: result.exit },
 													},
 													isError: false,
 												};

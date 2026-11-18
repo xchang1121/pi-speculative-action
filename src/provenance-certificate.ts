@@ -22,8 +22,6 @@ import {
 import { normalizeTimelineComputation, type SerializedTimelineComputation } from "./task-timing.ts";
 import type { WorkspaceDirectoryState, WorkspaceFileMutation } from "./workspace-sandbox.ts";
 export { validateArtifact, type ArtifactReference } from "./content-chunks.ts";
-/** Decimal strings preserve filesystem cookies beyond JavaScript's exact integer range. */
-export type OFDPosition = number | string;
 export interface SemanticEnvironmentEntry {
 	readonly name: string;
 	readonly present: boolean;
@@ -31,20 +29,11 @@ export interface SemanticEnvironmentEntry {
 }
 export interface InheritedFileDescriptor {
 	readonly fd: number;
-	/** Native boundary projection: false identifies a queued-only OFD, not an FD table entry. */
-	readonly installed?: false;
 	readonly type:
 		"closed" | "regular" | "null" | "directory" | "pipe" | "socket" | "eventfd" | "tty" | "device" | "other";
 	readonly flagsDigest: Sha256Digest;
 	readonly endpointDigest?: Sha256Digest;
 	readonly contentDigest?: Sha256Digest;
-	readonly offset?: OFDPosition;
-	/** Canonical descriptor representing this inherited open-file description. */
-	readonly alias?: number;
-	/** Kernel object representative, independent of the OFD representative. */
-	readonly object?: number;
-	readonly resourcePath?: string;
-	readonly resourceAliases?: readonly string[];
 	readonly eof?: boolean;
 }
 /** Static identity known immediately before one actual exec, independent of its parent shell. */
@@ -140,12 +129,6 @@ export type DynamicDependency =
 			readonly digest: Sha256Digest;
 			/** The fields a partial statx reported, in declaration order; absent means all of them. */
 			readonly fields?: readonly FilesystemObservationField[];
-	  }
-	| {
-			readonly kind: "fd";
-			readonly fd: number;
-			readonly contentDigest: Sha256Digest;
-			readonly eof: boolean;
 	  };
 export type ProvenanceTaint = (typeof import("./config-schema.ts").PROVENANCE_TAINTS)[number];
 export interface DynamicDependencyCertificate {
@@ -192,45 +175,8 @@ export type ExitOutcome =
 			readonly signal: number;
 			readonly coreDumped: boolean;
 	  };
-export const RESOURCE_TRANSITIONS = [
-	"consume",
-	"peek",
-	"produce",
-	"shutdown",
-	"release",
-	"ready",
-	"flags",
-	"failure",
-	"receive_message",
-	"peek_message",
-	"send_message",
-	"splice",
-	"tee",
-	"lock",
-] as const;
-export type ResourceTransitionKind = (typeof RESOURCE_TRANSITIONS)[number];
-export interface ProcessResourceEffects {
-	readonly descriptions: readonly {
-		readonly id: number;
-		readonly position?: {
-			readonly before: OFDPosition;
-			readonly after: OFDPosition;
-		};
-		readonly flags?: number;
-	}[];
-	readonly objects: readonly {
-		readonly id: number;
-		readonly consumed?: number;
-		readonly content?: ArtifactReference;
-	}[];
-	readonly transitions?: readonly {
-		readonly id: number;
-		readonly kind: ResourceTransitionKind;
-		readonly data: ArtifactReference;
-		readonly requested?: number;
-	}[];
-}
-export type ProcessResultRecord = {
+export interface ProcessResultRecord {
+	readonly exit: ExitOutcome;
 	readonly replayProfile: "buffered_noninteractive";
 	readonly streamMetadataObserved?: boolean;
 	/** Producer process wall time; observational only and never used to authorize replay. */
@@ -239,20 +185,7 @@ export type ProcessResultRecord = {
 	readonly computation?: SerializedTimelineComputation;
 	/** Globally ordered output and filesystem effects. */
 	readonly journal: readonly OrderedEffectEvent[];
-	readonly resources?: ProcessResourceEffects;
-} & (
-	| {
-			readonly exit: ExitOutcome;
-			readonly continuation?: never;
-	  }
-	| {
-			readonly exit?: never;
-			readonly continuation: {
-				readonly imageDigest: Sha256Digest;
-				readonly imageBytes: number;
-			};
-	  }
-);
+}
 /** Immutable completed-execution evidence indexed by WeakKey and validated into StrongKey. */
 export interface ProcessProvenanceCertificate {
 	readonly id: Sha256Digest;
@@ -336,7 +269,6 @@ export function processWeakKey(prototype: ExecPrototype): Sha256Digest {
 export function dependencyPathsetKey(certificate: DynamicDependencyCertificate): Sha256Digest {
 	return digestObject(
 		normalizeDependencies(certificate.dependencies).map((dependency) => {
-			if (dependency.kind === "fd") return { kind: dependency.kind, fd: dependency.fd };
 			const identity = { kind: dependency.kind, path: dependency.path };
 			switch (dependency.kind) {
 				case "file":
@@ -474,8 +406,7 @@ export function certificateReplayable(
 		(isSha256Digest(certificate.prototype.stdin.digest) && certificate.prototype.stdin.eof);
 	const accepted = new Set(acceptedTaints);
 	return (
-		!certificate.result.continuation &&
-		!certificate.result.resources &&
+		completedResult(certificate.result) &&
 		certificate.prototype.inheritedFDs.every((descriptor) => descriptor.fd <= 2) &&
 		certificate.dependencyCertificate.complete &&
 		certificate.dependencyCertificate.taints.every((taint) => accepted.has(taint)) &&
@@ -487,6 +418,9 @@ export function certificateReplayable(
 // Only this module's owned, validated records may skip capture, never arbitrary frozen inputs.
 const normalizedCertificates = new WeakSet<object>();
 const normalizedPrototypes = new WeakSet<ExecPrototype>();
+const standardDescriptorFields = new Set<string>([
+	"fd", "type", "flagsDigest", "endpointDigest", "contentDigest", "eof",
+] satisfies (keyof InheritedFileDescriptor)[]);
 function normalizePrototype(input: ExecPrototype): ExecPrototype {
 	if (normalizedPrototypes.has(input)) return input;
 	const {
@@ -549,12 +483,7 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 			if (
 				!isSafeCount(source.fd, 0, 2) ||
 				descriptors.has(source.fd) ||
-				source.alias !== undefined ||
-				source.installed !== undefined ||
-				source.object !== undefined ||
-				source.offset !== undefined ||
-				source.resourcePath !== undefined ||
-				source.resourceAliases !== undefined
+				!Object.keys(source).every((field) => standardDescriptorFields.has(field))
 			)
 				throw new Error("inherited descriptor state is unsupported");
 			for (const digest of [source.flagsDigest, source.endpointDigest, source.contentDigest])
@@ -662,25 +591,20 @@ function normalizeDependencies(dependencies: readonly DynamicDependency[]): Dyna
 	return [...seen.keys()].sort().map((identity) => seen.get(identity)!);
 }
 export function dynamicDependencyIdentity(dependency: DynamicDependency): string {
-	if (dependency.kind === "fd") return `fd:${dependency.fd}`;
 	return dependency.kind === "metadata"
 		? `${dependency.kind}:${dependency.followSymlinks ? "follow" : "nofollow"}:${dependency.fields ? `${dependency.fields.join(",")}:` : ""}${dependency.path}`
 		: `${dependency.kind}:${dependency.path}`;
 }
 function validateDependency(dependency: DynamicDependency): void {
 	if (!dependency || typeof dependency !== "object") throw new Error("invalid dynamic dependency");
-	if (dependency.kind !== "fd" && !validLogicalPath(dependency.path))
-		throw new Error("invalid dependency path");
+	if (!validLogicalPath(dependency.path)) throw new Error("invalid dependency path");
 	if (!validDependencyFields(dependency)) {
-		const kind =
-			dependency.kind === "fd" ? "descriptor" : dependency.kind === "absence" ? "negative" : dependency.kind;
+		const kind = dependency.kind === "absence" ? "negative" : dependency.kind;
 		throw new Error(`invalid ${kind} dependency`);
 	}
 }
 function validDependencyFields(dependency: DynamicDependency): boolean {
 	switch (dependency.kind) {
-		case "fd":
-			return isSafeCount(dependency.fd) && isSha256Digest(dependency.contentDigest);
 		case "file":
 			return (
 				["input", "executable", "shared_object"].includes(dependency.role) &&
@@ -739,11 +663,16 @@ function validExcludedEntries(entries: readonly string[] | undefined): boolean {
 			))
 	);
 }
+const resultFields = new Set<string>([
+	"exit", "replayProfile", "streamMetadataObserved", "observedProcessMs", "computation", "journal",
+] satisfies (keyof ProcessResultRecord)[]);
+function completedResult(result: ProcessResultRecord): boolean {
+	return !!result.exit && Object.keys(result).every((field) => resultFields.has(field));
+}
 function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype): ProcessResultRecord {
 	const computation = normalizeTimelineComputation(result.computation);
 	if (result.replayProfile !== "buffered_noninteractive") throw new Error("unsupported replay profile");
-	if (result.continuation || result.resources || !result.exit)
-		throw new Error("only completed processes with ordinary standard streams are supported");
+	if (!completedResult(result)) throw new Error("invalid completed process result");
 	if (
 		result.exit.kind === "code"
 			? !isSafeCount(result.exit.code, 0, 255)

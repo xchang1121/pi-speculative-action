@@ -83,7 +83,6 @@ import type {
 	HeldExecProcess,
 	HeldExecSnapshot,
 	HeldExecTiming,
-	HeldFileDescriptor,
 } from "./linux-held-exec.ts";
 import {
 	executionDomainCollector,
@@ -524,8 +523,6 @@ export interface LinuxProcessBackendOptions {
 	readonly sandlockBinary?: string;
 	readonly heldExecBinary?: string;
 	readonly heldExecObserverBinary?: string;
-	/** Seal finished commands without capturing resumable process images. */
-	readonly completedOnly?: boolean;
 	/** Additional host paths that speculative processes must never read. */
 	readonly deniedPaths?: readonly string[];
 }
@@ -554,8 +551,7 @@ export interface LinuxProcessSession {
 	/** Execute one retained exec unit in this fresh sandbox; its output is not the enclosing tool's result. */
 	readonly executeBinding: (binding: ProcessExecutionBinding) => Promise<{
 		readonly output: readonly BufferedOutput[];
-		readonly exit?: ExitOutcome;
-		readonly suspended?: true;
+		readonly exit: ExitOutcome;
 	}>;
 	readonly ownership: ProcessHandoffOwnership;
 	readonly metrics: () => LinuxProcessReuseMetrics;
@@ -575,20 +571,15 @@ interface ExecMount {
 interface SandboxMount extends ExecMount {
 	readonly readOnly: boolean;
 }
-interface DispatcherRequest extends Required<Pick<HeldExecSnapshot, "invocation" | "cwd" | "environment">> {
+interface ProcessArguments extends ProcessLaunchOptions {
 	readonly argv0: string;
 	readonly args: readonly string[];
-	readonly context: ProcessExecutionContext;
-	/** The successfully installed image, held before its first user instruction. */
-	readonly pid: number;
-	readonly descriptors?: readonly HeldFileDescriptor[];
+	readonly cwd: string;
+	readonly environment: Readonly<Record<string, string>>;
+	readonly invocation?: readonly [path: string, comm: string];
+	readonly imageSource?: string;
+	readonly streams?: true; // inherited pipes the launcher holds and settles
 }
-type ProcessArguments = Pick<DispatcherRequest, "argv0" | "args" | "cwd" | "environment"> &
-	ProcessLaunchOptions & {
-		readonly invocation?: readonly [path: string, comm: string];
-		readonly imageSource?: string;
-		readonly streams?: true; // inherited pipes the launcher holds and settles
-	};
 type BoundProcessInvocation = ProcessArguments & {
 	readonly sourceRoot: string;
 	readonly executable: string;
@@ -601,7 +592,7 @@ interface BufferedOutput {
 }
 interface DispatcherResponse {
 	readonly held?: HeldExecDecision;
-	readonly kind: "hit" | "executed" | "bypass" | "continue";
+	readonly kind: "hit" | "executed" | "bypass";
 	readonly output?: readonly BufferedOutput[];
 	readonly exit?: ExitOutcome;
 	/** Present only after a sealed result was registered; independent of optional disk publication. */
@@ -1424,11 +1415,7 @@ export class LinuxProcessReuseBackend {
 								},
 								invocation.shell,
 								-session.metrics.wholeCommandRequests,
-								prototype,
-								true,
-								undefined,
-								preparation,
-								request,
+								{ prototype, preparation, outlet: request },
 							);
 							if (result.kind === "hit") for (const event of result.output ?? []) request.onData(event.data);
 							return {
@@ -1459,10 +1446,7 @@ export class LinuxProcessReuseBackend {
 							request,
 							executable,
 							session.metrics.requests,
-							prototype,
-							true,
-							undefined,
-							preparation,
+							{ prototype, preparation },
 						);
 						session.signal.throwIfAborted();
 						if (
@@ -1805,7 +1789,6 @@ export class LinuxProcessReuseBackend {
 		const target = route[1];
 		if (
 			route.length !== 6 ||
-			route[0] !== "B" ||
 			route.at(-1) !== "" ||
 			!target?.startsWith("/") ||
 			!route.at(-2)?.startsWith("/")
@@ -1824,35 +1807,24 @@ export class LinuxProcessReuseBackend {
 			const executable = session.projection.toPhysical(
 				(await image.stat()).nlink ? target : target.replace(/ \(deleted\)$/, ""),
 			)!;
-			const snapshot = await inspectHeldExecProcess(held.pid, executable, "stdio");
+			const snapshot = await inspectHeldExecProcess(held.pid, executable);
 			const cwd = session.projection.toPhysical(route.at(-2)!);
 			if (
 				!cwd ||
-				snapshot.invocation![0] !== route[2] ||
-				snapshot.invocation![1] !== Buffer.from(route[3]!).subarray(0, 15).toString()
+				snapshot.invocation[0] !== route[2] ||
+				snapshot.invocation[1] !== Buffer.from(route[3]!).subarray(0, 15).toString()
 			)
 				throw new Error("exec context changed");
-			const request: DispatcherRequest = {
-				pid: held.pid,
-				descriptors: held.descriptors,
-				invocation: snapshot.invocation!,
-				argv0: snapshot.argv[0]!,
-				args: snapshot.argv.slice(1),
-				cwd,
-				environment: snapshot.environment,
-				context: snapshot.context,
-			};
+			const { context, environment, invocation, argv } = snapshot;
+			const args = argv.slice(1);
 			this.add(session, "requests");
 			const requestID = session.metrics.requests;
 			const ready = await this.resolveReady();
-			const eligibility = request.descriptors?.length
-				? "inherited_descriptors"
-				: eligibleRequest(session, request, ready.executionContext);
+			const eligibility = eligibleRequest(session, context, cwd, args, ready.executionContext);
 			if (typeof eligibility === "string") {
 				this.setError(session, `process_bypass:${eligibility}`, "bypasses");
 				return native;
 			}
-			const { argv0, args, environment, invocation } = request;
 			const resumed = Promise.withResolvers<void>();
 			const exited = Promise.withResolvers<number>();
 			const start = (await source.read()).journal(held.pid)?.length;
@@ -1860,29 +1832,16 @@ export class LinuxProcessReuseBackend {
 			const domain = {
 				pid: held.pid,
 				trace: traceTail(source, session.projection.toLogical(cwd), { execution: { pid: held.pid, start } }),
-				endpoints: request.context.outputEndpoints,
+				endpoints: context.outputEndpoints,
 				resume: resumed.resolve,
 				exit: exited.promise,
 			};
 			const completed = this.executeRequest(
 				session,
-				{
-					argv0,
-					args,
-					cwd,
-					environment,
-					invocation,
-					imageSource,
-					...eligibility,
-				},
+				{ argv0: argv[0]!, args, cwd, environment, invocation, imageSource, ...eligibility },
 				executable,
 				requestID,
-				undefined,
-				undefined,
-				request.pid,
-				undefined,
-				undefined,
-				domain,
+				{ domain },
 			);
 			const running = session.lifecycle.track(completed);
 			return await Promise.race([
@@ -1913,13 +1872,14 @@ export class LinuxProcessReuseBackend {
 		request: ProcessArguments,
 		executable: string,
 		requestID: number,
-		prototype?: ExecPrototype,
-		captureWorkspace?: true,
-		inPlace?: number,
-		preparation?: TimelineInterval,
-		outlet?: ProcessExecutionRequest,
-		domain?: DomainExecution,
+		options: { domain: DomainExecution } | {
+			prototype: ExecPrototype;
+			preparation: TimelineInterval;
+			outlet?: ProcessExecutionRequest;
+		},
 	): Promise<DispatcherResponse> {
+		const domain = "domain" in options ? options.domain : undefined;
+		const outlet = "outlet" in options ? options.outlet : undefined;
 		return measureProcess(
 			session,
 			async () => {
@@ -1927,13 +1887,12 @@ export class LinuxProcessReuseBackend {
 				const channel = controlledSubcomputeChannel(request.environment);
 				const signal = AbortSignal.any([session.signal, ...(outlet?.signal ? [outlet.signal] : [])]);
 				signal.throwIfAborted();
-				const captured = prototype
-					? { output: prototype, computation: preparation }
+				const captured = "prototype" in options
+					? { output: options.prototype, computation: options.preparation }
 					: await TimelineInterval.outside(() =>
 							TimelineInterval.measure(() => this.prototype(session.projection, request, executable)),
 						);
-				preparation = captured.computation;
-				const observedPrototype = captured.output;
+				const { computation: preparation, output: observedPrototype } = captured;
 				const weakKey = processWeakKey(observedPrototype);
 				const executablePath = observedPrototype.executablePath;
 				const acquired = await TimelineInterval.outside(() =>
@@ -1951,7 +1910,7 @@ export class LinuxProcessReuseBackend {
 							),
 					}),
 				);
-				if (acquired.kind === "hit" && acquired.plan.kind === "completed_replay") {
+				if (acquired.kind === "hit") {
 					const plan = acquired.plan;
 					const binding = acquired.producer?.binding;
 					return TimelineInterval.outside(async (): Promise<DispatcherResponse> => {
@@ -1966,7 +1925,7 @@ export class LinuxProcessReuseBackend {
 							id: `${session.token}:${requestID}`,
 							owner: session.token,
 							startedAt,
-							pid: inPlace,
+							pid: domain?.pid,
 							evidence: certificate.dependencyCertificate,
 							external: paths.filter((target) => !pathContains(session.sourceRoot, target)),
 							written: paths
@@ -2012,14 +1971,14 @@ export class LinuxProcessReuseBackend {
 								});
 							if (outlet) this.add(session, "wholeCommandHits");
 							else this.recordHit(acquired.producer?.scope, acquired.joined, session);
-							recordProcessDependency(session, computation, inPlace);
+							recordProcessDependency(session, computation, domain?.pid);
 							const observed = certificate.result.observedProcessMs;
 							if (observed !== undefined)
 								this.add(session, outlet ? "wholeCommandReusedProcessMs" : "reusedProcessMs", observed);
 							if (!outlet && binding && this.handoffs.resolveBinding(binding, session.scope))
 								session.executionBindings.set(requestID, binding);
 						};
-						if (domain && certificate.result.exit?.kind === "code")
+						if (domain && certificate.result.exit.kind === "code")
 							return {
 								kind: "hit",
 								held: {
@@ -2046,14 +2005,12 @@ export class LinuxProcessReuseBackend {
 				if (acquired.kind !== "work") throw new Error("process work reservation failed");
 				this.add(session, outlet ? "wholeCommandMisses" : "misses");
 				try {
-					if (preparation) {
-						TimelineInterval.group(preparation, session);
-						recordProcessDependency(
-							session,
-							{ computation: preparation, owned: true, shared: [preparation] },
-							inPlace,
-						);
-					}
+					TimelineInterval.group(preparation, session);
+					recordProcessDependency(
+						session,
+						{ computation: preparation, owned: true, shared: [preparation] },
+						domain?.pid,
+					);
 					const work = acquired.work;
 					const ready = await this.resolveReady();
 					const started = performance.now();
@@ -2208,7 +2165,7 @@ export class LinuxProcessReuseBackend {
 								owner: session.token,
 								startedAt: Date.now(),
 								tail,
-								...(inPlace !== undefined ? { pid: inPlace } : {}),
+								...(domain ? { pid: domain.pid } : {}),
 							}),
 						);
 						stage = "execution";
@@ -2276,7 +2233,7 @@ export class LinuxProcessReuseBackend {
 											},
 											onOutputEndpoints: (endpoints) => {
 												session.nestedOutputEndpoints.add((outputEndpoints = endpoints));
-												if (captureWorkspace) session.topLevelOutputEndpoints = endpoints;
+												session.topLevelOutputEndpoints = endpoints;
 											},
 											cwd: request.cwd,
 											environment: request.environment,
@@ -2477,7 +2434,7 @@ export class LinuxProcessReuseBackend {
 								recordProcessDependency(
 									session,
 									{ computation, owned: true, shared: [computation] },
-									inPlace,
+									domain?.pid,
 								);
 								const result: ProcessResultRecord = {
 									replayProfile: "buffered_noninteractive",
@@ -2543,7 +2500,7 @@ export class LinuxProcessReuseBackend {
 									);
 								}
 								stage = "handoff_registration";
-								if (await this.handoffs.publish(weakKey, work, input, undefined, computation))
+								if (await this.handoffs.publish(weakKey, work, input, computation))
 									this.add(session, outlet ? "wholeCommandPublished" : "published");
 								const { streams: _streams, imageSource: _imageSource, ...invocation } = request;
 								const binding =
@@ -2581,7 +2538,7 @@ export class LinuxProcessReuseBackend {
 							...(reusable !== undefined ? { reusable } : {}),
 						};
 					} catch (error) {
-						if (stage !== "capture" || captureWorkspace || session.signal.aborted || work.signal.aborted)
+						if (stage !== "capture" || !domain || session.signal.aborted || work.signal.aborted)
 							throw error;
 						this.setError(session, failureDetail(error), "bypasses");
 						return { kind: "bypass" };
@@ -2609,7 +2566,7 @@ export class LinuxProcessReuseBackend {
 					this.handoffs.complete(weakKey, acquired.work);
 				}
 			},
-			inPlace,
+			domain?.pid,
 		);
 	}
 	private async planPrototype(
@@ -2820,8 +2777,8 @@ export class LinuxProcessReuseBackend {
 				this.add(undefined, "misses");
 				return measured({ kind: "continue" });
 			}
-			if (process.descriptors?.length) return measured({ kind: "continue" });
 			const snapshot = await inspectHeldExecProcess(process.pid, executable);
+			if (!validProcessContext(snapshot.context)) throw new Error("held process descriptors are not replayable");
 			if (!pathContains(sourceRoot, snapshot.cwd)) {
 				this.setError(undefined, "actor_bypass:cwd_outside_workspace", "bypasses");
 				return measured({ kind: "continue" });
@@ -2934,12 +2891,7 @@ export class LinuxProcessReuseBackend {
 			const acquired = result.kind === "hit" ? result : undefined;
 			settle = acquired?.settle;
 			const { plan } = acquired ?? {};
-			if (
-				!acquired ||
-				!plan ||
-				plan.certificate.result.continuation ||
-				plan.certificate.result.exit.kind !== "code"
-			) {
+			if (!acquired || !plan || plan.certificate.result.exit.kind !== "code") {
 				this.add(undefined, "misses");
 				return measured({
 					kind: "continue",
@@ -3105,6 +3057,7 @@ function bufferedProcessPrototype(
 	platformFingerprint: string,
 ) {
 	const { context } = snapshot;
+	const streamKey = byteStreamContextKey(context);
 	return createExecPrototype({
 		executablePath: projection.toLogical(snapshot.executable),
 		invocation: snapshot.invocation,
@@ -3114,11 +3067,7 @@ function bufferedProcessPrototype(
 		environment: snapshot.environment,
 		umask: context.umask,
 		processContextDigest: sha256Digest(context.key),
-		...(byteStreamContextKey(context)
-			? {
-					byteStreamContextDigest: sha256Digest(byteStreamContextKey(context)!),
-				}
-			: {}),
+		...(streamKey ? { byteStreamContextDigest: sha256Digest(streamKey) } : {}),
 		stdin: { type: "closed", eof: true },
 		fileDescriptorTableComplete: true,
 		inheritedFDs: context.descriptorTypes.map((type, fd) => ({
@@ -3463,16 +3412,15 @@ async function captureDependencies(
 			incompleteReasons.add(`metadata_changed:${target}`);
 		}
 	const atStart = sharedWalk(async (dependency: DynamicDependency) => {
-		if (dependency.kind !== "fd" && dependency.kind !== "lock" && external.before.has(dependency.path)) {
+		if (dependency.kind !== "lock" && external.before.has(dependency.path)) {
 			const initial = external.before.get(dependency.path);
 			// Only a private object created AND removed by this run can discard its metadata.
 			// A retained output's identity must still agree with the object the Actor will see.
 			if (dependency.kind !== "metadata" || (await vanishedPrivateObject(dependency.path))) return initial;
 		}
-		const physical = dependency.kind === "fd" ? undefined : session.projection.toPhysical(dependency.path);
+		const physical = session.projection.toPhysical(dependency.path);
 		const relative = physical && relativeFilesystemPath(snapshot.root, physical);
 		if (
-			dependency.kind === "fd" ||
 			!physical ||
 			relative === undefined ||
 			session.workspace.observationExcludes.includes(relative.split(path.sep)[0]!)
@@ -4703,31 +4651,33 @@ async function runSpawn(
 }
 function eligibleRequest(
 	session: ActiveSession,
-	request: DispatcherRequest,
+	context: ProcessExecutionContext,
+	cwd: string,
+	args: readonly string[],
 	expectedContext: ProcessExecutionContext,
 ) {
-	if (!validProcessContext(request.context)) return "process_context_unsupported";
-	if (!pathContains(session.workspace.sandboxRoot, request.cwd)) return "cwd_outside_workspace";
-	if (request.args.length > speculativeConfig().processReuse.maxArguments) return "argument_count_limit";
+	if (!validProcessContext(context)) return "process_context_unsupported";
+	if (!pathContains(session.workspace.sandboxRoot, cwd)) return "cwd_outside_workspace";
+	if (args.length > speculativeConfig().processReuse.maxArguments) return "argument_count_limit";
 	if (
-		request.args.reduce((sum, value) => sum + Buffer.byteLength(value), 0) >
+		args.reduce((sum, value) => sum + Buffer.byteLength(value), 0) >
 		speculativeConfig().processReuse.maxArgumentBytes
 	)
 		return "argument_bytes_limit";
 	if (!session.topLevelOutputEndpoints) return "output_endpoint_capture_missing";
-	if (request.context.outputEndpoints.some((endpoint) => !endpoint)) return "request_output_endpoint_missing";
+	if (context.outputEndpoints.some((endpoint) => !endpoint)) return "request_output_endpoint_missing";
 	// The launch key below still checks a discarded descriptor's type and flags. Both outlets belong to one captured process.
 	const endpoints =
 		[session.topLevelOutputEndpoints, ...session.nestedOutputEndpoints].find((pair) =>
-			request.context.outputEndpoints.every(
+			context.outputEndpoints.every(
 				(endpoint) => pair.includes(endpoint) || endpoint === "/dev/null",
 			),
 		) ?? session.topLevelOutputEndpoints;
-	const launch = processLaunchOptions(request.context, endpoints);
+	const launch = processLaunchOptions(context, endpoints);
 	if (!launch) return "output_endpoint_mismatch";
-	const context = routedProcessIdentity(expectedContext, launch);
-	if (request.context.launchKey !== context.launchKey) return "launch_key_mismatch";
-	if (request.context.umask !== context.umask) return "umask_mismatch";
+	const routed = routedProcessIdentity(expectedContext, launch);
+	if (context.launchKey !== routed.launchKey) return "launch_key_mismatch";
+	if (context.umask !== routed.umask) return "umask_mismatch";
 	return launch;
 }
 function shellArguments(invocation: ToolProcessInvocation, command: string) {
