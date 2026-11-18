@@ -12,7 +12,6 @@ export function searchJourney({ cwd, name, tools, args, invocation, world, resou
 	const authorized = Promise.withResolvers();
 	let prediction = true;
 	let turnID;
-	let actorWaiting = false;
 	let actorCalls = 0;
 	let feedback;
 	const host = createSpeculativeActionHost("search-qualification", {
@@ -32,7 +31,7 @@ export function searchJourney({ cwd, name, tools, args, invocation, world, resou
 		complete: async () => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" }),
 		resolveInvocation: (tool) => (tool === name ? invocation : undefined),
 		preflight: () => {
-			if (actorWaiting) authorized.resolve();
+			if (feedback) authorized.resolve();
 			return true;
 		},
 		executionWorlds: [world],
@@ -66,7 +65,6 @@ export function searchJourney({ cwd, name, tools, args, invocation, world, resou
 			});
 		},
 		actor: async (id, query = args) => {
-			actorWaiting = true;
 			feedback = Promise.withResolvers();
 			const before = actorCalls;
 			try {
@@ -97,7 +95,7 @@ export function searchJourney({ cwd, name, tools, args, invocation, world, resou
 				);
 				return { output, settlement };
 			} finally {
-				actorWaiting = false;
+				feedback = undefined;
 			}
 		},
 	};

@@ -213,10 +213,10 @@ function parseTraceLine(line: string): TraceLine {
 	const args: string[] = [];
 	const stack: string[] = [];
 	let start = head[0].length;
-	let quoted = false;
 	for (let index = start; index < line.length; index++) {
 		const character = line[index]!;
 		const context = stack.at(-1);
+		const quoted = context === '"';
 		if (character === "\\" && (quoted || context?.endsWith(">"))) {
 			index++;
 			continue;
@@ -225,7 +225,7 @@ function parseTraceLine(line: string): TraceLine {
 		run.lastIndex = index;
 		if (run.test(line)) index = run.lastIndex - 1;
 		if (quoted) {
-			if (character === '"') quoted = false;
+			if (character === '"') stack.pop();
 			continue;
 		}
 		// -yy sockets use -> for peers; filesystem paths escape literal angle brackets.
@@ -235,7 +235,7 @@ function parseTraceLine(line: string): TraceLine {
 			continue;
 		}
 		if (character === '"') {
-			quoted = true;
+			stack.push('"');
 			continue;
 		}
 		if (character === "/" && line[index + 1] === "*") {
@@ -280,7 +280,6 @@ export function nativeMetadataTrace(read: () => Buffer, privateUpper: string) {
 		returned?: Buffer;
 		response?: Buffer;
 		requested: boolean;
-		canceled: boolean;
 		failed: boolean;
 		error?: string;
 		ended?: number;
@@ -454,7 +453,6 @@ export function nativeMetadataTrace(read: () => Buffer, privateUpper: string) {
 							number,
 							arguments: args,
 							requested: false,
-							canceled: false,
 							failed: false,
 							pathRank: 0,
 							seen: Date.now(),
@@ -502,7 +500,7 @@ export function nativeMetadataTrace(read: () => Buffer, privateUpper: string) {
 						call.response = body;
 					} else if (kind === 5) call.failed = true;
 					else if (kind === 9) {
-						call.canceled = true;
+						call.line.name = "";
 						call.ended = at;
 					} else if (kind === 6) {
 						if (
@@ -540,8 +538,7 @@ export function nativeMetadataTrace(read: () => Buffer, privateUpper: string) {
 					const positional = number === 17 || number === 18;
 					line.at = state.seen;
 					line.order = state.ended ?? line.native!.entered;
-					if (state.canceled || (result !== undefined && [-512n, -513n, -514n, -516n].includes(result)))
-						line.name = "";
+					if (result !== undefined && [-512n, -513n, -514n, -516n].includes(result)) line.name = "";
 					line.result =
 						result === undefined
 							? ""
@@ -608,19 +605,9 @@ export function nativeMetadataTrace(read: () => Buffer, privateUpper: string) {
 }
 function nativeStatObservation(bytes: Buffer, extended: boolean): StatObservation {
 	const integer = (offset: number, size = 8, signed = false) => {
-		if (size === 2) {
-			return BigInt(bytes.readUInt16LE(offset));
-		} else {
-			if (size === 4) {
-				return BigInt(bytes.readUInt32LE(offset));
-			} else {
-				if (signed) {
-					return bytes.readBigInt64LE(offset);
-				} else {
-					return bytes.readBigUInt64LE(offset);
-				}
-			}
-		}
+		if (size === 2) return BigInt(bytes.readUInt16LE(offset));
+		if (size === 4) return BigInt(bytes.readUInt32LE(offset));
+		return signed ? bytes.readBigInt64LE(offset) : bytes.readBigUInt64LE(offset);
 	};
 	const time = (offset: number) =>
 		integer(offset, 8, true) * 1000000000n + integer(offset + 8, extended ? 4 : 8);

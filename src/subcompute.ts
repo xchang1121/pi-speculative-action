@@ -17,6 +17,7 @@ import {
 	type ToolFilesystemOperations,
 } from "./resource-version.ts";
 import { ProvenanceCertificateStore } from "./reuse-store.ts";
+import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { TimelineInterval } from "./task-timing.ts";
 import type { ObservedProcessPath, StraceObservation } from "./strace-observer.ts";
 type WireValue =
@@ -91,9 +92,8 @@ export class SubcomputeService {
 	private server?: Server;
 	private ready?: Promise<string>;
 	private directory?: string;
-	private closed = false;
+	private readonly lifetime = new RuntimeLifecycleLane();
 	private readonly clients = new Map<Socket, AbortController>();
-	private readonly pending = new Set<Promise<void>>();
 	private readonly scopes = new Map<string, SubcomputeScope>();
 	private readonly owners = new AsyncLocalStorage<Set<string>>();
 	private readonly cwd: string;
@@ -126,6 +126,7 @@ export class SubcomputeService {
 	}
 	async environment(): Promise<Readonly<Record<string, string>>> {
 		const socket = await this.socket();
+		if (this.lifetime.sealed) throw new Error("subcompute_service_closed");
 		if (this.scopes.size >= this.configuration.current.subcomputation.maxPendingRequests)
 			throw new Error("subcompute_scope_budget_exceeded");
 		const token = randomUUID();
@@ -153,16 +154,13 @@ export class SubcomputeService {
 		if (scope) {
 			clearTimeout(scope.timer);
 			for (const socket of scope.clients) socket.destroy(new Error("subcompute_context_closed"));
-			const cleanup = Promise.allSettled(scope.proofs.splice(0).map((proof) => proof.release()))
-				.then(() => {})
-				.finally(() => this.pending.delete(cleanup));
-			this.pending.add(cleanup);
+			this.lifetime.track(Promise.allSettled(scope.proofs.splice(0).map((proof) => proof.release())));
 		}
 		this.scopes.delete(token);
 		channels.delete(token);
 	}
 	socket(): Promise<string> {
-		if (this.closed) return Promise.reject(new Error("subcompute_service_closed"));
+		if (this.lifetime.sealed) return Promise.reject(new Error("subcompute_service_closed"));
 		return (this.ready ??= this.listen());
 	}
 	private async listen(): Promise<string> {
@@ -176,7 +174,10 @@ export class SubcomputeService {
 		}
 		const server = (this.server = createServer((socket) => {
 			socket.on("error", () => {});
-			if (this.closed || this.clients.size >= this.configuration.current.subcomputation.maxPendingRequests) {
+			if (
+				this.lifetime.sealed ||
+				this.clients.size >= this.configuration.current.subcomputation.maxPendingRequests
+			) {
 				socket.destroy(new Error("subcompute_connection_budget_exceeded"));
 				return;
 			}
@@ -189,22 +190,20 @@ export class SubcomputeService {
 			socket.setTimeout(this.configuration.current.subcomputation.socketTimeoutMs, () =>
 				socket.destroy(new Error("subcompute_timeout")),
 			);
-			const operation = withSpeculativeConfig(this.configuration, () => this.serve(socket, controller.signal))
-				.catch((error) => {
-					if (!socket.destroyed)
-						socket.end(
-							JSON.stringify({
-								protocol: 1,
-								state: "error",
-								error: String(error.message ?? error),
-							}) + "\n",
-						);
-				})
-				.finally(() => {
-					this.clients.delete(socket);
-					this.pending.delete(operation);
-				});
-			this.pending.add(operation);
+			this.lifetime.track(
+				withSpeculativeConfig(this.configuration, () => this.serve(socket, controller.signal))
+					.catch((error) => {
+						if (!socket.destroyed)
+							socket.end(
+								JSON.stringify({
+									protocol: 1,
+									state: "error",
+									error: String(error.message ?? error),
+								}) + "\n",
+							);
+					})
+					.finally(() => this.clients.delete(socket)),
+			);
 		}));
 		await new Promise<void>((resolve, reject) => {
 			server.once("error", reject);
@@ -213,7 +212,7 @@ export class SubcomputeService {
 				resolve();
 			});
 		});
-		if (this.closed) throw new Error("subcompute_service_closed");
+		if (this.lifetime.sealed) throw new Error("subcompute_service_closed");
 		return address;
 	}
 	private async serve(socket: Socket, signal: AbortSignal): Promise<void> {
@@ -367,20 +366,21 @@ export class SubcomputeService {
 			await session.dispose();
 		}
 	}
-	async dispose(): Promise<void> {
-		this.closed = true;
-		for (const token of this.scopes.keys()) this.releaseScope(token);
-		for (const [socket, controller] of this.clients) {
-			controller.abort(new Error("subcompute_service_closed"));
-			socket.destroy();
-		}
-		await this.ready?.catch(() => undefined);
-		if (this.server?.listening)
-			await new Promise<void>((resolve, reject) =>
-				this.server!.close((error) => (error ? reject(error) : resolve())),
-			);
-		await Promise.allSettled([...this.pending]);
-		if (this.directory) await rm(this.directory, { recursive: true, force: true });
+	dispose(): Promise<void> {
+		return this.lifetime.close(async () => {
+			for (const token of this.scopes.keys()) this.releaseScope(token);
+			for (const [socket, controller] of this.clients) {
+				controller.abort(new Error("subcompute_service_closed"));
+				socket.destroy();
+			}
+			await this.ready?.catch(() => undefined);
+			if (this.server?.listening)
+				await new Promise<void>((resolve, reject) =>
+					this.server!.close((error) => (error ? reject(error) : resolve())),
+				);
+			await this.lifetime.drain();
+			if (this.directory) await rm(this.directory, { recursive: true, force: true });
+		});
 	}
 }
 function encodeValue(value: unknown): WireValue {

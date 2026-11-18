@@ -663,13 +663,11 @@ function resourceCapture(
 	observedResult?: (output: ToolSettlement | undefined) => boolean,
 ): WorldResultCapture<ToolSettlement> {
 	const inputSource = Object.freeze({});
-	let open = true;
-	let sealing = false;
+	let phase: "open" | "sealing" | "disposed" = "open";
 	resourceVersions.set(inputSource, readInputs);
 	const dispose = async () => {
-		open = false;
-		close?.();
-		resourceVersions.delete(inputSource);
+		phase = "disposed";
+		if (resourceVersions.delete(inputSource)) close?.();
 		await session?.dispose();
 		await Promise.allSettled(versions.splice(0).map(releaseResourceVersion));
 	};
@@ -678,15 +676,16 @@ function resourceCapture(
 		...(inputsOnly || observedResult ? { inputSource } : {}),
 		dispose,
 		seal: async (output) => {
-			if (!open || sealing) throw new Error("resource_snapshot_capture_consumed");
-			sealing = true;
+			if (phase !== "open") throw new Error("resource_snapshot_capture_consumed");
+			phase = "sealing";
 			try {
 				if (!inputsOnly && !observedResult && output === undefined)
 					throw new Error("authoritative_result_missing");
 				await beforeSeal?.();
-				if (!open) throw new Error("resource_snapshot_capture_disposed");
+				if (!resourceVersions.has(inputSource)) throw new Error("resource_snapshot_capture_disposed");
 				for (const version of versions) version.view?.seal();
 				for (const version of versions) await session?.publish(version, undefined, versions);
+				if (!resourceVersions.has(inputSource)) throw new Error("resource_snapshot_capture_disposed");
 				const branch = resourceSnapshotBranch(
 					inputsOnly || (observedResult && !observedResult(output))
 						? { inputsOnly: true }
@@ -718,8 +717,7 @@ export function bindResourceOperation(
 		versions: ResourceVersionToken[];
 		queries: Set<object>;
 		session?: ResourceInputSession;
-		started?: boolean;
-		incomplete?: boolean;
+		phase: "available" | "observing" | "incomplete";
 	};
 	const active = new Map<string, Capture>();
 	const bytes = (owned: Capture, inputs = true) =>
@@ -733,6 +731,7 @@ export function bindResourceOperation(
 			if (active.has(callID) || !Number.isFinite(maxBytes) || maxBytes <= 0)
 				throw new Error("resource_snapshot_budget_invalid");
 			const owned: Capture = {
+				phase: "available",
 				maxBytes,
 				inputs: new Map(),
 				versions: [],
@@ -784,16 +783,17 @@ export function bindResourceOperation(
 					...[...owned.queries].flatMap((source) => resourceVersions.get(source)?.() ?? []),
 				],
 				session,
-				output ? (result) => !owned.incomplete && !!result && !result.isError : undefined,
+				output ? (result) => owned.phase !== "incomplete" && !!result && !result.isError : undefined,
 			);
 		},
 		authoritative: async (request) => {
-			const owned = active.get(request.callID)?.started ? undefined : active.get(request.callID);
+			const capture = active.get(request.callID);
+			const owned = capture?.phase === "available" ? capture : undefined;
 			const scope = resourceOperationContext.getStore();
 			if (!owned && !scope && native) return native(request);
-			if (owned) owned.started = true;
+			if (owned) owned.phase = "observing";
 			const unproven = () => {
-				if (owned) owned.incomplete = true;
+				if (owned) owned.phase = "incomplete";
 			};
 			const session =
 				owned?.session ??
@@ -948,29 +948,23 @@ export function bindResourceOperation(
 					retain(target, content);
 				},
 				prepare: async (binding, key, build, consume, hint, signal = request.signal) => {
-					let consuming = false;
-					let completed:
-						| {
-								value: Awaited<ReturnType<typeof consume>>;
-						  }
-						| undefined;
-					const use: typeof consume = async (value) => {
-						consuming = true;
-						completed = { value: await consume(value) };
-						return completed.value;
-					};
+					let consumption: ReturnType<typeof consume> | undefined;
+					const use: typeof consume = (value) => (consumption = (async () => consume(value))());
 					try {
 						await query((view) => view.prepare(binding, key, build, use, hint, signal), signal);
 					} catch (error) {
 						unproven();
-						if (consuming && !completed) throw error;
+						if (consumption)
+							return consumption.catch(() => {
+								throw error;
+							});
 					}
-					if (completed) return completed.value;
+					if (consumption) return consumption;
 					unproven();
 					signal.throwIfAborted();
 					const resource = await build(host, signal);
 					try {
-						return await use(resource.value);
+						return await consume(resource.value);
 					} finally {
 						await resource.dispose();
 					}

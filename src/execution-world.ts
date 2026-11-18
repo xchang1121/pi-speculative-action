@@ -1026,7 +1026,7 @@ export interface ExecutionWorldQualification {
 const qualifiedWorlds = new WeakMap<
 	object,
 	ExecutionWorldQualification & {
-		active: boolean;
+		disposal?: Promise<void>;
 	}
 >();
 /** Register an immutable implementation with an actual, repeatable provider qualification probe.
@@ -1045,11 +1045,6 @@ export function registerExecutionWorld<World extends ExecutionWorld<any, any, an
 		typeof qualification.verify !== "function"
 	)
 		throw new Error("execution world qualification requires concrete entries and a provider probe");
-	const entry = {
-		operations,
-		verify: qualification.verify.bind(qualification),
-		active: true,
-	};
 	const close = world.dispose?.bind(world);
 	const snapshot = (operation: ExecutionWorldOperation | undefined) =>
 		operation &&
@@ -1059,22 +1054,25 @@ export function registerExecutionWorld<World extends ExecutionWorld<any, any, an
 				operation.capabilities === "all" ? ("all" as const) : Object.freeze([...operation.capabilities]),
 			...(operation.tools ? { tools: Object.freeze([...operation.tools]) } : {}),
 		});
-	let disposed: Promise<void> | undefined;
 	const registered = Object.freeze({
 		...world,
 		speculation: snapshot(world.speculation),
 		observation: snapshot(world.observation),
 		dispose: () => {
-			entry.active = false;
-			return (disposed ??= Promise.resolve().then(close));
+			return (entry.disposal ??= Promise.resolve().then(close));
 		},
 	}) as unknown as World;
+	const entry = {
+		operations,
+		verify: qualification.verify.bind(qualification),
+		disposal: undefined as Promise<void> | undefined,
+	};
 	qualifiedWorlds.set(registered, entry);
 	return registered;
 }
 export function isRegisteredExecutionWorld(world: object, operation: ExecutionWorldEntry): boolean {
 	const entry = qualifiedWorlds.get(world);
-	return !!entry?.active && entry.operations.includes(operation);
+	return !!entry && !entry.disposal && entry.operations.includes(operation);
 }
 async function qualifyExecutionWorld(
 	world: object,
@@ -1089,7 +1087,7 @@ async function qualifyExecutionWorld(
 	const evidence = await entry.verify({ ...input, operation });
 	input.signal?.throwIfAborted();
 	if (
-		!entry.active ||
+		entry.disposal ||
 		evidence.externalEffects !== "excluded" ||
 		typeof evidence.fingerprint !== "string" ||
 		!evidence.fingerprint.trim()

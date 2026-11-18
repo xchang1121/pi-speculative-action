@@ -142,7 +142,6 @@ type Execute = (tool: AgentTool, args: Parameters<AgentTool["execute"]>) => Retu
 type Turn = {
 	readonly tools: readonly AgentTool[];
 	execute?: Execute;
-	closed?: boolean;
 };
 type Registered = {
 	readonly execute: Function;
@@ -204,7 +203,7 @@ export async function executeSdkTool(
 	const selected = definition ? tool : (scope.tools.get(tool.name) ?? tool);
 	scope.tools.set(tool.name, selected);
 	return sdkExecution.run(selected, () =>
-		scope.turn.execute && !scope.turn.closed ? scope.turn.execute(selected, args) : selected.execute(...args),
+		scope.turn.execute ? scope.turn.execute(selected, args) : selected.execute(...args),
 	);
 }
 /** Keep opaque callbacks available for child-operation learning, never for executing a host function ahead. */
@@ -263,10 +262,7 @@ function currentDefinition(tool: AgentTool): Registered | undefined {
 }
 export const isStockSdkTool = (tool: AgentTool): boolean => registeredTools.get(tool)?.stock === true;
 export function currentSdkTurn(context: ExtensionContext): Turn | undefined {
-	const scope = sdkSessions.get(context.sessionManager);
-	if (!scope) return;
-	scope.turn.closed = false;
-	return scope.turn;
+	return sdkSessions.get(context.sessionManager)?.turn;
 }
 export function attachSdkTools(
 	context: ExtensionContext,
@@ -287,8 +283,8 @@ export function attachSdkTools(
 	return {
 		tools: () => turn.tools,
 		dispose: () => {
-			turn.closed = true;
-			if (sdkSessions.get(context.sessionManager) === scope) sdkSessions.delete(context.sessionManager);
+			if (sdkSessions.get(context.sessionManager) !== scope) return;
+			sdkSessions.delete(context.sessionManager);
 			declaredSessionTools.delete(context.sessionManager);
 		},
 	};
@@ -637,36 +633,32 @@ function assembleAgentExecutionHost(
 				...(resolved.identity !== undefined ? { identity: immutableSnapshot(resolved.identity) } : {}),
 				...(resolved.process ? { process: immutableSnapshot(resolved.process) } : {}),
 			});
-		let action;
-		if (
+		const action =
 			schemaHash === undefined ||
 			![input, invocation?.identity, invocation?.process].every(isImmutableSnapshot)
-		) {
-			action = undefined;
-		} else {
-			action = actionSemantics.buildKey(
-				tool,
-				input,
-				options.cwd,
-				schemaHash,
-				invocation
-					? {
-							fingerprint: stableValueHash(
-								invocation.filesystem
-									? [
-											invocation.identity ?? invocation,
-											{
-												filesystemRoot: invocation.filesystemRoot ?? options.cwd,
-											},
-										]
-									: (invocation.identity ?? invocation),
-							),
-							context: invocation,
-							semantics: invocation.semantics,
-						}
-					: undefined,
-			);
-		}
+				? undefined
+				: actionSemantics.buildKey(
+						tool,
+						input,
+						options.cwd,
+						schemaHash,
+						invocation
+							? {
+									fingerprint: stableValueHash(
+										invocation.filesystem
+											? [
+													invocation.identity ?? invocation,
+													{
+														filesystemRoot: invocation.filesystemRoot ?? options.cwd,
+													},
+												]
+											: (invocation.identity ?? invocation),
+									),
+									context: invocation,
+									semantics: invocation.semantics,
+								}
+							: undefined,
+					);
 		return {
 			...(invocation ? { invocation } : {}),
 			...(action ? { action } : {}),

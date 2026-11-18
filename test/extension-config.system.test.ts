@@ -133,6 +133,29 @@ test("extension storage GC retains accepted clock certificates and setSettings r
 			"Invalid Candidate requests per Actor decision.",
 		]);
 		expect(settings.effective()?.candidateLimit).toBe(3);
+		const edit = (menu: string[], field: string, value: string) =>
+			interact([...menu, field, "Back", "Back", "Apply changes", "Close"], [value]);
+		const modelPage = ["Prediction sources", "Model Drafter"];
+		for (const [field, value] of [
+			["Minimum sampling temperature", 0.8],
+			["Maximum sampling temperature", 0.4],
+		] as const) {
+			expect
+				.soft(await edit(modelPage, field, String(value)))
+				.toEqual(["Speculative-action settings applied."]);
+			expect
+				.soft(settings.effective())
+				.toMatchObject({ drafterTemperatureMin: value, drafterTemperatureMax: value });
+		}
+		const storagePage = ["Advanced settings", "Scheduling and storage"];
+		expect
+			.soft(await edit(storagePage, "Live result memory", "0.5"))
+			.toEqual(["Speculative-action settings applied."]);
+		expect.soft(settings.effective()?.resourceCacheMaxBytes).toBe(524288);
+		expect
+			.soft(await interact([...storagePage, "Live result memory", "Back", "Back", "Close"], ["0.0000001"]))
+			.toEqual(["Invalid Live result memory."]);
+		expect.soft(settings.effective()?.resourceCacheMaxBytes).toBe(524288);
 		const applied = settings.effective();
 		await interact(["Speculative production", "Close"], [], true);
 		expect(settings.effective()).toEqual(applied);

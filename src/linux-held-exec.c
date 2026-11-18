@@ -389,10 +389,9 @@ struct traced_process {
   pid_t pid;
   int fd;
   int armed;
-  int stopped;
+  enum { TRACE_RUNNING, TRACE_STOPPED, TRACE_GROUP_STOP } stop;
   int pending;
   int delivered;
-  int listening;
   int historical;
   int awaiting_parent;
   int vforking;
@@ -606,7 +605,10 @@ struct exec_call {
   unsigned long code;
   unsigned long command;
   struct exec_files *files;
-  int phase;
+  /* Syscall entry/exit pairs are adjacent; a restart returns to the same pair's entry. */
+  enum { EXEC_LOOKUP_ENTRY = -1, EXEC_LOOKUP_EXIT, EXEC_FD_ENTRY, EXEC_FD_EXIT,
+         EXEC_CLOSE_ENTRY, EXEC_CLOSE_EXIT, EXEC_MM_ENTRY = 7, EXEC_MM_EXIT,
+         EXEC_NAME_ENTRY, EXEC_NAME_EXIT, EXEC_CLEANUP_ENTRY, EXEC_CLEANUP_EXIT, EXEC_RESUME } phase;
   int eligible;
   int lease;
   pid_t tid;
@@ -684,7 +686,7 @@ void pi_drop_exec_files(pid_t pid, void **context, void **pending, const char *s
   struct exec_files *files = *context;
   struct exec_call *call = *pending;
   if (call) {
-    if (call->files && call->files->fd < 0 && call->phase == 0)
+    if (call->files && call->files->fd < 0 && call->phase == EXEC_LOOKUP_EXIT)
       call->files->fd = exec_injected_fd(call->tid, source);
     if (call->files && call->files->fd >= 0)
       call->files->pending = 1;
@@ -785,7 +787,7 @@ int pi_step_exec_call(pid_t pid, void **context, void **file_context, int exitin
     if (!call)
       return -1;
     call->files = files;
-    call->phase = exiting ? 3 : 12;
+    call->phase = exiting ? EXEC_CLOSE_ENTRY : EXEC_CLEANUP_EXIT;
     files->pending = 0;
     *context = call;
     if (ptrace(PTRACE_GETREGS, pid, 0, &call->original) < 0 || exec_mask(pid, call, 1) < 0)
@@ -806,10 +808,15 @@ int pi_step_exec_call(pid_t pid, void **context, void **file_context, int exitin
     return 1;
   }
   switch (call->phase) {
-  case -1:
-    call->phase = 0;
+  case EXEC_LOOKUP_ENTRY:
+  case EXEC_FD_ENTRY:
+  case EXEC_CLOSE_ENTRY:
+  case EXEC_MM_ENTRY:
+  case EXEC_NAME_ENTRY:
+  case EXEC_CLEANUP_ENTRY:
+    call->phase++;
     return 1;
-  case 0:
+  case EXEC_LOOKUP_EXIT:
     if (value > 0 && value <= INT_MAX) {
       call->files->fd = (int)value - 1;
       if (call->files->refs > 1 && (call->files->pin = exec_pin(pid, call->files->fd)) < 0)
@@ -826,46 +833,37 @@ int pi_step_exec_call(pid_t pid, void **context, void **file_context, int exitin
           call->original.orig_rax == SYS_execveat ? call->original.r10 : call->original.rdx;
       registers.r8 = AT_EMPTY_PATH;
       registers.r9 = 0x5049455900000000UL;
-      call->phase = 1;
+      call->phase = EXEC_FD_ENTRY;
       return ptrace(PTRACE_SETREGS, pid, 0, &registers) == 0 ? 1 : -1;
     }
     /* A native-path continuation already executed; errors retain the caller
      * registers. */
     __attribute__((fallthrough));
-  case 2:
+  case EXEC_FD_EXIT:
     if (!value)
       return exec_mask(pid, call, 0);
     call->original.rax = registers.rax;
     if (call->files->fd >= 0) {
-      call->phase = 3;
+      call->phase = EXEC_CLOSE_ENTRY;
       return exec_rewind(pid, &call->original, SYS_close, call->files->fd, 0) == 0 ? 1 : -1;
     }
     break;
-  case 1:
-    call->phase = 2;
-    return 1;
-  case 3:
-    call->phase = 4;
-    return 1;
-  case 4:
-  case 12: {
+  case EXEC_CLOSE_EXIT:
+  case EXEC_CLEANUP_EXIT: {
     if (value)
       return -1;
     exec_closed(call->files);
-    if (call->phase == 12) {
+    if (call->phase == EXEC_CLEANUP_EXIT) {
       registers = call->original;
       registers.rip -= 2;
       registers.rax = registers.orig_rax;
       registers.orig_rax = (unsigned long)-1;
-      call->phase = 13;
+      call->phase = EXEC_RESUME;
       return ptrace(PTRACE_SETREGS, pid, 0, &registers) == 0 ? 1 : -1;
     }
     break;
   }
-  case 7:
-    call->phase = 8;
-    return 1;
-  case 8:
+  case EXEC_MM_EXIT:
     if (value)
       return -1;
     registers = call->original;
@@ -874,24 +872,18 @@ int pi_step_exec_call(pid_t pid, void **context, void **file_context, int exitin
     registers.rdi = PR_SET_NAME;
     registers.rsi = call->command;
     registers.rdx = registers.r10 = registers.r8 = registers.r9 = 0;
-    call->phase = 9;
+    call->phase = EXEC_NAME_ENTRY;
     return ptrace(PTRACE_SETREGS, pid, 0, &registers) == 0 ? 1 : -1;
-  case 9:
-    call->phase = 10;
-    return 1;
-  case 10:
+  case EXEC_NAME_EXIT:
     if (value || ptrace(PTRACE_POKETEXT, pid, call->original.rip, call->code) < 0)
       return -1;
     break;
-  case 11:
-    call->phase = 12;
-    return 1;
-  case 13:
+  case EXEC_RESUME:
     break;
   }
   if (exec_mask(pid, call, 0) < 0 || ptrace(PTRACE_SETREGS, pid, 0, &call->original) < 0)
     return -1;
-  int result = call->phase == 10 ? 2 | (call->eligible ? 4 : 0) : 0;
+  int result = call->phase == EXEC_NAME_EXIT ? 2 | (call->eligible ? 4 : 0) : 0;
   if (call->lease)
     close(call->lease - 1);
   free(call);
@@ -1049,7 +1041,7 @@ int pi_restore_exec_context(pid_t pid, const char *source, const char *invoked, 
   call->original = registers;
   call->original.rsp = stack;
   call->command = text + length;
-  call->phase = 7;
+  call->phase = EXEC_MM_ENTRY;
   call->eligible = eligible;
   errno = 0;
   call->code = (unsigned long)ptrace(PTRACE_PEEKTEXT, pid, registers.rip, 0);
@@ -1652,7 +1644,6 @@ static int start_decision(struct traced_process *process, const char *socket_pat
 struct actor_trace_job {
   struct traced_process process;
   char configuration[PI_HELD_LINE_BYTES];
-  int replayed;
 };
 
 void *pi_actor_start(pid_t pid, const char *source, int *notification) {
@@ -1722,21 +1713,26 @@ int pi_actor_step(void *context) {
   struct actor_trace_job *job = context;
   pid_t barrier = 0;
   int result = advance_decision(&job->process, 0, &barrier);
-  job->replayed |= job->process.armed;
-  return result == 1 && job->replayed ? 2 : result;
+  return result == 1 && job->process.armed ? 2 : result;
+}
+
+static void finish_observation(struct traced_process *observer, int completed) {
+  if (observer->job) {
+    pthread_cancel(observer->job->thread);
+    pthread_join(observer->job->thread, NULL);
+    free_job(observer->job);
+    observer->job = NULL;
+  }
+  if (observer->fd >= 0) {
+    (void)transfer(observer->fd, completed ? "D\n" : "C\n", 2, 1);
+    close(observer->fd);
+    observer->fd = -1;
+  }
 }
 
 void pi_actor_close(void *context, int completed) {
   struct actor_trace_job *job = context;
-  if (job->process.job) {
-    pthread_cancel(job->process.job->thread);
-    pthread_join(job->process.job->thread, NULL);
-    free_job(job->process.job);
-  }
-  if (job->process.fd >= 0) {
-    (void)transfer(job->process.fd, completed ? "D\n" : "C\n", 2, 1);
-    close(job->process.fd);
-  }
+  finish_observation(&job->process, completed);
   free(job);
 }
 
@@ -1749,12 +1745,6 @@ static int track_process(struct traced_process **processes, pid_t pid) {
   return 0;
 }
 
-static void finish_observation(struct traced_process *observer, int completed) {
-  (void)transfer(observer->fd, completed ? "D\n" : "C\n", 2, 1);
-  close(observer->fd);
-  observer->fd = -1;
-}
-
 static void release_process(struct traced_process **processes, pid_t pid, int completed) {
   struct traced_process **cursor = processes;
   while (*cursor) {
@@ -1764,11 +1754,6 @@ static void release_process(struct traced_process **processes, pid_t pid, int co
       continue;
     }
     *cursor = observer->next;
-    if (observer->job) {
-      pthread_cancel(observer->job->thread);
-      pthread_join(observer->job->thread, NULL);
-      free_job(observer->job);
-    }
     finish_observation(observer, completed);
     free(observer);
   }
@@ -1782,7 +1767,7 @@ static int release_tracees(struct traced_process **processes, int *acknowledged)
   int waiting = 0;
   for (struct traced_process *item = *processes; item;) {
     if (!item->historical) {
-      if (item->stopped && !item->listening && !item->awaiting_parent) {
+      if (item->stop == TRACE_STOPPED && !item->awaiting_parent) {
         if (ptrace(PTRACE_DETACH, item->pid, 0, item->delivered) < 0 && errno != ESRCH)
           return -1;
         release_process(processes, item->pid, 0);
@@ -1876,12 +1861,10 @@ static int trace(const char *socket_path, const char *token, const char *executi
     return 72;
   int status = 0;
   int root_status = -1;
-  int retiring = 0;
-  int draining = 0;
+  enum { OBSERVING, RETIRE_REQUESTED, DRAINING } phase = OBSERVING;
   int acknowledged = 0;
   int admitted = 0;
   int launched = 0;
-  unsigned exec_events = !skip_root;
   struct traced_process *processes = NULL;
   struct pollfd *polling = NULL;
   size_t capacity = 0;
@@ -1891,8 +1874,8 @@ static int trace(const char *socket_path, const char *token, const char *executi
   }
   for (;;) {
     struct pollfd control = {.fd = STDIN_FILENO, .events = POLLIN};
-    if (!retiring && poll(&control, 1, 0) > 0)
-      retiring = 1;
+    if (phase == OBSERVING && poll(&control, 1, 0) > 0)
+      phase = RETIRE_REQUESTED;
     struct signalfd_siginfo notification;
     while (read(signals, &notification, sizeof(notification)) > 0) {
     }
@@ -1912,12 +1895,12 @@ static int trace(const char *socket_path, const char *token, const char *executi
         } else {
           if (ptrace(PTRACE_CONT, item->pid, 0, 0) < 0 && errno != ESRCH)
             goto fatal;
-          item->stopped = 0;
+          item->stop = TRACE_RUNNING;
         }
       }
     }
   manage_descriptors:
-    if (descriptors && !draining) {
+    if (descriptors && phase != DRAINING) {
       if (!barrier)
         for (struct traced_process *item = processes; item; item = item->next)
           if (item->pending && !item->historical) {
@@ -1928,7 +1911,7 @@ static int trace(const char *socket_path, const char *token, const char *executi
       for (struct traced_process *item = processes; item; item = item->next) {
         /* Between its vfork event and VFORK_DONE a parent runs nothing: it
          * cannot stop, and needs not. */
-        if (item->historical || item->stopped || item->vforking)
+        if (item->historical || item->stop != TRACE_RUNNING || item->vforking)
           continue;
         ready = 0;
         if (barrier && ptrace(PTRACE_INTERRUPT, item->pid, 0, 0) < 0 && errno != ESRCH &&
@@ -1936,7 +1919,7 @@ static int trace(const char *socket_path, const char *token, const char *executi
           goto fatal;
       }
       for (struct traced_process *item = processes; item; item = item->next) {
-        if (item->historical || !item->stopped)
+        if (item->historical || item->stop == TRACE_RUNNING)
           continue;
         if (barrier) {
           if (ready && item->pid == barrier && !item->job &&
@@ -1946,22 +1929,21 @@ static int trace(const char *socket_path, const char *token, const char *executi
             goto manage_descriptors;
           }
         } else if (!item->job && !item->awaiting_parent) {
-          if (ptrace(item->listening ? PTRACE_LISTEN : PTRACE_CONT, item->pid, 0, item->delivered) <
+          if (ptrace(item->stop == TRACE_GROUP_STOP ? PTRACE_LISTEN : PTRACE_CONT, item->pid, 0, item->delivered) <
                   0 &&
               errno != ESRCH)
             goto fatal;
-          item->stopped = 0;
+          item->stop = TRACE_RUNNING;
           item->delivered = 0;
-          item->listening = 0;
         }
       }
     }
-    if (retiring || (root_status >= 0 && !barrier)) {
+    if (phase != OBSERVING || (root_status >= 0 && !barrier)) {
       int busy = 0;
       for (struct traced_process *item = processes; item; item = item->next)
         busy |= item->job != NULL;
       if (!busy) {
-        retiring = draining = 1;
+        phase = DRAINING;
         int live = release_tracees(&processes, &acknowledged);
         if (live < 0)
           goto fatal;
@@ -1990,7 +1972,7 @@ static int trace(const char *socket_path, const char *token, const char *executi
         capacity = count;
       }
       polling[0] = (struct pollfd){.fd = signals, .events = POLLIN};
-      polling[1] = (struct pollfd){.fd = retiring ? -1 : STDIN_FILENO, .events = POLLIN};
+      polling[1] = (struct pollfd){.fd = phase != OBSERVING ? -1 : STDIN_FILENO, .events = POLLIN};
       count = 2;
       for (struct traced_process *item = processes; item; item = item->next)
         if (item->job)
@@ -2025,35 +2007,34 @@ static int trace(const char *socket_path, const char *token, const char *executi
       current = processes;
       current->awaiting_parent = event == PTRACE_EVENT_STOP;
     }
-    current->stopped = 1;
-    current->listening = 0;
+    current->stop = TRACE_STOPPED;
     struct process_credentials credentials;
     if (!admitted) {
-      int valid = !retiring && pid == root && event == PTRACE_EVENT_STOP &&
+      int valid = phase == OBSERVING && pid == root && event == PTRACE_EVENT_STOP &&
                   process_owned(pid, &credentials) && credentials.parent == (unsigned)getppid();
       if (valid && ptrace(PTRACE_SETOPTIONS, root, 0, flags) < 0)
         goto fatal;
       if (!valid)
-        retiring = draining = 1;
+        phase = DRAINING;
       (void)transfer(3, valid ? "R" : "N", 1, 1);
       close(3);
       admitted = 1;
     }
     if (event == PTRACE_EVENT_EXEC && !process_owned(pid, &credentials))
-      retiring = draining = 1;
+      phase = DRAINING;
     /* libuv's fork still contains the host's CLOEXEC pins. Start ancestry at
      * the actual launch, where only descriptors inherited by the program
      * remain. */
-    if (event == PTRACE_EVENT_EXEC && !launched) {
+    int target_exec = event == PTRACE_EVENT_EXEC && (launched || !skip_root);
+    if (event == PTRACE_EVENT_EXEC)
       launched = 1;
-    }
     if (event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_VFORK_DONE)
       current->vforking = event == PTRACE_EVENT_VFORK;
     if (descriptors && delivered == (SIGTRAP | 0x80))
       delivered = 0;
     if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
       if (!launched && descriptors)
-        retiring = draining = 1;
+        phase = DRAINING;
       unsigned long child;
       if (ptrace(PTRACE_GETEVENTMSG, pid, 0, &child) < 0)
         goto fatal;
@@ -2066,14 +2047,14 @@ static int trace(const char *socket_path, const char *token, const char *executi
         known = processes;
       known->awaiting_parent = 0;
     }
-    if (!draining && event == PTRACE_EVENT_STOP && delivered != SIGTRAP) {
+    if (phase != DRAINING && event == PTRACE_EVENT_STOP && delivered != SIGTRAP) {
       if (descriptors) {
-        current->listening = 1;
+        current->stop = TRACE_GROUP_STOP;
         continue;
       }
       if (ptrace(PTRACE_LISTEN, pid, 0, 0) < 0 && errno != ESRCH)
         goto fatal;
-      current->stopped = 0;
+      current->stop = TRACE_RUNNING;
       continue;
     }
     if (event == PTRACE_EVENT_EXEC) {
@@ -2086,10 +2067,10 @@ static int trace(const char *socket_path, const char *token, const char *executi
         release_process(&processes, (pid_t)previous, 0);
       }
     }
-    if (event == PTRACE_EVENT_EXEC && ++exec_events > 1) {
-      if (!draining && skip && replace_with_exit(pid, skip_code) < 0)
+    if (target_exec) {
+      if (phase != DRAINING && skip && replace_with_exit(pid, skip_code) < 0)
         goto fatal;
-      if (socket_path && !retiring) {
+      if (socket_path && phase == OBSERVING) {
         for (struct traced_process *item = processes; item; item = item->next) {
           if (item->pid != pid)
             continue;
@@ -2101,7 +2082,7 @@ static int trace(const char *socket_path, const char *token, const char *executi
               goto fatal;
             item->historical = 1;
             item = processes;
-            item->stopped = 1;
+            item->stop = TRACE_STOPPED;
           }
           if (descriptors) {
             item->pending = 1;
@@ -2115,13 +2096,13 @@ static int trace(const char *socket_path, const char *token, const char *executi
     }
     if (event != 0)
       delivered = 0;
-    if (descriptors || draining) {
+    if (descriptors || phase == DRAINING) {
       current->delivered = delivered;
       continue;
     }
     if (ptrace(PTRACE_CONT, pid, 0, delivered) < 0 && errno != ESRCH)
       goto fatal;
-    current->stopped = 0;
+    current->stop = TRACE_RUNNING;
   held:;
   }
   while (processes)
@@ -2130,7 +2111,7 @@ static int trace(const char *socket_path, const char *token, const char *executi
   close(signals);
   pthread_sigmask(SIG_SETMASK, &original, NULL);
   if (root_status < 0)
-    return retiring ? 0 : 125;
+    return phase != OBSERVING ? 0 : 125;
   if (WIFEXITED(root_status))
     return WEXITSTATUS(root_status);
   signal(WTERMSIG(root_status), SIG_DFL);

@@ -11,7 +11,12 @@ import {
 } from "../src/filesystem-evidence.ts";
 import { nativeMetadataTrace, observeStrace, traceTail, writesWithin } from "../src/strace-observer.ts";
 import { temporaryDirectories } from "./filesystem.ts";
-import { sealProcessCertificate, type ProcessResultRecord } from "../src/process-reuse.ts";
+import { effectCommitFailure } from "../src/execution-world.ts";
+import {
+	ProcessHandoffOwnership,
+	sealProcessCertificate,
+	type ProcessResultRecord,
+} from "../src/process-reuse.ts";
 import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
 
 vi.mock("node:fs/promises", { spy: true });
@@ -234,4 +239,32 @@ test("keeps file admission and change detection after a digest is cached", async
 	await expect(captureFileDigest(input, 1024, AbortSignal.abort(new Error("cancelled")))).rejects.toThrow(
 		"cancelled",
 	);
+});
+
+test("a whole handoff waits for all child claims and only retries recoverable commits", async () => {
+	const owner = new ProcessHandoffOwnership();
+	const first = owner.claimChild()!;
+	const second = owner.claimChild()!;
+	first(false);
+	first(true);
+	await expect(owner.commit(async () => 0)).rejects.toThrow("already claimed");
+	second(false);
+	await expect(
+		owner.commit(async () => {
+			throw effectCommitFailure(new Error("stale"), "recoverable");
+		}),
+	).rejects.toThrow();
+	const result = Promise.withResolvers<number>();
+	const apply = vi.fn(() => result.promise);
+	const runs = [owner.commit(apply), owner.commit(apply)];
+	expect(owner.claimChild()).toBeUndefined();
+	expect(owner.pendingWhole).toBeDefined();
+	result.resolve(42);
+	expect(await Promise.all(runs)).toEqual([42, 42]);
+	expect(apply).toHaveBeenCalledTimes(1);
+	expect(owner.pendingWhole).toBeUndefined();
+	expect(owner.wholeClaimed).toBe(true);
+	const partial = new ProcessHandoffOwnership();
+	partial.claimChild()!(true);
+	await expect(partial.commit(apply)).rejects.toThrow("partially consumed");
 });

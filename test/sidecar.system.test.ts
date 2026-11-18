@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import { afterEach, expect, test, vi } from "vitest";
 import { createActorForkPlanSource } from "../src/self-speculation.ts";
 import { SelfSpeculationCoordinator, normalizeSelfSpeculationSettings } from "../src/self-speculation.ts";
+import { nextTurn } from "./async.ts";
 import { testModel } from "./model.ts";
 
 afterEach(() => vi.unstubAllEnvs());
@@ -142,6 +143,43 @@ test.each(["valid", "low confidence", "HTTP failure"])(
 			await coordinator.dispose();
 			server.closeAllConnections();
 			await new Promise<void>((resolve) => server.close(() => resolve()));
+		}
+	},
+);
+
+test.each(["resolve", "reject"])(
+	"a late %s cannot settle a replacement fork with the same turn ID",
+	async (outcome) => {
+		const pending = [0, 1].map(() =>
+			Promise.withResolvers<{ tool: string; input: { revision: number } }[]>(),
+		);
+		let calls = 0;
+		const coordinator = new SelfSpeculationCoordinator({
+			settings: () => normalizeSelfSpeculationSettings({ enabled: true, forkTransport: "drafter" }),
+			draftFork: () => pending[calls++]!.promise,
+		});
+		const begin = (revision: number) => {
+			coordinator.startTurn("same", testModel("actor"), { messages: [] }, revision);
+			coordinator.decorateActorPayload({});
+			coordinator.observeActorOutput({
+				type: "text_delta",
+				contentIndex: 0,
+				delta: "read",
+				partial: undefined as never,
+			});
+			return coordinator.actorForkPlanSource.waitForBatches("same", new AbortController().signal);
+		};
+		try {
+			const old = begin(1);
+			const current = begin(2);
+			await expect(old).resolves.toEqual([]);
+			if (outcome === "resolve") pending[0]!.resolve([{ tool: "read", input: { revision: 1 } }]);
+			else pending[0]!.reject(new Error("retired request"));
+			await nextTurn();
+			pending[1]!.resolve([{ tool: "read", input: { revision: 2 } }]);
+			expect(await current).toMatchObject([{ calls: [{ input: { revision: 2 } }] }]);
+		} finally {
+			await coordinator.dispose();
 		}
 	},
 );

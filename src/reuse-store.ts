@@ -859,25 +859,16 @@ export class ProvenanceCertificateStore {
 			const kind = storedKind === "certificate" ? "certificate" : "input";
 			const record = kind === "certificate" ? decodeCertificate(value) : decodeInputVersion(value);
 			const valid = record?.id === id;
-			let references;
-			if (!valid) {
-				references = undefined;
-			} else {
-				if (kind === "input") {
-					references = (record as StoredInputVersion).artifacts;
-				} else {
-					if (
-						certificateReplayable(
-							record as ProcessProvenanceCertificate,
-							this.acceptedTaints ?? speculativeConfig().processReuse.replayAcceptedTaints,
-						)
-					) {
-						references = referencedArtifacts(record as ProcessProvenanceCertificate);
-					} else {
-						references = undefined;
-					}
-				}
-			}
+			const references = !valid
+				? undefined
+				: kind === "input"
+					? (record as StoredInputVersion).artifacts
+					: certificateReplayable(
+								record as ProcessProvenanceCertificate,
+								this.acceptedTaints ?? speculativeConfig().processReuse.replayAcceptedTaints,
+						  )
+						? referencedArtifacts(record as ProcessProvenanceCertificate)
+						: undefined;
 			return {
 				key: `${kind}:${id}`,
 				kind,

@@ -37,25 +37,19 @@ export async function waitForCompletion<T>(
 	}
 	const bounded = timeoutMs !== undefined && Number.isFinite(timeoutMs);
 	if (!signal && !bounded) return { status: "completed", value: await promise };
-	return new Promise((resolve, reject) => {
-		let settled = false;
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const finish = (complete: () => void) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			signal?.removeEventListener("abort", aborted);
-			complete();
-		};
-		const aborted = () => finish(() => resolve({ status: "aborted" }));
-		signal?.addEventListener("abort", aborted, { once: true });
-		if (bounded)
-			timer = setTimeout(() => finish(() => resolve({ status: "deadline" })), Math.max(0, timeoutMs));
-		void promise.then(
-			(value) => finish(() => resolve({ status: "completed", value })),
-			(error) => finish(() => reject(error)),
-		);
-	});
+	const { promise: completion, resolve, reject } = Promise.withResolvers<CompletionWaitResult<T>>();
+	const aborted = () => resolve({ status: "aborted" });
+	signal?.addEventListener("abort", aborted, { once: true });
+	const timer = bounded
+		? setTimeout(() => resolve({ status: "deadline" }), Math.max(0, timeoutMs))
+		: undefined;
+	void promise.then((value) => resolve({ status: "completed", value }), reject);
+	try {
+		return await completion;
+	} finally {
+		clearTimeout(timer);
+		signal?.removeEventListener("abort", aborted);
+	}
 }
 /** Tracks owned asynchronous work, including tasks added while earlier work settles. */
 export class PendingTasks {

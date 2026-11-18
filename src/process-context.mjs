@@ -4,6 +4,12 @@ import { closeSync, openSync, readFileSync } from "node:fs";
 import { readFile, readlink, stat } from "node:fs/promises";
 import { speculativeConfig } from "./config-schema.ts";
 /** @typedef {import("./provenance-certificate.js").InheritedFileDescriptor["type"]} DescriptorType */
+/** @type {ReadonlyMap<bigint, DescriptorType>} */
+const descriptorTypes = new Map([
+	[0o010000n, "pipe"],
+	[0o140000n, "socket"],
+	[0o020000n, "device"],
+]);
 /** @typedef {{
  * readonly key: string, readonly launchKey: string, readonly umask: number,
  * readonly descriptorTypes: readonly [DescriptorType, DescriptorType, DescriptorType],
@@ -68,24 +74,10 @@ export async function captureProcessContext(pid, inheritedDescriptors) {
 				flags: 0,
 			};
 		const { fd, stat: metadata, endpoint, fdinfo: info } = item;
-		const format = BigInt(metadata.mode) & 61440n;
+		const format = BigInt(metadata.mode) & 0o170000n;
 		const flags = /^flags:\s*([0-7]+)/m.exec(info)?.[1];
 		if (!flags) throw new Error(`held descriptor ${fd} flags unavailable`);
-		/** @type {DescriptorType} */
-		let type;
-		if (format === 4096n) {
-			type = "pipe";
-		} else {
-			if (format === 49152n) {
-				type = "socket";
-			} else {
-				if (format === 8192n) {
-					type = "device";
-				} else {
-					type = "other";
-				}
-			}
-		}
+		const type = descriptorTypes.get(format) ?? "other";
 		return {
 			fd,
 			endpoint,
@@ -178,27 +170,10 @@ export function processLaunchOptions(context, endpoints) {
 	const outlets = endpoints ?? context.outputEndpoints;
 	/** @param {string} endpoint @param {1 | 2} fd */
 	const route = (endpoint, fd) => {
-		if (endpoint === "/dev/null") {
-			return 0;
-		} else {
-			if (pipes[fd - 1]) {
-				if (fd === 2 && endpoint === context.outputEndpoints[0]) {
-					return 1;
-				} else {
-					return fd;
-				}
-			} else {
-				if (endpoint === outlets[0]) {
-					return 1;
-				} else {
-					if (endpoint === outlets[1]) {
-						return 2;
-					} else {
-						return undefined;
-					}
-				}
-			}
-		}
+		if (endpoint === "/dev/null") return 0;
+		if (pipes[fd - 1]) return fd === 2 && endpoint === context.outputEndpoints[0] ? 1 : fd;
+		if (endpoint === outlets[0]) return 1;
+		if (endpoint === outlets[1]) return 2;
 	};
 	const stdout = route(context.outputEndpoints[0], 1);
 	const stderr = route(context.outputEndpoints[1], 2);

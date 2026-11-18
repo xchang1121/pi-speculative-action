@@ -1850,7 +1850,6 @@ async function projectOutput<Output>(
 			: undefined;
 	const coverage = candidate.projectionCoverage.find((item) => item.rule === rule?.id);
 	let rebuilt: Awaited<ReturnType<NonNullable<typeof reconstruct>>>;
-	let transferred = false;
 	try {
 		const { output: projected, computation: execution } = await TimelineInterval.measure(async () => {
 			const projected: Output | undefined =
@@ -1871,8 +1870,7 @@ async function projectOutput<Output>(
 			return { ok: false, cause: cause("projection", "query_proof_missing") };
 		if (projected === undefined) return { ok: false, cause: cause("projection", "view_not_covered") };
 		const resource = rebuilt?.dispose ? { dispose: rebuilt.dispose.bind(rebuilt), references: 1 } : undefined;
-		transferred = true;
-		return {
+		const result: ProjectionResult<Output> = {
 			ok: true,
 			output: projected,
 			execution,
@@ -1883,16 +1881,20 @@ async function projectOutput<Output>(
 			requiresQueryValidation: rebuilt?.requiresQueryValidation,
 			resource,
 		};
+		rebuilt = undefined;
+		return result;
 	} catch (error) {
 		return {
 			ok: false,
 			cause: cause("projection", "reconstruction_failed", errorDetail(error)),
 		};
 	} finally {
-		if (!transferred)
-			await Promise.resolve()
-				.then(() => rebuilt?.dispose?.())
-				.catch(() => {});
+		if (rebuilt?.dispose)
+			try {
+				await rebuilt.dispose();
+			} catch {
+				/* A discarded reconstruction cannot change the selected result. */
+			}
 	}
 }
 function callKey(turnID: string, callID: string): string {
@@ -2341,15 +2343,15 @@ export function makeSpeculativeActionRuntime<
 	const acquireCandidate = (session: Session, candidate: Candidate, owner: string) =>
 		candidateStore.has(session.id, candidate) ? candidate.work.acquire(owner) : undefined;
 	const borrowResourceInputs = (session: Session, source: Candidate | undefined, owner: string) => {
-		const leases = new Map<Candidate, NonNullable<ReturnType<typeof acquireCandidate>>>();
-		let closed = false;
+		let leases: Map<Candidate, NonNullable<ReturnType<typeof acquireCandidate>>> | undefined = new Map();
 		return {
 			lookup: function* (path?: string): Iterable<object> {
-				if (closed || session.lifecycle.sealed || session.settings.reuseEnabled === false) return;
+				if (!leases || session.lifecycle.sealed || session.settings.reuseEnabled === false) return;
 				for (const candidate of [
 					...candidateStore.lookupInputs(session.id, path === undefined ? undefined : [path]),
 					...candidateStore.pending(session.id),
 				]) {
+					if (!leases) return;
 					const inputs = candidateBranch(candidate)?.inputSource ?? candidate.inputSource;
 					if (
 						candidate === source ||
@@ -2364,14 +2366,16 @@ export function makeSpeculativeActionRuntime<
 						yield inputs;
 					}
 				}
+				if (!leases) return;
 				for (const state of session.turns.values())
 					if (actorTurnActive(state))
-						for (const action of state.actorActions) if (action.inputSource) yield action.inputSource;
+						for (const action of state.actorActions)
+							if (leases && action.inputSource) yield action.inputSource;
 			},
 			dispose: () => {
-				closed = true;
-				for (const lease of leases.values()) lease.release();
-				leases.clear();
+				const owned = leases;
+				leases = undefined;
+				for (const lease of owned?.values() ?? []) lease.release();
 			},
 		};
 	};
@@ -3737,20 +3741,13 @@ export function makeSpeculativeActionRuntime<
 			: state.generation.signal;
 		const attempted = new Set<Candidate>();
 		const stopCandidate = (candidate: Candidate): boolean => {
-			let failure;
-			if (signal?.aborted) {
-				failure = cause("control", "actor_aborted");
-			} else {
-				if (!actorTurnActive(state)) {
-					failure = cause("control", "disabled");
-				} else {
-					if (state.settings.reuseEnabled === false) {
-						failure = cause("control", "reuse_disabled");
-					} else {
-						failure = undefined;
-					}
-				}
-			}
+			const failure = signal?.aborted
+				? cause("control", "actor_aborted")
+				: !actorTurnActive(state)
+					? cause("control", "disabled")
+					: state.settings.reuseEnabled === false
+						? cause("control", "reuse_disabled")
+						: undefined;
 			if (!failure) return false;
 			actorAction.setFallback(failure, candidate.id);
 			return true;
@@ -3998,7 +3995,6 @@ export function makeSpeculativeActionRuntime<
 			);
 		}
 		let matchingPredictions: ClaimedPrediction[] = [];
-		let terminalFailure = false;
 		const pending = new Set<Promise<void>>();
 		const actorSignal = signal ? AbortSignal.any([signal, state.generation.signal]) : state.generation.signal;
 		const follow = (task: Promise<void>) => {
@@ -4080,15 +4076,15 @@ export function makeSpeculativeActionRuntime<
 			return Object.freeze(prepared);
 		} catch (error) {
 			if (isPoisonedEffectCommit(error)) {
-				terminalFailure = true;
+				state.actorActions.delete(actorAction);
+				actorAction.finishConsumption();
 				throw error;
 			}
 			return Object.freeze(prepared); // Speculation failed after matching: the native run still settles and is recorded.
 		} finally {
 			abandonActorPreview(state, preview, actorAction.fallback.cause);
 			actorAction.deferToFallback();
-			if (terminalFailure) actorAction.finishConsumption();
-			else if (actorAction.state.status === "awaiting_fallback") {
+			if (actorAction.state.status === "awaiting_fallback" && state.actorActions.has(actorAction)) {
 				if (!scheduler.has(actorAction)) preemptForActor(state.session);
 				state.session.effects.enqueue(() => startQueuedCandidates(state.session));
 				try {
@@ -4098,8 +4094,7 @@ export function makeSpeculativeActionRuntime<
 						state.settings.reuseEnabled !== false &&
 						adapter.captureAuthoritativeResult &&
 						concrete &&
-						!captureSignal.aborted &&
-						state.actorActions.has(actorAction)
+						!captureSignal.aborted
 					) {
 						const capture = await adapter.captureAuthoritativeResult({
 							...turnContext(state),

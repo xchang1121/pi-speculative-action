@@ -1077,8 +1077,8 @@ export interface SandboxFileChange extends SandboxChangeTarget, Omit<WorkspaceRe
 export type SandboxDirectoryState = import("./workspace-sandbox.ts").WorkspaceDirectoryState;
 export interface SandboxDirectoryChange extends SandboxChangeTarget {
 	readonly kind: "directory";
-	/** Preserve native creation policy; private directory permissions are not Actor metadata. */
-	readonly operation?: "mkdir";
+	/** A native mkdir inherits the caller's policy. A private copy-up reproduces the recorded mode. */
+	readonly operation?: "mkdir" | "copy_up";
 	readonly before?: SandboxDirectoryState;
 	readonly after?: SandboxDirectoryState;
 }
@@ -1622,11 +1622,9 @@ export class WorkspaceSandboxService {
 		this.checkpoints.set(checkpoint, retained);
 		const commit = new EffectCommit<ToolSettlement>();
 		const lifetime = new RuntimeLifecycleLane();
-		const inputs = new Map<string, ResourceInput>();
+		let inputs: Map<string, ResourceInput> | undefined = new Map();
 		const release = snapshot.dispose ?? retainWorkspaceChanges(changes);
-		let reading = false;
-		let readsTransferred = false;
-		let transferred = false;
+		let reads: "available" | "claimed" | "transferred" = "available";
 		return {
 			backend,
 			checkpoint,
@@ -1659,19 +1657,19 @@ export class WorkspaceSandboxService {
 							// A proven commit anchors future forks in the live workspace, independently of unadopted ancestors.
 							retained.committed = true;
 							retained.parent = undefined;
-							if (lifetime.sealed) inputs.clear();
+							if (lifetime.sealed) inputs?.clear();
 							return output;
 						});
 					}),
 				),
 			takeReadInputs: (maxBytes) => {
-				if (reading || lifetime.sealed || commit.result) return Promise.resolve(undefined);
-				reading = true;
+				if (reads !== "available" || lifetime.sealed || commit.result) return Promise.resolve(undefined);
+				reads = "claimed";
 				return lifetime.admit(async () => {
 					if (snapshot.readInputs && snapshot.readInputs.capturedBytes <= maxBytes) {
 						const validity = await snapshot.readInputs.validate?.();
-						if (validity?.status === "valid") {
-							readsTransferred = true;
+						if (!lifetime.sealed && validity?.status === "valid") {
+							reads = "transferred";
 							return snapshot.readInputs;
 						}
 					}
@@ -1691,24 +1689,20 @@ export class WorkspaceSandboxService {
 				});
 			},
 			takeCommittedInputs: async (maxBytes) => {
-				if (lifetime.sealed || !retained.committed || transferred) return undefined;
-				transferred = true;
+				if (lifetime.sealed || !retained.committed || !inputs?.size) return undefined;
+				const committed = inputs;
+				inputs = undefined;
 				return lifetime.admit(async () => {
-					if (!inputs.size) return undefined;
-					try {
-						const branch = await createCommittedResourceInputs(action, sourceRoot, inputs, maxBytes);
-						if (!lifetime.sealed) return branch;
-						await branch.dispose();
-						return undefined;
-					} finally {
-						inputs.clear();
-					}
+					const branch = await createCommittedResourceInputs(action, sourceRoot, committed, maxBytes);
+					if (!lifetime.sealed) return branch;
+					await branch.dispose();
+					return undefined;
 				});
 			},
 			dispose() {
-				inputs.clear();
+				inputs?.clear();
 				return lifetime.dispose(async () => {
-					if (!readsTransferred) await snapshot.readInputs?.dispose();
+					if (reads !== "transferred") await snapshot.readInputs?.dispose();
 					await release();
 				});
 			},
@@ -1940,10 +1934,10 @@ export class WorkspaceSandboxService {
 										createdDirectories,
 										parents,
 									);
-									await mkdir(change.target, change.operation ? undefined : { mode: change.after.mode });
+									const mode = change.operation === "mkdir" ? undefined : change.after.mode;
+									await mkdir(change.target, { mode });
 									applied.push(change);
-									if (!change.operation && process.platform !== "win32")
-										await chmod(change.target, change.after.mode);
+									if (mode !== undefined && process.platform !== "win32") await chmod(change.target, mode);
 								} else if (process.platform !== "win32" && change.before.mode !== change.after.mode) {
 									await chmod(change.target, change.after.mode);
 									applied.push(change);
@@ -2202,12 +2196,11 @@ export class WorkspaceSandboxService {
 	): Promise<WorkspaceExecutionSnapshot> {
 		const contents = workspace?.contents ?? (await this.createContentPool());
 		const release = contents?.retain();
-		const readVersions: ResourceVersionToken[] = [];
+		let readVersions: ResourceVersionToken[] = [];
 		const store = (await this.storage)?.store;
 		const session = store
 			? new ResourceInputSession({ store }, speculativeConfig().runtime.resourceCacheMaxBytes)
 			: undefined;
-		let transferred = false;
 		return withFilesystemReadView(undefined, async (source) => {
 			const sourceRoot = path.resolve(context.cwd);
 			await using privateReads = workspace ? FilesystemReadView.ambient() : undefined;
@@ -2558,16 +2551,17 @@ export class WorkspaceSandboxService {
 						session?.configuration,
 					)
 				: undefined;
-			transferred = !!readInputs;
-			return {
+			const snapshot = {
 				output,
 				changes: workspace ? captured : ownSandboxChanges(captured),
 				readInputs,
 				executionMetrics: {},
 				dispose: workspace ? undefined : retainWorkspaceChanges(captured),
 			};
+			if (readInputs) readVersions = [];
+			return snapshot;
 		}).finally(async () => {
-			if (!transferred) await Promise.allSettled(readVersions.map((token) => token.release()));
+			await Promise.allSettled(readVersions.map((token) => token.release()));
 			await session?.dispose();
 			await release?.();
 		});
@@ -2995,8 +2989,7 @@ async function createWorkspaceTransactionDriver(
 ): Promise<WorkspaceTransactionDriver> {
 	// Each interval borrows the domain's original versions. Its writer later attributes overlapping changes.
 	interface Capture {
-		contaminated: boolean;
-		overlapped: boolean;
+		status: "exclusive" | "overlapping" | "contaminated";
 		readonly before?: WorkspaceStructureSnapshot;
 		readonly versions?: WorkspaceContentSnapshot;
 		readonly racing: readonly string[];
@@ -3074,7 +3067,7 @@ async function createWorkspaceTransactionDriver(
 	const begin = (): Promise<WorkspaceTransactionCapture> =>
 		lock.serialize(async () => {
 			const overlapped = active.size > 0;
-			for (const other of active) other.overlapped = true;
+			for (const other of active) if (other.status === "exclusive") other.status = "overlapping";
 			const start = poisonReason
 				? undefined
 				: await captureBefore(overlapped).catch((error) => {
@@ -3082,14 +3075,13 @@ async function createWorkspaceTransactionDriver(
 						return undefined;
 					});
 			const capture: Capture = {
-				contaminated: false,
-				overlapped,
+				status: overlapped ? "overlapping" : "exclusive",
 				before: start && { ...start.versions.snapshot },
 				versions: start?.versions,
 				racing: start?.racing ?? [],
 			};
 			const input = async (resource: string, maxBytes = Infinity) => {
-				if (capture.contaminated || !capture.before)
+				if (capture.status === "contaminated" || !capture.before)
 					throw new Error("workspace transaction input is unavailable");
 				const entry = capture.before.entries.get(resource);
 				if (entry?.kind === "file" && entry.size > maxBytes)
@@ -3121,26 +3113,12 @@ async function createWorkspaceTransactionDriver(
 		ownership?: () => Promise<WorkspaceTransactionOwnership | undefined>,
 	): Promise<WorkspaceTransactionDelta> {
 		const settled = await lock.serialize(async () => {
-			if (!active.delete(capture))
-				return {
-					complete: false,
-					changes: [],
-					reason: "transaction_already_settled",
-				};
-			if (capture.contaminated || (capture.overlapped && !ownership))
-				return {
-					complete: false,
-					changes: [],
-					reason: "overlapping_workspace_transaction",
-				};
-			if (!capture.before)
-				return {
-					complete: false,
-					changes: [],
-					reason: poisonReason ?? "workspace_transaction_unavailable",
-				};
+			if (!active.delete(capture)) return { reason: "transaction_already_settled" };
+			if (capture.status === "contaminated" || (capture.status === "overlapping" && !ownership))
+				return { reason: "overlapping_workspace_transaction" };
+			if (!capture.before) return { reason: poisonReason ?? "workspace_transaction_unavailable" };
 			try {
-				const { versions } = await captureBefore(capture.overlapped);
+				const { versions } = await captureBefore(capture.status === "overlapping");
 				const after = versions.snapshot;
 				return {
 					after,
@@ -3150,8 +3128,6 @@ async function createWorkspaceTransactionDriver(
 				};
 			} catch (error) {
 				return {
-					complete: false,
-					changes: [],
 					reason: `workspace_transaction_capture:${errorMessage(error)}`,
 					before: capture.before,
 				};
@@ -3166,14 +3142,15 @@ async function createWorkspaceTransactionDriver(
 			};
 		const { after, capturedAt, paths } = settled;
 		const before = capture.before!;
-		const owned: WorkspaceTransactionOwnership | undefined = capture.overlapped
-			? await ownership!().catch(() => undefined)
-			: {
-					written: new Set(paths),
-					observed: new Map(),
-					endedAt: capturedAt,
-					interfered: async () => false,
-				};
+		const owned: WorkspaceTransactionOwnership | undefined =
+			capture.status === "overlapping"
+				? await ownership!().catch(() => undefined)
+				: {
+						written: new Set(paths),
+						observed: new Map(),
+						endedAt: capturedAt,
+						interfered: async () => false,
+					};
 		const incomplete = (reason: string) => ({
 			complete: false,
 			changes: [],
@@ -3268,7 +3245,10 @@ async function createWorkspaceTransactionDriver(
 			complete: true,
 			changes,
 			before,
-			after: capture.overlapped ? workspaceStructureSnapshot(after.root, entries, after.complete) : after,
+			after:
+				capture.status === "overlapping"
+					? workspaceStructureSnapshot(after.root, entries, after.complete)
+					: after,
 		};
 	}
 	async function captureBefore(overlapped = false): Promise<{
@@ -3307,11 +3287,11 @@ async function createWorkspaceTransactionDriver(
 	}
 	const abort = (capture: Capture, unchanged?: true): Promise<void> =>
 		lock.serialize(async () => {
-			if (active.delete(capture) && !unchanged) for (const other of active) other.contaminated = true;
+			if (active.delete(capture) && !unchanged) for (const other of active) other.status = "contaminated";
 		});
 	const dispose = (): Promise<void> =>
 		lock.serialize(async () => {
-			for (const capture of active) capture.contaminated = true;
+			for (const capture of active) capture.status = "contaminated";
 			active.clear();
 			const closingClock = clock;
 			clock = undefined;
@@ -3493,7 +3473,11 @@ async function assertCommitTarget(
 	) {
 		throw new Error(`sandbox commit path escapes workspace: ${change.resource}`);
 	}
-	if (change.kind === "directory" && change.operation && (change.before || !change.after)) {
+	if (
+		change.kind === "directory" &&
+		change.operation &&
+		(!change.after || (change.operation === "mkdir" && change.before))
+	) {
 		throw new Error("Native directory creation requires an absent baseline and a sealed result");
 	}
 	if (change.kind !== "directory")
@@ -3601,6 +3585,17 @@ async function verifySandboxDirectoryAfter(
 ): Promise<readonly string[] | undefined> {
 	// Native mkdir observes existence; subsequent new-entry reads/access need their own proof.
 	let names: readonly string[] | undefined;
+	if (change.operation === "copy_up") {
+		const actual = await view.stat(change.target);
+		if (
+			!actual.isDirectory() ||
+			Number(actual.mode & 0o777n) !== change.after?.mode ||
+			Number(actual.uid) !== change.after.uid ||
+			Number(actual.gid) !== change.after.gid
+		)
+			throw new Error(`private directory permissions changed while committing: ${change.resource}`);
+		return;
+	}
 	const same = change.operation
 		? (await view.stat(change.target)).isDirectory()
 		: sameSandboxState(

@@ -219,18 +219,21 @@ export async function pinFilesystemObject(target: string): Promise<{
 }
 /** One capture owns one detached read-only root. Cloning changes mount identity, never inode identity. */
 export class FilesystemReadView {
-	private descriptor: number | undefined;
+	private descriptor: number | "ambient" | "closed";
 	private readonly mounts: string;
 	private readonly observed = new Set<string>(["/"]);
-	private closed = false;
 	private readonly reader: typeof nativeFilesystem;
-	private constructor(descriptor: number | undefined, mounts: string, reader = nativeFilesystem) {
+	private constructor(descriptor: number | "ambient", mounts: string, reader = nativeFilesystem) {
 		this.descriptor = descriptor;
 		this.mounts = mounts;
 		this.reader = reader;
 	}
+	private get ambient(): boolean {
+		if (this.descriptor === "closed") throw new Error("read-only filesystem view is closed");
+		return this.descriptor === "ambient";
+	}
 	static ambient(): FilesystemReadView {
-		return new FilesystemReadView(undefined, "");
+		return new FilesystemReadView("ambient", "");
 	}
 	static async open(): Promise<FilesystemReadView> {
 		const reader = await ensureNativeFilesystem();
@@ -254,7 +257,7 @@ export class FilesystemReadView {
 		flags: number,
 		observe = (fd: number) => adoptFilesystemDescriptor(fd, flags),
 	): number {
-		if (this.closed || this.descriptor === undefined || !this.reader)
+		if (typeof this.descriptor !== "number" || !this.reader)
 			throw new Error("read-only filesystem view is closed or unavailable");
 		const absolute = path.isAbsolute(target) ? target : `${process.cwd()}/${target}`;
 		if (absolute.includes("\0")) throw new Error("invalid filesystem pathname");
@@ -281,24 +284,20 @@ export class FilesystemReadView {
 		return value;
 	}
 	async pin(target: string, follow = false): Promise<FilesystemObjectHandle> {
-		if (this.closed) throw new Error("read-only filesystem view is closed");
-		if (this.descriptor === undefined) return fs.open(target, 0x200000 | (follow ? 0 : constants.O_NOFOLLOW));
+		if (this.ambient) return fs.open(target, 0x200000 | (follow ? 0 : constants.O_NOFOLLOW));
 		const descriptor = this.open(target, 0x200000 | (follow ? 0 : constants.O_NOFOLLOW));
 		return filesystemDescriptorHandle(descriptor);
 	}
 	async stat(target: string, follow = false): Promise<BigIntStats> {
-		if (this.closed) throw new Error("read-only filesystem view is closed");
-		if (this.descriptor === undefined) return (follow ? fs.stat : fs.lstat)(target, { bigint: true });
+		if (this.ambient) return (follow ? fs.stat : fs.lstat)(target, { bigint: true });
 		return this.observe(target, follow, (fd) => fstatSync(fd, { bigint: true }));
 	}
 	async realpath(target: string): Promise<string> {
-		if (this.closed) throw new Error("read-only filesystem view is closed");
-		if (this.descriptor === undefined) return fs.realpath(target);
+		if (this.ambient) return fs.realpath(target);
 		return this.observe(target, true, (fd) => readlinkSync(`/proc/self/fd/${fd}`));
 	}
 	async readlink(target: string): Promise<string> {
-		if (this.closed) throw new Error("read-only filesystem view is closed");
-		if (this.descriptor === undefined) return fs.readlink(target);
+		if (this.ambient) return fs.readlink(target);
 		return this.observe(target, false, (fd) => {
 			for (
 				let capacity = Math.min(
@@ -325,8 +324,7 @@ export class FilesystemReadView {
 		});
 	}
 	async readDirectory(target: string): Promise<FileHandle> {
-		if (this.closed) throw new Error("read-only filesystem view is closed");
-		if (this.descriptor === undefined)
+		if (this.ambient)
 			return fs
 				.open(target, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOATIME)
 				.catch((error) => {
@@ -342,8 +340,7 @@ export class FilesystemReadView {
 	}
 	/** Observe lookup ancestors by default; explicit roots also include mounts below them. */
 	async verify(targets?: Iterable<string>): Promise<void> {
-		if (this.closed) throw new Error("read-only filesystem view is closed");
-		if (this.descriptor === undefined) return;
+		if (this.ambient) return;
 		const current = await fs.readFile("/proc/self/mountinfo", "utf8");
 		if (current === this.mounts) return;
 		const paths = [...(targets ?? this.observed)].map((target) => path.resolve(target));
@@ -352,11 +349,9 @@ export class FilesystemReadView {
 			throw new Error("filesystem mount topology changed during capture");
 	}
 	async close(): Promise<void> {
-		if (!this.closed) {
-			this.closed = true;
-			if (this.descriptor !== undefined) closeSync(this.descriptor);
-			this.descriptor = undefined;
-		}
+		const descriptor = this.descriptor;
+		this.descriptor = "closed";
+		if (typeof descriptor === "number") closeSync(descriptor);
 	}
 	[Symbol.asyncDispose](): Promise<void> {
 		return this.close();

@@ -61,6 +61,7 @@ import {
 	sha256Digest,
 	type Sha256Digest,
 	stableStringify,
+	releaseOnce,
 } from "./primitives.ts";
 import { ensureNativeFilesystem, nativeFilesystem } from "./process-startup.mjs";
 import type { ProvenanceCertificateStore } from "./reuse-store.ts";
@@ -633,8 +634,7 @@ type PreparedResource = {
 	readonly declined: Promise<void>;
 	readonly composed?: Promise<void>;
 	borrowers: number;
-	revoked?: boolean;
-	retained?: boolean;
+	phase: "building" | "retained" | "revoked";
 	shareable?: boolean;
 	proofs?: ResourceVersionToken[];
 };
@@ -660,7 +660,6 @@ export class ResourceReadView {
 		}
 	>();
 	private owner?: ResourceReadView;
-	private loadOwner = false;
 	private failure?: Error;
 	private allocatedBytes = 0;
 	private readonly memory?: ResourceInputMemory;
@@ -673,7 +672,10 @@ export class ResourceReadView {
 	}
 	private objectCount = 0;
 	private inputEpoch = 0;
-	private sealed = false;
+	private mode: "capturing" | "sealed" | "read_only" | "read_through" = "capturing";
+	private get sealed() {
+		return this.mode !== "capturing";
+	}
 	private pending?: Promise<void>;
 	private dependencies?: Set<string>;
 	private lookup?: ResourceInputLookup;
@@ -729,7 +731,7 @@ export class ResourceReadView {
 	}
 	get hasPreparedInputs(): boolean {
 		return [...(this.prepared?.bindings.values() ?? [])].some((entries) =>
-			[...entries.values()].some((entry) => entry.retained && !entry.revoked && entry.destination.retained),
+			[...entries.values()].some((entry) => entry.phase === "retained" && entry.destination.retained),
 		);
 	}
 	get canRetainObject(): boolean {
@@ -750,7 +752,7 @@ export class ResourceReadView {
 		}));
 		for (const entries of this.prepared?.bindings.values() ?? [])
 			for (const cached of entries.values()) {
-				if (cached.retained && cached.resource && !this.entries.has(cached.resource))
+				if (cached.phase === "retained" && cached.resource && !this.entries.has(cached.resource))
 					resources.push({ path: cached.resource, descendants: false });
 			}
 		return resources;
@@ -761,10 +763,9 @@ export class ResourceReadView {
 		return Object.assign(new ResourceReadView(0, undefined, undefined, undefined, undefined, memory), {
 			entries: this.entries,
 			owner: this,
-			sealed: true,
+			mode: load ? "read_through" : "read_only",
 			boundary: this.boundary,
 			prepared: this.prepared,
-			loadOwner: load,
 		});
 	}
 	/** Keep proven path metadata; payloads and preparations remain with their original owner. */
@@ -841,11 +842,11 @@ export class ResourceReadView {
 					[...cached.dependencies].some((key) => dependencies.has(key)) ||
 					cached.proofs?.some((proof) => [...proof.observations.keys()].some((key) => dependencies.has(key)))
 				) {
-					cached.revoked = true;
+					cached.phase = "revoked";
 					entries.delete(key);
 					if (cached.resource) removed.push(cached.resource);
 					if (!cached.borrowers) void this.prepared!.lifetime.release(cached);
-				} else if (cached.retained && cached.resource) preparedNames.add(cached.resource);
+				} else if (cached.phase === "retained" && cached.resource) preparedNames.add(cached.resource);
 			}
 		return [...new Set(removed)].filter((target) => !this.entries.has(target) && !preparedNames.has(target));
 	}
@@ -1066,9 +1067,9 @@ export class ResourceReadView {
 				const cached = prepared.bindings.get(identity)?.get(key);
 				const compatible = (cached: PreparedResource | undefined) =>
 					cached &&
-					!cached.revoked &&
+					cached.phase !== "revoked" &&
 					cached.destination.retained &&
-					(cached.retained || !cached.cancellation.signal.aborted) &&
+					(cached.phase === "retained" || !cached.cancellation.signal.aborted) &&
 					cached.boundary?.root === this.boundary?.root &&
 					cached.boundary?.physicalRoot === this.boundary?.physicalRoot;
 				const use = async (cached: PreparedResource, building = false, source?: ResourceInputSource) => {
@@ -1079,22 +1080,17 @@ export class ResourceReadView {
 					let accepted = building;
 					try {
 						// A composed waiter must take its own proof references before the producer can retire.
-						let ready;
-						if (building) {
-							ready = cached.ready!.then(() => true);
-						} else {
-							if (cached.retained && cached.destination === owner) {
-								ready = Promise.resolve(true);
-							} else {
-								ready = Promise.race([
-									cached.ready!.then(() => cached.shareable),
-									cached.declined.then(() => cached.shareable),
-									...(!this.acceptProofs && cached.composed
-										? [cached.composed.then(() => cached.shareable && !cached.proofs?.length)]
-										: []),
-								]).then((shareable) => shareable && (!cached.proofs?.length || !!this.acceptProofs));
-							}
-						}
+						const ready = building
+							? cached.ready!.then(() => true)
+							: cached.phase === "retained" && cached.destination === owner
+								? Promise.resolve(true)
+								: Promise.race([
+										cached.ready!.then(() => cached.shareable),
+										cached.declined.then(() => cached.shareable),
+										...(!this.acceptProofs && cached.composed
+											? [cached.composed.then(() => cached.shareable && !cached.proofs?.length)]
+											: []),
+									]).then((shareable) => shareable && (!cached.proofs?.length || !!this.acceptProofs));
 						const readiness = await waitForCompletion(ready, signal);
 						signal?.throwIfAborted();
 						if (readiness.status !== "completed" || !readiness.value) return undefined;
@@ -1129,7 +1125,7 @@ export class ResourceReadView {
 							const transferred =
 								this.acceptProofs &&
 								proofs.length &&
-								(source || !cached.retained || cached.destination !== owner);
+								(source || cached.phase !== "retained" || cached.destination !== owner);
 							if (transferred) {
 								for (const proof of this.acceptProofs!(proofs))
 									this.collectProofs?.set(proof.observations, proof);
@@ -1155,7 +1151,7 @@ export class ResourceReadView {
 					} finally {
 						this.preparing?.waiting.delete(cached);
 						withdraw();
-						if (!--cached.borrowers && !(cached.retained && !cached.revoked)) {
+						if (!--cached.borrowers && cached.phase !== "retained") {
 							const released = TimelineInterval.outside(() =>
 								(cached.destination.prepared?.lifetime ?? prepared.lifetime).release(cached),
 							);
@@ -1180,12 +1176,13 @@ export class ResourceReadView {
 				}
 				const inputEpoch = owner.inputEpoch; // Rejected old sources precede this new computation.
 				let resource: Awaited<ReturnType<typeof build>> | undefined;
-				let bytes = 0;
+				let charged = 0;
 				let computationBytes = 0;
 				const declined = Promise.withResolvers<void>();
 				const composed = this.acceptProofs && Promise.withResolvers<void>();
 				const name = target && filesystemPathKey(target);
 				const pending: PreparedResource = {
+					phase: "building",
 					resource: name,
 					origin: owner,
 					destination: owner,
@@ -1203,7 +1200,7 @@ export class ResourceReadView {
 							if (prepared.bindings.get(identity)?.get(key) === pending)
 								prepared.bindings.get(identity)!.delete(key);
 							await Promise.allSettled(pending.proofs?.map((proof) => proof.release()) ?? []);
-							if (pending.retained) pending.destination.capturedBytes -= bytes;
+							pending.destination.capturedBytes -= charged;
 							pending.value = undefined;
 							pending.data = undefined;
 						}
@@ -1213,7 +1210,7 @@ export class ResourceReadView {
 				if (!entries) prepared.bindings.set(identity, (entries = new Map()));
 				if (
 					!entries.has(key) ||
-					(!entries.get(key)!.retained && entries.get(key)!.cancellation.signal.aborted)
+					(entries.get(key)!.phase !== "retained" && entries.get(key)!.cancellation.signal.aborted)
 				)
 					entries.set(key, pending);
 				pending.ready = prepared.lifetime.track(
@@ -1265,7 +1262,7 @@ export class ResourceReadView {
 						const data = registration && snapshotPreparation(resource.value);
 						pending.value = data ? data.value : resource.value;
 						pending.data = data?.data;
-						bytes =
+						const bytes =
 							(data ? preparationDataBytes(data.data.length) : resource.bytes) +
 							computationBytes +
 							resourceProofBytes(pending.proofs ?? []) +
@@ -1278,6 +1275,7 @@ export class ResourceReadView {
 						destination.assertComplete();
 						const retention = destination.preparations();
 						if (
+							pending.phase === "building" &&
 							resource.cacheable !== false &&
 							inputEpoch === owner.inputEpoch &&
 							!destination.sealed &&
@@ -1286,7 +1284,8 @@ export class ResourceReadView {
 							let entries = retention.bindings.get(identity);
 							if (!entries) retention.bindings.set(identity, (entries = new Map()));
 							if (!entries.has(key) || entries.get(key) === pending) {
-								pending.retained = true;
+								pending.phase = "retained";
+								charged = bytes;
 								entries.set(key, retention.lifetime.own(pending));
 								destination.capturedBytes += bytes;
 							}
@@ -1494,8 +1493,7 @@ export class ResourceReadView {
 					if (
 						!this.boundary ||
 						typeof binding !== "string" ||
-						!prepared.retained ||
-						prepared.revoked ||
+						prepared.phase !== "retained" ||
 						!prepared.data ||
 						prepared.destination !== this ||
 						!prepared.shareable ||
@@ -1576,7 +1574,7 @@ export class ResourceReadView {
 	seal(): void {
 		if (this.pending) this.failure ??= new Error("resource_snapshot_capture_pending");
 		this.assertComplete();
-		this.sealed = true;
+		if (!this.sealed) this.mode = "sealed";
 	}
 	dispose(): void | Promise<void> {
 		this.failure = new Error("resource_snapshot_disposed");
@@ -1621,7 +1619,7 @@ export class ResourceReadView {
 			origin: this,
 			destination: this,
 			borrowers: 0,
-			retained: true,
+			phase: "retained",
 			shareable: true,
 			cancellation: new SharedAbortScope(),
 			waiting: new Set(),
@@ -1641,7 +1639,7 @@ export class ResourceReadView {
 		this.assertComplete();
 		if (this.owner && this.boundary && !containsFilesystemPath(this.boundary.root, target))
 			this.unproven(target);
-		if (this.loadOwner && this.owner && !this.owner.sealed) await this.owner.get(target, scope);
+		if (this.mode === "read_through" && this.owner && !this.owner.sealed) await this.owner.get(target, scope);
 		if (this.load && !this.sealed) {
 			const pending = (this.pending ?? Promise.resolve()).then(() => {
 				const { entry } = this.entry(target, followsResource(scope));
@@ -1894,27 +1892,24 @@ async function watchReadonlyFilesystem(
 		}
 	>();
 	const dirty = new Set([root]);
-	let closed = false;
+	let stopped: Error | "closed" | undefined;
 	let pending: Promise<void> | undefined;
-	let failure: Error | undefined;
-	const close = () => {
-		if (!closed) {
-			closed = true;
-			for (const entry of watched.values()) entry.watcher.close();
-			watched.clear();
-		}
+	const close = (reason: Error | "closed" = "closed") => {
+		if (stopped) return;
+		stopped = reason;
+		for (const entry of watched.values()) entry.watcher.close();
+		watched.clear();
 	};
 	const fail = (error: Error) => {
-		if (!closed) {
-			failure = error;
-			close();
+		if (!stopped) {
+			close(error);
 			failed(error);
 		}
 	};
 	const refresh = (): Promise<void> => {
-		if (closed) return failure ? Promise.reject(failure) : Promise.resolve();
+		if (stopped) return stopped === "closed" ? Promise.resolve() : Promise.reject(stopped);
 		return (pending ??= (async () => {
-			while (dirty.size && !closed) {
+			while (dirty.size && !stopped) {
 				const roots = [...dirty];
 				dirty.clear();
 				await using filesystem = await openFilesystemReadView();
@@ -1922,7 +1917,7 @@ async function watchReadonlyFilesystem(
 				for (const subtree of roots) {
 					const seen = new Set<string>();
 					const paths = [subtree];
-					for (let cursor = 0; cursor < paths.length && !closed; cursor++) {
+					for (let cursor = 0; cursor < paths.length && !stopped; cursor++) {
 						const target = paths[cursor];
 						let descriptor: number | undefined;
 						try {
@@ -1938,7 +1933,7 @@ async function watchReadonlyFilesystem(
 							if (prior?.identity !== identity) {
 								prior?.watcher.close();
 								const watcher = watch(`/proc/self/fd/${descriptor}`, (event, filename) => {
-									if (closed) return;
+									if (stopped) return;
 									changed(directory && filename ? path.join(target, filename.toString()) : target, event);
 									if (event === "rename") {
 										changed(target, event);
@@ -1958,7 +1953,7 @@ async function watchReadonlyFilesystem(
 							if (descriptor !== undefined) closeSync(descriptor);
 						}
 					}
-					if (closed) break;
+					if (stopped) break;
 					for (const [target, entry] of watched)
 						if (containsFilesystemPath(subtree, target) && !seen.has(target)) {
 							entry.watcher.close();
@@ -1967,7 +1962,7 @@ async function watchReadonlyFilesystem(
 				}
 				await filesystem.verify([...roots, sourceRoot]);
 			}
-			if (failure) throw failure;
+			if (stopped && stopped !== "closed") throw stopped;
 		})().finally(() => {
 			pending = undefined;
 		}));
@@ -1979,7 +1974,7 @@ async function watchReadonlyFilesystem(
 			settle: async () => {
 				do {
 					await refresh();
-				} while (pending || (!closed && dirty.size));
+				} while (pending || (!stopped && dirty.size));
 			},
 		};
 	} catch (error) {
@@ -1999,9 +1994,11 @@ export class ResourceVersionManager {
 	>();
 	private references = 0;
 	private watcher?: ResourceWatcher;
-	private reliable = false;
+	private status: "open" | "watching" | "degraded" | "closed" = "open";
+	private get open(): boolean {
+		return this.status !== "closed";
+	}
 	private ready?: Promise<void>;
-	private open = true;
 	readonly root: string;
 	private readonly snapshotExcludes: ReadonlySet<string>;
 	private readonly onIdle?: () => void;
@@ -2029,10 +2026,7 @@ export class ResourceVersionManager {
 	}
 	private async startWatching() {
 		try {
-			const failed = () => {
-				this.reliable = false;
-				this.changed(this.root, "unknown");
-			};
+			const failed = () => this.changed(this.root, "unknown");
 			if (nativeFilesystem)
 				this.watcher = await watchReadonlyFilesystem(
 					this.root,
@@ -2051,10 +2045,10 @@ export class ResourceVersionManager {
 				this.watcher = undefined;
 				return;
 			}
-			this.reliable = true;
+			if (this.status === "open") this.status = "watching";
 			await watcherTurn();
 		} catch {
-			this.reliable = false;
+			if (this.open) this.status = "degraded";
 		}
 	}
 	/** Undefined dependencies grant only bounded on-demand captures; observation of host tools stays eager. */
@@ -2395,7 +2389,7 @@ export class ResourceVersionManager {
 					).values(),
 				].filter((dependency) => !observations.has(dependencyKey(dependency)));
 				if (!normalized.length) return;
-				if (observing && this.reliable) precise = await this.acquirePreciseWatches(normalized);
+				if (observing && this.status === "watching") precise = await this.acquirePreciseWatches(normalized);
 				for (const observation of await fingerprintDependencies(
 					normalized,
 					physicalRoot,
@@ -2473,7 +2467,7 @@ export class ResourceVersionManager {
 				physicalRoot,
 				observations,
 				epoch: this.epoch,
-				watching: Boolean(observing && this.reliable),
+				watching: Boolean(observing && this.status === "watching"),
 				preciseContent: Object.freeze(precise?.paths ?? []),
 				manager: this,
 				...(retained ? { view: retained, inputView: new WeakRef(retained) } : {}),
@@ -2564,7 +2558,8 @@ export class ResourceVersionManager {
 		if (!this.open || token.manager !== this || token.root !== this.root)
 			return "resource_version_owner_changed";
 		if (!sealing || !token.watching) return undefined; // Future reuse compares semantics; events only disprove a host execution window.
-		if (!this.reliable || this.changesSince(token).uncertain) return "resource_observation_window_unprovable";
+		if (this.status !== "watching" || this.changesSince(token).uncertain)
+			return "resource_observation_window_unprovable";
 		const precise = new Set(token.preciseContent.map(filesystemPathKey));
 		const changed = this.events.some(
 			(event) =>
@@ -2574,7 +2569,7 @@ export class ResourceVersionManager {
 		return changed ? "resource_observation_window_changed" : undefined;
 	}
 	changesSince(token: ResourceVersionToken): ResourceChangeSet {
-		if (token.manager !== this || token.root !== this.root || !token.watching || !this.reliable)
+		if (token.manager !== this || token.root !== this.root || !token.watching || this.status !== "watching")
 			return { uncertain: true, paths: [] };
 		const oldest = this.events[0]?.epoch ?? this.epoch;
 		if (token.epoch < oldest && this.events.length >= speculativeConfig().filesystem.maxHistoryEntries)
@@ -2593,15 +2588,16 @@ export class ResourceVersionManager {
 		};
 	}
 	close() {
-		this.open = false;
+		this.status = "closed";
 		this.watcher?.close();
 		this.watcher = undefined;
-		this.reliable = false;
 		for (const precise of this.preciseWatches.values()) precise.watcher.close();
 		this.preciseWatches.clear();
 		this.events.length = 0;
 	}
 	private changed(changedPath: string, type: ResourceEvent["type"]) {
+		if (!this.open) return;
+		if (type === "unknown") this.status = "degraded";
 		const absolute = path.resolve(changedPath);
 		const event = { epoch: ++this.epoch, path: absolute, type };
 		this.events.push(event);
@@ -2637,7 +2633,6 @@ export class ResourceVersionManager {
 							if (descriptor !== undefined) closeSync(descriptor);
 						}
 						watcher.on("error", () => {
-							this.reliable = false;
 							this.changed(target, "unknown");
 						});
 						this.preciseWatches.set(key, { watcher, references: 1 });
@@ -3281,22 +3276,18 @@ async function fingerprintDependencies(
 							}),
 						),
 					));
-				let content: StableFilesystemCapture;
-				if (streamed) {
-					content = streamed.capture;
-				} else {
-					if (bytes) {
-						content = {
-							content: bytes instanceof ChunkedContent ? undefined : bytes,
-							bytesRead: bytes.length,
-							hash: contentDigest(bytes).slice(7),
-							stat: info,
-							realPath: realTarget,
-							computation: supplied && "computation" in supplied ? supplied.computation : undefined,
-						};
-					} else {
-						content =
-							(!retain && cachedCapture(info, realTarget)) ||
+				const content: StableFilesystemCapture = streamed
+					? streamed.capture
+					: bytes
+						? {
+								content: bytes instanceof ChunkedContent ? undefined : bytes,
+								bytesRead: bytes.length,
+								hash: contentDigest(bytes).slice(7),
+								stat: info,
+								realPath: realTarget,
+								computation: supplied && "computation" in supplied ? supplied.computation : undefined,
+							}
+						: (!retain && cachedCapture(info, realTarget)) ||
 							(await fingerprintIO(() =>
 								captureStableFile(target, retain ? Number(info.size) : undefined, retain, {
 									stat: info,
@@ -3305,8 +3296,6 @@ async function fingerprintDependencies(
 									view: filesystem,
 								}),
 							));
-					}
-				}
 				assertInside(realRoot, content.realPath);
 				retainEntry(
 					{
@@ -3532,17 +3521,6 @@ function errorCode(error: unknown) {
 function missingResource(error: unknown): boolean {
 	const code = errorCode(error);
 	return code === "ENOENT" || code === "ENOTDIR";
-}
-function releaseOnce<Result>(release: () => Result): () => Result | undefined {
-	let released = false;
-	let result: Result | undefined;
-	return () => {
-		if (!released) {
-			released = true;
-			result = release();
-		}
-		return result;
-	};
 }
 const priorityIO = new AsyncLocalStorage<true>();
 export const fingerprintIO = (() => {

@@ -870,14 +870,13 @@ function consumedComputations(roots: readonly TimelineDependency[]) {
 	>();
 	const visited = new Map<TimelineInterval, number>();
 	const groups = new ComputationGroups();
-	let complete = true;
-	let incomplete = false;
+	let uncertainty: "none" | "local" | "reused" = "none";
 	const pending = roots.map((input) => ({ input, inheritedReuse: false })).reverse();
 	while (pending.length) {
 		const { input, inheritedReuse } = pending.pop()!;
 		if (input.computeUncertain) {
-			complete = false;
-			if (inheritedReuse || input.reused) incomplete = true;
+			if (inheritedReuse || input.reused) uncertainty = "reused";
+			else if (uncertainty === "none") uncertainty = "local";
 		}
 		if (input.overhead) continue;
 		const computation = input.computation;
@@ -897,7 +896,7 @@ function consumedComputations(roots: readonly TimelineDependency[]) {
 		for (let index = inputs.length - 1; index >= 0; index--)
 			pending.push({ input: inputs[index]!, inheritedReuse: reused });
 	}
-	return { selected, groups, complete, incomplete };
+	return { selected, groups, complete: uncertainty === "none", incomplete: uncertainty === "reused" };
 }
 function computationIdentity(object: object): string {
 	return (evidence(object).id ||= `timeline:${identityNamespace}:${++nextIdentity}`);

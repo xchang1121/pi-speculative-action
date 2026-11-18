@@ -104,6 +104,7 @@ import type {
 import { definedProcessEnvironment } from "./linux-process-world.ts";
 import type { Sha256Digest } from "./primitives.ts";
 import {
+	releaseOnce,
 	ignoreMissing,
 	digestObject,
 	errorMessage,
@@ -165,7 +166,7 @@ import {
 import type { ProvenanceStoreOptions, VerifiedArtifactClosure } from "./reuse-store.ts";
 import { ProvenanceCertificateStore } from "./reuse-store.ts";
 import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
-import type { ResourceValidation } from "./settlement.ts";
+import { cause, zeroValidationMetrics, type ResourceValidation } from "./settlement.ts";
 import type { StraceObservation, TracedWrite, TraceTail } from "./strace-observer.ts";
 import {
 	nativeMetadataTrace,
@@ -196,7 +197,7 @@ import {
 	createParentDirectories,
 	matchesSandboxBaseline,
 	readRegularState,
-	readSandboxDirectoryState,
+	directoryEntriesDigest,
 	sandboxWorkspaceChanges,
 	snapshotDependency,
 	workspaceInputVersion,
@@ -441,8 +442,6 @@ export async function installLinuxDependencies(
 		const decoder = new StringDecoder("utf8");
 		const signal = AbortSignal.any([loader.signal, lifetime.signal]);
 		let output = "";
-		let failed = false;
-		let finished = false;
 		const append = (text: string) => {
 			output = (
 				output +
@@ -462,45 +461,32 @@ export async function installLinuxDependencies(
 				onData: (data) => append(decoder.write(data)),
 			})
 			.then(
-				({ exitCode }) => {
-					failed = exitCode !== 0;
-					if (failed) append(`\nInstaller exited with ${exitCode ?? "a signal"}.\n`);
-				},
-				(error) => {
-					failed = true;
-					append(`\n${errorMessage(error)}\n`);
-				},
+				({ exitCode }) => (exitCode === 0 ? undefined : `Installer exited with ${exitCode ?? "a signal"}.`),
+				errorMessage,
 			)
-			.finally(() => {
+			.then((failure) => {
 				append(decoder.end());
-				finished = true;
-				done({ output, failed, cancelled: signal.aborted });
+				if (failure !== undefined) append(`\n${failure}\n`);
+				done({ output, failed: failure !== undefined, cancelled: signal.aborted });
 			});
 		return {
 			render: (width) => loader.render(width),
 			invalidate: () => loader.invalidate(),
 			handleInput: (data) => loader.handleInput(data),
 			dispose() {
-				if (!finished) lifetime.abort();
+				lifetime.abort();
 				loader.dispose();
 			},
 		};
 	});
 	const partial = /\bunavailable\b/i.test(result.output);
-	let status;
-	if (result.cancelled) {
-		status = "Installation cancelled; completed components remain installed.";
-	} else {
-		if (result.failed) {
-			status = "Linux dependency installation failed.";
-		} else {
-			if (partial) {
-				status = "Installation finished with unavailable components.";
-			} else {
-				status = "Linux dependency installation finished.";
-			}
-		}
-	}
+	const status = result.cancelled
+		? "Installation cancelled; completed components remain installed."
+		: result.failed
+			? "Linux dependency installation failed."
+			: partial
+				? "Installation finished with unavailable components."
+				: "Linux dependency installation finished.";
 	const detail = result.output.trim().split("\n").slice(-14).join("\n");
 	ctx.ui.notify(
 		`${status}\n${detail}\nInstaller output describes installation checks; runtime qualification is reported separately. Restart Pi to load updated helpers and recheck workspace drivers.`,
@@ -755,7 +741,6 @@ export class LinuxProcessReuseBackend {
 		status: ProcessRouteSnapshot;
 	};
 	private nativeRetirement?: Promise<void>;
-	private disposed = false;
 	private readonly handoffs: ProcessHandoffRegistry<NativeProcessInvocation>;
 	private readonly counters: MutableLinuxProcessReuseMetrics = emptyWorldReuseMetrics();
 	private readonly actorCounters: MutableLinuxProcessReuseMetrics = emptyWorldReuseMetrics();
@@ -910,7 +895,7 @@ export class LinuxProcessReuseBackend {
 		return this.producers > 0 || this.handoffs.hasResults;
 	}
 	private heldBoundary(): Promise<LinuxHeldExecBoundary> {
-		if (this.disposed || this.nativeRetirement)
+		if (this.disposal || this.nativeRetirement)
 			return Promise.reject(new Error("native process observation is retiring"));
 		if (!this.heldExec) {
 			const controller = new AbortController();
@@ -949,10 +934,10 @@ export class LinuxProcessReuseBackend {
 		return this.heldExec.ready;
 	}
 	nativeDiagnostics(enabled = true): ProcessRouteSnapshot {
-		if (this.disposed || process.platform !== "linux")
+		if (this.disposal || process.platform !== "linux")
 			return {
 				state: "unavailable",
-				detail: this.disposed ? "Native route disposed" : "Linux or WSL 2 required",
+				detail: this.disposal ? "Native route disposed" : "Linux or WSL 2 required",
 			};
 		if (!enabled) return { state: "disabled", detail: "Native process reuse is disabled" };
 		return this.nativeRetirement
@@ -964,7 +949,7 @@ export class LinuxProcessReuseBackend {
 	}
 	async refreshNativeObservation(enabled = true): Promise<void> {
 		await this.resetNativeObservation();
-		if (enabled && !this.disposed && process.platform === "linux")
+		if (enabled && !this.disposal && process.platform === "linux")
 			await this.heldBoundary().catch(() => undefined);
 	}
 	private nativeObservation(sourceRoot: string, scope?: ExecutionScope, signal?: AbortSignal) {
@@ -988,7 +973,7 @@ export class LinuxProcessReuseBackend {
 		const observation = this.observations.getStore();
 		try {
 			if (
-				!this.disposed &&
+				!this.disposal &&
 				process.platform === "linux" &&
 				((observation?.learn && !observation.closed && sameScope(observation.scope, owner)) ||
 					this.hasReusableWork ||
@@ -1028,7 +1013,7 @@ export class LinuxProcessReuseBackend {
 		return this.configuration.bind({
 			execute: async (request) => {
 				if (
-					this.disposed ||
+					this.disposal ||
 					this.observations.getStore()?.reuseEnabled === false ||
 					process.platform !== "linux" ||
 					!pathContains(sourceRoot, request.cwd)
@@ -1063,7 +1048,7 @@ export class LinuxProcessReuseBackend {
 						plan = await this.planPrototype(prototype, projection, acceptProducer, {
 							signal: request.signal,
 						});
-						if (this.disposed || !plan?.certificate.result.exit) return;
+						if (this.disposal || !plan?.certificate.result.exit) return;
 						request.signal?.throwIfAborted();
 						if (!plan.validate()) return;
 						await replayFilesystemEffects(
@@ -1316,8 +1301,8 @@ export class LinuxProcessReuseBackend {
 				if (discarded)
 					return {
 						status: "indeterminate",
-						cause: { stage: "freshness", code: "process_session_disposed" },
-						metrics: { bytesRead: 0, filesRead: 0, mode: "exact" },
+						cause: cause("freshness", "process_session_disposed"),
+						metrics: zeroValidationMetrics(),
 					};
 				try {
 					ready.collector.check();
@@ -1329,13 +1314,13 @@ export class LinuxProcessReuseBackend {
 							code: "execution_domain_unavailable",
 							detail: errorMessage(error),
 						},
-						metrics: { bytesRead: 0, filesRead: 0, mode: "exact" },
+						metrics: zeroValidationMetrics(),
 					};
 				}
 				if (admission?.valid())
 					return {
 						...admission.result,
-						metrics: { bytesRead: 0, filesRead: 0, mode: "exact" },
+						metrics: zeroValidationMetrics(),
 					};
 				admission?.proof.close();
 				admission = undefined;
@@ -1360,16 +1345,12 @@ export class LinuxProcessReuseBackend {
 						filesystemMountTopology(mounts, paths),
 					]);
 				const proof = executionDomainProof(ready.collector, session.sourceRoot);
-				let retained = false;
 				try {
 					if (policy(await readFile("/proc/self/mountinfo", "utf8")) !== policy(session.sourceMounts))
 						return {
 							status: "stale",
-							cause: {
-								stage: "freshness",
-								code: "source_mount_policy_changed",
-							},
-							metrics: { bytesRead: 0, filesRead: 0, mode: "exact" },
+							cause: cause("freshness", "source_mount_policy_changed"),
+							metrics: zeroValidationMetrics(),
 						};
 					const result = await validateTransferredProcessEvidence(
 						session.topLevelEvidence,
@@ -1391,10 +1372,9 @@ export class LinuxProcessReuseBackend {
 					// The session owns both this proof and the prepared result; its final commit
 					// rechecks continuity instead of repeating the same dependency reads.
 					admission = { proof, valid, result };
-					retained = true;
 					return result;
 				} finally {
-					if (!retained) proof.close();
+					if (admission?.proof !== proof) proof.close();
 				}
 			};
 			const validate = () =>
@@ -1563,7 +1543,7 @@ export class LinuxProcessReuseBackend {
 		});
 	}
 	private async allocateSession(input: Parameters<LinuxProcessReuseBackend["open"]>[0]) {
-		if (this.disposed) throw new Error("Linux process backend is disposed");
+		if (this.disposal) throw new Error("Linux process backend is disposed");
 		const ready = await TimelineInterval.outside(
 			async () => (await TimelineInterval.collect(() => this.resolveReady())).output,
 		);
@@ -1704,15 +1684,15 @@ export class LinuxProcessReuseBackend {
 		return { session, ready, readyAt, controller, server };
 	}
 	dispose(): Promise<void> {
-		if (this.disposal) return this.disposal;
-		this.disposed = true;
-		const handoffs = this.handoffs.dispose();
-		return (this.disposal = this.resetNativeObservation().finally(() =>
-			Promise.all([this.replayWorkspace.dispose(), this.store.dispose(), handoffs]),
-		));
+		return (this.disposal ??= Promise.resolve().then(() => {
+			const handoffs = this.handoffs.dispose();
+			return this.resetNativeObservation().finally(() =>
+				Promise.all([this.replayWorkspace.dispose(), this.store.dispose(), handoffs]),
+			);
+		}));
 	}
 	private async resolveReady(): Promise<ReadyBackend> {
-		if (this.disposed) throw new Error("Linux process backend is disposed");
+		if (this.disposal) throw new Error("Linux process backend is disposed");
 		this.ready ??= TimelineInterval.collect(() => this.probe()).then((result) => result.output);
 		return this.ready;
 	}
@@ -2750,10 +2730,9 @@ export class LinuxProcessReuseBackend {
 		} = {},
 	): Promise<ReadyProcessPlan | undefined> {
 		await using privateReads = session ? FilesystemReadView.ambient() : undefined;
-		const proof = session
+		let proof = session
 			? undefined
 			: executionDomainProof((await this.resolveReady()).collector, projection.sourceRoot);
-		let retained = false;
 		try {
 			// Proof reads belong to the caller's excluded lookup interval, even when file capture emits owned receipts.
 			const plan = (
@@ -2819,53 +2798,44 @@ export class LinuxProcessReuseBackend {
 			if (proof) {
 				// This closure belongs to this lookup alone; its existing artifact lifetime also owns the proof.
 				const dispose = plan.artifacts.dispose.bind(plan.artifacts);
+				const { close } = proof;
 				Object.defineProperty(plan.artifacts, "dispose", {
-					value: () => dispose().finally(() => proof.close()),
+					value: () => dispose().finally(close),
 				});
-				retained = true;
+				proof = undefined;
 			}
 			return { ...plan, validate };
 		} finally {
-			if (!retained) proof?.close();
+			proof?.close();
 		}
 	}
 	private async decideHeldExec(process: HeldExecProcess, scope?: ExecutionScope): Promise<HeldExecDecision> {
 		const observation = this.observations.getStore();
-		let reserved = false;
-		let completing = false;
-		const releaseLearning = () => {
-			if (reserved) {
-				observation!.pending--;
-				reserved = false;
-			}
-		};
+		let releaseLearning: (() => void) | undefined;
 		const measured = (decision: HeldExecDecision): HeldExecDecision => {
 			if (decision.kind === "replay" && observation?.claims) {
 				const settle = decision.settle;
 				const claims = observation.claims;
-				let pending = true;
 				Atomics.add(claims, 0, 1);
 				decision = {
 					...decision,
-					settle: (consumed) => {
-						if (pending) {
-							pending = false;
-							if (!consumed) Atomics.sub(claims, 0, 1);
-							return settle?.(consumed);
-						}
-					},
+					settle: releaseOnce((consumed: boolean) => {
+						if (!consumed) Atomics.sub(claims, 0, 1);
+						return settle?.(consumed);
+					}),
 				};
 			}
-			if (reserved && decision.kind === "continue" && decision.observeCompletion) {
+			if (releaseLearning && decision.kind === "continue" && decision.observeCompletion) {
 				const complete = decision.observeCompletion;
-				completing = true;
+				const release = releaseLearning;
+				releaseLearning = undefined;
 				decision = {
 					...decision,
 					observeCompletion: async (...args) => {
 						try {
 							await complete(...args);
 						} finally {
-							releaseLearning();
+							release();
 						}
 					},
 				};
@@ -2900,7 +2870,6 @@ export class LinuxProcessReuseBackend {
 			observation.pending < speculativeConfig().processReuse.learnedLaunches;
 		const order = observation ? Atomics.add(observation.ordering, 0, 1) + 1 : 0;
 		let settle: ((consumed: boolean) => void | Promise<void>) | undefined;
-		let transferred = false;
 		this.add(undefined, "requests");
 		try {
 			process.signal?.throwIfAborted();
@@ -2916,7 +2885,9 @@ export class LinuxProcessReuseBackend {
 			const executablePath = projection.toLogical(executable);
 			if (learning) {
 				observation!.pending++;
-				reserved = true;
+				releaseLearning = releaseOnce(() => {
+					observation!.pending--;
+				});
 			}
 			const available =
 				observation?.reuseEnabled !== false &&
@@ -3039,7 +3010,7 @@ export class LinuxProcessReuseBackend {
 						signal: process.signal,
 					}),
 			});
-			let acquired = result.kind === "hit" ? result : undefined;
+			const acquired = result.kind === "hit" ? result : undefined;
 			settle = acquired?.settle;
 			const { plan } = acquired ?? {};
 			if (
@@ -3114,16 +3085,16 @@ export class LinuxProcessReuseBackend {
 						});
 				},
 			});
-			transferred = true;
+			settle = undefined;
 			return decision;
 		} catch (error) {
 			this.setError(undefined, `actor_child:${errorMessage(error)}`, "bypasses");
 			return measured({ kind: "continue" });
 		} finally {
 			try {
-				if (!transferred) await settle?.(false);
+				await settle?.(false);
 			} finally {
-				if (!completing) releaseLearning();
+				releaseLearning?.();
 			}
 		}
 	}
@@ -3607,45 +3578,46 @@ async function captureDependencies(
 					dependency.fields,
 				),
 			};
-		let same;
-		if (dependency.kind === "metadata") {
-			same = !!entry || changed.has(dependency.path) || !created.has(physical);
-		} else {
-			if (dependency.kind === "absence") {
-				same =
+		switch (dependency.kind) {
+			case "metadata":
+				if (entry || changed.has(dependency.path) || !created.has(physical)) return dependency;
+				break;
+			case "absence":
+				if (
 					!entry &&
 					(dependency.parentEntriesDigest === undefined ||
-						(parent?.kind === "directory" && parent.entriesDigest === dependency.parentEntriesDigest));
-			} else {
-				if (dependency.kind === "directory") {
-					same =
-						entry?.kind === "directory" &&
-						entry.metadataDigest === dependency.metadataDigest &&
-						(dependency.entriesDigest ?? entry.entriesDigest) === entry.entriesDigest;
-				} else {
-					if (dependency.kind === "symlink") {
-						same = entry?.kind === "symlink" && entry.target === dependency.target;
-					} else {
-						if (dependency.kind === "lock") {
-							same = entry?.kind === "file";
-						} else {
-							same =
-								!changed.has(dependency.path) &&
-								entry?.kind === "file" &&
-								entry.metadataDigest === dependency.metadataDigest;
-						}
-					}
-				}
-			}
+						(parent?.kind === "directory" && parent.entriesDigest === dependency.parentEntriesDigest))
+				)
+					return dependency;
+				break;
+			case "directory":
+				if (
+					entry?.kind === "directory" &&
+					entry.metadataDigest === dependency.metadataDigest &&
+					(dependency.entriesDigest ?? entry.entriesDigest) === entry.entriesDigest
+				)
+					return dependency;
+				break;
+			case "symlink":
+				if (entry?.kind === "symlink" && entry.target === dependency.target) return dependency;
+				break;
+			case "lock":
+				if (entry?.kind === "file") return dependency;
+				break;
+			default:
+				if (
+					!changed.has(dependency.path) &&
+					entry?.kind === "file" &&
+					entry.metadataDigest === dependency.metadataDigest
+				)
+					return dependency;
 		}
-		return same
-			? dependency
-			: workspaceDependency(
-					physical,
-					dependency.path,
-					dependency.kind === "file" ? dependency.role : "input",
-					dependency.kind === "directory" && !!dependency.entriesDigest,
-				);
+		return workspaceDependency(
+			physical,
+			dependency.path,
+			dependency.kind === "file" ? dependency.role : "input",
+			dependency.kind === "directory" && !!dependency.entriesDigest,
+		);
 	}, JSON.stringify);
 	// Kernel pathname walk over the baseline: links are recorded and expanded in place and `..` leaves the directory
 	// actually reached. Sandlock collapses `..` first, so another result means the sandbox read another object.
@@ -3674,24 +3646,15 @@ async function captureDependencies(
 				!physical && !speculativeConfig().processReuse.volatilePaths.some((root) => pathContains(root, next))
 					? await hostEntry(next).catch(ignoreMissing)
 					: undefined;
-			let entry;
-			if (physical) {
-				entry = snapshot.entries.get(relativeFilesystemPath(snapshot.root, physical)!);
-			} else {
-				if (captured?.link !== undefined) {
-					entry = { kind: "symlink", target: captured.link };
-				} else {
-					if (captured?.info.isDirectory()) {
-						entry = { kind: "directory" };
-					} else {
-						if (captured?.info.isFile()) {
-							entry = { kind: "file" };
-						} else {
-							entry = undefined;
-						}
-					}
-				}
-			}
+			const entry = physical
+				? snapshot.entries.get(relativeFilesystemPath(snapshot.root, physical)!)
+				: captured?.link !== undefined
+					? { kind: "symlink", target: captured.link }
+					: captured?.info.isDirectory()
+						? { kind: "directory" }
+						: captured?.info.isFile()
+							? { kind: "file" }
+							: undefined;
 			if (captured?.info.isDirectory()) hostComplete &&= !!(await hostInput(next));
 			if (entry?.kind === "file" && pending.length)
 				return { path: next, links, hostComplete, blocked: true as const };
@@ -3917,40 +3880,26 @@ async function captureDependencies(
 								?.map((dependency) => (dependency.kind === "file" ? { ...dependency, role } : dependency)),
 						};
 					const captured = safe && !absent && (await hostInput(physical));
-					let dependency;
-					if (absent) {
-						dependency = await captureAbsenceDependency(
-							physical,
-							slash(physical),
-							false,
-							[],
-							undefined,
-							hostReads,
-						);
-					} else {
-						if (captured && captured.info.isFile()) {
-							dependency = (
-								await captureFileDependency(physical, slash(physical), role, {
-									includeMetadata: true,
-									view: hostReads,
-								})
-							).dependency;
-						} else {
-							if (captured && captured.info.isDirectory()) {
-								dependency = await captureDirectoryDependency(
-									physical,
-									slash(physical),
-									!listed,
-									[],
-									listed,
-									undefined,
-									hostReads,
-								);
-							} else {
-								dependency = undefined;
-							}
-						}
-					}
+					const dependency = absent
+						? await captureAbsenceDependency(physical, slash(physical), false, [], undefined, hostReads)
+						: captured && captured.info.isFile()
+							? (
+									await captureFileDependency(physical, slash(physical), role, {
+										includeMetadata: true,
+										view: hostReads,
+									})
+								).dependency
+							: captured && captured.info.isDirectory()
+								? await captureDirectoryDependency(
+										physical,
+										slash(physical),
+										!listed,
+										[],
+										listed,
+										undefined,
+										hostReads,
+									)
+								: undefined;
 					return { physical, value: dependency && [dependency] };
 				} catch (error) {
 					return { physical, error };
@@ -4094,23 +4043,60 @@ export async function privateReplay(
 		const source = own ? target : lower ? change.target : undefined;
 		const address = { root: upper, target, resource: path.relative(upper, target) };
 		if (change.kind === "directory") {
-			const state = source ? await readSandboxDirectoryState(source, undefined, view) : undefined;
-			if (!matchesSandboxBaseline(change, state))
+			const captured =
+				source && (await captureFilesystemEntry(source, "directory", view).catch(ignoreMissing));
+			const entry = captured ? captureWorkspaceStructureEntry(captured) : undefined;
+			if (entry && entry.kind !== "directory")
+				throw new Error(`private replay expected directory: ${change.target}`);
+			const state = entry && directoryState(entry);
+			let visible = state;
+			if (own && lower && state && captured) {
+				const inherited = (
+					await captureFilesystemEntry(change.target, "directory", view).catch(ignoreMissing)
+				)?.entries;
+				if (inherited?.length) {
+					const names = new Map(
+						inherited
+							.filter((item) => !deleted(path.join(change.target, item.name)))
+							.map((item) => [item.name, item]),
+					);
+					for (const item of captured.entries!) names.set(item.name, item);
+					visible = { ...state, entriesDigest: directoryEntriesDigest([...names.values()]) };
+				}
+			}
+			if (!matchesSandboxBaseline(change, visible))
 				throw new Error(`resource changed before replay: ${change.target}`);
-			if (own || change.after)
-				projected.push({ ...change, ...address, before: own ? change.before : undefined });
+			const { before, after } = change;
+			const modeChange =
+				before && after && before.mode !== after.mode && before.entriesDigest === after.entriesDigest;
+			if (own || after)
+				projected.push({
+					...change,
+					...address,
+					before: own ? state : undefined,
+					operation: change.operation === "mkdir" || modeChange ? "copy_up" : change.operation,
+				});
 		} else {
 			const state = source
 				? await readRegularState(source, change.before?.byteLength, view, contents)
 				: undefined;
 			if (!matchesSandboxBaseline(change, state))
 				throw new Error(`resource changed before replay: ${change.target}`);
+			let aliases = change.aliases;
 			if (!own && state) {
-				const names = change.aliases ?? [change.target];
-				if (change.aliases) await assertFileAliases(change.root, change.target, names, state.identity, view);
-				for (const name of names) seeds.set(physical(name), state);
+				const names = aliases ?? [change.target];
+				if (aliases) await assertFileAliases(change.root, change.target, aliases, state.identity, view);
+				const visible: string[] = [];
+				for (const name of names) {
+					const destination = physical(name);
+					if (name !== change.target && (deleted(name) || (await lstat(destination).catch(ignoreMissing))))
+						continue;
+					visible.push(name);
+					seeds.set(destination, state);
+				}
+				if (aliases) aliases = visible;
 			}
-			projected.push({ ...change, ...address, ...projectFileMutation(change, physical) });
+			projected.push({ ...change, ...address, ...projectFileMutation({ ...change, aliases }, physical) });
 		}
 		if (!change.after && lower && (await lstat(change.target).catch(ignoreMissing)))
 			whiteouts.push(
@@ -4809,20 +4795,14 @@ async function runSpawn(
 function wireResponse(response: DispatcherResponse) {
 	const frames = [...(response.output ?? []).map((event) => ({ ...event, kind: "o" }))];
 	const exit = response.exit;
-	let end;
-	if (response.kind === "bypass") {
-		end = "b";
-	} else {
-		if (response.kind === "continue") {
-			end = "c";
-		} else {
-			if (exit?.kind === "signal") {
-				end = `s ${exit.signal}`;
-			} else {
-				end = `x ${exit?.kind === "code" ? exit.code : 125}`;
-			}
-		}
-	}
+	const end =
+		response.kind === "bypass"
+			? "b"
+			: response.kind === "continue"
+				? "c"
+				: exit?.kind === "signal"
+					? `s ${exit.signal}`
+					: `x ${exit?.kind === "code" ? exit.code : 125}`;
 	return Buffer.concat([
 		...frames.flatMap(({ fd, kind, data }) => [Buffer.from(`${kind}${fd} ${data.length}\n`), data]),
 		Buffer.from(`${end}\n`),
@@ -5037,8 +5017,8 @@ export async function validateTransferredProcessEvidence(
 	if (!evidence) {
 		return {
 			status: "indeterminate",
-			cause: { stage: "freshness", code: "process_evidence_missing" },
-			metrics: { bytesRead: 0, filesRead: 0, mode: "exact" },
+			cause: cause("freshness", "process_evidence_missing"),
+			metrics: zeroValidationMetrics(),
 		};
 	}
 	const blockingTaints = evidence.taints.filter((taint) => !acceptedReplayTaints().includes(taint));

@@ -18,6 +18,7 @@ import {
 import type { Sha256Digest } from "./primitives.ts";
 import {
 	errorMessage,
+	releaseOnce,
 	immutableSnapshot,
 	isImmutableSnapshot,
 	isSha256Digest,
@@ -671,15 +672,16 @@ function contractCompatible(
 		certificate.result.replayProfile === "buffered_noninteractive"
 	);
 }
-const BRANCH = { partial: 1, whole: 2, child: 4 } as const;
 /** One-shot children and their enclosing branch share adoption authority. */
 export class ProcessHandoffOwnership {
-	private authority = 0;
-	private transfer?: {
-		readonly apply: WeakRef<() => Promise<unknown>>;
-		readonly result: Promise<unknown>;
-	};
-	private committing?: Promise<unknown>;
+	private children = 0;
+	private claim?:
+		| "partial"
+		| {
+				readonly apply: WeakRef<() => Promise<unknown>>;
+				readonly result: Promise<unknown>;
+				pending: boolean;
+		  };
 	private readonly observer?: WeakRef<(adoption: ExecutionOperationAdoption) => void>;
 	private readonly scopeOwner?: WeakRef<(scope: ExecutionScope, salvage?: boolean) => boolean>;
 	private readonly consumer?: ExecutionScope;
@@ -709,51 +711,48 @@ export class ProcessHandoffOwnership {
 		this.observer?.deref()?.(adoption);
 	}
 	get wholeClaimed(): boolean {
-		return !!(this.authority & BRANCH.whole);
+		return typeof this.claim === "object";
 	}
 	get pendingWhole(): Promise<unknown> | undefined {
-		return this.committing;
+		return typeof this.claim === "object" && this.claim.pending ? this.claim.result : undefined;
 	}
 	claimChild(): ((consumed: boolean) => void) | undefined {
-		if (this.authority & BRANCH.whole) return;
-		this.authority += BRANCH.child;
-		let pending = true;
-		return (consumed) => {
-			if (pending) {
-				pending = false;
-				if (consumed) this.authority |= BRANCH.partial;
-				this.authority -= BRANCH.child;
-			}
-		};
+		if (this.wholeClaimed) return;
+		this.children++;
+		return releaseOnce((consumed: boolean) => {
+			this.children--;
+			if (consumed) this.claim = "partial";
+		});
 	}
 	async commit<T>(apply: () => Promise<T>): Promise<T> {
-		if (this.transfer?.apply.deref() === apply) return this.transfer.result as Promise<T>;
-		const state = this.authority;
-		if (!state) this.authority = BRANCH.whole;
-		if (state)
+		const previous = this.claim;
+		if (typeof previous === "object" && previous.apply.deref() === apply)
+			return previous.result as Promise<T>;
+		if (previous || this.children)
 			throw effectCommitFailure(
 				new Error(
-					state & BRANCH.partial
+					previous === "partial"
 						? "process execution was partially consumed"
 						: "process execution was already claimed",
 				),
 				"recoverable",
 			);
-		const result = Promise.resolve()
-			.then(() => apply())
-			.catch((error) => {
-				if (error instanceof EffectCommitFailure && error.disposition === "recoverable") {
-					this.authority = 0;
-					this.transfer = undefined;
-				}
-				throw error;
-			})
-			.finally(() => {
-				if (this.committing === result) this.committing = undefined;
-			});
-		this.committing = result;
-		this.transfer = { apply: new WeakRef(apply), result };
-		return result;
+		const claim = {
+			apply: new WeakRef(apply),
+			pending: true,
+			result: Promise.resolve()
+				.then(apply)
+				.catch((error) => {
+					if (error instanceof EffectCommitFailure && error.disposition === "recoverable")
+						this.claim = undefined;
+					throw error;
+				})
+				.finally(() => {
+					claim.pending = false;
+				}),
+		};
+		this.claim = claim;
+		return claim.result;
 	}
 }
 export interface ProcessHandoff {
@@ -846,7 +845,6 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	private maxRetainedBytes: number;
 	private retainedBytes = 0;
 	private completedCount = 0;
-	private disposed = false;
 	private readonly lifetime = new RuntimeLifecycleLane();
 	constructor(store: ProvenanceCertificateStore, maxRetainedBytes: number) {
 		this.store = store;
@@ -876,7 +874,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		invocation: Invocation,
 		executionMs: number,
 	): ProcessExecutionBinding | undefined {
-		if (this.disposed || !Number.isFinite(executionMs) || executionMs < 0) return;
+		if (this.lifetime.sealed || !Number.isFinite(executionMs) || executionMs < 0) return;
 		const record = this.reserve(
 			key,
 			executablePath,
@@ -1022,7 +1020,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		waiters.add(wake);
 		this.waiters.set(request.key, waiters);
 		try {
-			while (!this.disposed && !request.signal?.aborted) {
+			while (!this.lifetime.sealed && !request.signal?.aborted) {
 				// One subscription spans the lookup; a change invalidates only this pass's negative evidence.
 				if (changed.signal.aborted) {
 					changed = new AbortController();
@@ -1046,50 +1044,43 @@ export class ProcessHandoffRegistry<Invocation = never> {
 					const plan = candidate
 						? await request.lookup([candidate], undefined, new Map([[candidate.id, result!.artifacts]]))
 						: await request.lookup(undefined, new Set(considered.values()));
-					let granted = false;
+					if (!plan) continue;
+					let unused = plan.artifacts;
 					try {
-						if (this.disposed || request.signal?.aborted) break;
-						const release = () => {
-							void this.lifetime.release(plan?.artifacts);
-						};
-						if (plan && !candidate) {
-							granted = true;
-							return {
-								kind: "hit",
-								plan,
-								joined: waits.length > 0,
-								settle: release,
-							};
-						}
+						if (this.lifetime.sealed || request.signal?.aborted) break;
 						if (
-							plan &&
-							completed &&
-							candidate === plan.certificate &&
-							completed.state === state &&
-							this.executions.has(completed)
-						) {
-							const settle = this.claim(completed);
-							if (!settle) continue;
-							granted = true;
-							return {
-								kind: "hit",
-								plan,
-								joined: waits.length > 0,
-								producer: completed,
-								waiting: waits.filter((wait) => wait.handoff === completed).map((wait) => wait.interval),
-								settle: (consumed, forward) => {
-									try {
-										settle(consumed, forward);
-									} finally {
-										release();
+							candidate &&
+							(!completed ||
+								candidate !== plan.certificate ||
+								completed.state !== state ||
+								!this.executions.has(completed))
+						)
+							continue;
+						const claim = completed && this.claim(completed);
+						if (completed && !claim) continue;
+						const hit: ProcessHandoffAcquisition<Plan> = {
+							kind: "hit",
+							plan,
+							joined: waits.length > 0,
+							...(completed
+								? {
+										producer: completed,
+										waiting: waits.filter((wait) => wait.handoff === completed).map((wait) => wait.interval),
 									}
-								},
-							};
-						}
+								: {}),
+							settle: () => {
+								try {
+									claim?.();
+								} finally {
+									void this.lifetime.release(plan.artifacts);
+								}
+							},
+						};
+						unused = undefined;
+						return hit;
 					} finally {
-						if (!granted) await plan?.artifacts?.dispose();
+						if (unused) await unused.dispose();
 					}
-					continue;
 				}
 				if (producer)
 					return {
@@ -1135,16 +1126,13 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			changed.abort();
 		}
 	}
-	private claim(record: HandoffRecord): ((consumed: boolean, forward?: boolean) => void) | undefined {
+	private claim(record: HandoffRecord): (() => void) | undefined {
 		if (record.state.status !== "completed") return;
 		record.borrowers++;
-		let pending = true;
-		return () => {
-			if (!pending) return;
-			pending = false;
+		return releaseOnce(() => {
 			record.borrowers--;
 			this.trim();
-		};
+		});
 	}
 	/** Register the producer's retained versions; extending their lifetime into history is an explicit store operation. */
 	async publish(
@@ -1230,14 +1218,15 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		for (const record of this.records()) if (record.state.status !== "running") this.remove(record);
 	}
 	dispose(): Promise<void> {
-		this.disposed = true;
+		if (this.lifetime.sealed) return this.lifetime.dispose();
+		const closing = this.lifetime.dispose();
 		for (const key of this.waiters.keys()) this.wake(key);
 		for (const record of this.records()) {
 			if (record.state.status === "running") record.controller.abort(new Error("process handoff disposed"));
 			if (!this.complete(record.key, record)) this.remove(record);
 		}
 		this.completedCount = 0;
-		return this.lifetime.dispose();
+		return closing;
 	}
 	private reserve(
 		key: Sha256Digest,
@@ -1245,7 +1234,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		ownership: ProcessHandoffOwnership,
 		scope?: ExecutionScope,
 	) {
-		if (this.disposed) throw new Error("process handoff registry is disposed");
+		if (this.lifetime.sealed) throw new Error("process handoff registry is disposed");
 		const { promise: completion, resolve: settle } = Promise.withResolvers<void>();
 		const controller: AbortController = new AbortController();
 		const record = {

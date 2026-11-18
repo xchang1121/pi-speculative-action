@@ -71,11 +71,12 @@ export class LinuxOverlayfsCapabilityRegistry {
 		speculativeConfig().filesystem.overlayResolved,
 	);
 	private readonly degraded = new Map<string, string>();
-	private disabledDetail?: string;
-	private disposed = false;
+	private disabled?: string | Error;
+	private get disabledDetail(): string | undefined {
+		if (this.disabled instanceof Error) throw this.disabled;
+		return this.disabled;
+	}
 	async capability(options: LinuxOverlayfsOptions = {}): Promise<LinuxOverlayfsCapability> {
-		if (this.disposed) throw new Error("Linux OverlayFS capability registry is disposed");
-		if (this.disabledDetail) return { available: false, detail: this.disabledDetail };
 		const capability = await this.memoized(
 			this.requests,
 			`${options.overlayfsBinary ?? "auto"}\0${options.fusermountBinary ?? "auto"}`,
@@ -110,21 +111,23 @@ export class LinuxOverlayfsCapabilityRegistry {
 		>,
 		detail: string,
 	): void {
-		if (this.disposed || this.disabledDetail) return;
+		if (this.disabled) return;
 		const key = availableCapabilityKey(capability);
 		const disabled = `fuse-overlayfs driver disabled: ${detail}`;
 		if (!this.degraded.has(key) && this.degraded.size >= speculativeConfig().filesystem.overlayDegraded) {
-			this.disabledDetail = `fuse-overlayfs registry disabled after ${speculativeConfig().filesystem.overlayDegraded + 1} driver degradations`;
-			this.requests.clear();
-			this.resolved.clear();
-			this.degraded.clear();
+			this.disable(
+				`fuse-overlayfs registry disabled after ${speculativeConfig().filesystem.overlayDegraded + 1} driver degradations`,
+			);
 			return;
 		}
 		this.degraded.set(key, disabled);
 	}
 	dispose(): void {
-		if (this.disposed) return;
-		this.disposed = true;
+		if (!(this.disabled instanceof Error))
+			this.disable(new Error("Linux OverlayFS capability registry is disposed"));
+	}
+	private disable(reason: string | Error): void {
+		this.disabled = reason;
 		this.requests.clear();
 		this.resolved.clear();
 		this.degraded.clear();
@@ -134,6 +137,8 @@ export class LinuxOverlayfsCapabilityRegistry {
 		key: string,
 		load: () => Promise<LinuxOverlayfsCapability>,
 	): Promise<LinuxOverlayfsCapability> {
+		const disabled = this.disabledDetail;
+		if (disabled) return Promise.resolve({ available: false, detail: disabled });
 		const now = Date.now();
 		const cached = cache.get(key);
 		if (cached && (cached.expiresAt === undefined || cached.expiresAt > now)) return cached.pending;

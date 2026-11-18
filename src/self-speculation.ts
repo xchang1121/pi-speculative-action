@@ -122,12 +122,10 @@ interface PendingFork {
 	content: string;
 	reasoning: string;
 	outputChunks: number;
-	requestBound: boolean;
+	phase: "unbound" | "ready" | "probing" | "settled";
 	attempts: number;
 	lastProbeOutputChunks: number;
 	retryAt: number;
-	probeInFlight: boolean;
-	settled: boolean;
 }
 /** One turn-scoped Actor probe source, including result delivery and cancellation. */
 export class ActorForkPlanSource {
@@ -196,21 +194,19 @@ export class ActorForkPlanSource {
 			content: "",
 			reasoning: "",
 			outputChunks: 0,
-			requestBound: false,
+			phase: "unbound",
 			attempts: 0,
 			lastProbeOutputChunks: 0,
 			retryAt: 1,
-			probeInFlight: false,
-			settled: false,
 		});
 	}
 	bindActorRequest(turnID: string): void {
 		const pending = this.pending.get(turnID);
-		if (pending) pending.requestBound = true;
+		if (pending?.phase === "unbound") pending.phase = "ready";
 	}
 	observeActorDelta(turnID: string, event: AssistantMessageEvent): ActorProbeSnapshot | undefined {
 		const pending = this.pending.get(turnID);
-		if (!pending || pending.settled || !pending.requestBound) return undefined;
+		if (!pending || pending.phase === "settled" || pending.phase === "unbound") return undefined;
 		const retrySooner = (updates: number) => {
 			pending.retryAt = Math.min(pending.retryAt, pending.lastProbeOutputChunks + updates);
 		};
@@ -227,8 +223,8 @@ export class ActorForkPlanSource {
 	}
 	finishProbe(turnID: string): boolean {
 		const pending = this.pending.get(turnID);
-		if (!pending || pending.settled) return true;
-		pending.probeInFlight = false;
+		if (!pending || pending.phase === "settled") return true;
+		if (pending.phase === "probing") pending.phase = "ready";
 		return pending.attempts >= pending.schedule.maxAttempts;
 	}
 	claimPendingProbe(turnID: string): ActorProbeSnapshot | undefined {
@@ -237,14 +233,12 @@ export class ActorForkPlanSource {
 	}
 	private claimProbe(pending: PendingFork): ActorProbeSnapshot | undefined {
 		if (
-			pending.settled ||
-			pending.probeInFlight ||
-			!pending.requestBound ||
+			pending.phase !== "ready" ||
 			pending.attempts >= pending.schedule.maxAttempts ||
 			pending.outputChunks < pending.retryAt
 		)
 			return undefined;
-		pending.probeInFlight = true;
+		pending.phase = "probing";
 		pending.lastProbeOutputChunks = pending.outputChunks;
 		pending.retryAt = pending.outputChunks + pending.schedule.retryStreamUpdates;
 		pending.attempts++;
@@ -261,21 +255,22 @@ export class ActorForkPlanSource {
 	}
 	finishActorStream(turnID: string): void {
 		const pending = this.pending.get(turnID);
-		if (!pending || pending.settled) return;
+		if (!pending || pending.phase === "settled") return;
 		pending.controller.abort();
 		this.publish(turnID, []);
 	}
 	publish(turnID: string, batches: readonly ActorForkActionBatch[]): void {
 		const pending = this.pending.get(turnID);
-		if (!pending || pending.settled) return;
-		pending.settled = true;
-		pending.resolve(structuredClone(batches));
+		if (!pending || pending.phase === "settled") return;
+		const snapshot = structuredClone(batches);
+		pending.phase = "settled";
+		pending.resolve(snapshot);
 	}
 	closeTurn(turnID: string): void {
 		const pending = this.pending.get(turnID);
 		if (!pending) return;
 		pending.controller.abort();
-		if (!pending.settled) pending.resolve([]);
+		pending.resolve([]);
 		this.pending.delete(turnID);
 	}
 	reset(): void {
@@ -354,7 +349,6 @@ interface TurnState {
 	readonly settings: SelfSpeculationSettings;
 	readonly candidates: Map<string, CandidateRecord>;
 	requestID?: string;
-	requestBound: boolean;
 	dirty: boolean;
 	flushTask?: Promise<void>;
 	forkTask?: Promise<void>;
@@ -365,7 +359,6 @@ interface TurnState {
 	readonly matchedForkKeys: Set<string>;
 	readonly reportedCandidates: Map<string, ReportedCandidate>;
 	readonly modelKey: string;
-	ended: boolean;
 }
 /** Unknown until declared; a declaration serves only the kinds it lists as true. */
 type ControlPlaneCapabilities = Partial<Record<"fork" | "candidates" | "logprobs" | "provider", boolean>>;
@@ -453,7 +446,6 @@ export class SelfSpeculationCoordinator {
 	private readonly pendingCandidates = new Map<number, Map<string, CandidateRecord>>();
 	private active?: TurnState;
 	private latestStartedDecisionSequence = 0;
-	private acceptingCandidates = false;
 	private candidateSequence = 0;
 	/** acceptedDraftTokens counts registration acknowledgements; verifiedAcceptedDraftTokens counts target acceptance. */
 	private readonly counters = Object.fromEntries(COUNTERS.map((key) => [key, 0])) as Record<
@@ -488,10 +480,9 @@ export class SelfSpeculationCoordinator {
 		this.actionModels.set(turnID, modelKey);
 		if (!settings.enabled || !isSafeCount(decisionSequence, 1)) {
 			this.pendingCandidates.clear();
-			this.acceptingCandidates = false;
+			this.latestStartedDecisionSequence = 0;
 			return;
 		}
-		this.acceptingCandidates = true;
 		this.latestStartedDecisionSequence = decisionSequence;
 		for (const target of this.pendingCandidates.keys())
 			if (target < decisionSequence) this.pendingCandidates.delete(target);
@@ -505,7 +496,6 @@ export class SelfSpeculationCoordinator {
 			actorContext: context,
 			settings,
 			candidates,
-			requestBound: false,
 			dirty: candidates.size > 0,
 			actorActionKeys: new Set(),
 			forkCandidateKeys: new Set(),
@@ -513,7 +503,6 @@ export class SelfSpeculationCoordinator {
 			matchedForkKeys: new Set(),
 			reportedCandidates: new Map(),
 			modelKey,
-			ended: false,
 		};
 		this.actorForkPlanSource.startTurn(turnID);
 		if (settings.forkTransport !== "drafter" && !this.capabilities.has(controlPlaneKey(settings)))
@@ -522,11 +511,10 @@ export class SelfSpeculationCoordinator {
 	/** Bind exactly one authoritative Actor provider request to the current speculative turn. */
 	decorateActorPayload(payload: unknown): unknown {
 		const state = this.active;
-		if (!state || state.requestBound) return payload;
+		if (!state || state.requestID !== undefined) return payload;
 		const settings = state.settings;
 		const existing = isRecord(payload) ? nonEmptyString(payload[settings.requestIDField]) : undefined;
 		state.requestID = existing ?? this.requestID();
-		state.requestBound = true;
 		state.providerPayload = cloneSerializable(payload);
 		this.actorForkPlanSource.bindActorRequest(state.turnID);
 		this.scheduleFlush(state);
@@ -539,11 +527,10 @@ export class SelfSpeculationCoordinator {
 	}
 	addCandidate(candidate: MaterializedSpeculativeCandidate<string>): void {
 		const state = this.active;
-		if (!this.settings().enabled || !this.acceptingCandidates) return;
+		if (!this.settings().enabled || !this.latestStartedDecisionSequence) return;
 		const targetDecisionSequence = candidate.expectedDecisionSequence;
 		if (!isSafeCount(targetDecisionSequence, 1)) return;
-		if (state && targetDecisionSequence < state.decisionSequence) return;
-		if (!state && targetDecisionSequence < this.latestStartedDecisionSequence) return;
+		if (targetDecisionSequence < this.latestStartedDecisionSequence) return;
 		const candidates =
 			state && targetDecisionSequence === state.decisionSequence
 				? state.candidates
@@ -634,7 +621,11 @@ export class SelfSpeculationCoordinator {
 		if (this.active) this.actorForkPlanSource.finishActorStream(this.active.turnID);
 	}
 	private scheduleActorProbe(state: TurnState, snapshot?: ActorProbeSnapshot): void {
-		if (state.ended || state.forkTask || (!state.requestID && state.settings.forkTransport !== "drafter"))
+		if (
+			this.active !== state ||
+			state.forkTask ||
+			(!state.requestID && state.settings.forkTransport !== "drafter")
+		)
 			return;
 		const probe = snapshot ?? this.actorForkPlanSource.claimPendingProbe(state.turnID);
 		if (!probe) return;
@@ -676,6 +667,7 @@ export class SelfSpeculationCoordinator {
 					).then((receipt) => this.recordReceipt(receipt, state, true))
 		)
 			.then((outcome) => {
+				if (this.active !== state) return;
 				const exhausted = this.actorForkPlanSource.finishProbe(state.turnID);
 				if (settings.forkActionEnabled && !outcome?.committed && !exhausted) return;
 				this.actorForkPlanSource.publish(
@@ -685,14 +677,13 @@ export class SelfSpeculationCoordinator {
 				this.reconcileForkMatches(state);
 			})
 			.catch((error: unknown) => {
-				this.actorForkPlanSource.finishProbe(state.turnID);
-				this.actorForkPlanSource.publish(state.turnID, []);
+				if (this.active === state) this.actorForkPlanSource.publish(state.turnID, []);
 				if (signal?.aborted) return;
 				throw error;
 			})
 			.finally(() => {
 				if (state.forkTask === task) state.forkTask = undefined;
-				if (this.active === state && !state.ended) this.scheduleActorProbe(state);
+				this.scheduleActorProbe(state);
 			});
 		state.forkTask = task;
 		this.background.track(task);
@@ -765,14 +756,10 @@ export class SelfSpeculationCoordinator {
 		this.actorForkPlanSource.reset();
 		this.pendingCandidates.clear();
 		this.latestStartedDecisionSequence = 0;
-		this.acceptingCandidates = false;
 	}
 	private closeActive(preserveForRetry: boolean): void {
 		const state = this.active;
-		if (state) {
-			state.ended = true;
-			this.actorForkPlanSource.closeTurn(state.turnID);
-		}
+		if (state) this.actorForkPlanSource.closeTurn(state.turnID);
 		this.active = undefined;
 		if (state && preserveForRetry && state.candidates.size) {
 			// The active decision owns its bundle exclusively; outstanding submissions keep the old snapshot.

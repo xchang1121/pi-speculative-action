@@ -1345,15 +1345,13 @@ export type ActorStreamPreview =
 type StreamedCall = {
 	arguments: string;
 	depth: number;
-	quoted: boolean;
-	escaped: boolean;
+	lexeme: "json" | "string" | "escape";
 	ready: boolean;
-	toolPreviewed: boolean;
-	callPreviewed: boolean;
+	preview: "none" | "tool";
 };
 /** Derives non-authoritative scheduling hints from the same Actor stream in every host integration. */
 export class ActorStreamPreviewTracker {
-	private readonly calls = new Map<number, StreamedCall>();
+	private readonly calls = new Map<number, StreamedCall | "delivered">();
 	clear(): void {
 		this.calls.clear();
 	}
@@ -1362,46 +1360,44 @@ export class ActorStreamPreviewTracker {
 			const state = this.calls.get(update.contentIndex);
 			this.calls.delete(update.contentIndex);
 			const { id, name, arguments: args } = update.toolCall;
-			return state?.callPreviewed ? [] : [{ type: "call", call: { id, name, arguments: args } }];
+			return state === "delivered" ? [] : [{ type: "call", call: { id, name, arguments: args } }];
 		}
 		if (update.type !== "toolcall_start" && update.type !== "toolcall_delta") return [];
 		const call = update.partial.content[update.contentIndex];
 		if (call?.type !== "toolCall") return [];
-		const state = this.calls.get(update.contentIndex) ?? {
+		const prior = this.calls.get(update.contentIndex);
+		if (prior === "delivered") return [];
+		const state: StreamedCall = prior ?? {
 			arguments: "",
 			depth: 0,
-			quoted: false,
-			escaped: false,
+			lexeme: "json",
 			ready: false,
-			toolPreviewed: false,
-			callPreviewed: false,
+			preview: "none",
 		};
 		this.calls.set(update.contentIndex, state);
-		if (state.callPreviewed) return [];
 		if (update.type === "toolcall_delta") {
 			state.arguments += update.delta;
 			// Scan only new characters; strict parsing still decides whether the complete input is an object.
 			for (const character of update.delta) {
-				if (state.escaped) state.escaped = false;
-				else if (character === "\\" && state.quoted) state.escaped = true;
-				else if (character === '"') state.quoted = !state.quoted;
-				else if (!state.quoted) {
+				if (state.lexeme === "escape") state.lexeme = "string";
+				else if (character === "\\" && state.lexeme === "string") state.lexeme = "escape";
+				else if (character === '"') state.lexeme = state.lexeme === "string" ? "json" : "string";
+				else if (state.lexeme === "json") {
 					if (character === "{" || character === "[") state.depth++;
 					else if (character === "}" || character === "]") state.ready = --state.depth === 0 || state.ready;
 				}
 			}
 		}
 		const result: ActorStreamPreview[] = [];
-		if (!state.toolPreviewed && call.name) {
-			state.toolPreviewed = true;
+		if (state.preview === "none" && call.name) {
+			state.preview = "tool";
 			result.push({ type: "tool", tool: call.name });
 		}
 		if (update.type === "toolcall_delta" && state.ready && call.name && call.id) {
 			state.ready = false;
 			const parsed = jsonObject(state.arguments);
 			if (parsed) {
-				state.callPreviewed = true;
-				state.arguments = "";
+				this.calls.set(update.contentIndex, "delivered");
 				result.push({
 					type: "call",
 					call: { id: call.id, name: call.name, arguments: parsed },

@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { speculativeConfig } from "./config-schema.ts";
 
-type Lease = { readonly connection: ObjectConnection; readonly id: number; closed: boolean };
+type Lease = { readonly connection: ObjectConnection; id?: number };
 type Reply = {
 	readonly value?: unknown;
 	readonly error?: { readonly code: string; readonly message: string };
@@ -43,11 +43,9 @@ class ObjectConnection {
 	private input = Buffer.alloc(0);
 	private errors = "";
 	private sequence = 0;
-	private closed = false;
-	private retiring = false;
+	private phase: "starting" | "ready" | "retiring" | "closed" | "startup_failed" = "starting";
 	private exitTimer?: NodeJS.Timeout;
 	private idleTimer?: NodeJS.Timeout;
-	private qualified = false;
 	readonly finished = this.completion.promise;
 
 	constructor(signature: string) {
@@ -77,13 +75,13 @@ class ObjectConnection {
 		});
 	}
 	get accepting(): boolean {
-		return !this.closed && !this.retiring;
+		return this.phase === "starting" || this.phase === "ready";
 	}
 	get pid(): number | undefined {
 		return this.child.pid;
 	}
 	get startupFailed(): boolean {
-		return this.closed && !this.qualified;
+		return this.phase === "startup_failed";
 	}
 	terminate(): void {
 		this.child.kill();
@@ -119,7 +117,7 @@ class ObjectConnection {
 			},
 			Math.min(
 				this.config.filesystem.objectLeaseTimeoutMs,
-				this.qualified ? Infinity : this.config.filesystem.objectLeaseStartupTimeoutMs,
+				this.phase === "starting" ? this.config.filesystem.objectLeaseStartupTimeoutMs : Infinity,
 			),
 		);
 		this.pending.set(id, { operation, argument, replyBytes, ...result, timer });
@@ -165,7 +163,7 @@ class ObjectConnection {
 				if (!reply.error && pending.operation === "pin") {
 					if (reply.value !== id) throw new Error("invalid lease identity");
 					this.leases.add(id);
-					this.qualified = true;
+					this.phase = "ready";
 				}
 				if (!reply.error && pending.operation === "close") this.leases.delete(pending.argument as number);
 				clearTimeout(pending.timer);
@@ -182,7 +180,7 @@ class ObjectConnection {
 	private retireIfIdle(): void {
 		if (this.pending.size || this.leases.size || !this.accepting) return;
 		const retire = () => {
-			this.retiring = true;
+			this.phase = "retiring";
 			this.child.stdin.end();
 			this.exitTimer = setTimeout(() => this.terminate(), this.config.processReuse.terminateGraceMs);
 			this.exitTimer.unref();
@@ -195,8 +193,8 @@ class ObjectConnection {
 		}
 	}
 	private fail(error: Error): void {
-		if (this.closed) return;
-		this.closed = true;
+		if (this.phase === "closed" || this.phase === "startup_failed") return;
+		this.phase = this.phase === "starting" ? "startup_failed" : "closed";
 		clearTimeout(this.idleTimer);
 		for (const pending of this.pending.values()) {
 			clearTimeout(pending.timer);
@@ -214,9 +212,10 @@ function owned(value: object): Lease {
 	return lease;
 }
 async function release(lease: Lease): Promise<void> {
-	if (lease.closed) return;
-	lease.closed = true;
-	await lease.connection.close(lease.id);
+	const id = lease.id;
+	if (id === undefined) return;
+	lease.id = undefined;
+	await lease.connection.close(id);
 }
 
 const provider = {
@@ -247,14 +246,14 @@ const provider = {
 				throw error;
 			})) as number;
 		const value = Object.freeze({});
-		const lease = { connection, id, closed: false };
+		const lease = { connection, id };
 		owners.set(value, lease);
 		collected.register(value, lease, value);
 		return value;
 	},
 	async identity(value: object): Promise<Buffer> {
 		const lease = owned(value);
-		if (lease.closed) throw failure("WIN32_6", "Windows object lease is closed");
+		if (lease.id === undefined) throw failure("WIN32_6", "Windows object lease is closed");
 		const encoded = await lease.connection.request("identity", lease.id);
 		if (typeof encoded !== "string" || !/^[0-9a-f]{56}$/.test(encoded))
 			throw failure("ERR_LEASE_IDENTITY", "Invalid Windows object identity");

@@ -31,6 +31,7 @@ import {
 	startupScope,
 } from "./process-startup.mjs";
 import { type DynamicDependency, type OFDPosition } from "./provenance-certificate.ts";
+import { PendingTasks } from "./runtime-lifecycle.ts";
 export { resolveLinuxExecHelper } from "./process-startup.mjs";
 /** Kernel collection shares the execution owner's lifetime, not its privileges. */
 export async function executionDomainCollector(binary: string) {
@@ -107,20 +108,24 @@ export async function executionDomainCollector(binary: string) {
 		check,
 		open: () => {
 			const id = request(1).readBigUInt64LE(8);
-			let closed = false;
-			let watching = false;
+			let phase: "open" | "watching" | "closed" = "open";
 			let descriptor: number | undefined;
 			let failure: string | undefined;
 			return {
+				get closed() {
+					return phase === "closed";
+				},
 				get failure() {
 					return failure;
 				},
 				trace: (broker: string) => {
-					if (closed || descriptor !== undefined) throw new Error("execution record owner is unavailable");
+					if (phase === "closed" || descriptor !== undefined)
+						throw new Error("execution record owner is unavailable");
 					descriptor = Number(request(11, id, Buffer.from(`${broker}\0`)).readBigUInt64LE(16));
 					let offset = 0;
 					return () => {
-						if (closed || descriptor === undefined) throw new Error("execution record owner is closed");
+						if (phase === "closed" || descriptor === undefined)
+							throw new Error("execution record owner is closed");
 						const fence = request(12, id);
 						const length = Number(fence.readBigUInt64LE(16));
 						if (
@@ -145,11 +150,12 @@ export async function executionDomainCollector(binary: string) {
 					...command,
 				],
 				watch: (roots: readonly string[]) => {
+					if (phase === "closed") return "execution record owner is closed";
 					try {
 						request(5, id, Buffer.from(`${roots.join("\0")}\0`));
-						watching = true;
+						phase = "watching";
 					} catch (error) {
-						watching = false;
+						phase = "open";
 						return (error as Error).message;
 					}
 				},
@@ -160,7 +166,7 @@ export async function executionDomainCollector(binary: string) {
 						readonly path: string;
 					}[],
 				) => {
-					if (closed || !watching) return false;
+					if (phase !== "watching") return false;
 					try {
 						for (let index = 0; index < objects.length; index += changeBatch) {
 							const descriptors: number[] = [];
@@ -182,7 +188,7 @@ export async function executionDomainCollector(binary: string) {
 					}
 				},
 				version: () => {
-					if (closed || !watching) return;
+					if (phase !== "watching") return;
 					const answer = request(6, id);
 					const incomplete = answer.readBigUInt64LE(24) | answer.readBigUInt64LE(32);
 					failure = incomplete ? `observer_history_incomplete:0x${incomplete.toString(16)}` : undefined;
@@ -196,7 +202,7 @@ export async function executionDomainCollector(binary: string) {
 						readonly contents?: boolean;
 					}[],
 				) => {
-					if (closed || !watching) return;
+					if (phase !== "watching") return;
 					const objects = new Set<string>();
 					const unstable = new Set<string>();
 					let version: bigint | undefined;
@@ -221,14 +227,12 @@ export async function executionDomainCollector(binary: string) {
 					}
 				},
 				close: () => {
-					if (!closed) {
-						closed = true;
-						try {
-							request(4, id);
-						} finally {
-							if (descriptor !== undefined) closeSync(descriptor);
-							descriptor = undefined;
-						}
+					if (phase === "closed") return;
+					phase = "closed";
+					try {
+						request(4, id);
+					} finally {
+						if (descriptor !== undefined) closeSync(descriptor);
 					}
 				},
 			};
@@ -245,7 +249,6 @@ export function executionDomainProof(
 ) {
 	const namespace = statSync("/proc/self/ns/mnt", { bigint: true });
 	const domain = collector.open();
-	let closed = false;
 	let reason = domain.watch([root]) ?? "";
 	const since = domain.version();
 	if (since === undefined) reason ||= domain.failure || "observer_unavailable";
@@ -358,7 +361,7 @@ export function executionDomainProof(
 			};
 			return () => {
 				try {
-					if (!supported || closed || !unchanged()) return false;
+					if (!supported || domain.closed || !unchanged()) return false;
 					if (!domain.admit([...objects.values()])) {
 						reason = "input_census_unstable_or_unsupported";
 						return false;
@@ -376,13 +379,10 @@ export function executionDomainProof(
 			};
 		},
 		close() {
-			if (!closed) {
-				closed = true;
-				try {
-					domain.close();
-				} catch {
-					/* A lost owner already revoked its evidence. */
-				}
+			try {
+				domain.close();
+			} catch {
+				/* A lost owner already revoked its evidence. */
 			}
 		},
 	};
@@ -744,12 +744,12 @@ export class LinuxHeldExecBoundary {
 			failure: undefined as Error | undefined,
 			decide: startupScope.exit(() => AsyncResource.bind(options.decide)),
 			barrier: (options.descriptors ? "descriptors" : "none") as HeldExecTiming["barrier"],
-			pending: new Set<Promise<void>>(),
+			pending: new PendingTasks(),
 			sockets: new Set<net.Socket>(),
 			completion: done.then(async (): Promise<void> => {
-				await Promise.allSettled(active.pending);
-				signal.removeEventListener("abort", retire);
 				this.active.delete(execution);
+				await active.pending.drain();
+				signal.removeEventListener("abort", retire);
 				if (active.failure) throw active.failure;
 			}),
 		};
@@ -786,7 +786,7 @@ export class LinuxHeldExecBoundary {
 		try {
 			const request = parseRequest(await readLine(socket));
 			active = request?.token === this.token ? this.active.get(request.execution) : undefined;
-			active?.pending.add(pending);
+			active?.pending.track(pending);
 			active?.sockets.add(socket);
 			if (!request || !active || !(await heldBy(request, active.observer))) {
 				return void socket.end("C\n");
@@ -891,7 +891,6 @@ export class LinuxHeldExecBoundary {
 				} catch {
 					/* Timing evidence cannot replace the process outcome. */
 				}
-			active?.pending.delete(pending);
 			active?.sockets.delete(socket);
 			release();
 		}

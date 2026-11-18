@@ -3,7 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { expect, test } from "vitest";
 import { FilesystemReadView } from "../src/filesystem-evidence.ts";
-import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
+import {
+	directoryEntriesDigest,
+	readSandboxDirectoryState,
+	WorkspaceSandboxService,
+} from "../src/workspace-sandbox.ts";
 import { inspectLinuxEnvironment, privateReplay } from "../src/linux-process-backend.ts";
 import {
 	executionDomainCollector,
@@ -128,6 +132,118 @@ test.skipIf(process.platform !== "linux")(
 			expect(log.split("\n")).toContain(primary.slice(1));
 			await privateReplay(service, storage, [{ ...address(primary), after: before }], view);
 			expect(await readFile(upper(alias))).toEqual(after);
+		} finally {
+			await service.dispose();
+			await rm(root, { recursive: true, force: true });
+		}
+	},
+);
+
+test.skipIf(process.platform !== "linux").each(["create", "copy-up"])(
+	"restores exact private directory permissions and replays its next baseline (%s)",
+	async (kind) => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-private-mode-"));
+		const target = path.join(root, "dir");
+		const storage = path.join(root, "branch");
+		const upper = path.join(storage, "writes", "upper", target);
+		const service = new WorkspaceSandboxService();
+		await using view = FilesystemReadView.ambient();
+		try {
+			if (kind === "copy-up") {
+				await mkdir(target, { mode: 0o750 });
+				await writeFile(path.join(target, "inherited"), "host");
+			}
+			const before = await readSandboxDirectoryState(target);
+			const parent = await stat(root);
+			const after = {
+				entriesDigest: before?.entriesDigest ?? directoryEntriesDigest([]),
+				uid: parent.uid,
+				gid: parent.gid,
+				mode: kind === "create" ? 0o777 : 0o710,
+			};
+			const change = {
+				kind: "directory",
+				operation: "mkdir",
+				root,
+				target,
+				resource: "dir",
+				before,
+				after,
+			} as const;
+			await privateReplay(service, storage, [change], view);
+			expect((await stat(upper)).mode & 0o777).toBe(after.mode);
+			await privateReplay(
+				service,
+				storage,
+				[{ ...change, operation: undefined, before: after, after: { ...after, mode: 0o700 } }],
+				view,
+			);
+			expect((await stat(upper)).mode & 0o777).toBe(0o700);
+			await expect(privateReplay(service, storage, [{ ...change, before: after }], view)).rejects.toThrow(
+				"resource changed",
+			);
+			expect((await stat(upper)).mode & 0o777).toBe(0o700);
+			expect(await readSandboxDirectoryState(target)).toEqual(before);
+		} finally {
+			await service.dispose();
+			await rm(root, { recursive: true, force: true });
+		}
+	},
+);
+
+test.skipIf(process.platform !== "linux").each(["shadowed", "whiteout"])(
+	"only seeds visible lower hard links in a private replay (%s)",
+	async (kind) => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-private-alias-"));
+		const storage = path.join(root, "branch");
+		const upper = (name: string) => path.join(storage, "writes", "upper", name);
+		const primary = path.join(root, "primary");
+		const sibling = path.join(root, "sibling");
+		const alias = path.join(root, "alias");
+		const before = Buffer.from("host");
+		const after = Buffer.from("replayed");
+		const shadow = Buffer.from("earlier private change");
+		const service = new WorkspaceSandboxService();
+		await using view = FilesystemReadView.ambient();
+		try {
+			await writeFile(primary, before);
+			await link(primary, sibling);
+			await link(primary, alias);
+			await privateReplay(
+				service,
+				storage,
+				[{ root, target: alias, resource: "alias", before, after: kind === "shadowed" ? shadow : undefined }],
+				view,
+			);
+			const previous = kind === "shadowed" ? await stat(upper(alias)) : undefined;
+			await privateReplay(
+				service,
+				storage,
+				[
+					{
+						operation: "write_contents",
+						root,
+						target: primary,
+						resource: "primary",
+						before,
+						after,
+						aliases: [primary, sibling, alias],
+					},
+				],
+				view,
+			);
+			expect(await readFile(upper(primary))).toEqual(after);
+			expect(await readFile(upper(sibling))).toEqual(after);
+			expect((await stat(upper(sibling))).ino).toBe((await stat(upper(primary))).ino);
+			if (previous) {
+				expect((await stat(upper(alias))).ino).toBe(previous.ino);
+				expect(await readFile(upper(alias))).toEqual(shadow);
+			} else {
+				await expect(stat(upper(alias))).rejects.toMatchObject({ code: "ENOENT" });
+				const log = await readFile(path.join(storage, "writes", "deleted.log"), "utf8");
+				expect(log.split("\n")).toContain(alias.slice(1));
+			}
+			for (const name of [primary, sibling, alias]) expect(await readFile(name)).toEqual(before);
 		} finally {
 			await service.dispose();
 			await rm(root, { recursive: true, force: true });

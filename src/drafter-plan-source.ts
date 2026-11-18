@@ -34,8 +34,8 @@ export interface DrafterBudgetSnapshot {
 }
 /** Shared usage accounting; request limits belong to the host and provider. */
 export class DrafterTaskBudget {
-	private state = this.empty();
-	private finished = false;
+	private latest = this.empty();
+	private active: typeof this.latest | undefined = this.latest;
 	async run(input: {
 		readonly model: Model<Api>;
 		readonly context: Context;
@@ -47,11 +47,7 @@ export class DrafterTaskBudget {
 		) => Promise<AssistantMessage>;
 	}): Promise<AssistantMessage> {
 		input.options?.signal?.throwIfAborted();
-		if (this.finished) {
-			this.state = this.empty();
-			this.finished = false;
-		}
-		const state = this.state;
+		const state = (this.active ??= this.latest = this.empty());
 		state.requests++;
 		state.unreportedRequests++;
 		const message = await input.complete(input.model, input.context, input.options);
@@ -67,10 +63,10 @@ export class DrafterTaskBudget {
 		return message;
 	}
 	finishTask(): void {
-		this.finished = true;
+		this.active = undefined;
 	}
 	snapshot(): DrafterBudgetSnapshot {
-		return { ...this.state };
+		return { ...this.latest };
 	}
 	private empty() {
 		return { requests: 0, reportedTokens: 0, unreportedRequests: 0 };
@@ -652,24 +648,15 @@ export function forceToolChoice(
 ): SimpleStreamOptions["onPayload"] {
 	return async (payload, model) => {
 		const next = (await inherited?.(payload, model)) ?? payload;
-		let forced;
-		if (!tool) {
-			forced = FORCED_TOOL_CHOICE[model.api];
-		} else {
-			if (model.api === "anthropic-messages") {
-				forced = { type: "tool", name: tool };
-			} else {
-				if (model.api === "openai-completions") {
-					forced = { type: "function", function: { name: tool } };
-				} else {
-					if (FORCED_TOOL_CHOICE[model.api]) {
-						forced = { type: "function", name: tool };
-					} else {
-						forced = undefined;
-					}
-				}
-			}
-		}
+		const forced = !tool
+			? FORCED_TOOL_CHOICE[model.api]
+			: model.api === "anthropic-messages"
+				? { type: "tool", name: tool }
+				: model.api === "openai-completions"
+					? { type: "function", function: { name: tool } }
+					: FORCED_TOOL_CHOICE[model.api]
+						? { type: "function", name: tool }
+						: undefined;
 		return forced && next && typeof next === "object" && "tools" in next
 			? { ...next, tool_choice: forced }
 			: next;

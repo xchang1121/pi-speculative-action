@@ -488,7 +488,7 @@ export class PatternAwareStore {
 	private write?: Promise<void>;
 	private dirty = false;
 	private persistTimer?: ReturnType<typeof setTimeout>;
-	private loaded = false;
+	private loading?: Promise<void>;
 	private readonly settings: PatternAwareSettings;
 	private readonly persistenceFile?: string;
 	/** Shared by every workspace: validated patterns with no workspace path in them, learned in one and usable in all. */
@@ -519,26 +519,25 @@ export class PatternAwareStore {
 			projectors: actionSemantics.projectors?.map(ownActionKeyProjector),
 		};
 	}
-	async load() {
-		if (this.loaded) return;
-		this.loaded = true;
-		await this.loadWorkspace();
-		// Patterns another workspace validated start here as fresh, keeping their evidence; local feedback moves them from there.
-		const portable = this.portableFile ? await readPatterns(this.portableFile) : [];
-		for (const pattern of portable)
-			if (
-				!this.patterns.has(pattern.id) &&
-				this.portable(pattern) &&
-				pattern.context.length <= this.settings.maxContextLength
-			)
-				this.patterns.set(pattern.id, {
-					...pattern,
-					lastSeenSequence: this.clock,
-				});
-		if (portable.length) {
-			this.contexts = undefined;
-			this.trimPatterns();
-		}
+	load(): Promise<void> {
+		return (this.loading ??= this.loadWorkspace().then(async () => {
+			// Patterns another workspace validated start here as fresh, keeping their evidence; local feedback moves them from there.
+			const portable = this.portableFile ? await readPatterns(this.portableFile) : [];
+			for (const pattern of portable)
+				if (
+					!this.patterns.has(pattern.id) &&
+					this.portable(pattern) &&
+					pattern.context.length <= this.settings.maxContextLength
+				)
+					this.patterns.set(pattern.id, {
+						...pattern,
+						lastSeenSequence: this.clock,
+					});
+			if (portable.length) {
+				this.contexts = undefined;
+				this.trimPatterns();
+			}
+		}));
 	}
 	private async loadWorkspace() {
 		if (!this.persistenceFile) return;
@@ -866,7 +865,8 @@ export class PatternAwareStore {
 	}
 	async flush(): Promise<void> {
 		const target = this.persistenceFile;
-		if (!target || !this.loaded) return;
+		if (!target || !this.loading) return;
+		await this.loading;
 		while (true) {
 			if (this.persistTimer) {
 				clearTimeout(this.persistTimer);
@@ -1170,7 +1170,7 @@ export class PatternAwareStore {
 		);
 	}
 	private persist() {
-		if (!this.persistenceFile || !this.loaded) return;
+		if (!this.persistenceFile || !this.loading) return;
 		this.dirty = true;
 		if (this.persistTimer) return;
 		this.persistTimer = setTimeout(() => {
@@ -1305,20 +1305,13 @@ export function patternAwareSettings(value: unknown): PatternAwareSettings {
 	return parsePatternSettings(asRecord(value), speculativeConfig().pattern);
 }
 export function patternAwarePersistenceFile(workspace: string, stateDirectory?: string) {
-	let root;
-	if (stateDirectory) {
-		root = path.resolve(stateDirectory);
-	} else {
-		if (process.env.PI_STATE_DIR) {
-			root = path.resolve(process.env.PI_STATE_DIR);
-		} else {
-			if (process.platform === "win32") {
-				root = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "pi");
-			} else {
-				root = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "pi");
-			}
-		}
-	}
+	const root = stateDirectory
+		? path.resolve(stateDirectory)
+		: process.env.PI_STATE_DIR
+			? path.resolve(process.env.PI_STATE_DIR)
+			: process.platform === "win32"
+				? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "pi")
+				: path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "pi");
 	return path.join(root, "pattern-aware", `${hash(path.resolve(workspace))}.json`);
 }
 export function projectPatternAwareObservation(

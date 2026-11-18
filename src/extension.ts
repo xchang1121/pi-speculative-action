@@ -1159,14 +1159,21 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 							? Number(input) * (bytes ? 1048576 : 1)
 							: NaN
 						: input.trim() || undefined;
-				if (bytes && !Number.isSafeInteger(Number(input))) {
+				if (bytes && !Number.isSafeInteger(next)) {
 					ui.notify(`Invalid ${label}.`, "warning");
 					continue;
 				}
 			}
 			const [group, member] = field.split(".");
 			const patch = member ? { ...Reflect.get(draft, group!), [member]: next } : next;
-			const normalized = normalizeSpeculativeActionSettings({ ...draft, [group!]: patch });
+			const updated = { ...draft, [group!]: patch };
+			if (typeof next === "number") {
+				if (field === "drafterTemperatureMin" && next > draft.drafterTemperatureMax)
+					updated.drafterTemperatureMax = next;
+				if (field === "drafterTemperatureMax" && next < draft.drafterTemperatureMin)
+					updated.drafterTemperatureMin = next;
+			}
+			const normalized = normalizeSpeculativeActionSettings(updated);
 			if (!isDeepStrictEqual(fieldValue(normalized, field), next)) ui.notify(`Invalid ${label}.`, "warning");
 			else draft = normalized;
 		}

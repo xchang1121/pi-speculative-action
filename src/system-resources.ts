@@ -271,7 +271,6 @@ export class SpeculationScheduler<Job extends object> {
 	private capacity: HardwareResources = {};
 	private admission: HardwareResources = {};
 	private timer?: ReturnType<typeof setTimeout>;
-	private sampling = false;
 	private readonly options: SchedulerOptions;
 	constructor(options: SchedulerOptions = {}) {
 		this.options = options;
@@ -438,26 +437,26 @@ export class SpeculationScheduler<Job extends object> {
 		return [...this.entries.values()].filter((entry) => !owner || entry.scope.owner === owner);
 	}
 	watch(delay = this.options.pollIntervalMs?.() ?? SCHEDULING_DEFAULTS.resourcePollIntervalMs): void {
-		if (!this.options.resources || this.timer || this.sampling || !this.options.active?.()) return;
-		this.timer = setTimeout(() => {
-			this.timer = undefined;
-			if (!this.options.active?.()) return;
-			this.sampling = true;
-			void this.options
-				.resources!.sample()
-				.then((snapshot) => {
-					if (this.options.active?.()) {
-						this.updateResources(snapshot);
-						this.options.changed?.();
-					}
-				})
-				.catch(() => {})
-				.finally(() => {
-					this.sampling = false;
+		const resources = this.options.resources;
+		if (!resources || this.timer || !this.options.active?.()) return;
+		const timer = (this.timer = setTimeout(async () => {
+			try {
+				if (!this.options.active?.()) return;
+				const snapshot = await resources.sample();
+				if (this.timer === timer && this.options.active?.()) {
+					this.updateResources(snapshot);
+					this.options.changed?.();
+				}
+			} catch {
+				// A failed sample does not stop polling.
+			} finally {
+				if (this.timer === timer) {
+					this.timer = undefined;
 					this.watch();
-				});
-		}, delay);
-		this.timer.unref?.();
+				}
+			}
+		}, delay));
+		timer.unref?.();
 	}
 	close(): void {
 		clearTimeout(this.timer);

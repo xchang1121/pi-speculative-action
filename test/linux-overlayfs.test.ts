@@ -100,3 +100,13 @@ describe("Linux OverlayFS workspace substrate", () => {
 		},
 	);
 });
+
+it("closing the OverlayFS registry invalidates a probe already in flight", async () => {
+	const registry = new LinuxOverlayfsCapabilityRegistry();
+	const probe = registry.capability({
+		overlayfsBinary: path.join(os.tmpdir(), "absent-pi-overlayfs-binary"),
+	});
+	registry.dispose();
+	await expect(probe).rejects.toThrow("registry is disposed");
+	await expect(registry.capability()).rejects.toThrow("registry is disposed");
+});

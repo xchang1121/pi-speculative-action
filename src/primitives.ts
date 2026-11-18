@@ -358,3 +358,15 @@ export function execHostText(
 		},
 	);
 }
+
+/** Consume a release callback before invoking it; reentrant or later calls cannot release twice. */
+export function releaseOnce<Args extends unknown[], Result>(release: (...args: Args) => Result) {
+	let callback: typeof release | undefined = release;
+	let result: Result | undefined;
+	return (...args: Args) => {
+		const run = callback;
+		callback = undefined;
+		if (run) result = run(...args);
+		return result;
+	};
+}

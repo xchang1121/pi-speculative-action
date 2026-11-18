@@ -5,7 +5,8 @@ import { createInterface } from "node:readline";
 import { afterEach, expect, test } from "vitest";
 import { Type } from "typebox";
 import { subcomputeEnvironment } from "../src/index.ts";
-import { controlledSubcomputeChannel } from "../src/subcompute.ts";
+import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
+import { controlledSubcomputeChannel, SubcomputeService } from "../src/subcompute.ts";
 import { systemHost } from "./agent-system-fixture.ts";
 import { temporaryDirectories } from "./filesystem.ts";
 
@@ -133,6 +134,25 @@ test("one protocol connection reuses steps, revalidates snapshots and omits larg
 		await host.dispose();
 	}
 }, 30000);
+
+test("shutdown prevents late channel creation and concurrent callers share its completion", async () => {
+	const cwd = await directories.create();
+	const store = new ProvenanceCertificateStore(cwd);
+	const service = new SubcomputeService(cwd, store, () => 1024);
+	try {
+		const socket = await service.socket();
+		expect(socket).toBeTruthy();
+		const channel = service.environment();
+		const closing = service.dispose();
+		expect(service.dispose()).toBe(closing);
+		await expect(channel).rejects.toThrow("subcompute_service_closed");
+		await closing;
+		await expect(service.socket()).rejects.toThrow("subcompute_service_closed");
+	} finally {
+		await service.dispose();
+		await store.dispose();
+	}
+});
 
 function client(environment: Readonly<Record<string, string>>) {
 	const socket = connect(environment.PI_SUBCOMPUTE_SOCKET!);

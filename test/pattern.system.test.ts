@@ -45,8 +45,10 @@ test.each([1, 2])("preserves constant prediction support when another session ch
 	assertSupport();
 	await store.flush();
 	store = new PatternAwareStore(settings, file);
+	const loading = store.load();
 	await store.load();
 	assertSupport();
+	await loading;
 });
 
 test("scopes reserved observation revisions to each PatternAware turn", async () => {
