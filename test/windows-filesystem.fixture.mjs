@@ -8,7 +8,11 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { isMainThread, parentPort, Worker, workerData } from "node:worker_threads";
 import { windowsFilesystem } from "../src/windows-filesystem.ts";
-import { resolveSpeculativeConfig as resolveConfig, withSpeculativeConfig } from "../src/config-schema.ts";
+import {
+	SpeculativeConfiguration,
+	resolveSpeculativeConfig as resolveConfig,
+	withSpeculativeConfig,
+} from "../src/config-schema.ts";
 
 const resolveSpeculativeConfig = (input = {}) =>
 	resolveConfig({
@@ -83,10 +87,11 @@ await withSpeculativeConfig(resolveSpeculativeConfig(), async () => {
 		try {
 			await run("idle helpers serve serial captures and retire after the configured timeout", async () => {
 				const { file } = fixture("idle");
-				const config = resolveSpeculativeConfig({ filesystem: { objectLeaseIdleMs: 200 } });
-				await withSpeculativeConfig(config, async () => {
+				const config = new SpeculativeConfiguration({ filesystem: { objectLeaseIdleMs: 200 } });
+				await config.run(async () => {
 					let processID;
 					for (let index = 0; index < 8; index++) {
+						config.update({ filesystem: { objectLeaseIdleMs: 200 }, runtime: { candidateLimit: index + 1 } });
 						const lease = await pin(file);
 						await snapshot(lease);
 						processID ??= provider.processIDs()[0];
@@ -98,6 +103,39 @@ await withSpeculativeConfig(resolveSpeculativeConfig(), async () => {
 					assert.deepEqual(provider.processIDs(), []);
 				});
 				return { serialCaptures: 8, helperStarts: 1, idleRetired: true };
+			});
+			await run("budget changes keep active handles on one helper", async () => {
+				const { directory, file } = fixture("update-budgets");
+				const longer = path.join(directory, "a".repeat(110));
+				fs.writeFileSync(longer, "other");
+				const config = new SpeculativeConfiguration();
+				const limits = (maxTreeEntries, maxRequestBytes) =>
+					config.update({
+						filesystem: { objectLeaseIdleMs: 0, maxTreeEntries },
+						processReuse: { maxRequestBytes },
+					});
+				await config.run(async () => {
+					const small = Buffer.byteLength(file) + 64;
+					limits(1, small);
+					const first = await pin(file);
+					const [pid] = provider.processIDs();
+					const before = await snapshot(first);
+					await assert.rejects(() => pin(file), /capacity exceeded/);
+					await assert.rejects(() => pin(longer), { code: "ERR_LEASE_REQUEST" });
+					limits(2, 2048);
+					const second = await pin(longer);
+					assert.deepEqual(provider.processIDs(), [pid]);
+					limits(1, small);
+					await assert.rejects(() => pin(file), /capacity exceeded/);
+					assert.equal(await provider.liveCount(), 2);
+					const reading = snapshot(first);
+					limits(1, 4);
+					await assert.rejects(() => pin(file), { code: "ERR_LEASE_REQUEST" });
+					assert.deepEqual(await reading, before);
+					await close(second);
+					await close(first);
+					assert.deepEqual(provider.processIDs(), []);
+				});
 			});
 			await run("parent exit cleans an idle helper without waiting for the idle timeout", async () => {
 				const { file } = fixture("parent-exit");

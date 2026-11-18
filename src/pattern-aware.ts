@@ -7,9 +7,7 @@ import { actionKeyCovers, ownActionKeyProjector } from "./action-semantics.ts";
 import {
 	DEFAULT_SPECULATIVE_CONFIG,
 	speculativeConfig,
-	booleanOr,
 	nonNegativeInteger,
-	positiveInteger,
 	probability as probabilitySetting,
 	settingsParser,
 } from "./config-schema.ts";
@@ -472,36 +470,7 @@ type PatternPool = {
 };
 const { defaults: patternAwareDefaults, parse: parsePatternSettings } = settingsParser(
 	DEFAULT_SPECULATIVE_CONFIG.pattern,
-	{
-		enabled: booleanOr,
-		// Prediction policy only; authoritative observations always train.
-		/** Built-in relations are selectable independently of the patterns learned from real calls. */
-		presets: presetSelection,
-
-		/** Admit future-gap/preparation candidates and expand completed predictions into a multi-step frontier. */
-		multiStepEnabled: booleanOr,
-
-		maxContextLength: positiveInteger,
-
-		/** Maximum competing concrete actions retained per tool at each PatternAware frontier. */
-		beamWidth: positiveInteger,
-
-		/** Maximum number of recursively predicted actions on one branch. */
-		maxPredictionDepth: positiveInteger,
-
-		maxFutureGap: nonNegativeInteger,
-
-		/** Weighted future-gap quantile used as the expected launch horizon; the deadline keeps full observed support. */
-		futureGapCoverage: probabilitySetting,
-
-		decayHalfLifeEvents: positiveInteger,
-
-		/** Observed support required to promote a structured field binding. */
-		minOccurrences: positiveInteger,
-
-		/** Maximum learned patterns retained in the corpus. */
-		maxPatterns: positiveInteger,
-	},
+	{ presets: presetSelection, maxFutureGap: nonNegativeInteger, futureGapCoverage: probabilitySetting },
 );
 export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = patternAwareDefaults;
 
@@ -1333,10 +1302,7 @@ function configuredPersistenceFile(file: string, analyzerKey: string, semanticsK
 	);
 }
 export function patternAwareSettings(value: unknown): PatternAwareSettings {
-	return parsePatternSettings({
-		...speculativeConfig().pattern,
-		...asRecord(value),
-	});
+	return parsePatternSettings(asRecord(value), speculativeConfig().pattern);
 }
 export function patternAwarePersistenceFile(workspace: string, stateDirectory?: string) {
 	let root;
@@ -1354,9 +1320,6 @@ export function patternAwarePersistenceFile(workspace: string, stateDirectory?: 
 		}
 	}
 	return path.join(root, "pattern-aware", `${hash(path.resolve(workspace))}.json`);
-}
-export function failureClass(_text: string): string {
-	return "failed";
 }
 export function projectPatternAwareObservation(
 	output: unknown,
@@ -1524,21 +1487,6 @@ class PatternBindingAnalysis {
 		if (!entries.length) yield [segments, array ? [] : {}];
 		for (const entry of entries) if (entry) yield* this.leaves(entry[1], [...segments, entry[0]]);
 	}
-}
-export function inferBindings(
-	context: ReadonlyArray<PatternAwareEvent>,
-	target: Record<string, unknown>,
-): Record<string, PatternAwareBinding> {
-	return new PatternBindingAnalysis().inferBindings(context, target);
-}
-export function applyBindingsVariants(
-	bindings: Readonly<Record<string, PatternAwareBinding>>,
-	context: ReadonlyArray<PatternAwareEvent>,
-	limit = speculativeConfig().prediction.maxBindingVariants,
-): ReadonlyArray<Record<string, unknown>> {
-	return new PatternBindingAnalysis()
-		.applyWeightedBindings(bindings, context, limit)
-		.map(({ input }) => input);
 }
 function hasSufficientBindingProvenance(
 	bindings: Readonly<Record<string, PatternAwareBinding>>,

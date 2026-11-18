@@ -70,6 +70,7 @@ import {
 	FILESYSTEM_OBSERVATION_FIELDS,
 	FilesystemCaptureChangedError,
 	filesystemEntryType,
+	filesystemModeType,
 	filesystemMetadataDigest,
 	FilesystemReadView,
 	mapFilesystem,
@@ -86,6 +87,7 @@ import type { LinuxOverlayfsMount, LinuxOverlayfsOptions } from "./linux-overlay
 import { LinuxOverlayfsCapabilityRegistry, mountLinuxOverlayfs } from "./linux-overlayfs.ts";
 import type { Sha256Digest } from "./primitives.ts";
 import {
+	ignoreMissing,
 	containsFilesystemPath,
 	digestObject,
 	errorMessage,
@@ -296,27 +298,6 @@ export interface WorkspaceTransactionDriver {
 export interface WorkspaceStructureDriver {
 	readonly capture: () => Promise<WorkspaceStructureSnapshot>;
 	readonly retain?: (versions: FilesystemVersionSource) => () => void;
-}
-/**
- * Keep transaction machinery off read-only/replay paths. Concurrent first users share one driver,
- * and a failed construction remains failed rather than silently changing observation policy.
- */
-export function deferredWorkspaceTransactionDriver(
-	create: () => Promise<WorkspaceTransactionDriver>,
-): WorkspaceTransactionDriver {
-	let driver: Promise<WorkspaceTransactionDriver> | undefined;
-	let disposal: Promise<void> | undefined;
-	return {
-		begin: async () => {
-			if (!disposal) {
-				const resolved = await (driver ??= Promise.resolve().then(create));
-				if (!disposal) return resolved.begin();
-				await disposal;
-			}
-			throw new Error("workspace transaction driver is disposed");
-		},
-		dispose: () => (disposal ??= driver ? driver.then((resolved) => resolved.dispose()) : Promise.resolve()),
-	};
 }
 async function gitOutput(cwd: string, args: readonly string[]): Promise<string> {
 	const { stdout } = await execHostFile("git", ["--no-optional-locks", "-C", cwd, ...args], {
@@ -1078,15 +1059,7 @@ export function statChangeDigest(stat: Stats | BigIntStats): Sha256Digest {
 		mode: Number(stat.mode),
 		size: Number(stat.size),
 		links: Number(stat.nlink),
-
-		type:
-			(
-				{
-					[0o100000]: "file",
-					[0o040000]: "directory",
-					[0o120000]: "symlink",
-				} as Record<number, string>
-			)[Number(stat.mode) & 0o170000] ?? "other",
+		type: filesystemModeType(stat.mode),
 	});
 }
 interface SandboxChangeTarget {
@@ -1129,8 +1102,9 @@ export interface WorkspaceExecutionSnapshot extends SandboxExecutionDelta {
 }
 export type WorkspaceSandboxDriver = "auto" | "git" | "overlayfs" | "in_memory";
 export interface WorkspaceSandboxOptions extends LinuxOverlayfsOptions {
+	/** Kept for existing callers; immutable snapshots no longer invoke Git. */
 	readonly gitBinary?: string;
-	/** Auto is portable Git unless a trace-guarded runtime explicitly qualifies a COW driver. */
+	/** Auto uses an immutable CAS snapshot unless a trace-guarded runtime explicitly qualifies a COW driver. */
 	readonly driver?: WorkspaceSandboxDriver;
 	/** Root edits and writes run in memory over the workspace itself (default); false always allocates a private workspace. */
 	readonly inPlaceMutations?: boolean;
@@ -1234,12 +1208,24 @@ function createWorkspaceObservation(
 			};
 		},
 	};
-	const transactions = deferredWorkspaceTransactionDriver(() => createWorkspaceTransactionDriver(workspace));
+	let transactionDriver: Promise<WorkspaceTransactionDriver> | undefined;
+	let disposal: Promise<void> | undefined;
 	workspace = {
 		...data,
 		contents,
 		structure,
-		transactions,
+		transactions: {
+			begin: async () => {
+				if (!disposal) {
+					const driver = await (transactionDriver ??= createWorkspaceTransactionDriver(workspace));
+					if (!disposal) return driver.begin();
+				}
+				await disposal;
+				throw new Error("workspace transaction driver is disposed");
+			},
+			dispose: () =>
+				(disposal ??= transactionDriver?.then((driver) => driver.dispose()) ?? Promise.resolve()),
+		},
 		sourceChanges,
 		observationExcludes: speculativeConfig().filesystem.excludes,
 		metadataImage: data.metadata?.image,
@@ -1354,8 +1340,6 @@ export interface SandboxWorkspaceBranchOptions extends WorkspaceSandboxOptions {
 	readonly cwd: string;
 	readonly action: SpeculativeToolExecutionContext["action"];
 	readonly parentCheckpoint?: WorldCheckpoint;
-	/** Borrow an immutable workspace when validate is supplied; preparation never proves current inputs. */
-	readonly preparation?: QualifiedWorkspaceSandboxDriver;
 	/** An operation boundary may supply its complete input/effect delta, avoiding a second tree scan. */
 	readonly execute: (workspace: SandboxWorkspaceContext) => Promise<ToolSettlement | SandboxExecutionDelta>;
 	/** Optional backend metrics collected during execute/capture and sealed into the branch. */
@@ -1411,8 +1395,7 @@ function sameWorkspaceChangeSnapshot(
 	}
 	return true;
 }
-// The execution world mirrors everything the actor can read below cwd. Git metadata is
-// replaced by the private repository and commit's own temporary files are internal.
+// Internal staging files are excluded from the captured workspace.
 const SANDBOX_STAGING_FILE_PREFIX = ".pi-speculative-";
 export interface WorkspaceCheckpoint {
 	readonly token: WorldCheckpoint;
@@ -1426,12 +1409,10 @@ const retiredWorkspaceCheckpoints = new FinalizationRegistry<() => Promise<void>
 	void release().catch(() => {});
 });
 export interface QualifiedWorkspaceSandboxDriver {
-	readonly driver: Exclude<WorkspaceSandboxDriver, "auto">;
+	readonly driver: Extract<WorkspaceSandboxDriver, "in_memory" | "overlayfs">;
 	readonly fingerprint: string;
 }
 /** Bound filesystem operations validate all captured inputs and effects in the commit transaction. */
-const capturedWorkspaceInputs = Symbol("captured workspace inputs");
-type SandboxPreparation = QualifiedWorkspaceSandboxDriver | typeof capturedWorkspaceInputs;
 /** Owns workspace repositories and commit serialization for one extension/runtime lifecycle. */
 export class WorkspaceSandboxService {
 	readonly configuration = currentSpeculativeConfiguration();
@@ -1460,16 +1441,16 @@ export class WorkspaceSandboxService {
 	useContentStore(store: ProvenanceCertificateStore): void {
 		if (!this.storage) this.store = store;
 	}
-	async fingerprint(options: WorkspaceSandboxOptions = {}, sourceRoot?: string): Promise<string> {
+	async fingerprint(options: WorkspaceSandboxOptions = {}): Promise<string> {
 		this.assertOpen();
-		return (await this.resolveDriver(options, sourceRoot)).fingerprint;
+		return (await this.resolveDriver(options)).fingerprint;
 	}
 	async qualify(
 		options: WorkspaceSandboxOptions,
-		sourceRoot: string,
+		_sourceRoot?: string,
 	): Promise<QualifiedWorkspaceSandboxDriver> {
 		this.assertOpen();
-		return await this.resolveDriver(options, sourceRoot);
+		return await this.resolveDriver(options);
 	}
 	branch(
 		options: Pick<SandboxWorkspaceBranchOptions, "cwd" | "action" | "parentCheckpoint" | "validate">,
@@ -1487,11 +1468,15 @@ export class WorkspaceSandboxService {
 	async withWorkspace<T>(
 		cwd: string,
 		run: (workspace: SandboxWorkspaceContext) => Promise<T>,
-		options: Pick<WorkspaceSandboxOptions, "gitBinary" | "liveLower"> | string = {},
+		options: Pick<WorkspaceSandboxOptions, "liveLower" | "gitBinary"> | string = {},
 	): Promise<T> {
 		this.assertOpen();
-		const config = typeof options === "string" ? { gitBinary: options } : options;
-		return await this.withPrivateWorkspace(cwd, config.gitBinary ?? "git", "git", config, run);
+		return this.withPrivateWorkspace(
+			cwd,
+			"in_memory",
+			typeof options === "string" ? {} : { liveLower: options.liveLower },
+			run,
+		);
 	}
 	async commitDelta(delta: SandboxExecutionDelta, privateView?: FilesystemReadView): Promise<ToolSettlement> {
 		this.assertOpen();
@@ -1548,28 +1533,25 @@ export class WorkspaceSandboxService {
 		this.contents.add(pool);
 		return pool;
 	}
-	private async resolveDriver(
-		options: WorkspaceSandboxOptions,
-		_sourceRoot?: string,
-	): Promise<QualifiedWorkspaceSandboxDriver> {
-		const driver = options.driver === "auto" || options.driver === undefined ? "in_memory" : options.driver;
-		if (driver !== "overlayfs") return { driver, fingerprint: "immutable-cas-workspace:1" };
+	private async resolveDriver(options: WorkspaceSandboxOptions): Promise<QualifiedWorkspaceSandboxDriver> {
+		if (options.driver !== "overlayfs")
+			return { driver: "in_memory", fingerprint: "immutable-cas-workspace:1" };
 		const capability = await this.overlayfsCapabilities.capability(options);
 		if (!capability.available) throw new Error(capability.detail);
 		return {
-			driver,
+			driver: "overlayfs",
 			fingerprint: `immutable-cas-overlayfs:${capability.fingerprint}`,
 		};
 	}
 	createExecutionWorld(options: WorkspaceSandboxOptions = {}): SpeculativeAgentExecutionWorld {
 		this.assertOpen();
-		// Generic mutations retain Git unless OverlayFS was explicitly requested. Process routes
+		// Generic mutations retain an immutable workspace. Process routes
 		// qualify a live lower from their invocation cwd to preserve native metadata.
 		const resolvedOptions: WorkspaceSandboxOptions =
-			options.driver === "overlayfs" ? options : { ...options, driver: "git" };
+			options.driver === "overlayfs" ? options : { ...options, driver: "in_memory" };
 		const roots = new Set<string>();
 		return {
-			id: "git_worktree",
+			id: "workspace_branch",
 			scope: "fallback",
 			isolation: "workspace_branch",
 			speculation: {
@@ -1621,7 +1603,7 @@ export class WorkspaceSandboxService {
 			};
 		const { changes } = snapshot;
 		const { executionFingerprint } = action;
-		const backend = "git_worktree";
+		const backend = "workspace_branch";
 		const id = randomUUID();
 		const checkpoint = Object.freeze({
 			backend,
@@ -1870,19 +1852,7 @@ export class WorkspaceSandboxService {
 										? await readSandboxDirectoryState(change.target, undefined, view)
 										: await readRegularState(change.target, undefined, view, contents);
 								baselines.set(change, current);
-								if (
-									change.kind === "directory" && change.validationOnly
-										? !!current !== !!change.before
-										: !sameSandboxState(
-												current,
-												change.kind === "directory"
-													? change.before
-													: change.before && {
-															content: change.before,
-															mode: change.beforeMode ?? 0,
-														},
-											)
-								)
+								if (!matchesSandboxBaseline(change, current))
 									throw new Error(`resource changed before commit: ${change.resource}`);
 								if (change.accessMode) await access(await view.realpath(change.target), change.accessMode);
 								if (change.kind !== "directory" && change.aliases)
@@ -2125,15 +2095,12 @@ export class WorkspaceSandboxService {
 			.finally(() => release?.());
 		return this.lifetime.track(commit);
 	}
-	async fork(
-		options: SandboxWorkspaceBranchOptions,
-		preparation: SandboxPreparation | undefined = options.validate ? options.preparation : undefined,
-	): Promise<WorldBranch<ToolSettlement>> {
+	async fork(options: SandboxWorkspaceBranchOptions): Promise<WorldBranch<ToolSettlement>> {
 		this.assertOpen();
 		const sourceRoot = path.resolve(options.cwd);
 		const parent = this.checkpoint(options.parentCheckpoint, sourceRoot);
 		return this.createBranch(
-			await this.capture(options, parent, preparation),
+			await this.capture(options, parent),
 			sourceRoot,
 			options.action,
 			parent,
@@ -2143,7 +2110,6 @@ export class WorkspaceSandboxService {
 	async capture(
 		options: Omit<SandboxWorkspaceBranchOptions, "action" | "parentCheckpoint">,
 		parent?: WorkspaceCheckpoint,
-		preparation: SandboxPreparation | undefined = options.validate ? options.preparation : undefined,
 	): Promise<WorkspaceExecutionSnapshot> {
 		this.assertOpen();
 		const sourceRoot = path.resolve(options.cwd);
@@ -2154,11 +2120,12 @@ export class WorkspaceSandboxService {
 		let capturedSnapshot: WorkspaceExecutionSnapshot | undefined;
 		try {
 			const resolvedDriver = await this.resolveDriver(
-				options.driver === "auto" || options.driver === undefined ? { ...options, driver: "git" } : options,
+				options.driver === "auto" || options.driver === undefined
+					? { ...options, driver: "in_memory" }
+					: options,
 			);
 			return await this.withPrivateWorkspace(
 				sourceRoot,
-				options.gitBinary ?? "git",
 				resolvedDriver.driver,
 				options,
 				async (workspace) => {
@@ -2182,7 +2149,6 @@ export class WorkspaceSandboxService {
 					});
 				},
 				parent,
-				preparation,
 			);
 		} catch (error) {
 			await capturedSnapshot?.dispose?.();
@@ -2197,7 +2163,7 @@ export class WorkspaceSandboxService {
 	): Promise<QualifiedWorkspaceSandboxDriver> {
 		this.assertOpen();
 		options.signal?.throwIfAborted();
-		const qualified = await this.resolveDriver(options, cwd);
+		const qualified = await this.resolveDriver(options);
 		await (await this.tree(path.resolve(cwd))).capture.captureVersions();
 		options.signal?.throwIfAborted();
 		return Object.freeze(qualified);
@@ -2220,16 +2186,13 @@ export class WorkspaceSandboxService {
 			} catch (error) {
 				if (error !== LINKED_INPUT) throw error;
 			}
-		return this.fork(
-			{
-				cwd: sourceRoot,
-				action: context.action,
-				parentCheckpoint: context.parentCheckpoint,
-				...options,
-				execute: (workspace) => this.executeFilesystemMutation(context, execute, workspace),
-			},
-			capturedWorkspaceInputs,
-		);
+		return this.fork({
+			cwd: sourceRoot,
+			action: context.action,
+			parentCheckpoint: context.parentCheckpoint,
+			...options,
+			execute: (workspace) => this.executeFilesystemMutation(context, execute, workspace),
+		});
 	}
 	/** Both substrates capture the same operation delta; only a private workspace performs speculative writes. */
 	private async executeFilesystemMutation(
@@ -2381,11 +2344,7 @@ export class WorkspaceSandboxService {
 				const directory =
 					!workspace && known
 						? known.kind === "directory"
-						: (
-								await view.stat(file).catch((error) => {
-									if (!isMissing(error)) throw error;
-								})
-							)?.isDirectory();
+						: (await view.stat(file).catch(ignoreMissing))?.isDirectory();
 				const exists = directory
 					? (await directoryInput(logical)).before !== undefined
 					: (await fileInput(logical)).content !== undefined;
@@ -2448,20 +2407,8 @@ export class WorkspaceSandboxService {
 								size: includeSize ? known.after?.byteLength : undefined,
 							};
 						const info = await view.stat(file, fields !== "entry");
-						let type: "file" | "directory" | "symlink" | "special";
-						if (info.isDirectory()) {
-							type = "directory";
-						} else {
-							if (info.isFile()) {
-								type = "file";
-							} else {
-								if (info.isSymbolicLink()) {
-									type = "symlink";
-								} else {
-									type = "special";
-								}
-							}
-						}
+						const kind = filesystemModeType(info.mode);
+						const type = kind === "other" ? "special" : kind;
 						return {
 							isDirectory: () => info.isDirectory(),
 							type,
@@ -2487,34 +2434,36 @@ export class WorkspaceSandboxService {
 						return [...names].sort();
 					}),
 				prepare: async (binding, key, build, consume, hint, signal = context.signal) => {
-					let baseline = true;
 					const written = (logical: string, scope: string) => {
 						if (scope === "binding" || scope === "resolution") return false;
 						const target = path.resolve(sourceRoot, logical);
-						const writes = [...changes.values()];
+						const key = filesystemPathKey(target);
+						const known = changes.get(key);
+						if (known && !known.validationOnly) return true;
+						const descendants = ["names", "entries", "tree_entries", "tree_content"].includes(scope);
+						const overlaps = (change: SandboxWorkspaceChange) =>
+							!change.validationOnly &&
+							(filesystemPathKey(change.target) === key ||
+								(change.kind === "directory"
+									? containsFilesystemPath(change.target, target)
+									: change.aliases?.some((alias) => filesystemPathKey(alias) === key)) ||
+								(descendants && containsFilesystemPath(target, change.target)));
+						for (const change of changes.values()) if (overlaps(change)) return true;
 						for (
 							let parent = this.checkpoint(context.parentCheckpoint, sourceRoot);
 							parent;
 							parent = parent.parent
 						)
-							if (!parent.committed) writes.push(...parent.changes);
-						return writes.some(
-							(change) =>
-								!change.validationOnly &&
-								(filesystemPathKey(change.target) === filesystemPathKey(target) ||
-									(change.kind === "directory" && containsFilesystemPath(change.target, target)) ||
-									(change.kind !== "directory" &&
-										change.aliases?.some(
-											(alias) => filesystemPathKey(alias) === filesystemPathKey(target),
-										)) ||
-									(["names", "entries", "tree_entries", "tree_content"].includes(scope) &&
-										containsFilesystemPath(target, change.target))),
-						);
+							if (!parent.committed && parent.changes.some(overlaps)) return true;
+						return false;
 					};
-					const transactionView = (captured: ToolFilesystemOperations): ToolFilesystemOperations => {
+					const transactionView = (
+						captured: ToolFilesystemOperations,
+						dirty = () => {},
+					): ToolFilesystemOperations => {
 						const select = (logical: string, scope: string) => {
 							if (!written(logical, scope)) return captured;
-							baseline = false;
+							dirty();
 							return operations;
 						};
 						const overlay: ToolFilesystemOperations = {
@@ -2528,8 +2477,15 @@ export class WorkspaceSandboxService {
 									binding,
 									key,
 									async (view, signal) => {
-										const result = await build(transactionView(view), signal);
-										return { ...result, cacheable: baseline && result.cacheable !== false };
+										let stepBaseline = true;
+										const result = await build(
+											transactionView(view, () => {
+												stepBaseline = false;
+												dirty();
+											}),
+											signal,
+										);
+										return { ...result, cacheable: stepBaseline && result.cacheable !== false };
 									},
 									use,
 									hint,
@@ -2618,10 +2574,8 @@ export class WorkspaceSandboxService {
 	}
 	private async createPrivateSandboxWorkspace(
 		cwd: string,
-		_gitBinary: string,
-		driver: Exclude<WorkspaceSandboxDriver, "auto">,
+		driver: QualifiedWorkspaceSandboxDriver["driver"],
 		options: WorkspaceSandboxOptions,
-		_preparation?: SandboxPreparation,
 	) {
 		const sourceRoot = path.resolve(cwd);
 		const tree = await this.tree(sourceRoot);
@@ -2747,20 +2701,12 @@ export class WorkspaceSandboxService {
 	}
 	private async withPrivateWorkspace<T>(
 		cwd: string,
-		gitBinary: string,
-		driver: Exclude<WorkspaceSandboxDriver, "auto">,
+		driver: QualifiedWorkspaceSandboxDriver["driver"],
 		overlayOptions: WorkspaceSandboxOptions,
 		run: (workspace: PrivateSandboxWorkspace) => Promise<T>,
 		checkpoint?: WorkspaceCheckpoint,
-		preparation?: SandboxPreparation,
 	): Promise<T> {
-		const workspace = await this.createPrivateSandboxWorkspace(
-			cwd,
-			gitBinary,
-			driver,
-			overlayOptions,
-			preparation,
-		);
+		const workspace = await this.createPrivateSandboxWorkspace(cwd, driver, overlayOptions);
 		try {
 			if (checkpoint) await this.materializeCheckpoint(workspace, checkpoint);
 			return await run(workspace);
@@ -2909,7 +2855,7 @@ export function sandboxWorkspaceChanges(
 	});
 }
 const LINKED_INPUT = new Error("linked workspace input");
-/** Git owns bytes and links, while an OS snapshot also owns empty directories and object metadata.
+/** The structure snapshot owns file names, empty directories and object metadata.
  * Pin every translated object until disposal: unlink/recreate must never reuse a saved inode mapping. */
 async function captureSnapshotMetadata(sourceRoot: string, copiedRoot = sourceRoot) {
 	return withFilesystemReadView(undefined, async (view) => {
@@ -3561,7 +3507,7 @@ async function assertCommitTarget(
 		}
 	await assertNoSymlinkPath(root, target, capture);
 }
-async function readRegularState(
+export async function readRegularState(
 	target: string,
 	maxBytes?: number,
 	view?: FilesystemReadView,
@@ -3586,7 +3532,7 @@ async function readRegularState(
 		throw error;
 	}
 }
-async function assertFileAliases(
+export async function assertFileAliases(
 	root: string,
 	target: string,
 	aliases: readonly string[],
@@ -3621,6 +3567,14 @@ export async function readSandboxDirectoryState(
 		if (isMissing(error)) return undefined;
 		throw error;
 	}
+}
+export function matchesSandboxBaseline(
+	change: SandboxWorkspaceChange,
+	state: RegularFileState | SandboxDirectoryState | undefined,
+): boolean {
+	if (change.kind === "directory")
+		return change.validationOnly ? !!state === !!change.before : sameSandboxState(state, change.before);
+	return sameSandboxState(state, change.before && { content: change.before, mode: change.beforeMode ?? 0 });
 }
 export function sameSandboxState(
 	left: RegularFileState | SandboxDirectoryState | undefined,
@@ -3841,7 +3795,7 @@ async function stageAtomicWrite(
 		if (!staged) await rm(temporary, { force: true }).catch(() => undefined);
 	}
 }
-async function createParentDirectories(
+export async function createParentDirectories(
 	sourceRoot: string,
 	target: string,
 	view: FilesystemReadView,

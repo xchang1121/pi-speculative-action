@@ -192,7 +192,7 @@ export function createCompletedProcessExecutionWorld(
 ): SpeculativeAgentExecutionWorld {
 	return createLinuxProcessExecutionWorld({
 		...options,
-		driver: "git",
+		driver: "in_memory",
 		completedOnly: true,
 	});
 }
@@ -200,7 +200,7 @@ export function createCompletedProcessExecutionWorld(
 export function createRestorableProcessExecutionWorld(options: HostProcessWorldOptions) {
 	return createLinuxProcessExecutionWorld({
 		...options,
-		driver: "git",
+		driver: "in_memory",
 		completedOnly: false,
 	});
 }
@@ -230,10 +230,9 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 	const workspaceSandbox = suppliedWorkspace ?? new WorkspaceSandboxService();
 	const ownsWorkspaceSandbox = suppliedWorkspace === undefined;
 	workspaceSandbox.useContentStore(backend.store);
-	const { gitBinary, driver, overlayfsBinary, fusermountBinary } = options;
+	const { driver, overlayfsBinary, fusermountBinary } = options;
 	// Processes observe their inputs' times and inodes: an overlay over the workspace itself shows the Actor's own.
 	const workspaceOptions = {
-		gitBinary,
 		driver,
 		overlayfsBinary,
 		fusermountBinary,
@@ -287,7 +286,7 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 	let backendChecked = false;
 	const qualify = async (sourceRoot: string) => {
 		const root = path.resolve(sourceRoot);
-		const selected = await workspaceSandbox.qualify(workspaceOptions, root);
+		const selected = await workspaceSandbox.qualify(workspaceOptions);
 		qualifiedDrivers.set(root, selected);
 		return selected;
 	};
@@ -401,7 +400,6 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 									...workspaceOptions,
 									cwd: sourceRoot,
 									driver: selected.driver,
-									preparation: operation ? selected : undefined,
 									executionMetrics: () => ({ reuse: session?.metrics() }),
 									validate: () => session!.validate(),
 									afterCapture: () => session!.seal([]),

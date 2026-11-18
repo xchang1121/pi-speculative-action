@@ -14,6 +14,7 @@ import {
 	access,
 	chmod,
 	copyFile,
+	link,
 	lstat,
 	mkdir,
 	mkdtemp,
@@ -22,6 +23,7 @@ import {
 	readFile,
 	readlink,
 	rm,
+	rmdir,
 	stat,
 	writeFile,
 } from "node:fs/promises";
@@ -102,6 +104,7 @@ import type {
 import { definedProcessEnvironment } from "./linux-process-world.ts";
 import type { Sha256Digest } from "./primitives.ts";
 import {
+	ignoreMissing,
 	digestObject,
 	errorMessage,
 	execHostText,
@@ -178,6 +181,7 @@ import type {
 	SandboxWorkspaceChange,
 	SandboxWorkspaceContext,
 	WorkspaceStructureSnapshot,
+	WorkspaceRegularDelta,
 	WorkspaceTransactionCapture,
 	WorkspaceTransactionDelta,
 	WorkspaceTransactionDiff,
@@ -185,11 +189,14 @@ import type {
 } from "./workspace-sandbox.ts";
 import {
 	diffWorkspaceStructures,
+	captureWorkspaceStructureEntry,
 	ExecutionPathProjection,
 	projectFileMutation,
+	assertFileAliases,
+	createParentDirectories,
+	matchesSandboxBaseline,
+	readRegularState,
 	readSandboxDirectoryState,
-	restoreModifiedTimes,
-	sameSandboxState,
 	sandboxWorkspaceChanges,
 	snapshotDependency,
 	workspaceInputVersion,
@@ -765,9 +772,7 @@ export class LinuxProcessReuseBackend {
 			...options,
 		};
 		configureNativeFilesystem(this.options.heldExecBinary);
-		this.store = new ProvenanceCertificateStore(options.storeRoot, {
-			...options.store,
-		});
+		this.store = new ProvenanceCertificateStore(options.storeRoot, options.store);
 		this.replayWorkspace = new WorkspaceSandboxService(this.store);
 		this.planner = new ProcessReusePlanner({ store: this.store });
 		this.handoffs = new ProcessHandoffRegistry(
@@ -3425,10 +3430,7 @@ async function captureDependencies(
 	const hostInput = sharedWalk(
 		async (target: string): Promise<Awaited<ReturnType<typeof hostEntry>> | undefined> => {
 			if (speculativeConfig().processReuse.volatilePaths.some((root) => pathContains(root, target))) return;
-			const captured = await hostEntry(target).catch((error) => {
-				if (!missing(error)) throw error;
-				return undefined;
-			});
+			const captured = await hostEntry(target).catch(ignoreMissing);
 			if (
 				!captured ||
 				(captured.info.uid !== 0n && captured.info.uid !== BigInt(process.getuid?.() ?? -1)) ||
@@ -3670,9 +3672,7 @@ async function captureDependencies(
 					: undefined;
 			const captured =
 				!physical && !speculativeConfig().processReuse.volatilePaths.some((root) => pathContains(root, next))
-					? await hostEntry(next).catch((error) => {
-							if (!missing(error)) throw error;
-						})
+					? await hostEntry(next).catch(ignoreMissing)
 					: undefined;
 			let entry;
 			if (physical) {
@@ -4057,16 +4057,13 @@ async function replayFilesystemEffects(
 			});
 		}
 		// Inside a speculative session, what lies outside the workspace belongs to its private branch until adoption.
-		const external = privateStorage
-			? changes.filter((change) => !pathContains(workspaceRoot, change.target))
-			: [];
-		if (external.length) await privateReplay(privateStorage!, external);
-		if (changes.length > external.length)
+		const { private: external, workspace = [] } = Object.groupBy(changes, (change) =>
+			privateStorage && !pathContains(workspaceRoot, change.target) ? "private" : "workspace",
+		);
+		if (external) await privateReplay(owner, privateStorage!, external, privateReads!, contents, workspace);
+		else if (workspace.length)
 			await owner.commitDelta(
-				{
-					output: { result: { content: [], details: {} }, isError: false },
-					changes: changes.filter((change) => !external.includes(change)),
-				},
+				{ changes: workspace, output: { result: { content: [], details: {} }, isError: false } },
 				privateReads,
 			);
 	} finally {
@@ -4075,79 +4072,89 @@ async function replayFilesystemEffects(
 }
 /** Apply changes in a session's private branch as its sandboxes would have: over the merged view's state, into its upper
  * directory, a removal of a host object as a whiteout its sandboxes read. */
-async function privateReplay(storage: string, changes: readonly SandboxWorkspaceChange[]) {
+export async function privateReplay(
+	owner: Pick<WorkspaceSandboxService, "commitDelta">,
+	storage: string,
+	changes: readonly SandboxWorkspaceChange[],
+	view: FilesystemReadView,
+	contents?: ContentChunkPool,
+	workspace: readonly SandboxWorkspaceChange[] = [],
+) {
 	const { upper, log, deleted } = await privateBranch(storage);
-	const merged = async (target: string) =>
-		(await lstat(path.join(upper, target)).then(
-			() => path.join(upper, target),
-			() => undefined,
-		)) ?? (deleted(target) ? undefined : target);
+	const physical = (target: string) => path.join(upper, target);
+	const projected = [...workspace];
+	const seeds = new Map<string, NonNullable<Awaited<ReturnType<typeof readRegularState>>>>();
+	const whiteouts: string[] = [];
+	await mkdir(upper, { recursive: true });
 	for (const change of changes) {
-		const current = await merged(change.target);
-		const captured =
-			current && change.kind !== "directory" ? await captureStableFile(current, undefined, false) : undefined;
-		if (
-			captured &&
-			change.kind !== "directory" &&
-			(!change.before ||
-				captured.bytesRead !== change.before.byteLength ||
-				`sha256:${captured.hash}` !== contentDigest(change.before))
-		)
-			throw new Error(`resource changed before replay: ${change.target}`);
-		const state =
-			current === undefined
-				? undefined
-				: change.kind === "directory"
-					? await readSandboxDirectoryState(current)
-					: {
-							content: change.before!,
-							mode: Number(captured!.stat.mode) & 0o7777,
-						};
-		if (
-			!sameSandboxState(
-				state,
-				change.kind === "directory"
-					? change.before
-					: change.before && {
-							content: change.before,
-							mode: change.beforeMode!,
-						},
-			)
-		) {
-			throw new Error(`resource changed before replay: ${change.target}`);
-		}
-	}
-	for (const change of changes) {
-		const copy = path.join(upper, change.target);
-		if (change.kind === "directory" ? change.after : change.after !== undefined) {
-			await mkdir(path.dirname(copy), { recursive: true });
-			if (change.kind === "directory") await mkdir(copy, { recursive: true });
-			else {
-				const handle = await open(copy, "w");
-				try {
-					await writeContent(handle, change.after!);
-				} finally {
-					await handle.close();
-				}
-				await chmod(copy, change.afterMode ?? 0o644);
-				await restoreModifiedTimes([[copy, change.afterModified]]);
+		const target = physical(change.target);
+		await assertNoSymlinkPath(upper, target);
+		const own = await lstat(target).catch(ignoreMissing);
+		const lower = !deleted(change.target);
+		const source = own ? target : lower ? change.target : undefined;
+		const address = { root: upper, target, resource: path.relative(upper, target) };
+		if (change.kind === "directory") {
+			const state = source ? await readSandboxDirectoryState(source, undefined, view) : undefined;
+			if (!matchesSandboxBaseline(change, state))
+				throw new Error(`resource changed before replay: ${change.target}`);
+			if (own || change.after)
+				projected.push({ ...change, ...address, before: own ? change.before : undefined });
+		} else {
+			const state = source
+				? await readRegularState(source, change.before?.byteLength, view, contents)
+				: undefined;
+			if (!matchesSandboxBaseline(change, state))
+				throw new Error(`resource changed before replay: ${change.target}`);
+			if (!own && state) {
+				const names = change.aliases ?? [change.target];
+				if (change.aliases) await assertFileAliases(change.root, change.target, names, state.identity, view);
+				for (const name of names) seeds.set(physical(name), state);
 			}
-			continue;
+			projected.push({ ...change, ...address, ...projectFileMutation(change, physical) });
 		}
-		await rm(copy, { recursive: true, force: true });
-		if (
-			await lstat(change.target).then(
-				() => true,
-				() => false,
-			)
-		) {
-			await mkdir(path.dirname(log), { recursive: true });
-			await writeFile(
-				log,
-				`${change.target.slice(1).replace(/[\\\n\r]/g, (char) => (char === "\n" ? "\\n" : char === "\r" ? "\\r" : "\\\\"))}\n`,
-				{ flag: "a" },
+		if (!change.after && lower && (await lstat(change.target).catch(ignoreMissing)))
+			whiteouts.push(
+				change.target
+					.slice(1)
+					.replace(/[\\\n\r]/g, (char) => ({ "\n": "\\n", "\r": "\\r", "\\": "\\\\" })[char]!),
 			);
+	}
+	const seeded: string[] = [];
+	const parents: string[] = [];
+	let committed = false;
+	try {
+		const objects = new Map<string, string>();
+		for (const [target, state] of seeds) {
+			await assertNoSymlinkPath(upper, target);
+			await createParentDirectories(upper, target, view, parents);
+			const key = `${state.identity!.dev}:${state.identity!.ino}`;
+			const anchor = objects.get(key);
+			if (anchor) {
+				await link(anchor, target);
+				seeded.push(target);
+			} else {
+				await using handle = await open(target, "wx", state.mode);
+				seeded.push(target);
+				await writeContent(handle, state.content);
+				await handle.chmod(state.mode);
+				objects.set(key, target);
+			}
 		}
+		if (projected.length)
+			await owner.commitDelta(
+				{ changes: projected, output: { result: { content: [], details: {} }, isError: false } },
+				view,
+			);
+		committed = true;
+		if (whiteouts.length) await writeFile(log, whiteouts.join("\n") + "\n", { flag: "a" });
+	} catch (error) {
+		if (committed)
+			throw new EffectCommitFailure("poisoned", "private whiteouts could not be published", error);
+		if (!isPoisonedEffectCommit(error)) {
+			for (const target of seeded.reverse()) await rm(target, { force: true });
+			for (const target of parents.reverse()) await rmdir(target);
+		}
+		throw error;
 	}
 }
 function directoryState({ entriesDigest, mode, uid, gid }: SandboxDirectoryState) {
@@ -4346,7 +4353,7 @@ const privateUpper = (session: ActiveSession) => path.join(session.processRoot, 
 async function privateBranch(storage: string) {
 	const upper = path.join(storage, "writes", "upper");
 	const log = path.join(storage, "writes", "deleted.log");
-	const deletions = (await readFile(log, "utf8").catch(() => ""))
+	const deletions = ((await readFile(log, "utf8").catch(ignoreMissing)) ?? "")
 		.split("\n")
 		.filter(Boolean)
 		.map(
@@ -4507,118 +4514,89 @@ async function privateCommits(
 	prestate?: PrivatePrestate,
 ) {
 	const { upper, deleted } = await privateBranch(path.join(session.processRoot, "private"));
-	const stat = (target: string) => lstat(target, { bigint: true }).catch(() => undefined);
-	const changes: SandboxWorkspaceChange[] = [];
+	const after = await session.privateStructure.captureVersions();
+	const entries = new Map(after.snapshot.entries);
+	const deltas: WorkspaceRegularDelta[] = [];
 	const before = new Map<string, DynamicDependency | undefined>();
-	for (const target of new Set(
+	const targets = new Set(
 		owned.flatMap((writer) => writer.external ?? []).map((name) => path.posix.resolve(name)),
-	)) {
+	);
+	for (const target of targets) {
 		if (speculativeConfig().processReuse.stableDevices.includes(target)) continue;
-		const copy = path.join(upper, target);
-		const [own, native] = await Promise.all([stat(copy), stat(target)]);
-		const prior = privateEntry(prestate, target)?.captured.info;
-		const initial = prior ?? (prestate?.deleted(target) ? undefined : native);
+		const relative = target.slice(1);
+		const own = after.entries.get(relative);
+		const prior = privateEntry(prestate, target);
+		const initial =
+			prior?.captured ??
+			(prestate?.deleted(target)
+				? undefined
+				: await captureFilesystemEntry(target, "directory").catch(ignoreMissing));
 		before.set(target, undefined);
 		if (
-			(!prior && native && Number(native.ctimeMs) > since) ||
-			[own, initial].some((info) => info && !info.isFile() && !info.isDirectory()) ||
-			(prior?.isFile() && !privateFile(prestate, target))
+			(!prior && initial && Number(initial.info.ctimeMs) > since) ||
+			[own?.captured, initial].some((entry) => entry && !entry.info.isFile() && !entry.info.isDirectory())
 		)
 			continue;
-		const file = (at: string, info?: BigIntStats) =>
-			info?.isFile()
-				? captureFileContent(
-						at,
+		const beforeEntry = prior?.entry ?? (initial && captureWorkspaceStructureEntry(initial));
+		const beforeFile =
+			privateFile(prestate, target) ??
+			(!prior && initial?.info.isFile()
+				? await captureFileContent(
+						target,
 						speculativeConfig().processReuse.maxCaptureBytes,
 						session.workspace.contents,
-						{ stat: info },
+						{ stat: initial.info },
 					)
-				: undefined;
-		const [afterFile, beforeFile] = await Promise.all([
-			file(copy, own),
-			privateFile(prestate, target) ?? file(target, initial),
-		]);
-		const entry = prestate?.versions?.snapshot.entries.get(target.slice(1));
-		let beforeDirectory;
-		if (initial?.isDirectory()) {
-			if (prior) {
-				if (entry?.kind === "directory") {
-					beforeDirectory = directoryState(entry);
-				} else {
-					beforeDirectory = undefined;
-				}
-			} else {
-				beforeDirectory = await readSandboxDirectoryState(target);
-			}
-		} else {
-			beforeDirectory = undefined;
-		}
+				: undefined);
+		const afterFile = after.files.get(relative);
+		if ((initial?.info.isFile() && !beforeFile) || (own?.captured.info.isFile() && !afterFile)) continue;
 		before.set(
 			target,
-			beforeFile
-				? {
-						kind: "file",
-						path: target,
-						role: "input",
-						contentDigest: `sha256:${beforeFile.hash}`,
-						metadataDigest: filesystemMetadataDigest(initial!),
-					}
-				: beforeDirectory
-					? {
-							kind: "directory",
-							path: target,
-							entriesDigest: beforeDirectory.entriesDigest,
-							metadataDigest: filesystemMetadataDigest(initial!),
-						}
-					: { kind: "absence", path: target },
+			snapshotDependency(
+				target,
+				beforeEntry?.kind === "file" ? { ...beforeEntry, digest: `sha256:${beforeFile!.hash}` } : beforeEntry,
+				undefined,
+			),
 		);
 		if (
 			(!own && !deleted(target)) ||
-			(own?.isDirectory() && initial?.isDirectory()) ||
+			(own?.entry.kind === "directory" && beforeEntry?.kind === "directory") ||
 			(afterFile &&
 				beforeFile &&
 				afterFile.hash === beforeFile.hash &&
-				own!.mode === initial!.mode &&
-				own!.mtimeNs === initial!.mtimeNs)
+				own!.captured.info.mode === initial!.info.mode &&
+				own!.captured.info.mtimeNs === initial!.info.mtimeNs)
 		)
 			continue;
-		const root = await hostRoot(target);
-		const resource = slash(path.relative(root, target));
-		changes.push(
-			own?.isDirectory() || initial?.isDirectory()
-				? {
-						kind: "directory",
-						root,
-						target,
-						resource,
-						before: beforeDirectory,
-						...(own
-							? {
-									operation: "mkdir" as const,
-									after: (await readSandboxDirectoryState(copy))!,
-								}
-							: {}),
-					}
-				: {
-						root,
-						target,
-						resource,
-						...(beforeFile
-							? {
-									before: beforeFile.content!,
-									beforeMode: Number(initial!.mode) & 0o7777,
-								}
-							: {}),
-						...(afterFile
-							? {
-									after: afterFile.content!,
-									afterMode: Number(own!.mode) & 0o7777,
-									afterModified: String(own!.mtimeNs),
-								}
-							: {}),
-					},
-		);
+		if (beforeEntry) entries.set(relative, beforeEntry);
+		else entries.delete(relative);
+		if (own?.entry.kind !== "directory" && beforeEntry?.kind !== "directory")
+			deltas.push({
+				relativePath: relative,
+				before: beforeFile?.content,
+				beforeMode: beforeEntry?.kind === "file" ? beforeEntry.mode : undefined,
+				after: afterFile?.content,
+				afterMode: own?.entry.kind === "file" ? own.entry.mode : undefined,
+			});
 	}
+	const diff = diffWorkspaceStructures(
+		{ ...after.snapshot, entries },
+		after.snapshot,
+		deltas,
+		new ExecutionPathProjection({ sourceRoot: "/", workspaceRoot: upper }),
+	);
+	const changes = diff.complete
+		? await Promise.all(
+				sandboxWorkspaceChanges("/", diff).map(async (change): Promise<SandboxWorkspaceChange> => {
+					const root = await hostRoot(change.target);
+					const address = { root, resource: slash(path.relative(root, change.target)) };
+					if (change.kind === "directory" && change.after)
+						return { ...change, ...address, operation: "mkdir" };
+					return { ...change, ...address };
+				}),
+			)
+		: [];
+
 	if (prestate)
 		for (const [target, dependencies] of await privateInputImages(
 			session,
@@ -4637,7 +4615,7 @@ async function privateCommits(
 		(await privateInterference(session, new Set(before.keys()), prestate.startedAt, owned))
 	)
 		for (const target of before.keys()) before.set(target, undefined);
-	return { changes, before, complete: [...before.values()].every(Boolean) };
+	return { changes, before, complete: diff.complete && [...before.values()].every(Boolean) };
 }
 /** The entry is flushed before a syscall runs; a partial entry seen at capture start stays unsafe after completion. */
 async function privateInterference(
@@ -4970,19 +4948,13 @@ async function captureActorDependencies(
 		let prefix = path.parse(input.path).root;
 		for (const segment of input.path.slice(prefix.length).split(path.sep).filter(Boolean)) {
 			prefix = path.join(prefix, segment);
-			const info = await view.stat(prefix, false).catch((error) => {
-				if (!missing(error)) throw error;
-				return undefined;
-			});
+			const info = await view.stat(prefix, false).catch(ignoreMissing);
 			if (!info) break;
 			if (info.isSymbolicLink()) add(await captureSymlinkDependency(prefix, prefix, view));
 		}
 		const info = await view
 			.stat(input.path, input.role === "metadata" ? input.followSymlinks : true)
-			.catch((error) => {
-				if (!missing(error)) throw error;
-				return undefined;
-			});
+			.catch(ignoreMissing);
 		if (!info) {
 			const absence = await captureAbsenceDependency(input.path, input.path, false, [], undefined, view);
 			if (!absence) throw new Error(`actor_absence_changed:${input.path}`);

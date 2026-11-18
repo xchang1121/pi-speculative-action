@@ -18,6 +18,9 @@ export function hasErrorCode(error: unknown, code: string): boolean {
 export function isMissing(error: unknown): boolean {
 	return hasErrorCode(error, "ENOENT");
 }
+export function ignoreMissing(error: unknown): undefined {
+	if (!isMissing(error)) throw error;
+}
 /** Stable dependency-first traversal. Missing vertices and cycles reject the whole graph. */
 export function dependencyOrder<Node>(
 	roots: Iterable<Node>,
@@ -188,6 +191,11 @@ export function stableEqual(left: unknown, right: unknown): boolean {
 	if (left === right) return true;
 	if (!isObject(left) || !isObject(right)) return false;
 	return equalObject(left, right);
+}
+export function deepFreeze<Value>(value: Value): Value {
+	if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+	for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+	return Object.freeze(value);
 }
 const immutableSnapshots = new WeakSet<object>();
 /** Only owned, lossless data trees can carry an immutable execution identity. */

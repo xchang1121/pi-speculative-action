@@ -17,23 +17,21 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import os from "node:os";
 import { serialize } from "node:v8";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Worker } from "node:worker_threads";
-import type { ActionProjectionRule } from "./action-semantics.ts";
+
 import {
 	BASH_TIMEOUT_ACTION_KEY_PROJECTOR,
 	GREP_LITERAL_ACTION_KEY_PROJECTOR,
 	grepLiteralMatches,
 	PI_ACTION_SEMANTICS,
-	type ActionSemanticsDefinition,
+	resolvePiToolPath,
+	type ActionProjectionRule,
 } from "./action-semantics.ts";
 import { bindResourceOperation } from "./agent-execution-world.ts";
 import { speculativeConfig } from "./config-schema.ts";
@@ -44,13 +42,36 @@ import {
 	type ToolSettlement,
 } from "./execution-world.ts";
 import { captureStableFile } from "./filesystem-evidence.ts";
-import { asRecord, isSafeCount, relativeFilesystemPath, resolveHostExecutable, slash } from "./primitives.ts";
+import {
+	asRecord,
+	execHostFile,
+	isRecord,
+	isSafeCount,
+	relativeFilesystemPath,
+	resolveHostExecutable,
+	slash,
+} from "./primitives.ts";
 import {
 	captureResourceVersion,
 	createSerializablePreparationBinding,
 	type ToolFilesystemOperations,
 } from "./resource-version.ts";
 import { SharedAbortScope } from "./runtime-lifecycle.ts";
+const requirePi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+const { Minimatch } = requirePi("minimatch") as {
+	Minimatch: new (
+		pattern: string,
+		options: object,
+	) => {
+		match(name: string, partial?: boolean): boolean;
+		globParts: string[][];
+	};
+};
+const ignore: (options: object) => import("ignore").Ignore = requirePi("ignore");
+function qualifiedPi(): boolean {
+	const { strictHostVersionCheck, hostVersions } = speculativeConfig().runtime;
+	return !strictHostVersionCheck || hostVersions.includes(VERSION);
+}
 export const PI_CLOSED_SEARCH_TOOLS: readonly string[] = ["find", "grep"];
 // Pi's read resolver/sniffer are private APIs. Other versions retain observation, not assumed authority.
 export const PI_OPERATION_TOOLS: Readonly<Record<"resources" | "workspace" | "process", readonly string[]>> =
@@ -96,131 +117,62 @@ export function resolvePiToolInvocation(
 	input: unknown,
 	options: PiToolInvocationOptions,
 ): ToolInvocation | undefined {
-	if (
-		speculativeConfig().runtime.strictHostVersionCheck &&
-		!speculativeConfig().runtime.hostVersions.includes(VERSION)
-	)
-		return;
+	if (!qualifiedPi()) return;
 	if ([...PI_OPERATION_TOOLS.resources, ...PI_OPERATION_TOOLS.workspace].includes(tool)) {
-		const cwd = options.cwd;
-		const autoResizeImages = options.autoResizeImages ?? true;
-		const modelSupportsImages = options.modelSupportsImages ?? true;
+		const { cwd, autoResizeImages = true, modelSupportsImages = true } = options;
 		const executor = "pi.filesystem.local";
 		const requested = tool === "read" ? asRecord(input)?.path : undefined;
-		const invocation: ToolInvocation = {
-			executor,
-			filesystemRoot: path.parse(cwd).root,
-			...(typeof requested === "string" ? { filesystemResources: readResourcePaths(requested, cwd) } : {}),
-			identity: {
-				executor,
-				cwd,
-				version: VERSION,
-				autoResizeImages,
-				modelSupportsImages,
-			},
-			filesystem: async (view, request) => {
-				const denied = (): never => {
-					throw new Error("Filesystem operation is not authorized by this execution world");
-				};
-				let scoped: ToolsOptions;
-				if (tool === "read") {
-					scoped = {
-						read: {
-							autoResizeImages,
-							operations: {
-								access: view.access,
-								readFile: view.readFile,
-								detectImageMimeType: async (target) => {
-									const mime = await import(
-										new URL("./utils/mime.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href
-									);
-									return mime.detectSupportedImageMimeType(
-										await view.readFile(target, speculativeConfig().search.imageSniffBytes),
-									);
-								},
-							},
-						},
-					};
-				} else {
-					if (tool === "ls") {
-						scoped = {
-							ls: {
-								operations: {
-									exists: view.exists ?? denied,
-									stat: view.stat ? (target) => view.stat!(target, "type", false) : denied,
-									readdir: view.readdir ?? denied,
-								},
-							},
-						};
-					} else {
-						if (tool === "write") {
-							scoped = {
-								write: {
-									operations: {
-										writeFile: view.writeFile ?? denied,
-										mkdir: view.mkdir ?? denied,
-									},
-								},
-							};
-						} else {
-							scoped = {
-								edit: {
-									operations: {
-										readFile: view.readFile,
-										access: (target) => view.access(target, true),
-										writeFile: view.writeFile ?? denied,
-									},
-								},
-							};
-						}
-					}
-				}
-				const factory = toolFactories[tool as PiToolName];
-				const definition = factory(cwd, scoped[tool as PiToolName] as never);
-				// The qualified stock read executor consults only model.input, never other context fields.
-				const context = {
-					model: { input: modelSupportsImages ? ["image"] : [] },
-				} as ExtensionContext;
-				// Stock cancellation can reject before its internal operation and image worker finish.
-				const result = await settleFilesystemOperation<ToolSettlement["result"]>(
-					view,
-					() =>
-						definition.execute(
-							request.callID,
-							(tool === "read" && typeof requested === "string"
-								? {
-										...(request.args as object),
-										path: readResourcePaths(requested, cwd)[0],
-									}
-								: request.args) as never,
-							undefined,
-							undefined,
-							context,
-						),
-					request.signal,
-				);
-				return { result, isError: false };
-			},
+		const filesystem: NonNullable<ToolInvocation["filesystem"]> = async (view, request) => {
+			const denied = (): never => {
+				throw new Error("Filesystem operation is not authorized by this execution world");
+			};
+			const operations = {
+				...view,
+				access: (target: string) => view.access(target, tool === "edit"),
+				exists: view.exists ?? denied,
+				stat: view.stat ? (target: string) => view.stat!(target, "type", false) : denied,
+				readdir: view.readdir ?? denied,
+				writeFile: view.writeFile ?? denied,
+				mkdir: view.mkdir ?? denied,
+				detectImageMimeType: async (target: string) => {
+					const mime = await import(
+						new URL("./utils/mime.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href
+					);
+					return mime.detectSupportedImageMimeType(
+						await view.readFile(target, speculativeConfig().search.imageSniffBytes),
+					);
+				},
+			};
+			const definition = toolFactories[tool as PiToolName](cwd, { autoResizeImages, operations } as never);
+			// The qualified stock read executor consults only model.input, never other context fields.
+			const context = {
+				model: { input: modelSupportsImages ? ["image"] : [] },
+			} as ExtensionContext;
+			const args =
+				tool === "read" && typeof requested === "string"
+					? { ...(request.args as object), path: resolvePiToolPath(requested, cwd) }
+					: request.args;
+			// Stock cancellation can reject before its internal operation and image worker finish.
+			const result = await settleFilesystemOperation<ToolSettlement["result"]>(
+				() => definition.execute(request.callID, args as never, undefined, undefined, context),
+				request.signal,
+			);
+			return { result, isError: false };
 		};
 		return {
-			...invocation,
+			executor,
+			identity: { executor, cwd, version: VERSION, autoResizeImages, modelSupportsImages },
+			...(typeof requested === "string" ? { filesystemResources: [resolvePiToolPath(requested, cwd)] } : {}),
 			...bindResourceOperation(
-				invocation.filesystem!,
-				invocation.filesystemRoot!,
+				filesystem,
+				path.parse(cwd).root,
 				undefined,
 				PI_ACTION_SEMANTICS.definition(tool)?.effect === "observation",
 			),
 		};
 	}
-	if (
-		!PI_OPERATION_TOOLS.process.includes(tool) ||
-		!input ||
-		typeof input !== "object" ||
-		Array.isArray(input)
-	)
-		return undefined;
-	const record = input as Record<string, unknown>;
-	if (typeof record.command !== "string") return undefined;
+	const record = asRecord(input);
+	if (!PI_OPERATION_TOOLS.process.includes(tool) || typeof record?.command !== "string") return;
 	const shell = getShellConfig(options.shellPath);
 	const executor = "pi.bash.local";
 	const shared = {
@@ -246,6 +198,7 @@ export function resolvePiToolInvocation(
 		},
 	};
 }
+
 /** Only a finished command projects: Pi reports a timeout or non-zero exit as an error, which no other timeout reproduces. */
 export const PI_BASH_TIMEOUT_PROJECTION_RULE: ActionProjectionRule<ToolSettlement> = {
 	...BASH_TIMEOUT_ACTION_KEY_PROJECTOR,
@@ -281,18 +234,8 @@ export const PI_GREP_LITERAL_PROJECTION_RULE: ActionProjectionRule<ToolSettlemen
 		}
 		// At its limit the Actor's own search stops early and says so.
 		if (kept.length >= Number(actor.input.limit)) return undefined;
-		return {
-			result: {
-				...output.result,
-				content: [
-					{
-						type: "text",
-						text: kept.length ? kept.join("\n") : "No matches found",
-					},
-				],
-			},
-			isError: false,
-		};
+		const text = kept.length ? kept.join("\n") : "No matches found";
+		return { ...output, result: { ...output.result, content: [{ type: "text", text }] } };
 	},
 };
 /** Pi's bash throws once a completed command exits non-zero, appending this status last (aborts and timeouts append others). */
@@ -305,1141 +248,494 @@ export function piToolErrorSettlement(tool: string, error: unknown): ToolSettlem
 		? toolErrorSettlement(error)
 		: { ...toolErrorSettlement(error), exitCode: Number(code) };
 }
-type FilesystemCall = {
-	workers: Promise<void>[];
-	exists?: ToolFilesystemOperations["exists"];
-	paths?: string[];
-	failure?: unknown;
-};
-const filesystemCalls = new AsyncLocalStorage<FilesystemCall>();
+const filesystemCalls = new AsyncLocalStorage<Promise<void>[]>();
 let filesystemExecutions = 0;
 const ownFilesystemWorker = (worker: Worker) => {
-	filesystemCalls
-		.getStore()
-		?.workers.push(new Promise<void>((resolve) => worker.once("exit", () => resolve())));
+	filesystemCalls.getStore()?.push(new Promise<void>((resolve) => worker.once("exit", () => resolve())));
 };
-function readResourcePaths(input: string, cwd: string): readonly string[] {
-	const requirePi = createRequire(import.meta.url);
-	const { resolvePath } = requirePi(
-		fileURLToPath(new URL("./utils/paths.js", import.meta.resolve("@earendil-works/pi-coding-agent"))),
-	);
-	return [
-		resolvePath(input, cwd, {
-			homeDir: os.homedir(),
-			normalizeUnicodeSpaces: true,
-			stripAtPrefix: true,
-		}),
-	];
-}
 /** Only the qualified stock filesystem contract runs here; unrelated Actor workers keep their owner. */
 async function settleFilesystemOperation<Result>(
-	view: ToolFilesystemOperations,
 	operation: () => Promise<Result>,
 	signal?: AbortSignal,
 ): Promise<Result> {
 	signal?.throwIfAborted();
 	const workers: Promise<void>[] = [];
-	const call: FilesystemCall = { workers, exists: view.exists };
 	if (filesystemExecutions++ === 0) process.on("worker", ownFilesystemWorker);
 	let result: Result;
 	try {
-		result = await filesystemCalls.run(call, operation);
+		result = await filesystemCalls.run(workers, operation);
 	} finally {
 		// Node queues its worker-created event on nextTick, even if the tool already resolved.
 		await new Promise<void>((resolve) => process.nextTick(resolve));
 		while (workers.length) await Promise.all(workers.splice(0));
 		if (--filesystemExecutions === 0) process.off("worker", ownFilesystemWorker);
-		// Stock pathExists catches access errors; an unproven observation must still reject the whole call.
-		if ("failure" in call) throw call.failure;
 	}
 	signal?.throwIfAborted();
 	return result;
 }
-const capturedSearchProfile = () =>
-	Object.freeze({
-		id: "pi.captured-search.explicit-v2",
+export async function createClosedSearchProfile(cwd: string) {
+	const profile = {
+		id: "pi.captured-search.explicit-v3",
 		pi: VERSION,
 		platform: process.platform,
-		find: {
-			platform: "linux",
-			nocase: false,
-			dot: true,
-			matchBase: true,
-			nocomment: true,
-			nonegate: true,
-			braceExpandMax: speculativeConfig().search.braceExpandMax,
-		},
-		grep: { flags: ["--no-config", "--sort=path", "--no-ignore-global"] },
-		limits: {
-			inputBytes: speculativeConfig().search.maxInputBytes,
-			entries: speculativeConfig().search.maxEntries,
-		},
-	});
-export async function createClosedSearchProfile(cwd: string) {
-	if (
-		speculativeConfig().runtime.strictHostVersionCheck &&
-		!speculativeConfig().runtime.hostVersions.includes(VERSION)
-	)
-		throw new Error(`Unqualified Pi version: ${VERSION}`);
-	const home = os.homedir();
-	const profile = capturedSearchProfile();
-	const { resolvePath } = await import(
-		new URL("./utils/paths.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href
-	);
+		limits: speculativeConfig().search,
+	};
+	const root = path.parse(cwd).root;
+	if (!qualifiedPi()) throw new Error(`Unqualified Pi version: ${VERSION}`);
 	const unavailable: string[] = [];
-	const grep = await prepareGrepEngine(home, profile.grep, (reason) => unavailable.push(String(reason)));
+	const engine = await prepareGrepEngine().catch((error) => {
+		unavailable.push(String(error));
+		return undefined;
+	});
 	const invocations = new Map<string, ToolInvocation>();
-	try {
-		for (const tool of PI_CLOSED_SEARCH_TOOLS) {
-			if (tool === "grep" && !grep) continue;
-			const semantics = await createClosedSearchSemantics(tool, cwd, home);
-			const execute = async (
-				request: Parameters<NonNullable<ToolInvocation["authoritative"]>>[0],
-				provided?: ToolFilesystemOperations,
-			): Promise<ToolSettlement> => {
-				const capture = provided
-					? undefined
-					: await captureResourceVersion(undefined, cwd, PI_ACTION_SEMANTICS, profile.limits.inputBytes);
-				const view = provided ?? capture!.view!;
-				try {
-					if (tool === "find") return await runCapturedFind(view, cwd, request.args, request.signal);
-					const engine = grep!;
-					const query = request.args as GrepInput;
-					const target = resolvePath(query.path || ".", cwd, {
-						homeDir: home,
-						normalizeUnicodeSpaces: true,
-						stripAtPrefix: true,
-					});
-					const build = async (inputs: ToolFilesystemOperations, signal: AbortSignal) => {
-						const root = await fs.mkdtemp(path.join(engine.root, "inputs-"));
-						const dispose = async () => {
-							assert.equal(path.dirname(root), engine.root);
-							await fs.rm(root, { recursive: true, force: true });
-						};
-						try {
-							const prepared = await prepareCapturedGrep(
-								inputs,
-								cwd,
-								root,
-								{ ...query, path: target },
-								signal,
-								(directory, args, stop, emit) => engine.execute("selection", directory, args, stop, emit),
-							);
-							return {
-								value: { root, ...prepared },
-								bytes: prepared.bytes,
-								dispose,
-							};
-						} catch (error) {
-							await dispose();
-							throw error;
-						}
-					};
-					const run = (prepared: PreparedGrep) =>
-						formatCapturedGrep(view, engine, prepared, { ...query, path: target }, request.signal);
-					if (view.prepare)
-						return await view.prepare(
-							engine,
-							JSON.stringify([target, query.glob]),
-							build,
-							run,
-							target,
-							request.signal,
-						);
-					const prepared = await build(view, request.signal);
-					try {
-						return await run(prepared.value);
-					} finally {
-						await prepared.dispose();
-					}
-				} finally {
-					await capture?.release();
-				}
-			};
-			invocations.set(
-				tool,
-				Object.freeze({
-					executor: profile.id,
-					identity: {
-						profile,
-						cwd,
-						home,
-						...(tool === "grep" ? { engine: grep!.identity } : {}),
-					},
-					semantics,
-					...bindResourceOperation(
-						(view, request) => execute(request, view),
-						path.parse(cwd).root,
-						(request) => execute(request),
-						true,
-					),
-				} satisfies ToolInvocation),
-			);
-		}
-		return {
-			profile,
-			unavailable,
-			invocations: invocations as ReadonlyMap<string, ToolInvocation>,
-			dispose: async () => {
-				await grep?.release();
-			},
+	for (const tool of PI_CLOSED_SEARCH_TOOLS) {
+		if (tool === "grep" && !engine) continue;
+		const semantics = PI_ACTION_SEMANTICS.definition(tool)!;
+		const execute = async (
+			request: Parameters<NonNullable<ToolInvocation["authoritative"]>>[0],
+			provided?: ToolFilesystemOperations,
+		): Promise<ToolSettlement> => {
+			const capture = provided
+				? undefined
+				: await captureResourceVersion(undefined, root, PI_ACTION_SEMANTICS, profile.limits.maxInputBytes);
+			const view = provided ?? capture!.view!;
+			try {
+				if (tool === "find") return await runCapturedFind(view, cwd, request.args, request.signal);
+				return await runCapturedGrep(view, cwd, request.args as GrepInput, request.signal, engine!);
+			} finally {
+				await capture?.release();
+			}
 		};
-	} catch (error) {
-		await grep?.release();
-		throw error;
+		invocations.set(tool, {
+			executor: profile.id,
+			identity: {
+				profile,
+				cwd,
+				home: os.homedir(),
+				...(tool === "grep" ? { engine: engine!.identity } : {}),
+			},
+			semantics: {
+				...semantics,
+				epoch: profile.id,
+				effect: "observation",
+				requirements: RESOURCE_OBSERVATION_EFFECTS,
+				resourceScope: "captured_inputs",
+				canonicalize: (input) => {
+					const action = semantics.canonicalize(input, cwd);
+					return action && { ...action, input: asRecord(input)! };
+				},
+			},
+			...bindResourceOperation(
+				(view, request) => execute(request, view),
+				root,
+				(request) => execute(request),
+				true,
+			),
+		});
 	}
+	return { profile, unavailable, invocations, dispose: async () => engine?.release() };
 }
+
+/** Select names exclusively through the captured view; ignored directories are never enumerated. */
+async function walkSearchInputs(
+	view: ToolFilesystemOperations,
+	cwd: string,
+	target: string,
+	pattern: string | undefined,
+	signal: AbortSignal,
+	engine?: Awaited<ReturnType<typeof prepareGrepEngine>>,
+	expression?: string,
+): Promise<string[]> {
+	const limits = speculativeConfig().search;
+	const grep = !!engine;
+	const original = target;
+	if (grep) {
+		const root = await Promise.resolve(view.stat!(target, "type", false)).catch(() => {
+			throw new Error(`Path not found: ${target}`);
+		});
+		if (root.isDirectory()) target = root.realPath!;
+		if (process.platform !== "win32") cwd = (await view.stat!(cwd, "type", false)).realPath!;
+	}
+	const options = {
+		dot: true,
+		matchBase: true,
+		nocomment: true,
+		nonegate: true,
+		platform: "linux" as const,
+		braceExpandMax: limits.braceExpandMax,
+	};
+	const negative = grep && pattern?.startsWith("!");
+	if (grep)
+		pattern = pattern
+			?.replace(/^(!?)\//u, "$1")
+			.replace(/(?<!\\)\{([^{}]*)\}/gu, (_, alternatives: string) => {
+				const parts = alternatives.split(/(?<!\\),/u).filter(Boolean);
+				return parts.length > 1 ? `{${parts.join(",")}}` : (parts[0] ?? "");
+			});
+	const directoryPattern = grep && pattern?.endsWith("/");
+	if (directoryPattern) pattern = pattern!.slice(0, -1);
+	const matcher = pattern ? new Minimatch(negative ? pattern.slice(1) : pattern, options) : undefined;
+	type Rule = { directory: string; rank: number; matcher: import("ignore").Ignore };
+	const layers = new Map<string, Rule[]>();
+	const selected: string[] = [];
+	let entries = 0;
+	let bytes = 0;
+	let nameBytes = 0;
+	const repositories = new Set<string>();
+	const text = async (file: string) => {
+		if (!(await view.exists!(file))) return undefined;
+		const content = await view.readFile(file);
+		assert.ok((bytes += content.length) <= limits.maxInputBytes, "search input byte budget");
+		return content.toString("utf8");
+	};
+	const rules = async (directory: string): Promise<Rule[]> => {
+		const cached = layers.get(directory);
+		if (cached) return cached;
+		const parent = path.dirname(directory);
+		let inherited = directory === parent || (!grep && directory === cwd) ? [] : await rules(parent);
+		let exclude = path.join(directory, ".git/info/exclude");
+		if (grep) {
+			const git = path.join(directory, ".git");
+			const hasGit = await view.exists!(git);
+			if (hasGit || (engine!.jj && (await view.exists!(path.join(directory, ".jj"))))) {
+				repositories.add(directory);
+				inherited = inherited.filter((rule) => rule.rank > 1);
+				if (hasGit && !(await view.stat!(git, "type", false)).isDirectory()) {
+					const pointer = (await text(git))?.split(/\r?\n/u)[0];
+					if (pointer?.startsWith("gitdir: ")) {
+						const gitdir = path.resolve(cwd, pointer.slice(8));
+						const common = (await text(path.join(gitdir, "commondir")))?.split(/\r?\n/u)[0];
+						if (common) exclude = path.resolve(common.startsWith(".") ? gitdir : cwd, common, "info/exclude");
+					}
+				}
+			} else if (repositories.has(parent)) repositories.add(directory);
+		}
+		const names = grep ? [exclude, ".gitignore", ".ignore", ".rgignore"] : [".gitignore"];
+		const local: Rule[] = [];
+		for (const [rank, name] of names.entries()) {
+			if (grep && rank < 2 && !repositories.has(directory)) continue;
+			const content = await text(path.resolve(directory, name));
+			if (content !== undefined) {
+				const matcher = ignore({ ignorecase: false }).add(content);
+				if (grep && relativeFilesystemPath(directory, target) !== undefined)
+					for (let name = target; name !== directory; name = path.dirname(name))
+						matcher.add("!" + slash(path.relative(directory, name)).replace(/[\\*?\[\]!# ]/gu, "\\$&") + "/");
+				local.push({ directory, rank, matcher });
+			}
+		}
+		const result = [...inherited, ...local].sort((a, b) => a.rank - b.rank);
+		layers.set(directory, result);
+		return result;
+	};
+	const walk = async (file: string): Promise<void> => {
+		signal.throwIfAborted();
+		assert.ok(entries++ < limits.maxEntries, "search entry budget");
+		if (grep) assert.ok(entries <= limits.maxDirectoryEntries, "metadata entry budget");
+		const stat = await view.stat!(file, "entry", false);
+		const root = file === target;
+		if (!root && (stat.type === "symlink" || stat.type === "special")) {
+			if (process.platform === "win32" && stat.type === "symlink")
+				await Promise.resolve(view.stat!(file, "type", false)).catch(async (error) => {
+					if (engine) await engine.execute(engine.root, ["--", expression!, "missing"], signal, file);
+					throw error;
+				});
+			return;
+		}
+		const directory = (stat.type === "symlink" ? await view.stat!(file, "type", false) : stat).isDirectory();
+		const relative = slash(path.relative(target, file));
+		const name = grep
+			? slash(path.relative(cwd, path.join(original, relative)))
+			: relative + (directory ? "/" : "");
+		const spellings = grep ? [name] : [name, `./${name}`, slash(file) + (directory ? "/" : "")];
+		const matches = (!directoryPattern || directory) && spellings.some((name) => matcher?.match(name));
+		let ignored = false;
+		if (!root) {
+			if ((directory && path.basename(file) === ".git") || (!grep && path.basename(file) === "node_modules"))
+				return;
+			for (const rule of await rules(path.dirname(file))) {
+				const result = rule.matcher.test(slash(path.relative(rule.directory, file)) + (directory ? "/" : ""));
+				if (result.ignored || result.unignored) ignored = result.ignored;
+			}
+			if (grep && matcher && matches) ignored = !!negative;
+			if (ignored) return;
+		}
+		if (directory) {
+			if (!grep && relative && matches) selected.push(file + path.sep);
+			if (
+				!grep &&
+				relative &&
+				matcher?.globParts.every((parts) => parts.length > 1) &&
+				!spellings.some((name) => matcher.match(name.replace(/\/$/u, ""), true))
+			)
+				return;
+			await rules(file);
+			for (const name of await view.readdir!(file)) {
+				assert.ok(path.basename(name) === name && name !== "." && name !== "..", "invalid directory entry");
+				await walk(path.join(file, name));
+			}
+		} else if (grep ? root || !matcher || negative || matches : matches) {
+			if (grep)
+				assert.ok(
+					(nameBytes += Buffer.byteLength(file) + 1) <= limits.maxResultBytes,
+					"selected name budget",
+				);
+			selected.push(file);
+		}
+	};
+	await walk(target);
+	return (grep ? selected.map((file) => path.join(original, path.relative(target, file))) : selected).sort(
+		(a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)),
+	);
+}
+
 async function runCapturedFind(
 	view: ToolFilesystemOperations,
-	root: string,
+	cwd: string,
 	args: unknown,
 	signal: AbortSignal,
 ): Promise<ToolSettlement> {
-	const requirePi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-	interface Matcher {
-		match(value: string, partial?: boolean): boolean;
-		globParts: readonly (readonly string[])[];
-	}
-	const { Minimatch } = requirePi("minimatch") as {
-		Minimatch: new (pattern: string, options: object) => Matcher;
-	};
-	const ignore = requirePi("ignore") as (options: object) => {
-		add(text: string): {
-			test(value: string): {
-				ignored: boolean;
-				unignored: boolean;
-			};
-		};
-	};
-	const namespace = path.posix;
-	const profile = capturedSearchProfile();
-	const input = new Map<string, unknown>();
-	const read = async (operation: string, target: string): Promise<unknown> => {
-		signal.throwIfAborted();
-		const key = JSON.stringify([operation, target]);
-		if (!input.has(key)) {
-			assert.ok(input.size < profile.limits.entries, "input entry budget");
-			input.set(key, await readClosedSearchInput(view, root, operation, target, profile.limits.inputBytes));
-		}
-		return input.get(key);
-	};
-	type IgnoreRule = {
-		directory: string;
-		matcher: ReturnType<ReturnType<typeof ignore>["add"]>;
-	};
-	const rules = new Map<string, IgnoreRule[]>();
-	const decisions = new Map<string, boolean>();
-	const layers = async (directory: string): Promise<IgnoreRule[]> => {
-		const cached = rules.get(directory);
-		if (cached) return cached;
-		const inherited = directory === "/workspace" ? [] : await layers(namespace.dirname(directory));
-		let text = "";
-		try {
-			text = Buffer.from(
-				(await read("readFile", namespace.join(directory, ".gitignore"))) as Uint8Array,
-			).toString("utf8");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		}
-		const selected = [...inherited, { directory, matcher: ignore({ ignorecase: false }).add(text) }];
-		rules.set(directory, selected);
-		return selected;
-	};
-	const ignored = async (target: string, directory: boolean): Promise<boolean> => {
-		if (target === "/workspace") return false;
-		const cached = decisions.get(target);
-		if (cached !== undefined) return cached;
-		const parent = namespace.dirname(target);
-		let excluded = await ignored(parent, true);
-		if (!excluded) {
-			for (const layer of await layers(parent)) {
-				const relative = namespace.relative(layer.directory, target) + (directory ? "/" : "");
-				const match = layer.matcher.test(relative);
-				if (match.ignored || match.unignored) excluded = match.ignored;
-			}
-		}
-		decisions.set(target, excluded);
-		return excluded;
-	};
-	const tool = createFindToolDefinition(root, {
+	const { execute } = createFindToolDefinition(cwd, {
 		operations: {
-			exists: async (target) => {
-				try {
-					await read("stat", (await read("resolve", target)) as string);
-					return true;
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-					throw error;
-				}
-			},
-			glob: async (pattern, cwd, options) => {
-				const base = (await read("resolve", cwd)) as string;
-				const matches: string[] = [];
-				const matcher = new Minimatch(pattern, profile.find);
-				const excluded = options.ignore.map((pattern) => new Minimatch(pattern, profile.find));
-				const walk = async (target: string): Promise<void> => {
-					const { directory } = (await read("stat", target)) as {
-						directory: boolean;
-					};
-					const relative = namespace.relative(base, target);
-					if (
-						(await ignored(target, directory)) ||
-						excluded.some((rule) => rule.match(target + (directory ? "/" : "")))
-					)
-						return;
-					const spellings = [relative, `./${relative}`, target];
-					if (relative && spellings.some((value) => matcher.match(value + (directory ? "/" : "")))) {
-						matches.push(
-							path.resolve(root, namespace.relative("/workspace", target)) + (directory ? path.sep : ""),
-						);
-					}
-					if (
-						directory &&
-						(!relative ||
-							matcher.globParts.some((parts) => parts.length === 1) ||
-							spellings.some((value) => matcher.match(value, true)))
-					) {
-						for (const name of (await read("readdir", target)) as string[])
-							await walk(namespace.join(target, name));
-					}
-				};
-				await walk(base);
-				return matches.sort().slice(0, options.limit);
-			},
+			exists: view.exists!,
+			glob: async (pattern, target, { limit }) =>
+				(await walkSearchInputs(view, cwd, target, pattern, signal)).slice(0, limit),
 		},
 	});
-	return {
-		result: await tool.execute("captured-find", args as never, signal, undefined, {} as ExtensionContext),
-		isError: false,
-	};
+	const result = await execute("captured-find", args as never, signal, undefined, {} as ExtensionContext);
+	return { result, isError: false };
 }
-async function formatCapturedGrep(
-	view: ToolFilesystemOperations,
-	engine: NonNullable<Awaited<ReturnType<typeof prepareGrepEngine>>>,
-	prepared: PreparedGrep,
-	query: GrepInput & {
-		path: string;
-	},
-	signal: AbortSignal,
-): Promise<ToolSettlement> {
-	type Match = {
-		path: {
-			text: string;
-		};
-		line_number: number;
-		lines: {
-			text?: string;
-		};
+
+async function prepareGrepEngine() {
+	const limits = speculativeConfig().search;
+	const { getToolPath } = await import(
+		new URL("./utils/tools-manager.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href
+	);
+	const selected: string | null = getToolPath("rg");
+	const name = process.platform === "win32" ? "rg.exe" : "rg";
+	const binary = await captureStableFile(
+		await resolveHostExecutable(
+			limits.executable || (selected && path.isAbsolute(selected) ? selected : undefined),
+			"rg",
+			[path.join(getAgentDir(), "bin", name)],
+			process.platform === "win32" ? [name] : [],
+		),
+		speculativeConfig().processReuse.privateFileBytes,
+		true,
+	);
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-captured-search-"));
+	const executable = path.join(root, name);
+	const probeRoot = path.join(root, "qualification");
+	const release = () => fs.rm(root, { recursive: true, force: true });
+	const environment = {
+		HOME: os.homedir(),
+		LC_ALL: "C",
+		...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
 	};
-	const matches: Match[] = [];
-	await matchCapturedGrep(view, engine, prepared, query, signal, ({ fd, data }) => {
-		if (fd !== 1) return;
-		for (const line of data.toString("utf8").split("\n")) {
+	const flags = [
+		"--no-config",
+		"--sort=path",
+		"--no-ignore",
+		"--json",
+		"--line-number",
+		"--color=never",
+		"--hidden",
+	];
+	const execute = async (cwd: string, args: string[], signal: AbortSignal, missing?: string) => {
+		const result = await execHostFile(executable, [...flags, ...args], {
+			cwd,
+			env: environment,
+			signal,
+			windowsHide: true,
+			encoding: "utf8",
+			maxBuffer: cwd === probeRoot ? limits.maxResultBytes : limits.maxInputBytes,
+		}).catch((error) => {
+			if (error.code === 1) return { stdout: "", stderr: "" };
+			if (error.stderr) {
+				const message = String(error.stderr).trim();
+				throw new Error(
+					missing
+						? message.replace(
+								/^rg: missing:(?: IO error for operation on missing:)?/u,
+								() => `rg: ${missing}:`,
+							)
+						: message,
+				);
+			}
+			throw error;
+		});
+		signal.throwIfAborted();
+		const matches = new Map<string, GrepMatch[]>();
+		for (const line of result.stdout.split("\n")) {
 			if (!line) continue;
-			const event = JSON.parse(line);
-			if (event.type === "match") matches.push(event.data);
+			const { type, data } = JSON.parse(line);
+			if (type !== "match") continue;
+			const key = path.basename(data.path.text);
+			if (!matches.has(key)) matches.set(key, []);
+			matches.get(key)!.push({ line_number: data.line_number, lines: data.lines });
 		}
-	});
-	if (!matches.length)
-		return {
-			result: {
-				content: [{ type: "text", text: "No matches found" }],
-				details: undefined,
-			},
-			isError: false,
+		return matches;
+	};
+	try {
+		await fs.writeFile(executable, binary.content!, { flag: "wx", mode: 0o500 });
+		await fs.mkdir(path.join(probeRoot, ".jj"), { recursive: true });
+		for (const file of ["probe", "ignored"])
+			await fs.writeFile(path.join(probeRoot, file), "capability-probe\n");
+		await fs.writeFile(path.join(probeRoot, ".gitignore"), "ignored\n");
+		const args = ["--ignore", "--no-ignore-parent", "--no-ignore-global", "--", "capability-probe", "."];
+		const probe = await execute(
+			probeRoot,
+			args,
+			AbortSignal.timeout(speculativeConfig().subcomputation.socketTimeoutMs),
+		);
+		assert.equal(probe.get("probe")?.[0]?.line_number, 1);
+		const jj = !probe.has("ignored");
+		await fs.rm(probeRoot, { recursive: true });
+		const identity = {
+			sha256: binary.hash,
+			platform: process.platform,
+			arch: process.arch,
+			environment,
+			flags,
 		};
-	const limit = Math.max(1, query.limit ?? speculativeConfig().search.grepLimit);
+		const matchesBinding = createSerializablePreparationBinding(
+			{ engine: identity, namespace: "pi.captured-grep", version: "3" },
+			acceptsGrepMatches,
+		);
+		return { root, identity, matchesBinding, execute, release, jj };
+	} catch (error) {
+		await release();
+		throw error;
+	}
+}
+
+type GrepInput = Parameters<ReturnType<typeof createGrepToolDefinition>["execute"]>[1];
+type GrepMatch = { line_number: number; lines: { text?: string; bytes?: string } };
+function acceptsGrepMatches(value: unknown): boolean {
+	return (
+		Array.isArray(value) &&
+		value.every(
+			(match) =>
+				isRecord(match) &&
+				isSafeCount(match.line_number, 1) &&
+				isRecord(match.lines) &&
+				(typeof match.lines.text === "string" || typeof match.lines.bytes === "string"),
+		)
+	);
+}
+
+async function runCapturedGrep(
+	view: ToolFilesystemOperations,
+	cwd: string,
+	query: GrepInput,
+	signal: AbortSignal,
+	engine: Awaited<ReturnType<typeof prepareGrepEngine>>,
+): Promise<ToolSettlement> {
+	const limits = speculativeConfig().search;
+	const target = resolvePiToolPath(query.path || ".", cwd);
+	const files = await walkSearchInputs(view, cwd, target, query.glob, signal, engine, query.pattern);
+	let pending: { source: string; inputs: ToolFilesystemOperations; signal: AbortSignal }[] = [];
+	let batch: Promise<GrepMatch[][]> | undefined;
+	const enqueue = (source: string, inputs: ToolFilesystemOperations, signal: AbortSignal) => {
+		const index = pending.push({ source, inputs, signal }) - 1;
+		batch ??= new Promise<void>(setImmediate).then(async () => {
+			const inputs = pending;
+			pending = [];
+			batch = undefined;
+			const root = await fs.mkdtemp(path.join(engine.root, "matches-"));
+			const scope = new SharedAbortScope();
+			const release = inputs.map((item) => scope.acquire(item.signal));
+			let bytes = 0;
+			try {
+				for (const [index, item] of inputs.entries()) {
+					scope.signal.throwIfAborted();
+					const content = item.source ? await item.inputs.readFile(item.source) : Buffer.alloc(0);
+					assert.ok((bytes += content.length) <= limits.maxInputBytes, "search input byte budget");
+					await fs.writeFile(path.join(root, String(index)), content);
+				}
+				const args = ["--", query.pattern, root];
+				if (query.ignoreCase) args.unshift("--ignore-case");
+				if (query.literal) args.unshift("--fixed-strings");
+				const byFile = await engine.execute(root, args, scope.signal);
+				return inputs.map((_, index) => byFile.get(String(index)) ?? []);
+			} finally {
+				for (const withdraw of release) withdraw();
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		});
+		return batch.then((results) => {
+			signal.throwIfAborted();
+			return results[index]!;
+		});
+	};
+	const jobs = (files.length ? files : [""]).map((source) => {
+		const build = async (inputs: ToolFilesystemOperations, signal: AbortSignal) => {
+			const value = await enqueue(source, inputs, signal);
+			return { value, bytes: serialize(value).byteLength, dispose: () => {} };
+		};
+		const key = JSON.stringify([source, query.pattern, !!query.ignoreCase, !!query.literal]);
+		return source && view.prepare
+			? view.prepare(engine.matchesBinding, key, build, async (value) => value, source, signal)
+			: build(view, signal).then((result) => result.value);
+	});
+	const matches = await Promise.all(jobs).finally(() => Promise.allSettled(jobs));
+	const limit = Math.max(1, query.limit ?? limits.grepLimit);
 	const context = Math.max(0, query.context ?? 0);
-	const directory = !!view.stat && (await view.stat(query.path, "type", false)).isDirectory();
-	const target = fileURLToPath(prepared.path);
+	const directory = (await view.stat!(target, "type", false)).isDirectory();
 	const output: string[] = [];
 	let linesTruncated = false;
-	for (const match of matches.slice(0, limit)) {
-		const file = prepared.files.find((file) => file.path === match.path.text)!;
-		const relative = path.relative(target, file.path);
-		const label =
-			directory && relative && !relative.startsWith("..") ? slash(relative) : path.basename(file.path);
-		if (!context && match.lines.text !== undefined) {
-			const line = truncateLine(
-				match.lines.text.replace(/\r\n/g, "\n").replace(/\r/g, "").replace(/\n$/, ""),
-			);
-			linesTruncated ||= line.wasTruncated;
-			output.push(`${label}:${match.line_number}: ${line.text}`);
-			continue;
-		}
-		const lines = (await view.readFile(file.source))
-			.toString("utf8")
-			.replace(/\r\n/g, "\n")
-			.replace(/\r/g, "\n")
-			.split("\n");
-		for (
-			let current = Math.max(1, match.line_number - context);
-			current <= Math.min(lines.length, match.line_number + context);
-			current++
-		) {
-			const line = truncateLine(lines[current - 1] ?? "", speculativeConfig().search.lineCharacters);
-			linesTruncated ||= line.wasTruncated;
-			output.push(
-				current === match.line_number
-					? `${label}:${current}: ${line.text}`
-					: `${label}-${current}- ${line.text}`,
-			);
+	let count = 0;
+	for (const [index, rows] of matches.entries()) {
+		if (count >= limit) break;
+		if (!rows.length) continue;
+		const file = files[index]!;
+		const relative = path.relative(target, file);
+		const label = directory && relative && !relative.startsWith("..") ? slash(relative) : path.basename(file);
+		let lines: string[] | undefined;
+		for (const match of rows.slice(0, limit - count)) {
+			count++;
+			const row = match.line_number;
+			const inline = context
+				? undefined
+				: match.lines.text?.replace(/\r\n/g, "\n").replace(/\r/g, "").replace(/\n$/, "");
+			if (inline === undefined)
+				lines ??= (await view.readFile(file)).toString("utf8").replace(/\r\n?/g, "\n").split("\n");
+			for (let i = Math.max(1, row - context); i <= Math.min(lines?.length ?? row, row + context); i++) {
+				const line = truncateLine(
+					inline ?? lines![i - 1] ?? "",
+					inline === undefined ? limits.lineCharacters : undefined,
+				);
+				linesTruncated ||= line.wasTruncated;
+				const delimiter = i === row ? ":" : "-";
+				output.push(`${label}${delimiter}${i}${delimiter} ${line.text}`);
+			}
 		}
 	}
 	const truncation = truncateHead(output.join("\n"), {
 		maxLines: Number.MAX_SAFE_INTEGER,
-		maxBytes: speculativeConfig().search.displayBytes,
+		maxBytes: limits.displayBytes,
 	});
 	const details: Record<string, unknown> = {};
 	const notices: string[] = [];
-	if (matches.length >= limit) {
+	if (count >= limit) {
 		details.matchLimitReached = limit;
 		notices.push(`${limit} matches limit reached. Use limit=${limit * 2} for more, or refine pattern`);
 	}
 	if (truncation.truncated) {
 		details.truncation = truncation;
-		notices.push(`${formatSize(speculativeConfig().search.displayBytes)} limit reached`);
+		notices.push(`${formatSize(limits.displayBytes)} limit reached`);
 	}
 	if (linesTruncated) {
 		details.linesTruncated = true;
-		notices.push(
-			`Some lines truncated to ${speculativeConfig().search.lineCharacters} chars. Use read tool to see full lines`,
-		);
+		notices.push(`Some lines truncated to ${limits.lineCharacters} chars. Use read tool to see full lines`);
 	}
-	const text = truncation.content + (notices.length ? `\n\n[${notices.join(". ")}]` : "");
+	const text = count
+		? truncation.content + (notices.length ? `\n\n[${notices.join(". ")}]` : "")
+		: "No matches found";
 	return {
 		result: {
 			content: [{ type: "text", text }],
 			details: Object.keys(details).length ? details : undefined,
 		},
 		isError: false,
-	};
-}
-/** Pin only an already-installed qualified rg; failure leaves the independent find executor available. */
-async function prepareGrepEngine(
-	home: string,
-	profile: {
-		readonly flags: readonly string[];
-	},
-	unavailable: (error: unknown) => void,
-) {
-	let root: string | undefined;
-	try {
-		const { getToolPath } = await import(
-			new URL("./utils/tools-manager.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href
-		);
-		const selected: string | null = getToolPath("rg");
-		const existing = path.join(getAgentDir(), "bin", process.platform === "win32" ? "rg.exe" : "rg");
-		const binary = await captureStableFile(
-			await resolveHostExecutable(
-				speculativeConfig().search.executable ||
-					(selected && path.isAbsolute(selected) ? selected : undefined),
-				"rg",
-				[existing],
-				process.platform === "win32" ? ["rg.exe"] : [],
-			),
-			speculativeConfig().processReuse.privateFileBytes,
-			true,
-		);
-		root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-captured-search-"));
-		const owned = root;
-		const executable = path.join(owned, process.platform === "win32" ? "rg.exe" : "rg");
-		await fs.writeFile(executable, binary.content!, {
-			flag: "wx",
-			mode: 0o500,
-		});
-		const environment = Object.freeze({
-			HOME: home,
-			LC_ALL: "C",
-			...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
-		});
-		const flags = Object.freeze([...profile.flags]);
-		const version: Buffer[] = [];
-		const signal = AbortSignal.timeout(speculativeConfig().subcomputation.socketTimeoutMs);
-		let bytes = 0;
-		await fs.writeFile(path.join(owned, "probe.txt"), "capability-probe\n");
-		const result = await runCapturedSearchProcess(
-			executable,
-			[...flags, "--json", "--fixed-strings", "capability-probe", "probe.txt"],
-			owned,
-			environment,
-			signal,
-			({ data }) => {
-				assert.ok((bytes += data.length) <= speculativeConfig().search.maxResultBytes, "rg probe budget");
-				version.push(data);
-			},
-		);
-		signal.throwIfAborted();
-		assert.equal(result.code, 0);
-		assert.ok(
-			Buffer.concat(version)
-				.toString()
-				.split("\n")
-				.filter(Boolean)
-				.map((line) => JSON.parse(line))
-				.some((event) => event.type === "match" && event.data.line_number === 1),
-			"rg JSON capability",
-		);
-		await fs.rm(path.join(owned, "probe.txt"));
-		const identity = Object.freeze({
-			sha256: binary.hash,
-			platform: process.platform,
-			arch: process.arch,
-			environment,
-			flags,
-		});
-		const matchesBinding: object = createSerializablePreparationBinding(
-			{ engine: identity, namespace: "pi.captured-grep", version: "2" },
-			acceptsGrepMatches,
-		);
-		return {
-			root: owned,
-			identity,
-			matchesBinding,
-			execute: (
-				stage: "actor" | "selection" | "producer",
-				cwd: string,
-				args: readonly string[],
-				signal: AbortSignal,
-				emit: (output: SearchOutput) => void,
-			) =>
-				runCapturedSearchProcess(
-					executable,
-					[
-						...flags,
-						...(stage === "actor" ? [] : ["--no-ignore-parent"]),
-						...(stage === "producer" ? ["--no-ignore"] : []),
-						...args,
-					],
-					cwd,
-					environment,
-					signal,
-					emit,
-				),
-			release: async () => {
-				assert.equal(path.dirname(owned), path.resolve(os.tmpdir()));
-				await fs.rm(owned, { recursive: true, force: true });
-			},
-		};
-	} catch (error) {
-		unavailable(error);
-		if (root) {
-			assert.equal(path.dirname(root), path.resolve(os.tmpdir()));
-			await fs.rm(root, { recursive: true, force: true });
-		}
-		return undefined;
-	}
-}
-/** A borrowed native request settles only after process/stream closure, including cancellation or output failure. */
-export async function runCapturedSearchProcess(
-	executable: string,
-	args: readonly string[],
-	cwd: string,
-	environment: Readonly<Record<string, string>>,
-	signal: AbortSignal,
-	emit: (output: SearchOutput) => void,
-	onSpawn?: () => void,
-) {
-	signal.throwIfAborted();
-	const child = spawn(executable, args, {
-		cwd,
-		env: environment,
-		stdio: ["ignore", "pipe", "pipe"],
-		windowsHide: true,
-	});
-	return new Promise<{
-		code: number | null;
-		signal: NodeJS.Signals | null;
-	}>((resolve, reject) => {
-		let failure:
-			| {
-					reason: unknown;
-			  }
-			| undefined;
-		const stop = () => {
-			child.kill("SIGKILL");
-		};
-		signal.addEventListener("abort", stop, { once: true });
-		if (signal.aborted) stop();
-		if (onSpawn) child.once("spawn", onSpawn);
-		for (const [fd, output] of [
-			[1, child.stdout],
-			[2, child.stderr],
-		] as const)
-			output.on("data", (data: Buffer) => {
-				if (!failure)
-					try {
-						emit({ fd, data });
-					} catch (error) {
-						failure = { reason: error };
-						stop();
-					}
-			});
-		child.once("error", (error) => {
-			failure ??= { reason: error };
-		});
-		child.once("close", (code, signalValue) => {
-			signal.removeEventListener("abort", stop);
-			if (failure) reject(failure.reason);
-			else resolve({ code, signal: signalValue });
-		});
-	});
-}
-/** Index paths with the bound resolver; replay the exact prepared arguments, never a second normalization. */
-export async function createClosedSearchSemantics(
-	tool: string,
-	cwd: string,
-	homeDir: string,
-): Promise<ActionSemanticsDefinition> {
-	assert.ok(tool === "find" || tool === "grep");
-	const profile = capturedSearchProfile();
-	const { resolvePath } = await import(
-		new URL("./utils/paths.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href
-	);
-	return Object.freeze({
-		...PI_ACTION_SEMANTICS.definition(tool)!,
-		epoch: profile.id,
-		effect: "observation",
-		requirements: RESOURCE_OBSERVATION_EFFECTS,
-		resourceScope: "captured_inputs",
-		canonicalize: (input: unknown) => {
-			const record = asRecord(input);
-			if (
-				!record ||
-				typeof record.pattern !== "string" ||
-				(record.path !== undefined && typeof record.path !== "string")
-			)
-				return undefined;
-			const target = resolvePath(record.path || ".", cwd, {
-				homeDir,
-				normalizeUnicodeSpaces: true,
-				stripAtPrefix: true,
-			});
-			const relative = relativeFilesystemPath(cwd, target);
-			return relative === undefined ? undefined : { input: record, resources: [slash(relative || ".")] };
-		},
-	});
-}
-/** Translate a closed namespace using only captured positive/negative evidence, never ambient host fs. */
-export async function readClosedSearchInput(
-	source: ToolFilesystemOperations,
-	root: string,
-	operation: string,
-	target: string,
-	maxBytes: number,
-): Promise<unknown> {
-	const fail = (code: string): never => {
-		throw Object.assign(new Error(`${code}: ${target}`), { code });
-	};
-	if (operation === "resolve") {
-		const relative = relativeFilesystemPath(root, target);
-		return relative === undefined ? fail("ENOENT") : path.posix.join("/workspace", slash(relative));
-	}
-	assert.ok(
-		source.stat &&
-			source.readdir &&
-			["stat", "readdir", "readFile"].includes(operation) &&
-			path.posix.isAbsolute(target),
-		"input operation denied",
-	);
-	const normalized = path.posix.normalize(target);
-	if (normalized === "/")
-		return operation === "stat"
-			? { directory: true }
-			: operation === "readdir"
-				? ["workspace"]
-				: fail("EISDIR");
-	const relative = path.posix.relative("/workspace", normalized);
-	if (relative === ".." || relative.startsWith("../")) return fail("ENOENT");
-	let physical = root;
-	for (const segment of relative ? relative.split("/") : []) {
-		if (!(await source.stat(physical, "type", false)).isDirectory()) return fail("ENOTDIR");
-		if (!(await source.readdir(physical)).includes(segment)) return fail("ENOENT");
-		physical = path.join(physical, segment);
-	}
-	const stat = await source.stat(physical, "type", operation === "readFile");
-	const directory = stat.isDirectory();
-	if (operation === "stat") return { directory };
-	if (operation === "readdir") return directory ? source.readdir(physical) : fail("ENOTDIR");
-	if (directory) return fail("EISDIR");
-	// A special inode's size does not bound the bytes readable from it.
-	assert.ok(
-		(stat.type === undefined || stat.type === "file") && isSafeCount(stat.size),
-		"file size is not proven by retained content",
-	);
-	assert.ok(stat.size! <= maxBytes, "input byte budget");
-	return source.readFile(physical);
-}
-type GrepInput = Parameters<ReturnType<typeof createGrepToolDefinition>["execute"]>[1];
-type SearchOutput = {
-	readonly fd: 1 | 2;
-	readonly data: Buffer;
-};
-type SearchSelection = (
-	cwd: string,
-	args: readonly string[],
-	signal: AbortSignal,
-	emit: (output: SearchOutput) => void,
-) => Promise<{
-	readonly code: number | null;
-}>;
-type PreparedGrep = {
-	readonly root: string;
-	readonly cwd: string;
-	readonly path: string;
-	readonly files: readonly {
-		readonly source: string;
-		readonly path: string;
-	}[];
-};
-function acceptsGrepMatches(value: unknown): boolean {
-	return (
-		Array.isArray(value) &&
-		value.every(
-			(match) =>
-				match &&
-				typeof match === "object" &&
-				Object.keys(match).length === 2 &&
-				Number.isSafeInteger(match.line_number) &&
-				match.line_number > 0 &&
-				match.lines &&
-				typeof match.lines === "object" &&
-				Object.keys(match.lines).length === 1 &&
-				((typeof match.lines.text === "string" && match.lines.bytes === undefined) ||
-					(typeof match.lines.bytes === "string" && match.lines.text === undefined)),
-		)
-	);
-}
-/** Match content once per explicit regex contract; Pi still owns limits, context and result formatting. */
-async function matchCapturedGrep(
-	view: ToolFilesystemOperations,
-	engine: NonNullable<Awaited<ReturnType<typeof prepareGrepEngine>>>,
-	prepared: PreparedGrep,
-	query: GrepInput,
-	signal: AbortSignal,
-	emit: (output: SearchOutput) => void,
-) {
-	type Match = {
-		readonly line_number: number;
-		readonly lines: {
-			readonly text?: string;
-			readonly bytes?: string;
-		};
-	};
-	let pending: {
-		readonly source: string;
-		readonly inputs: ToolFilesystemOperations;
-		readonly signal: AbortSignal;
-	}[] = [];
-	let queued: Promise<Match[][]> | undefined;
-	const enqueue = (source: string, inputs: ToolFilesystemOperations, signal: AbortSignal) => {
-		const index = pending.push({ source, inputs, signal }) - 1;
-		return (queued ??= new Promise<void>(setImmediate).then(async () => {
-			const batch = pending;
-			pending = [];
-			queued = undefined;
-			const scope = new SharedAbortScope();
-			const release = batch.filter((item) => !item.signal.aborted).map((item) => scope.acquire(item.signal));
-			const signal = scope.signal;
-			if (!release.length) scope.abort();
-			let root: string | undefined;
-			try {
-				signal.throwIfAborted();
-				root = await fs.mkdtemp(path.join(engine.root, "matches-"));
-				const files = new Map<string, Match[]>();
-				let inputBytes = 0;
-				let outputBytes = 0;
-				for (const [index, item] of batch.entries()) {
-					signal.throwIfAborted();
-					if (item.signal.aborted) continue;
-					const bytes = await item.inputs.readFile(item.source);
-					assert.ok(
-						(inputBytes += bytes.length) <= speculativeConfig().search.maxInputBytes,
-						"search input byte budget",
-					);
-					const file = path.join(root, String(index));
-					files.set(file, []);
-					await fs.writeFile(file, bytes);
-				}
-				const output: Buffer[] = [];
-				const diagnostic: Buffer[] = [];
-				const result = await engine.execute(
-					"producer",
-					root,
-					[
-						"--json",
-						"--line-number",
-						"--color=never",
-						"--hidden",
-						...(query.ignoreCase ? ["--ignore-case"] : []),
-						...(query.literal ? ["--fixed-strings"] : []),
-						"--",
-						query.pattern,
-						root,
-					],
-					signal,
-					({ fd, data }) => {
-						assert.ok(
-							(outputBytes += data.length) <= speculativeConfig().search.maxInputBytes,
-							"search match byte budget",
-						);
-						(fd === 1 ? output : diagnostic).push(data);
-					},
-				);
-				signal.throwIfAborted();
-				assert.ok(result.code === 0 || result.code === 1, Buffer.concat(diagnostic).toString());
-				for (const line of Buffer.concat(output).toString("utf8").split("\n")) {
-					if (!line) continue;
-					const event = JSON.parse(line);
-					if (event.type !== "match") continue;
-					const matches = files.get(event.data?.path?.text);
-					assert.ok(matches, "unowned grep match");
-					matches.push({
-						line_number: event.data.line_number,
-						lines: event.data.lines,
-					});
-				}
-				return batch.map((_, index) => files.get(path.join(root!, String(index)))!);
-			} finally {
-				for (const withdraw of release) withdraw();
-				if (root) {
-					assert.equal(path.dirname(root), engine.root);
-					await fs.rm(root, { recursive: true, force: true });
-				}
-			}
-		})).then((results) => {
-			signal.throwIfAborted();
-			return results[index]!;
-		});
-	};
-	if (!prepared.files.length) {
-		// Even an empty selection must compile the pattern and preserve native errors.
-		await enqueue("", { ...view, readFile: async () => Buffer.alloc(0) }, signal);
-		return { code: 1, signal: null };
-	}
-	const jobs = prepared.files.map((file) => {
-		const build = async (inputs: ToolFilesystemOperations, signal: AbortSignal) => {
-			const value = await enqueue(file.source, inputs, signal);
-			return { value, bytes: serialize(value).byteLength, dispose: () => {} };
-		};
-		return view.prepare
-			? view.prepare(
-					engine.matchesBinding,
-					JSON.stringify([file.source, query.pattern, !!query.ignoreCase, !!query.literal]),
-					build,
-					async (value) => value,
-					file.source,
-					signal,
-				)
-			: build(view, signal).then((resource) => resource.value);
-	});
-	try {
-		const results = await Promise.all(jobs);
-		signal.throwIfAborted();
-		for (const [index, matches] of results.entries())
-			for (const match of matches)
-				emit({
-					fd: 1,
-					data: Buffer.from(
-						JSON.stringify({
-							type: "match",
-							data: { ...match, path: { text: prepared.files[index]!.path } },
-						}) + "\n",
-					),
-				});
-		return {
-			code: results.some((matches) => matches.length) ? 0 : 1,
-			signal: null,
-		};
-	} finally {
-		await Promise.allSettled(jobs);
-	}
-}
-/** rg selects its own names/configuration over captured inputs; native reads never reach the source tree. */
-async function prepareCapturedGrep(
-	view: ToolFilesystemOperations,
-	cwd: string,
-	destination: string,
-	query: GrepInput & {
-		path: string;
-	},
-	signal: AbortSignal,
-	execute: SearchSelection,
-) {
-	const { exists, readdir } = view;
-	assert.ok(view.stat && exists && readdir, "search input capabilities required");
-	const stat = (target: string, fields: "type" | "entry") => view.stat!(target, fields, false);
-	const originalCwd = cwd;
-	const originalTarget = path.resolve(cwd, query.path);
-	const rootStat = await stat(originalTarget, "type");
-	const directory = rootStat.isDirectory();
-	const volume = path.parse(cwd).root;
-	const privateVolume = path.join(destination, "volume");
-	const realCwd = (await stat(cwd, "type")).realPath;
-	assert.ok(realCwd && rootStat.realPath, "resolved input names require captured evidence");
-	// Windows retains the cwd spelling; POSIX reports its physical path. Recreate the alias for rg itself.
-	if (process.platform !== "win32") cwd = realCwd;
-	const sourceTarget = directory ? rootStat.realPath : originalTarget;
-	const map = (source: string) => {
-		const relative = relativeFilesystemPath(volume, source);
-		assert.ok(relative !== undefined, "input crossed its declared filesystem root");
-		return path.join(privateVolume, relative);
-	};
-	const target = map(sourceTarget);
-	const logicalTarget = map(originalTarget);
-	const privateCwd = map(originalCwd);
-	const marker = "pi-directory-" + randomUUID();
-	const files = new Map<string, string | undefined>();
-	const loaded = new Set<string>();
-	const pending = new Map<string, string>();
-	const linkedConfigurations = new Set<string>();
-	const directories = new Set<string>();
-	const mkdir = async (target: string) => {
-		if (directories.has(target)) return;
-		await fs.mkdir(target, { recursive: true });
-		directories.add(target);
-	};
-	const linkDirectory = async (source: string, target: string) => {
-		if (source === target) return;
-		await mkdir(path.dirname(target));
-		const existing = await fs.realpath(target).catch((error) => {
-			if (error.code !== "ENOENT") throw error;
-		});
-		if (existing !== (await fs.realpath(source)))
-			await fs.symlink(source, target, process.platform === "win32" ? "junction" : "dir");
-	};
-	let entries = 0;
-	let inputBytes = 0;
-	const load = async (source: string, target: string) => {
-		signal.throwIfAborted();
-		const bytes = await view.readFile(source);
-		assert.ok(
-			(inputBytes += bytes.length) <= speculativeConfig().search.maxInputBytes,
-			"search input byte budget",
-		);
-		await fs.writeFile(target, bytes);
-		loaded.add(target);
-	};
-	const file = async (source: string, target: string, configuration: boolean) => {
-		if (!files.has(target)) {
-			await mkdir(path.dirname(target));
-			await fs.writeFile(target, "", { flag: "wx" });
-			files.set(target, source);
-		}
-		if (configuration) {
-			if ((await stat(source, "entry")).type === "symlink") linkedConfigurations.add(target);
-			if (!loaded.has(target)) await load(source, target);
-		}
-	};
-	const line = async (source: string) => {
-		const bytes = await fs.readFile(source, { signal });
-		if (!bytes.length) return undefined;
-		return new TextDecoder("utf-8", { fatal: true })
-			.decode(bytes.subarray(0, bytes.indexOf(10) < 0 ? bytes.length : bytes.indexOf(10)))
-			.replace(/\r$/, "");
-	};
-	const admitDirectory = async (parent: string, pattern: string) => {
-		const control = path.join(parent, ".rgignore");
-		if (!files.has(control)) files.set(control, undefined);
-		await fs.appendFile(control, `\n!/${pattern}/\n`);
-	};
-	const rules = async (source: string, target: string) => {
-		await mkdir(target);
-		for (const name of [".gitignore", ".ignore", ".rgignore"]) {
-			if (await exists(path.join(source, name)))
-				await file(path.join(source, name), path.join(target, name), true);
-		}
-		const jj = path.join(source, ".jj");
-		const privateJj = path.join(target, ".jj");
-		if (await exists(jj)) {
-			if ((await stat(jj, "type")).isDirectory()) await mkdir(privateJj);
-			else await file(jj, privateJj, false);
-			if ((await stat(jj, "entry")).type === "symlink") linkedConfigurations.add(privateJj);
-		}
-		const git = path.join(source, ".git");
-		const privateGit = path.join(target, ".git");
-		if (!(await exists(git))) return;
-		const entry = await stat(git, "entry");
-		const gitDirectory = (await stat(git, "type")).isDirectory();
-		if (gitDirectory) {
-			await mkdir(privateGit);
-			if (await exists(path.join(git, "info/exclude")))
-				await file(path.join(git, "info/exclude"), path.join(privateGit, "info/exclude"), true);
-			return;
-		}
-		assert.equal(entry.type, "file", "git pointer entry is not qualified");
-		await file(git, privateGit, true);
-		const pointer = await line(privateGit);
-		if (!pointer?.startsWith("gitdir: ")) return;
-		// This follows the pinned ignore engine's pointer resolution, not Git's broader config grammar.
-		const gitdir = path.resolve(cwd, pointer.slice(8));
-		const common = path.join(gitdir, "commondir");
-		const control = path.join(destination, "git-" + randomUUID());
-		await fs.mkdir(control);
-		await fs.writeFile(privateGit, "gitdir: " + control + "\n");
-		if (!(await exists(common))) return;
-		await file(common, map(common), true);
-		const commonLine = await line(map(common));
-		if (commonLine === undefined) return;
-		const commonDirectory = path.resolve(commonLine.startsWith(".") ? gitdir : cwd, commonLine);
-		await mkdir(map(commonDirectory));
-		await fs.writeFile(path.join(control, "commondir"), map(commonDirectory) + "\n");
-		const exclude = path.join(commonDirectory, "info/exclude");
-		if (await exists(exclude)) await file(exclude, map(exclude), true);
-	};
-	const walk = async (source: string, target: string) => {
-		signal.throwIfAborted();
-		assert.ok(entries++ < speculativeConfig().search.maxDirectoryEntries, "metadata entry budget");
-		if (path.basename(source) === ".git" && source !== sourceTarget) return;
-		const entry = await stat(source, "entry");
-		const configuration = [".gitignore", ".ignore", ".rgignore"].includes(path.basename(source));
-		if (entry.type === "symlink" && !configuration && source !== sourceTarget) {
-			if (process.platform === "win32") await stat(source, "type"); // Native search opens discovered junction metadata.
-			return;
-		}
-		if (entry.type === "special") {
-			assert.ok(!configuration && source !== sourceTarget, "special search input");
-			return;
-		}
-		if ((entry.type === "symlink" ? await stat(source, "type") : entry).isDirectory()) {
-			await rules(source, target);
-			pending.set(target, source);
-		} else await file(source, target, configuration);
-	};
-	const expand = async (target: string) => {
-		const source = pending.get(target);
-		assert.ok(source !== undefined);
-		pending.delete(target);
-		for (const name of await readdir(source)) {
-			assert.equal(path.basename(name), name);
-			assert.ok(name !== "." && name !== ".." && name !== marker);
-			await walk(path.join(source, name), path.join(target, name));
-		}
-	};
-	const select = async (targets: readonly string[], flags: readonly string[] = []) => {
-		const output: Buffer[] = [];
-		const diagnostic: Buffer[] = [];
-		let bytes = 0;
-		const { code } = await execute(
-			privateCwd,
-			["--files", "--null", "--hidden", ...flags, "--", ...targets],
-			signal,
-			({ fd, data }) => {
-				assert.ok(
-					(bytes += data.length) <= speculativeConfig().search.maxResultBytes,
-					"selected name budget",
-				);
-				(fd === 1 ? output : diagnostic).push(data);
-			},
-		);
-		assert.ok(code === 0 || code === 1, Buffer.concat(diagnostic).toString());
-		const raw = Buffer.concat(output);
-		const decoded = raw.toString("utf8");
-		assert.ok(Buffer.from(decoded).equals(raw), "filename encoding must round-trip without replacement");
-		return new Set(
-			decoded
-				.split("\0")
-				.filter(Boolean)
-				.map((selected) => {
-					const resolved = path.resolve(selected);
-					assert.ok(
-						relativeFilesystemPath(privateVolume, resolved) !== undefined,
-						"rg selected an unowned input",
-					);
-					return resolved;
-				}),
-		);
-	};
-	if (directory)
-		for (let source = sourceTarget; ; source = path.dirname(source)) {
-			if (source !== sourceTarget) {
-				await rules(source, map(source));
-				await admitDirectory(map(source), "*");
-			}
-			if (source === volume) break;
-		}
-	await mkdir(map(realCwd));
-	await linkDirectory(map(realCwd), privateCwd);
-	const parents = new Set([target]);
-	const deny = path.join(destination, "glob-deny");
-	if (query.glob) await fs.writeFile(deny, "*\n", { flag: "wx" });
-	const selectedFiles = async (flags: readonly string[] = []) => {
-		const ordinary = await select([privateVolume], flags);
-		let selected = ordinary;
-		if (query.glob) {
-			const classify = async (extra: readonly string[]) =>
-				new Set(
-					[
-						...(await select(
-							[...parents].map((parent) => path.join(logicalTarget, path.relative(target, parent))),
-							["--no-ignore", "--max-depth=2", "--glob", query.glob!, ...extra, ...flags],
-						)),
-					].map((file) => {
-						const relative = relativeFilesystemPath(logicalTarget, file);
-						assert.ok(relative !== undefined, "glob classification escaped its query");
-						return path.join(target, relative);
-					}),
-				);
-			// Native decisions under neutral/denied defaults distinguish explicit overrides without parsing a glob.
-			const allowed = await classify([]);
-			selected = await classify(["--ignore-file", deny]);
-			for (const file of ordinary) if (allowed.has(file)) selected.add(file);
-		}
-		return new Set(
-			[...selected].filter(
-				(file) =>
-					relativeFilesystemPath(target, file) !== undefined &&
-					!linkedConfigurations.has(file) &&
-					(!files.has(file) || files.get(file) !== undefined),
-			),
-		);
-	};
-	await walk(sourceTarget, target);
-	if (directory) {
-		await expand(target);
-		await linkDirectory(target, logicalTarget);
-	}
-	while (pending.size) {
-		const frontier = [...pending.keys()];
-		for (const parent of frontier) await fs.writeFile(path.join(parent, marker), "", { flag: "wx" });
-		const admitted = await selectedFiles(["--glob", "**/" + marker]);
-		for (const parent of frontier) {
-			await fs.unlink(path.join(parent, marker));
-			if (admitted.has(path.join(parent, marker))) {
-				if (query.glob) {
-					const name = path.basename(parent);
-					assert.ok(!/[\r\n]/.test(name), "directory rule name cannot contain a line ending");
-					await admitDirectory(path.dirname(parent), name.replace(/[\\*?\[\] ]/g, "\\$&"));
-				}
-				parents.add(parent);
-				await expand(parent);
-			} else pending.delete(parent);
-		}
-	}
-	const selected = directory ? await selectedFiles() : new Set([target]);
-	const selectedInputs: PreparedGrep["files"][number][] = [];
-	for (const [file, source] of files) {
-		if (source !== undefined && selected.has(file))
-			selectedInputs.push({
-				source,
-				path: path.join(logicalTarget, path.relative(target, file)),
-			});
-		else {
-			assert.ok(relativeFilesystemPath(privateVolume, file) !== undefined);
-			await fs.unlink(file);
-		}
-	}
-	selectedInputs.sort((left, right) => Buffer.compare(Buffer.from(left.path), Buffer.from(right.path)));
-	return {
-		cwd: privateCwd,
-		path: pathToFileURL(logicalTarget).href,
-		files: selectedInputs,
-		bytes:
-			inputBytes +
-			[...files.keys(), ...parents, privateCwd, logicalTarget, destination].reduce(
-				(sum, name) => sum + Buffer.byteLength(name),
-				0,
-			) +
-			selectedInputs.reduce((sum, file) => sum + Buffer.byteLength(JSON.stringify(file)), 0),
 	};
 }

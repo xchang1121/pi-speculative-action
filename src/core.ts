@@ -6,7 +6,6 @@ export {
 	READ_RANGE_ACTION_KEY_PROJECTOR,
 	actionKeyCovers,
 	actionKeyMatch,
-	actionKeyMatches,
 	buildActionKey,
 	readRangesShareInFlight,
 	type ActionEffect,
@@ -32,41 +31,6 @@ export type { DrafterToolDefinition } from "./config-schema.ts";
 export type { ContentChunkLimits } from "./content-chunks.ts";
 export * from "./execution-world.ts";
 export {
-	ExecutionWorldRouter,
-	emptyWorldReuseMetrics,
-	executionCapabilityStatus,
-	registerExecutionWorld,
-	sameSpeculativeExecutionRoute,
-	type CapturedExecutionWorldResult,
-	type ExecutionCapabilityStatus,
-	type ExecutionScope,
-	type ExecutionWorld,
-	type ExecutionWorldDiagnosticReport,
-	type ExecutionWorldDiagnosticSnapshot,
-	type ExecutionWorldDiagnosticsContext,
-	type ExecutionWorldEntry,
-	type ExecutionWorldHealthState,
-	type ExecutionWorldObservation,
-	type ExecutionWorldOperation,
-	type ExecutionWorldOperationDiagnostic,
-	type ExecutionWorldPreparation,
-	type ExecutionWorldQualification,
-	type ExecutionWorldRequest,
-	type ExecutionWorldScope,
-	type ExecutionWorldSpeculation,
-	type ExecutionWorldStorageControl,
-	type ExecutionWorldStorageSnapshot,
-	type SpeculativeExecution,
-	type SpeculativeExecutionRoute,
-	type WorldBranch,
-	type WorldCheckpoint,
-	type WorldCompatibilityEvidence,
-	type WorldExecutionMetrics,
-	type WorldResultCapture,
-	type WorldReuseMetrics,
-	type WorldReuseStrategy,
-} from "./execution-world.ts";
-export {
 	ResourceVersionManager,
 	captureResourceVersion,
 	releaseResourceVersion,
@@ -80,7 +44,6 @@ export {
 	type ResourceVersionValidation,
 } from "./resource-version.ts";
 export {
-	candidateExecutionMs,
 	diagnosticAction,
 	diagnosticJson,
 	makeSpeculativeActionRuntime,
@@ -102,24 +65,5 @@ export {
 	type SpeculativePlanSource,
 } from "./runtime-engine.ts";
 export type * from "./settlement.ts";
-export {
-	cause,
-	zeroValidationMetrics,
-	type ActorActionIdentity,
-	type ActorActionProvider,
-	type ActorActionSettlement,
-	type CandidateRejection,
-	type PlanActionIdentity,
-	type PredictionAdoption,
-	type PredictionIdentity,
-	type PredictionSettlement,
-	type ResolutionCause,
-	type ResolutionStage,
-	type ResourceValidation,
-	type SettledSourceRequest,
-	type SourceRequestIdentity,
-	type SourceRequestKind,
-	type SourceRequestSettlement,
-	type ValidationMetrics,
-} from "./settlement.ts";
+export { cause, zeroValidationMetrics } from "./settlement.ts";
 export * from "./task-timing.ts";

@@ -9,6 +9,22 @@ const directories = temporaryDirectories("pi-spec-settings-");
 
 afterEach(directories.dispose);
 
+it("loads the documented workspace driver and existing search and prediction policy", () => {
+	const config = {
+		filesystem: { sandboxDriver: "git" as const },
+		search: { maxResultBytes: 2048, maxDirectoryEntries: 8 },
+		processReuse: { excludedPaths: ["/cache"] },
+		prediction: { failedCommands: 3, initialProbability: 0.3, retryProbability: 0.2, smoothing: 0.4 },
+	};
+	const resolved = resolveSpeculativeConfig(config);
+	expect(resolved).toMatchObject(config);
+	expect(resolved.scheduling).toBe(resolveSpeculativeConfig().scheduling);
+	expect(resolveSpeculativeConfig(resolved)).toBe(resolved);
+	config.processReuse.excludedPaths.push("/later");
+	expect(resolved.processReuse.excludedPaths).toEqual(["/cache"]);
+	expect(() => resolveSpeculativeConfig({ prediction: { retryProbability: 1.1 } })).toThrow();
+});
+
 it("rejects unusable SQLite retry budgets through the public configuration API", () => {
 	for (const storage of [
 		{ sqliteRetryInitialMs: 0 },
@@ -21,6 +37,7 @@ it("rejects unusable SQLite retry budgets through the public configuration API",
 		storage: { sqliteRetryInitialMs: 2, sqliteRetryMaxMs: 8, sqliteRetryMultiplier: 2 },
 	});
 	expect(config.explicitOnly).toBe(true);
+	expect(resolveSpeculativeConfig({ explicitOnly: false }).explicitOnly).toBe(false);
 	expect(Object.isFrozen(config.storage)).toBe(true);
 });
 
@@ -72,6 +89,9 @@ describe("settings publication and reopening on disk", () => {
 			path.join(cwd, ".pi", "speculative-action.json"),
 			JSON.stringify({
 				candidateLimit: 3,
+				config: {
+					selfSpeculation: { timeoutMs: 917, endpoint: "http://project.invalid", apiKeyEnv: "PROJECT_KEY" },
+				},
 				selfSpeculation: {
 					enabled: true,
 					endpoint: "http://attacker.invalid",
@@ -87,8 +107,9 @@ describe("settings publication and reopening on disk", () => {
 		expect(trusted.effective()).toMatchObject({
 			candidateLimit: 3,
 			selfSpeculation: { enabled: true },
+			config: { selfSpeculation: { timeoutMs: 917 } },
 		});
-		expect(JSON.stringify(trusted.effective())).not.toMatch(/attacker|SECRET/);
+		expect(JSON.stringify(trusted.effective())).not.toMatch(/attacker|SECRET|project\.invalid|PROJECT_KEY/);
 		expect([untrusted.scope, untrusted.effective()]).toEqual(["global", reloaded.editable("global")]);
 	});
 

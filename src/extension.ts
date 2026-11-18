@@ -29,23 +29,13 @@ import {
 	type ActionDrafterBudgetSnapshot,
 	type CreateSpeculativeActionHostOptions,
 } from "./agent-integration.ts";
-import type { SchedulingSettings } from "./config-schema.ts";
 import {
-	millisecondsInput,
-	nonEmptyTextInput,
-	nonNegativeIntegerInput,
-	nonNegativeNumberInput,
-	optionalTextInput,
 	positiveInteger,
-	positiveIntegerInput,
-	probabilityInput,
 	resolveSpeculativeConfig,
-	settingInput,
 	SpeculativeActionSettingsStore,
 	SpeculativeConfiguration,
 	speculativeConfig,
 	withSpeculativeConfig,
-	type SettingInputDescriptor,
 	type SpeculativeActionPackageSettings,
 	type SpeculativeSettingsScope,
 } from "./config-schema.ts";
@@ -70,7 +60,7 @@ import {
 	ProcessExecutionCoordinator,
 	type ProcessRouteSnapshot,
 } from "./linux-process-world.ts";
-import { patternAwarePersistenceFile, type PatternAwareSettings } from "./pattern-aware.ts";
+import { patternAwarePersistenceFile } from "./pattern-aware.ts";
 import {
 	createClosedSearchProfile,
 	createPiToolDefinitions,
@@ -78,12 +68,9 @@ import {
 	resolvePiToolInvocation,
 } from "./pi-tool-invocation.ts";
 import { asRecord, errorMessage } from "./primitives.ts";
-import { ProvenanceCertificateStore } from "./reuse-store.ts";
 import type { SpeculativeActionEvent } from "./runtime-engine.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import {
-	httpEndpoint,
-	httpPath,
 	SelfSpeculationCoordinator,
 	type SelfSpeculationCoordinatorSnapshot,
 	type SelfSpeculationSettings,
@@ -102,106 +89,72 @@ const BACK = "Back";
 const USE_ACTIVE_MODEL = "Use active model";
 const CUSTOM_MODEL = "Custom model...";
 export type EffectiveSpeculativeActionSettings = ReturnType<typeof normalizeSpeculativeActionSettings>;
-type SettingInputDescriptors<T, K extends keyof T> = {
-	readonly [Field in K]: SettingInputDescriptor<T[Field]>;
+const SETTING_LABELS: Readonly<Record<string, string>> = {
+	enabled: "Speculative production",
+	reuseEnabled: "Cache & reuse",
+	candidateLimit: "Candidate requests per Actor decision",
+	maxConcurrentActions: "Speculative resource units per session",
+	resourceCacheMaxEntries: "Live result entries",
+	resourceCacheMaxBytes: "Live result memory",
+	executionStoreMaxEntries: "Reusable command history entries",
+	executionStoreMaxBytes: "Reusable command history memory",
+	drafterTemperatureMin: "Minimum sampling temperature",
+	drafterTemperatureMax: "Maximum sampling temperature",
+	prepareObservedOperations: "Prepare observed operations",
+	"executionRouting.primary": "Unified execution environment",
+	"executionRouting.nativeFallback": "Local safe fallback",
+	searchExecution: "Search execution",
+	drafterMaxDepth: "Drafter out-of-order follow-up batches",
+	drafterDeterministicCandidates: "Temperature-0 Drafter candidates",
+	"selfSpeculation.endpoint": "Control service URL",
+	"selfSpeculation.requestIDField": "Provider request ID field",
+	"selfSpeculation.candidatePath": "Candidate registration path",
+	"selfSpeculation.forkPath": "Actor probe path",
+	"selfSpeculation.clearPath": "Clear request path",
+	"selfSpeculation.capabilitiesPath": "Capabilities path",
+	"selfSpeculation.forkActionMinConfidence": "Minimum tool-name confidence",
+	"selfSpeculation.maxCandidates": "Candidates sent per Actor decision",
+	"selfSpeculation.maxDraftTokens": "Draft-token limit per candidate",
+	"selfSpeculation.actorProfile": "Actor tool-call Profile ('auto' to derive)",
+	"selfSpeculation.draftFormat": "Target tool-call format",
+	"selfSpeculation.draftBoundary": "Target tool-call boundary override ('auto' to derive)",
+	"selfSpeculation.timeoutMs": "Control request timeout (ms)",
+	"selfSpeculation.forkTemperature": "Actor probe temperature",
+	"selfSpeculation.forkMaxAttempts": "Maximum probes per Actor decision",
+	"selfSpeculation.forkRetryStreamUpdates": "Stream updates between retries",
+	"selfSpeculation.forkBoundaryStreamUpdates": "Stream updates before sentence-boundary retry",
+	"selfSpeculation.forkDecoder": "Forked tool-call decoder",
+	"selfSpeculation.forkForcedPrefix": "Forced tool-call prefix override ('auto' to derive)",
+	"selfSpeculation.apiKeyEnv": "Authentication token environment variable name (not the token)",
+	"scheduling.resourcePollIntervalMs": "Resource sampling interval (ms)",
+	"scheduling.gpuPollIntervalMs": "GPU sampling interval (ms)",
+	"scheduling.gpuProbeTimeoutMs": "GPU query timeout (ms)",
+	"scheduling.failureThreshold": "Failures before circuit opens",
+	"scheduling.failureRetryDecisions": "Retry every N eligible Actor decisions",
+	"scheduling.heavyCpu": "Process/tree CPU units",
+	"scheduling.lightCpu": "File snapshot CPU units",
+	"scheduling.heavyMemoryBytes": "Process/tree memory",
+	"scheduling.lightMemoryBytes": "File snapshot memory",
+	"scheduling.heavyIo": "Process/tree I/O fraction",
+	"scheduling.lightIo": "File snapshot I/O fraction",
+	"patternAware.maxContextLength": "Previous actions used as context",
+	"patternAware.maxFutureGap": "Maximum skipped Actor decisions",
+	"patternAware.futureGapCoverage": "Early-prediction coverage (0-1)",
+	"patternAware.decayHalfLifeEvents": "History half-life (events)",
+	"patternAware.minOccurrences": "Uses required before learning a pattern",
+	"patternAware.maxPatterns": "Stored pattern limit",
+	"patternAware.beamWidth": "Alternatives retained per tool",
+	"patternAware.maxPredictionDepth": "Maximum predicted tool steps",
+	drafterEnabled: "Enabled",
+	drafterPatternHints: "Show PatternAware expected calls",
+	"selfSpeculation.enabled": "Verify predicted calls during Actor decoding",
+	"selfSpeculation.forkEnabled": "Actor probe prediction",
+	"selfSpeculation.forkActionEnabled": "Use forked calls for tool pre-execution",
+	"selfSpeculation.requireLogprobs": "Require token probabilities",
+	"selfSpeculation.forkTransport": "Integration",
+	"patternAware.enabled": "Pattern predictions (learning stays active)",
+	"patternAware.multiStepEnabled": "Predict follow-up tool steps",
 };
-const ROOT_SETTING_INPUTS = {
-	candidateLimit: positiveIntegerInput("Candidate requests per Actor decision"),
-	maxConcurrentActions: positiveIntegerInput("Speculative resource units per session"),
-	resourceCacheMaxEntries: positiveIntegerInput("Live result entries"),
-	resourceCacheMaxBytes: mebibyteInput("Live result memory"),
-	executionStoreMaxEntries: positiveIntegerInput("Reusable command history entries"),
-	executionStoreMaxBytes: mebibyteInput("Reusable command history memory"),
-	drafterMaxDepth: nonNegativeIntegerInput("Drafter out-of-order follow-up batches"),
-	drafterDeterministicCandidates: nonNegativeIntegerInput("Temperature-0 Drafter candidates"),
-} satisfies Partial<
-	SettingInputDescriptors<EffectiveSpeculativeActionSettings, keyof EffectiveSpeculativeActionSettings>
->;
-function protocolInput(
-	title: string,
-	normalize: (value: unknown, fallback: string) => string,
-	error: string,
-) {
-	return settingInput(title, String, (input) => {
-		const value = normalize(input, "");
-		return value ? { ok: true, value } : { ok: false, error };
-	});
-}
-const servicePathInput = (title: string) =>
-	protocolInput(
-		title,
-		httpPath,
-		"Service path must start with one / and contain no whitespace or backslashes.",
-	);
-const SELF_SPECULATION_INPUTS = {
-	endpoint: protocolInput("Control service URL", httpEndpoint, "Endpoint must be an absolute HTTP(S) URL."),
-	requestIDField: nonEmptyTextInput("Provider request ID field"),
-	candidatePath: servicePathInput("Candidate registration path"),
-	forkPath: servicePathInput("Actor probe path"),
-	clearPath: servicePathInput("Clear request path"),
-	capabilitiesPath: servicePathInput("Capabilities path"),
-	forkActionMinConfidence: probabilityInput("Minimum tool-name confidence"),
-	maxCandidates: positiveIntegerInput("Candidates sent per Actor decision"),
-	maxDraftTokens: positiveIntegerInput("Draft-token limit per candidate"),
-	actorProfile: nonEmptyTextInput("Actor tool-call Profile ('auto' to derive)"),
-	draftFormat: nonEmptyTextInput("Target tool-call format"),
-	draftBoundary: nonEmptyTextInput("Target tool-call boundary override ('auto' to derive)"),
-	timeoutMs: millisecondsInput("Control request timeout (ms)"),
-	forkTemperature: nonNegativeNumberInput("Actor probe temperature"),
-	forkMaxAttempts: positiveIntegerInput("Maximum probes per Actor decision"),
-	forkRetryStreamUpdates: positiveIntegerInput("Stream updates between retries"),
-	forkBoundaryStreamUpdates: positiveIntegerInput("Stream updates before sentence-boundary retry"),
-	forkDecoder: nonEmptyTextInput("Forked tool-call decoder"),
-	forkForcedPrefix: nonEmptyTextInput("Forced tool-call prefix override ('auto' to derive)"),
-	apiKeyEnv: optionalTextInput("Authentication token environment variable name (not the token)"),
-} satisfies Partial<SettingInputDescriptors<SelfSpeculationSettings, keyof SelfSpeculationSettings>>;
-const SCHEDULING_INPUTS = {
-	resourcePollIntervalMs: millisecondsInput("Resource sampling interval (ms)"),
-	gpuPollIntervalMs: millisecondsInput("GPU sampling interval (ms)"),
-	gpuProbeTimeoutMs: millisecondsInput("GPU query timeout (ms)"),
-	failureThreshold: positiveIntegerInput("Failures before circuit opens"),
-	failureRetryDecisions: positiveIntegerInput("Retry every N eligible Actor decisions"),
-	heavyCpu: positiveIntegerInput("Process/tree CPU units"),
-	lightCpu: positiveIntegerInput("File snapshot CPU units"),
-	heavyMemoryBytes: mebibyteInput("Process/tree memory"),
-	lightMemoryBytes: mebibyteInput("File snapshot memory"),
-	heavyIo: probabilityInput("Process/tree I/O fraction"),
-	lightIo: probabilityInput("File snapshot I/O fraction"),
-} satisfies SettingInputDescriptors<SchedulingSettings, keyof SchedulingSettings>;
-const PATTERN_SETTING_INPUTS = {
-	maxContextLength: positiveIntegerInput("Previous actions used as context"),
-	maxFutureGap: nonNegativeIntegerInput("Maximum skipped Actor decisions"),
-	futureGapCoverage: probabilityInput("Early-prediction coverage (0-1)", {
-		error: "Early-prediction coverage must be between 0 and 1.",
-	}),
-	decayHalfLifeEvents: positiveIntegerInput("History half-life (events)", {
-		error: "Pattern half-life must be a positive integer.",
-	}),
-	minOccurrences: positiveIntegerInput("Uses required before learning a pattern"),
-	maxPatterns: positiveIntegerInput("Stored pattern limit"),
-	beamWidth: positiveIntegerInput("Alternatives retained per tool"),
-	maxPredictionDepth: positiveIntegerInput("Maximum predicted tool steps"),
-} satisfies Partial<SettingInputDescriptors<PatternAwareSettings, keyof PatternAwareSettings>>;
-const DRAFTER_TEMPERATURE_INPUT = settingInput<readonly [number, number]>(
-	"Drafter sampling temperature range",
-	([lower, upper]) => `${formatNumber(lower)},${formatNumber(upper)}`,
-	(input) => {
-		const [lower, upper, ...extra] = input
-			.split(",")
-			.map((item) => (item.trim() ? Number(item.trim()) : NaN));
-		return extra.length === 0 &&
-			Number.isFinite(lower) &&
-			Number.isFinite(upper) &&
-			lower >= 0 &&
-			upper >= lower
-			? { ok: true, value: [lower, upper] as const }
-			: {
-					ok: false,
-					error:
-						"Drafter temperature range must be two non-negative comma-separated numbers in ascending order.",
-				};
-	},
-);
 export type SpeculativeActionMetrics = SpeculativeTraceSummary & {
 	/** Reuse on the authoritative Actor path, excluding reuse internal to speculative branches. */
 	readonly actorProcessReuse: WorldReuseMetrics;
@@ -243,30 +196,22 @@ export interface SpeculativeActionExecutionWorldContext {
 	readonly settings: () => EffectiveSpeculativeActionSettings;
 }
 export function normalizeSpeculativeActionSettings(input: SpeculativeActionPackageSettings | undefined) {
-	return withSpeculativeConfig(
-		resolveSpeculativeConfig(input?.config),
-		() =>
-			({
-				...(input?.config ? { config: input.config } : {}),
-				...normalizeSpeculativeAgentSettings(input),
-				searchExecution: input?.searchExecution === "native" ? "native" : "captured",
-				...(typeof input?.draftModel === "string" && input.draftModel.trim()
-					? { draftModel: input.draftModel.trim() }
-					: {}),
-				executionStoreMaxEntries: positiveInteger(
-					input?.executionStoreMaxEntries,
-					speculativeConfig().storage.maxCertificates,
-				),
-				executionStoreMaxBytes: positiveInteger(
-					input?.executionStoreMaxBytes,
-					speculativeConfig().storage.maxBytes,
-				),
-				executionRouting: {
-					primary: input?.executionRouting?.primary !== false,
-					nativeFallback: input?.executionRouting?.nativeFallback !== false,
-				},
-			}) as const,
-	);
+	const config = resolveSpeculativeConfig(input?.config);
+	const agent = withSpeculativeConfig(config, () => normalizeSpeculativeAgentSettings(input));
+	const model = typeof input?.draftModel === "string" ? input.draftModel.trim() : undefined;
+	const { maxCertificates, maxBytes } = config.storage;
+	return {
+		...agent,
+		...(input?.config ? { config: input.config } : {}),
+		...(model ? { draftModel: model } : {}),
+		searchExecution: input?.searchExecution === "native" ? "native" : "captured",
+		executionStoreMaxEntries: positiveInteger(input?.executionStoreMaxEntries, maxCertificates),
+		executionStoreMaxBytes: positiveInteger(input?.executionStoreMaxBytes, maxBytes),
+		executionRouting: {
+			primary: input?.executionRouting?.primary !== false,
+			nativeFallback: input?.executionRouting?.nativeFallback !== false,
+		},
+	} as const;
 }
 export function formatSpeculativeActionStatus(input: {
 	readonly settings: EffectiveSpeculativeActionSettings;
@@ -276,18 +221,18 @@ export function formatSpeculativeActionStatus(input: {
 	const cache = metrics.cache;
 	const self = settings.selfSpeculation;
 	return [
-		`Speculative production: ${settings.enabled ? "On" : "Off"}; cache & reuse: ${settings.reuseEnabled ? "On" : "Off"}; observation and learning remain active`,
-		`Model Drafter: ${settings.drafterEnabled ? "On" : "Off"}`,
+		`Speculative production: ${onOff(settings.enabled)}; cache & reuse: ${onOff(settings.reuseEnabled)}; observation and learning remain active`,
+		`Model Drafter: ${onOff(settings.drafterEnabled)}`,
 		`Drafter model: ${settings.draftModel ?? "active model"}`,
 		`Candidate requests per Actor decision: ${settings.candidateLimit}`,
 		`Model Drafter policy: ${settings.drafterMaxDepth} out-of-order follow-up batches; ${settings.drafterDeterministicCandidates} temperature-0 candidates; sampling ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
 		`Speculative resource units per session: ${settings.maxConcurrentActions}`,
 		`Scheduler: sampling ${formatDuration(settings.scheduling.resourcePollIntervalMs)}; failure circuit ${settings.scheduling.failureThreshold} failures / ${settings.scheduling.failureRetryDecisions} eligible decisions`,
 		`Storage policy: ${settings.resourceCacheMaxEntries} live results/${formatBytes(settings.resourceCacheMaxBytes)}; ${settings.executionStoreMaxEntries} reusable commands/${formatBytes(settings.executionStoreMaxBytes)}`,
-		`Pattern predictions: ${settings.patternAware.enabled ? "On" : "Off"}; learning active; follow-up steps: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
+		`Pattern predictions: ${onOff(settings.patternAware.enabled)}; learning active; follow-up steps: ${onOff(settings.patternAware.multiStepEnabled)} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
 
-		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport !== "provider" && self.forkEnabled && self.forkActionEnabled ? (self.forkTransport === "drafter" ? "On (Drafter)" : `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})`) : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; Actor Profile=${self.actorProfile}; ${self.draftFormat} (${syntaxSettingLabel(self.draftBoundary)} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : FORK_TRANSPORT_LABELS[self.forkTransport]}`,
-		`Execution routing: admitted providers ${settings.executionRouting.primary ? "On" : "Off"}; local routes ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
+		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${onOff(self.enabled)}; early tool execution ${self.enabled && self.forkTransport !== "provider" && self.forkEnabled && self.forkActionEnabled ? (self.forkTransport === "drafter" ? "On (Drafter)" : `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})`) : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; Actor Profile=${self.actorProfile}; ${self.draftFormat} (${self.draftBoundary === "auto" ? "automatic" : self.draftBoundary} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : FORK_TRANSPORT_LABELS[self.forkTransport]}`,
+		`Execution routing: admitted providers ${onOff(settings.executionRouting.primary)}; local routes ${onOff(settings.executionRouting.nativeFallback)}; Actor always available`,
 		`Search execution: ${searchExecutionLabel(settings.searchExecution)}`,
 		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial, ${metrics.inputReuseHits} inputs`,
 		...(hasProcessReuse(metrics.actorProcessReuse)
@@ -341,7 +286,6 @@ export function createSpeculativeActionExtension(
 			sessions.run(async () => {
 				await controller?.dispose();
 				controller = await installController(ctx, pi, dependencies, providerRequest);
-				controller.attachUI(ctx.ui);
 			}),
 		);
 		pi.on("context", async (event, ctx) => {
@@ -366,30 +310,23 @@ export function createSpeculativeActionExtension(
 		pi.on("message_end", (event) => {
 			if (event.message.role === "assistant") controller?.finishActorOutput();
 		});
-		pi.on("turn_end", async () => {
-			await controller?.finishTurn(false);
-		});
-		pi.on("agent_settled", async () => {
-			await controller?.finishTurn(true);
-		});
+		pi.on("turn_end", () => controller?.finishTurn(false));
+		pi.on("agent_settled", () => controller?.finishTurn(true));
 		pi.on("session_shutdown", (_event, ctx) =>
 			sessions.run(async () => {
 				ctx.ui.setStatus(STATUS_KEY, undefined);
 				const current = controller;
 				controller = undefined;
-				current?.detachUI();
 				await current?.dispose().catch(() => undefined);
 			}),
 		);
-		const command = {
+		pi.registerCommand("speculative-action", {
 			description: "Configure speculative action pre-execution",
 			handler: (args: string, ctx: ExtensionCommandContext) => runCommand(args, ctx, controller),
-		};
-		pi.registerCommand("speculative-action", command);
+		});
 	};
 }
-const speculativeActionExtension = createSpeculativeActionExtension();
-export default speculativeActionExtension;
+export default createSpeculativeActionExtension();
 async function installController(
 	context: ExtensionContext,
 	pi: ExtensionAPI,
@@ -408,10 +345,9 @@ async function installController(
 	const settingsStore =
 		dependencies.createSettingsStore?.(context.cwd) ?? new SpeculativeActionSettingsStore(context.cwd);
 	await settingsStore.load(context.isProjectTrusted());
-	const configuration = new SpeculativeConfiguration(settingsStore.effective()?.config);
-	let currentSettings = configuration.run(() =>
-		normalizeSpeculativeActionSettings(settingsStore.effective()),
-	);
+	const initial = settingsStore.effective();
+	const configuration = new SpeculativeConfiguration(initial?.config);
+	let currentSettings = normalizeSpeculativeActionSettings(initial);
 	let currentMetrics: SpeculativeTraceSummary = emptySpeculativeTraceSummary({
 		cacheCapacity: currentSettings.resourceCacheMaxEntries,
 		cacheByteCapacity: currentSettings.resourceCacheMaxBytes,
@@ -502,7 +438,7 @@ async function installController(
 			const configured = settings().selfSpeculation;
 			return settings().enabled ? configured : { ...configured, enabled: false };
 		},
-		...(dependencies.selfSpeculationFetch ? { fetch: dependencies.selfSpeculationFetch } : {}),
+		fetch: dependencies.selfSpeculationFetch,
 		// Without reasoning, the Drafter must answer with the calls the Actor's own reasoning is heading for.
 		draftFork: async ({ model, context: actorContext, reasoning, content, signal, temperature }) => {
 			const message = await drafterBudget.run({
@@ -554,23 +490,13 @@ async function installController(
 		...configuration.current,
 		storage: { ...configuration.current.storage, root: storeRoot },
 	});
-	const inputStore = withSpeculativeConfig(
-		configuration,
-		() => new ProvenanceCertificateStore(storeRoot, { reservedRoot: true }),
-	);
+	const store = { reservedRoot: true } as const;
 	const rawProcessExecutor = adaptProcessToolOperations(
 		createControlledBashOperations({
 			shellPath: getShellConfig(piToolSettings.shellPath).shell,
 		}),
 	);
-	const processBackend = withSpeculativeConfig(
-		configuration,
-		() =>
-			new LinuxProcessReuseBackend({
-				storeRoot,
-				store: { reservedRoot: true },
-			}),
-	);
+	const processBackend = configuration.run(() => new LinuxProcessReuseBackend({ storeRoot, store }));
 	const processCoordinator = new ProcessExecutionCoordinator(
 		processBackend.completedReplayExecutor(rawProcessExecutor, {
 			sourceRoot: context.cwd,
@@ -586,50 +512,28 @@ async function installController(
 				)?.process,
 		}),
 	);
-	const processWorld = withSpeculativeConfig(configuration, () =>
+	const processWorld = configuration.run(() =>
 		createRestorableProcessExecutionWorld({
 			backend: processBackend,
 			coordinator: processCoordinator,
 			tools: ["bash"],
 			storeRoot,
-			store: { reservedRoot: true },
 		}),
 	);
 	const workspaceSandbox = configuration.run(
 		() => dependencies.createWorkspaceSandboxService?.() ?? new WorkspaceSandboxService(),
 	);
-	workspaceSandbox.useContentStore(inputStore);
+	workspaceSandbox.useContentStore(processBackend.store);
 	const resourceWorld = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, {
 		maxBytes: () => currentSettings.resourceCacheMaxBytes,
-		persistentInputs: { store: inputStore, internalCache: true },
+		persistentInputs: { store: processBackend.store, internalCache: true },
 	});
 	const executionWorlds = [
 		...new Set([
 			...primaryExecutionWorlds,
 			processWorld,
 			workspaceSandbox.createExecutionWorld(),
-			{
-				...resourceWorld,
-				storage: {
-					configure: ({ maxEntries, maxBytes }: { maxEntries: number; maxBytes: number }) =>
-						inputStore.configure({ maxCertificates: maxEntries, maxBytes }),
-					maintain: async (operation: "gc" | "clear") => {
-						const result = await (operation === "gc" ? inputStore.gc() : inputStore.clear());
-						return {
-							removedEntries: result.removedCertificates + result.removedInputVersions,
-							removedArtifacts: result.removedArtifacts,
-							removedBytes: result.removedBytes,
-						};
-					},
-				},
-				dispose: async () => {
-					try {
-						await resourceWorld.dispose?.();
-					} finally {
-						await inputStore.dispose();
-					}
-				},
-			},
+			{ ...resourceWorld, storage: processWorld.storage },
 		]),
 	];
 	const primaryExecutionWorldIDs = new Set(primaryExecutionWorlds.map((world) => world.id));
@@ -637,9 +541,10 @@ async function installController(
 		primaryExecutionWorldIDs.has(backend)
 			? currentSettings.executionRouting.primary
 			: currentSettings.executionRouting.nativeFallback;
+	const controls = new Set(executionWorlds.flatMap((world) => (world.storage ? [world.storage] : [])));
 	const configureExecutionStorage = () => {
-		for (const world of executionWorlds)
-			world.storage?.configure({
+		for (const control of controls)
+			control.configure({
 				maxEntries: currentSettings.executionStoreMaxEntries,
 				maxBytes: currentSettings.executionStoreMaxBytes,
 			});
@@ -678,23 +583,27 @@ async function installController(
 	);
 	const selectTool = (tool: AgentTool) =>
 		(isStockSdkTool(tool) && agentTools.get(tool.name)) || sdkCallbackTool(tool);
-	const toolCapabilities = () =>
-		resolveToolCapabilities(
-			new Map(
-				sdk
-					.tools()
-					.map(selectTool)
-					.map((tool) => [
-						tool.name,
-						agentTools.get(tool.name) === tool
-							? ((closedSearchEnabled() ? search?.profile?.invocations.get(tool.name)?.semantics : undefined)
-									?.requirements ?? PI_ACTION_SEMANTICS.requirements(tool.name))
-							: sdkToolInvocation(tool, latestContext.cwd).semantics?.requirements,
-					]),
-			),
-			executionRoutes(),
-		);
-	const runtimeSettings = () => currentSettings;
+	const toolCapabilities = () => {
+		const { worlds, actorProcessReplay } = executionRoutes();
+		const states = new Map<string, ToolCapabilityRow>();
+		for (const source of sdk.tools()) {
+			const selected = selectTool(source);
+			const tool = selected.name;
+			const captured = closedSearchEnabled() ? search?.profile?.invocations.get(tool) : undefined;
+			const requirements =
+				agentTools.get(tool) === selected
+					? (captured?.semantics?.requirements ?? PI_ACTION_SEMANTICS.requirements(tool))
+					: sdkToolInvocation(selected, latestContext.cwd).semantics?.requirements;
+			const capability = (mode: "speculation" | "observation") =>
+				requirements ? executionCapabilityStatus(requirements, worlds, mode, tool).state : "unavailable";
+			const fork = capability("speculation");
+			const observe = capability("observation");
+			const actor =
+				requirements && actorProcessReplay ? processRouteCapability(actorProcessReplay.state) : "unavailable";
+			states.set(tool, { fork, observe, replay: bestCapabilityState([fork, observe, actor]) });
+		}
+		return states;
+	};
 	const visibleMetrics = (): SpeculativeActionMetrics => ({
 		...currentMetrics,
 		actorProcessReuse: processWorld.actorMetrics(),
@@ -706,7 +615,7 @@ async function installController(
 	const host = (dependencies.createHost ?? createSpeculativeActionHost)(sessionID, {
 		cwd: context.cwd,
 		configuration,
-		getSettings: runtimeSettings,
+		getSettings: settings,
 		complete: completeDraft,
 		drafterBudget,
 		draftModel: draftModelFor,
@@ -723,10 +632,8 @@ async function installController(
 				environment: piShellEnvironment(latestContext),
 				autoResizeImages: piToolSettings.autoResizeImages,
 				modelSupportsImages: latestContext.model?.input.includes("image") ?? true,
-				...(piToolSettings.shellPath ? { shellPath: piToolSettings.shellPath } : {}),
-				...(piToolSettings.shellCommandPrefix
-					? { shellCommandPrefix: piToolSettings.shellCommandPrefix }
-					: {}),
+				shellPath: piToolSettings.shellPath,
+				shellCommandPrefix: piToolSettings.shellCommandPrefix,
 			});
 		},
 		executionWorlds,
@@ -774,18 +681,11 @@ async function installController(
 		editableSettings: () => normalizeSpeculativeActionSettings(settingsStore.editable()),
 		settingsScope: () => settingsStore.scope,
 		setSettingsScope: (scope: SpeculativeSettingsScope) => settingsStore.setScope(scope),
-		metrics: visibleMetrics,
 		toolCapabilities,
 		recentEvents: (): readonly string[] => [...recentEvents],
 		refreshExecutionDiagnostics,
 		executionRoutes,
 		maintainExecutionStorage: async (operation: "gc" | "clear") => {
-			const controls = executionWorlds.flatMap((world) => (world.storage ? [world.storage] : []));
-			if (!controls.length)
-				return {
-					text: "No execution world exposes persistent storage.",
-					failed: true,
-				};
 			let entries = 0;
 			let artifacts = 0;
 			let bytes = 0;
@@ -816,29 +716,20 @@ async function installController(
 					),
 				);
 			else settingsStore.clear();
-			const updatedConfig = settingsStore.effective()?.config;
+			const effective = settingsStore.effective();
+			const updatedConfig = effective?.config;
 			configuration.update({ ...updatedConfig, storage: { ...updatedConfig?.storage, root: storeRoot } });
-			currentSettings = configuration.run(() =>
-				normalizeSpeculativeActionSettings(settingsStore.effective()),
-			);
+			currentSettings = normalizeSpeculativeActionSettings(effective);
 			configureExecutionStorage();
 			if (!currentSettings.enabled || !currentSettings.selfSpeculation.enabled) selfSpeculation.reset();
 			await recoverSpeculation(() =>
 				refreshExecutionDiagnostics(
 					previous.searchExecution !== currentSettings.searchExecution ||
-						previous.executionRouting.primary !== currentSettings.executionRouting.primary ||
-						previous.executionRouting.nativeFallback !== currentSettings.executionRouting.nativeFallback,
+						!isDeepStrictEqual(previous.executionRouting, currentSettings.executionRouting) ||
+						!isDeepStrictEqual(previous.config, currentSettings.config),
 				),
 			);
 			await settingsStore.flush(); // Applied for this session either way; callers report whether it was saved.
-		},
-		attachUI: (nextUI: ExtensionUIContext) => {
-			ui = nextUI;
-			renderFooter();
-		},
-		detachUI: () => {
-			ui?.setStatus(STATUS_KEY, undefined);
-			ui = undefined;
 		},
 		startTurn: async (messages: AgentMessage[], nextContext: ExtensionContext) => {
 			latestContext = nextContext;
@@ -909,7 +800,6 @@ async function installController(
 		observeActorOutput: (event: Parameters<SelfSpeculationCoordinator["observeActorOutput"]>[0]) =>
 			selfSpeculation.observeActorOutput(event),
 		finishActorOutput: () => selfSpeculation.finishActorOutput(),
-		selfSpeculationSnapshot: () => selfSpeculation.snapshot(),
 		finishTurn: async (terminal = false) => {
 			const turnID = currentTurnID ?? (terminal ? lastTurnID : undefined);
 			if (!turnID) return;
@@ -922,18 +812,13 @@ async function installController(
 			else selfSpeculation.endTurn();
 			if (terminal) lastTurnID = undefined;
 		},
-		statusText: () => {
-			const effective = settings();
-			return [
-				formatSpeculativeActionStatus({
-					settings: effective,
-					metrics: visibleMetrics(),
-				}),
+		statusText: () =>
+			[
+				formatSpeculativeActionStatus({ settings: settings(), metrics: visibleMetrics() }),
 				formatDrafterBudgetStatus(host.drafterBudgetSnapshot()),
 				formatSelfSpeculationStatus(selfSpeculation.snapshot()),
 				executionWorldSummary(toolCapabilities(), executionRoutes()),
-			].join("\n");
-		},
+			].join("\n"),
 		dispose: () => {
 			sdk.dispose();
 			ui?.setStatus(STATUS_KEY, undefined);
@@ -959,6 +844,8 @@ async function installController(
 	} as const;
 	const sdk = attachSdkTools(context, [...agentTools.values()], () => pi.getActiveTools());
 	await recoverSpeculation(() => refreshExecutionDiagnostics());
+	ui = context.ui;
+	renderFooter();
 	return configuration.bind(controller);
 }
 async function recoverSpeculation<T>(operation: () => Promise<T>): Promise<T | undefined> {
@@ -1003,726 +890,287 @@ function loadPiToolSettings(context: ExtensionContext) {
 }
 async function runCommand(
 	args: string,
-	ctx: ExtensionCommandContext,
+	ctx: ExtensionContext,
 	controller: SpeculativeActionController | undefined,
 ): Promise<void> {
 	if (!controller) {
 		ctx.ui.notify("Speculative action runtime is unavailable.", "error");
 		return;
 	}
+	const { ui } = ctx;
 	const command = args.trim().toLowerCase();
 	if (command === "on" || command === "off") {
-		const saved = await controller
-			.setSettings({
-				...controller.editableSettings(),
-				enabled: command === "on",
-			})
-			.then(
-				() => "",
-				(error: unknown) => ` (not saved: ${errorMessage(error)})`,
-			);
-		ctx.ui.notify(
-			`Speculative production ${controller.settings().enabled ? "enabled" : "disabled"}${controller.settings().enabled === (command === "on") ? "" : " by the active project settings"}${saved}. Cache & reuse: ${controller.settings().reuseEnabled ? "On" : "Off"}; observation and learning remain active.`,
+		const enabled = command === "on";
+		const saved = await controller.setSettings({ ...controller.editableSettings(), enabled }).then(
+			() => "",
+			(error: unknown) => ` (not saved: ${errorMessage(error)})`,
+		);
+		const effective = controller.settings();
+		ui.notify(
+			`Speculative production ${effective.enabled ? "enabled" : "disabled"}${effective.enabled === enabled ? "" : " by the active project settings"}${saved}. Cache & reuse: ${onOff(effective.reuseEnabled)}; observation and learning remain active.`,
 			saved ? "warning" : "info",
 		);
 		return;
 	}
 	if (command === "reset") {
 		await controller.setSettings(undefined);
-		ctx.ui.notify("Active speculative action settings reset.", "info");
-		return;
-	}
-	if (command === "events") {
-		showRecentEvents(ctx, controller);
-		return;
-	}
-	if (command === "status" || (command === "" && ctx.mode !== "tui")) {
+		ui.notify("Active speculative action settings reset.", "info");
+	} else if (command === "events") {
+		ui.notify(controller.recentEvents().join("\n") || "No speculative action events recorded yet.", "info");
+	} else if (command === "status" || (!command && ctx.mode !== "tui")) {
 		await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
-		ctx.ui.notify(controller.statusText(), "info");
-		return;
-	}
-	if (command) {
-		ctx.ui.notify("Usage: /speculative-action [on|off|status|events|reset]", "warning");
-		return;
-	}
-	await openSettings(ctx, controller);
+		ui.notify(controller.statusText(), "info");
+	} else if (command) ui.notify("Usage: /speculative-action [on|off|status|events|reset]", "warning");
+	else await openSettings(ctx, controller);
 }
+const SETTINGS_PAGES: Readonly<Record<string, readonly string[]>> = {
+	"Speculative action": [
+		"enabled",
+		"reuseEnabled",
+		"Save settings to",
+		"Prediction sources",
+		"Tools & execution",
+		"Advanced settings",
+		"Apply changes",
+		"Discard changes",
+		"Status",
+		"Recent events",
+		"Restore defaults",
+	],
+	"Prediction sources": ["Model Drafter", "Prediction tools", "Actor probe", "Learned patterns"],
+	"Advanced settings": ["Model Drafter", "Actor probe", "Learned patterns", "Scheduling and storage"],
+	"Model Drafter": [
+		"draftModel",
+		...Object.keys(SETTING_LABELS).filter((key) => key.startsWith("drafter") || key === "candidateLimit"),
+	],
+	"Prediction tools": ["tools"],
+	"Tools & execution": [
+		"prepareObservedOperations",
+		"Execution routes",
+		"Check Linux environment",
+		"Install / update Linux dependencies",
+	],
+	"Execution routes": [
+		"executionRouting.primary",
+		"executionRouting.nativeFallback",
+		"searchExecution",
+		"Refresh and show capabilities",
+	],
+	"Actor probe": Object.keys(SETTING_LABELS).filter((key) => key.startsWith("selfSpeculation.")),
+	"Learned patterns": Object.keys(SETTING_LABELS).filter((key) => key.startsWith("patternAware.")),
+	"Scheduling and storage": [
+		...Object.keys(SETTING_LABELS).filter((key) =>
+			/^(maxConcurrentActions|resourceCache|executionStore)/.test(key),
+		),
+		"Scheduler policy",
+		"Reclaim reusable command history",
+		"Clear reusable command history",
+	],
+	"Scheduler policy": Object.keys(SETTING_LABELS).filter((key) => key.startsWith("scheduling.")),
+};
+
 async function openSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
-	let applied = structuredClone(controller.editableSettings());
-	let draft = structuredClone(applied);
-	const editor: SpeculativeActionController = {
-		...controller,
-		settings: () => draft,
-		setSettings: async (value) => {
-			draft = structuredClone(normalizeSpeculativeActionSettings(value));
-		},
-	};
+	const { ui } = ctx;
+	const pages = ["Speculative action"];
+	let applied = controller.editableSettings();
+	let draft = applied;
 	const reload = () => {
-		applied = structuredClone(controller.editableSettings());
-		draft = structuredClone(applied);
+		applied = controller.editableSettings();
+		draft = applied;
 	};
-	while (true) {
+	const refresh = async () => {
+		await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
+		ui.notify(executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes()), "info");
+	};
+	while (pages.length) {
+		const page = pages.at(-1)!;
 		const dirty = !isDeepStrictEqual(draft, applied);
-		const scope = controller.settingsScope() === "global" ? "All projects" : "This project";
-		const actions = new Map<string, MenuAction>([
-			[
-				`Speculative production: ${draft.enabled ? "On" : "Off"}`,
-				() => editor.setSettings({ ...draft, enabled: !draft.enabled }),
-			],
-			[
-				`Cache & reuse: ${draft.reuseEnabled ? "On" : "Off"}`,
-				() => editor.setSettings({ ...draft, reuseEnabled: !draft.reuseEnabled }),
-			],
-			[
-				`Save settings to: ${scope}${isDeepStrictEqual(applied, controller.settings()) ? "" : " (this project overrides shared settings)"}`,
-				async () => {
-					const selected = await ctx.ui.select("Save settings to", ["All projects", "This project", BACK]);
-					if (
-						(selected === "All projects" || selected === "This project") &&
-						(!dirty ||
-							(await ctx.ui.confirm("Discard changes?", "Switch configuration scope without applying?")))
-					) {
-						controller.setSettingsScope(selected === "All projects" ? "global" : "project");
-						reload();
+		const global = controller.settingsScope() === "global";
+		const menu = new Map<string, string>();
+		const available = page === "Prediction tools" ? [...controller.toolCapabilities().keys()] : [];
+		const tools = draft.tools ?? available;
+		const labels: Record<string, string> =
+			pages.length === 1
+				? {
+						"Apply changes": dirty ? "Apply changes (pending)" : "Apply changes",
+						"Prediction sources": `Prediction sources › ${sourceSummary(draft)}`,
+						"Advanced settings": "Advanced settings › tuning, decoding, scheduling, storage",
+						"Save settings to": `Save settings to: ${global ? "All projects" : "This project"}${isDeepStrictEqual(applied, controller.settings()) ? "" : " (this project overrides shared settings)"}`,
 					}
-				},
-			],
-			[`Prediction sources › ${sourceSummary(draft)}`, () => openPredictionSources(ctx, editor)],
-			["Tools & execution", () => openToolsAndExecution(ctx, editor, controller)],
-			["Advanced settings › tuning, decoding, scheduling, storage", () => openAdvancedSettings(ctx, editor)],
-			[
-				`Apply changes${dirty ? " (pending)" : ""}`,
-				async () => {
-					if (!dirty) return ctx.ui.notify("No pending speculative-action changes.", "info");
-					const saved = await controller.setSettings(draft).then(
-						() => true,
-						(error: unknown) =>
-							void ctx.ui.notify(
-								`Speculative-action settings apply to this session but were not saved: ${errorMessage(error)}`,
-								"error",
-							),
-					);
-					reload();
-					if (saved) ctx.ui.notify("Speculative-action settings applied.", "info");
-				},
-			],
-		]);
-		if (dirty)
-			actions.set("Discard changes", () => {
-				draft = structuredClone(applied);
-			});
-		actions.set("Status", async () => {
-			await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
-			ctx.ui.notify(controller.statusText(), "info");
-		});
-		actions.set("Recent events", () => showRecentEvents(ctx, controller));
-		actions.set("Restore defaults", async () => {
+				: page === "Model Drafter"
+					? { draftModel: `Model: ${draft.draftModel ?? activeModelReference(ctx)}` }
+					: {};
+		const fieldValue = (settings: EffectiveSpeculativeActionSettings, field: string) => {
+			const [group, member] = field.split(".");
+			const record: Record<string, unknown> = member ? Reflect.get(settings, group!) : settings;
+			return record[member ?? group!];
+		};
+		for (const field of SETTINGS_PAGES[page]!) {
+			if (!dirty && field === "Discard changes") continue;
+			if (!global && ["selfSpeculation.endpoint", "selfSpeculation.apiKeyEnv"].includes(field)) continue;
+			if (field === "tools") {
+				menu.set("Use all available tools", field);
+				for (const tool of available)
+					menu.set(`[${tools.includes(tool) ? "x" : " "}] ${tool}`, `tool:${tool}`);
+			} else if (SETTING_LABELS[field]) {
+				const value = fieldValue(draft, field);
+				const display =
+					typeof value === "boolean"
+						? onOff(value)
+						: field.endsWith("Bytes")
+							? formatBytes(Number(value))
+							: (value ?? "None");
+				menu.set(`${SETTING_LABELS[field]}: ${display}`, field);
+			} else menu.set(labels[field] ?? field, field);
+		}
+		const choice = await ui.select(page, [...menu.keys(), pages.length === 1 ? CLOSE : BACK]);
+		const field = choice && menu.get(choice);
+		if (!field) {
 			if (
-				!(await ctx.ui.confirm(
-					"Restore defaults?",
-					"Restore tuning values while keeping the production, reuse and source switches?",
-				))
-			)
-				return;
-			const defaults = normalizeSpeculativeActionSettings(undefined);
-			const { patternAware: pattern, selfSpeculation: probe } = draft;
-			await editor.setSettings({
-				...defaults,
-				enabled: draft.enabled,
-				reuseEnabled: draft.reuseEnabled,
-				drafterEnabled: draft.drafterEnabled,
-				tools: draft.tools,
-				prepareObservedOperations: draft.prepareObservedOperations,
-				patternAware: {
-					...defaults.patternAware,
-					enabled: pattern.enabled,
-					multiStepEnabled: pattern.multiStepEnabled,
-					presets: pattern.presets,
-				},
-				selfSpeculation: {
-					...defaults.selfSpeculation,
-					enabled: probe.enabled,
-					forkEnabled: probe.forkEnabled,
-					forkActionEnabled: probe.forkActionEnabled,
-				},
-			});
-		});
-		const choice = await ctx.ui.select("Speculative action", [...actions.keys(), CLOSE]);
-		if (!choice || choice === CLOSE) {
-			if (
+				pages.length > 1 ||
 				!dirty ||
-				(await ctx.ui.confirm(
+				(await ui.confirm(
 					"Discard changes?",
 					"Close without applying the pending speculative-action changes?",
 				))
 			)
-				return;
-			continue;
-		}
-		await actions.get(choice)?.();
-	}
-}
-function openPredictionSources(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-): Promise<void> {
-	return runSettingsMenu(ctx, controller, "Prediction sources", (settings) => [
-		[
-			`Model Drafter › ${settings.drafterEnabled ? "On" : "Off"}, ${settings.draftModel ?? activeModelReference(ctx)}`,
-			() => openDrafterSettings(ctx, controller),
-		],
-		[
-			`Prediction tools › ${settings.tools ? settings.tools.join(", ") || "None" : "All available"}`,
-			() => openPredictionTools(ctx, controller),
-		],
-		[
-			`Actor probe › ${actorForkSummary(settings.selfSpeculation)}`,
-			() => openActorForkSettings(ctx, controller),
-		],
-		[
-			`Learned patterns › ${settings.patternAware.enabled ? "On" : "Off"}, ${settings.patternAware.multiStepEnabled ? "follow-up steps" : "next step only"}`,
-			() => openPatternAwareSettings(ctx, controller),
-		],
-	]);
-}
-function openPredictionTools(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
-	return runSettingsMenu(ctx, controller, "Prediction tools", (settings) => {
-		const available = [...controller.toolCapabilities().keys()];
-		const selected = settings.tools ?? available;
-		return [
-			[
-				"Use all available tools",
-				() => {
-					const { tools, ...all } = settings;
-					return controller.setSettings(all);
-				},
-			],
-			...available.map((tool): [string, MenuAction] => [
-				`[${selected.includes(tool) ? "x" : " "}] ${tool}`,
-				() =>
-					controller.setSettings({
-						...settings,
-						tools: selected.includes(tool) ? selected.filter((name) => name !== tool) : [...selected, tool],
-					}),
-			]),
-		];
-	});
-}
-function openAdvancedSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
-	return runSettingsMenu(ctx, controller, "Advanced settings", (settings) => [
-		[
-			`Model Drafter tuning › ${settings.candidateLimit} requests, ${settings.drafterMaxDepth} out-of-order follow-up batches`,
-			() => openDrafterSettings(ctx, controller, true),
-		],
-		[
-			`Actor probe and target verification › ${settings.selfSpeculation.forkTransport}`,
-			() => openActorForkSettings(ctx, controller, "advanced"),
-		],
-		[
-			`Learned-pattern tuning › ${settings.patternAware.maxPatterns} stored patterns`,
-			() => openPatternAwareSettings(ctx, controller, "advanced"),
-		],
-		[
-			`Scheduling and storage › ${settings.maxConcurrentActions} resource units`,
-			() => openSchedulingAndCache(ctx, controller),
-		],
-	]);
-}
-function openDrafterSettings(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	advanced = false,
-): Promise<void> {
-	return runSettingsMenu(
-		ctx,
-		controller,
-		advanced ? "Model Drafter advanced" : "Model Drafter",
-		(settings) => {
-			const { input, toggle } = settingActions(ctx, settings, ROOT_SETTING_INPUTS, controller.setSettings);
-			return !advanced
-				? [
-						toggle("drafterEnabled", "Enabled"),
-						[
-							`Model › ${settings.draftModel ?? activeModelReference(ctx)}`,
-							() => editDraftModel(ctx, controller, settings),
-						],
-						input("candidateLimit", "Candidate requests per decision"),
-						[
-							`Advanced settings › sampling, out-of-order follow-up batches, cost control`,
-							() => openDrafterSettings(ctx, controller, true),
-						],
-					]
-				: [
-						toggle("drafterPatternHints", "Show PatternAware's expected calls"),
-						input("drafterMaxDepth", "Out-of-order follow-up batches"),
-						input("drafterDeterministicCandidates", "Temperature-0 candidates"),
-						[
-							`Sampling temperature: ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
-							() => editDrafterTemperatureRange(ctx, controller, settings),
-						],
-					];
-		},
-	);
-}
-type ActorForkMenu = "basic" | "advanced" | "integration" | "protocol" | "fork" | "target";
-function openActorForkSettings(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	menu: ActorForkMenu = "basic",
-): Promise<void> {
-	const titles = {
-		basic: "Actor probe",
-		advanced: "Actor probe advanced",
-		integration: "Integration and authentication",
-		protocol: "Service protocol",
-		fork: "Fork decoding",
-		target: "Target verification",
-	};
-	return runSettingsMenu(ctx, controller, titles[menu], (settings) => {
-		const self = settings.selfSpeculation;
-		const remote = self.forkTransport !== "drafter";
-		const save = (selfSpeculation: SelfSpeculationSettings) =>
-			controller.setSettings({ ...settings, selfSpeculation });
-		const { input, toggle } = settingActions(ctx, self, SELF_SPECULATION_INPUTS, save);
-		const link = (label: string, page: ActorForkMenu): [string, MenuAction] => [
-			label,
-			() => openActorForkSettings(ctx, controller, page),
-		];
-		if (menu === "basic") {
-			const active = self.enabled && self.forkEnabled;
-			return [
-				[
-					`Actor probe prediction: ${active ? "On" : "Off"}`,
-					() =>
-						save({
-							...self,
-							enabled: active ? self.enabled : true,
-							forkEnabled: !active,
-						}),
-				],
-				link("Advanced settings › integration, decoding, verification", "advanced"),
-				...(self.forkTransport !== "provider"
-					? [toggle("forkActionEnabled", "Use forked calls for tool pre-execution")]
-					: []),
-				...(remote && (self.forkTransport === "provider" || self.forkActionEnabled)
-					? [input("forkActionMinConfidence", undefined, formatPercent)]
-					: []),
-			];
-		}
-		if (menu === "advanced")
-			return [
-				link(`Integration and authentication › ${FORK_TRANSPORT_LABELS[self.forkTransport]}`, "integration"),
-				link(`Fork decoding › ${self.forkMaxAttempts} probes`, "fork"),
-				...(remote
-					? [
-							link(
-								`Target verification › ${self.maxCandidates} candidates × ${self.maxDraftTokens} tokens`,
-								"target",
-							),
-						]
-					: []),
-			];
-		if (menu === "integration") {
-			const actions = new Map<string, MenuAction>([
-				[
-					`Integration: ${FORK_TRANSPORT_LABELS[self.forkTransport]}`,
-					async () => {
-						const selected = await ctx.ui.select("Actor probe integration", [
-							...Object.values(FORK_TRANSPORT_LABELS),
-							BACK,
-						]);
-						const transport = Object.entries(FORK_TRANSPORT_LABELS).find(
-							([, label]) => label === selected,
-						)?.[0] as SelfSpeculationSettings["forkTransport"] | undefined;
-						if (transport) await save({ ...self, forkTransport: transport });
-					},
-				],
-			]);
-			if (remote) {
-				actions.set(...input("timeoutMs", "Request timeout", formatDuration));
-				if (controller.settingsScope() === "global") {
-					actions.set(...input("endpoint"));
-					actions.set(...input("apiKeyEnv", "Authentication token variable", (value) => value ?? "None"));
-				} else
-					actions.set("Service URL and authentication › All projects only", () =>
-						ctx.ui.notify(
-							"Choose Save settings to → All projects in the main menu to edit the service URL and authentication.",
-							"info",
-						),
-					);
-				actions.set(...link("Service protocol › request field, paths, probability evidence", "protocol"));
+				pages.pop();
+		} else if (SETTINGS_PAGES[field]) pages.push(field);
+		else if (field === "Save settings to") {
+			const scope = await ui.select(field, ["All projects", "This project", BACK]);
+			if (scope !== "All projects" && scope !== "This project") continue;
+			if (dirty && !(await ui.confirm("Discard changes?", "Switch configuration scope without applying?")))
+				continue;
+			controller.setSettingsScope(scope === "All projects" ? "global" : "project");
+			reload();
+		} else if (field === "Apply changes") {
+			if (!dirty) {
+				ui.notify("No pending speculative-action changes.", "info");
+				continue;
 			}
-			return actions;
-		}
-		if (menu === "protocol")
-			return [
-				...(["requestIDField", "candidatePath", "forkPath", "clearPath", "capabilitiesPath"] as const).map(
-					(key) => input(key),
-				),
-				toggle("requireLogprobs", "Require token probabilities"),
-			];
-		if (menu === "fork")
-			return [
-				input("forkTemperature", "Sampling temperature", formatNumber),
-				...(["forkMaxAttempts", "forkRetryStreamUpdates", "forkBoundaryStreamUpdates"] as const).map((key) =>
-					input(key),
-				),
-				...(remote
-					? [
-							input("forkDecoder", "Tool-call decoder"),
-							input("forkForcedPrefix", "Forced tool-call prefix", syntaxSettingLabel),
-						]
-					: []),
-			];
-		return [
-			toggle("enabled", "Verify predicted calls during Actor decoding"),
-			input("maxCandidates", "Candidates sent per decision"),
-			input("maxDraftTokens"),
-			input("actorProfile", "Actor Profile"),
-			input("draftFormat", "Tool-call format override"),
-			input("draftBoundary", "Tool-call boundary", syntaxSettingLabel),
-		];
-	});
-}
-function openPatternAwareSettings(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	menu: "basic" | "advanced" | "learning" | "multiStep" = "basic",
-): Promise<void> {
-	const title = {
-		basic: "Learned patterns",
-		advanced: "Learned-pattern advanced",
-		learning: "Learning history",
-		multiStep: "Multi-step search",
-	}[menu];
-	return runSettingsMenu(ctx, controller, title, (settings) => {
-		const pattern = settings.patternAware;
-		const { input, toggle } = settingActions(ctx, pattern, PATTERN_SETTING_INPUTS, (patternAware) =>
-			controller.setSettings({ ...settings, patternAware }),
-		);
-		if (menu === "basic")
-			return [
-				toggle("enabled", "Pattern predictions (learning stays active)"),
-				toggle("multiStepEnabled", "Predict follow-up tool steps"),
-				[
-					`Advanced settings › history, confidence, search limits`,
-					() => openPatternAwareSettings(ctx, controller, "advanced"),
-				],
-			];
-		if (menu === "advanced") {
-			const actions = new Map<string, MenuAction>([
-				[
-					`Learning history › ${pattern.maxContextLength} previous actions`,
-					() => openPatternAwareSettings(ctx, controller, "learning"),
-				],
-			]);
-			if (pattern.multiStepEnabled)
-				actions.set(
-					`Multi-step search › ${pattern.beamWidth} alternatives/tool, ${pattern.maxPredictionDepth} steps`,
-					() => openPatternAwareSettings(ctx, controller, "multiStep"),
+			try {
+				await controller.setSettings(draft);
+				ui.notify("Speculative-action settings applied.", "info");
+			} catch (error) {
+				ui.notify(
+					`Speculative-action settings apply to this session but were not saved: ${errorMessage(error)}`,
+					"error",
 				);
-			return actions;
-		}
-		return menu === "learning"
-			? [
-					input("maxContextLength"),
-					input("maxFutureGap"),
-					input("futureGapCoverage", "Early-prediction coverage", formatPercent),
-					input("decayHalfLifeEvents", "History half-life", (value) => `${value} events`),
-					input("minOccurrences", "Uses before learning a pattern"),
-					input("maxPatterns"),
-				]
-			: [input("beamWidth"), input("maxPredictionDepth")];
-	});
-}
-function openSchedulingAndCache(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-): Promise<void> {
-	return runSettingsMenu(ctx, controller, "Scheduling and storage", (settings) => {
-		const { input } = settingActions(ctx, settings, ROOT_SETTING_INPUTS, controller.setSettings);
-		const actions = new Map<string, MenuAction>([
-			input("maxConcurrentActions"),
-			["Scheduler policy › sampling, failure recovery", () => openSchedulingPolicy(ctx, controller)],
-			[
-				"Resource estimates › process/tree and file snapshots",
-				() => openSchedulingPolicy(ctx, controller, true),
-			],
-			input("resourceCacheMaxEntries"),
-			input("resourceCacheMaxBytes", "Live result memory", formatBytes),
-			input("executionStoreMaxEntries"),
-			input("executionStoreMaxBytes", "Reusable command history memory", formatBytes),
-		]);
-		for (const [label, operation] of [
-			["Reclaim", "gc"],
-			["Clear", "clear"],
-		] as const)
-			actions.set(`${label} reusable command history`, async () => {
-				if (
-					operation === "clear" &&
-					!(await ctx.ui.confirm(
-						"Clear reusable command history?",
-						"Delete all reusable command results and file effects? This cannot be undone.",
-					))
-				)
-					return;
-				const report = await recoverSpeculation(() => controller.maintainExecutionStorage(operation));
-				ctx.ui.notify(
-					report?.text ?? "Reusable command history maintenance failed.",
-					report && !report.failed ? "info" : "warning",
-				);
+			}
+			reload();
+		} else if (field === "Discard changes") draft = applied;
+		else if (field === "Status" || field === "Recent events")
+			await runCommand(field === "Status" ? "status" : "events", ctx, controller);
+		else if (field === "Check Linux environment") await checkLinuxEnvironment(ctx, refresh);
+		else if (field === "Install / update Linux dependencies") await installLinuxDependencies(ctx, refresh);
+		else if (field === "Refresh and show capabilities") await refresh();
+		else if (field.endsWith("reusable command history")) {
+			const operation = field.startsWith("Clear") ? "clear" : "gc";
+			if (
+				operation === "clear" &&
+				!(await ui.confirm(
+					"Clear reusable command history?",
+					"Delete all reusable command results and file effects?",
+				))
+			)
+				continue;
+			const report = await recoverSpeculation(() => controller.maintainExecutionStorage(operation));
+			ui.notify(
+				report?.text ?? "Reusable command history maintenance failed.",
+				report && !report.failed ? "info" : "warning",
+			);
+		} else if (field === "Restore defaults") {
+			if (
+				!(await ui.confirm(
+					"Restore defaults?",
+					"Restore tuning values while keeping the production, reuse and source switches?",
+				))
+			)
+				continue;
+			const { enabled, reuseEnabled, drafterEnabled, tools, prepareObservedOperations } = draft;
+			const { multiStepEnabled, presets } = draft.patternAware;
+			const { forkEnabled, forkActionEnabled } = draft.selfSpeculation;
+			draft = normalizeSpeculativeActionSettings({
+				enabled,
+				reuseEnabled,
+				drafterEnabled,
+				tools,
+				prepareObservedOperations,
+				patternAware: {
+					enabled: draft.patternAware.enabled,
+					multiStepEnabled,
+					presets,
+				},
+				selfSpeculation: {
+					enabled: draft.selfSpeculation.enabled,
+					forkEnabled,
+					forkActionEnabled,
+				},
 			});
-		return actions;
-	});
-}
-function openSchedulingPolicy(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	resources = false,
-): Promise<void> {
-	return runSettingsMenu(
-		ctx,
-		controller,
-		resources ? "Resource estimates" : "Scheduler policy",
-		(settings) => {
-			const policy = settings.scheduling;
-			const { input } = settingActions(ctx, policy, SCHEDULING_INPUTS, (scheduling) =>
-				controller.setSettings({ ...settings, scheduling }),
-			);
-			return (Object.keys(SCHEDULING_INPUTS) as (keyof SchedulingSettings)[])
-				.filter((key) => /^(heavy|light)/.test(key) === resources)
-				.map((key) => input(key));
-		},
-	);
-}
-type MenuAction = () => void | Promise<void>;
-async function runSettingsMenu(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	title: string,
-	actionsForCurrentSettings: (
-		settings: EffectiveSpeculativeActionSettings,
-	) => Iterable<readonly [string, MenuAction]>,
-): Promise<void> {
-	while (true) {
-		const actions = new Map(actionsForCurrentSettings(controller.settings()));
-		const choice = await ctx.ui.select(title, [...actions.keys(), BACK]);
-		if (!choice || choice === BACK) return;
-		await actions.get(choice)?.();
-	}
-}
-function openToolsAndExecution(
-	ctx: ExtensionContext,
-	editor: SpeculativeActionController,
-	controller: SpeculativeActionController,
-): Promise<void> {
-	return runSettingsMenu(ctx, editor, "Tools & execution", (settings) => {
-		const refresh = async () => {
-			await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
-			ctx.ui.notify(
-				executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes()),
-				"info",
-			);
-		};
-		return [
-			[
-				`Prepare observed operations › ${settings.prepareObservedOperations ? "On" : "Off"}`,
-				() =>
-					editor.setSettings({
-						...settings,
-						prepareObservedOperations: !settings.prepareObservedOperations,
-					}),
-			],
-			["Execution routes", () => openExecutionRoutes(ctx, editor, controller)],
-			["Check Linux environment", () => checkLinuxEnvironment(ctx, refresh)],
-			["Install / update Linux dependencies", () => installLinuxDependencies(ctx, refresh)],
-		];
-	});
-}
-async function openExecutionRoutes(
-	ctx: ExtensionContext,
-	editor: SpeculativeActionController,
-	controller: SpeculativeActionController,
-): Promise<void> {
-	await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
-	ctx.ui.notify(
-		`Reuse covers bound file inputs, deterministic computations and qualified file transactions. On supported Linux hosts, completed Bash branches can also be adopted after validation. Unsupported or changed inputs fall back to the Actor; live process restoration and external runtime sandboxes remain unavailable.\n${executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes())}`,
-		"info",
-	);
-	return runSettingsMenu(ctx, editor, "Execution routes", (settings) => {
-		const { worlds, primaryIDs } = controller.executionRoutes();
-		const actions = new Map<string, MenuAction>();
-		const routes = [
-			["primary", "Unified execution environment", primaryIDs.size, primaryIDs.size > 0],
-			[
-				"nativeFallback",
-				"Local safe fallback",
-				worlds.filter((world) => !primaryIDs.has(world.id)).length,
-				true,
-			],
-		] as const;
-		for (const [field, label, providers, available] of routes) {
-			const status = available ? `${providers} provider${providers === 1 ? "" : "s"}` : "not installed";
-			actions.set(
-				`${available && settings.executionRouting[field] ? "[x]" : "[ ]"} ${label} · ${status}`,
-				available
-					? () =>
-							editor.setSettings({
-								...settings,
-								executionRouting: {
-									...settings.executionRouting,
-									[field]: !settings.executionRouting[field],
-								},
-							})
-					: () => ctx.ui.notify("No unified execution environment is installed for this profile.", "info"),
-			);
-		}
-		actions.set(`Search execution › ${searchExecutionLabel(settings.searchExecution)}`, async () => {
-			const choice = await ctx.ui.select("Search execution", [
-				"Native Pi (default)",
-				"Captured search (find + available rg; no installation)",
-				BACK,
-			]);
-			if (!choice || choice === BACK) return;
-			if (choice.startsWith("Captured"))
-				ctx.ui.notify(
-					"Actor and speculation share Pi's installed find matcher and, when qualified, pinned rg (Windows x64 15.2.0; Linux x64 14.1.0). grep sorts paths and ignores RIPGREP_CONFIG_PATH/global Git ignores; parent ignore rules remain. Not Native Pi defaults. No installation. An admitted profile call never switches executor on failure.",
-					"warning",
-				);
-			await editor.setSettings({
-				...settings,
-				searchExecution: choice.startsWith("Captured") ? "captured" : "native",
+		} else if (field === "tools" || field.startsWith("tool:")) {
+			const tool = field.slice(5);
+			const selection = tools.includes(tool) ? tools.filter((name) => name !== tool) : [...tools, tool];
+			draft = normalizeSpeculativeActionSettings({
+				...draft,
+				tools: field === "tools" ? undefined : selection,
 			});
-		});
-		actions.set("Actor execution · always available", () =>
-			ctx.ui.notify("Actor execution is the authoritative final route and cannot be disabled here.", "info"),
-		);
-		actions.set("Refresh and show capabilities", async () => {
-			await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
-			ctx.ui.notify(
-				executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes()),
-				"info",
-			);
-		});
-		return actions;
-	});
-}
-async function promptSetting<T>(
-	ctx: ExtensionContext,
-	current: T,
-	descriptor: SettingInputDescriptor<T>,
-	publish: (value: T) => Promise<void>,
-): Promise<void> {
-	const input = await ctx.ui.input(descriptor.title, descriptor.format(current));
-	if (input === undefined) return;
-	const parsed = descriptor.parse(input);
-	if (!parsed.ok) ctx.ui.notify(parsed.error, "warning");
-	else await publish(parsed.value);
-}
-function settingActions<T extends object, Field extends keyof T>(
-	ctx: ExtensionContext,
-	current: T,
-	descriptors: SettingInputDescriptors<T, Field>,
-	publish: (value: T) => Promise<void>,
-) {
-	const update = (field: keyof T, value: unknown) => {
-		const next = { ...current };
-		if (value === undefined) Reflect.deleteProperty(next, field);
-		else Object.assign(next, { [field]: value });
-		return publish(next);
-	};
-	return {
-		input<Key extends Field>(
-			key: Key,
-			label = descriptors[key].title,
-			format: (value: T[Key]) => string | number = descriptors[key].format,
-		): [string, MenuAction] {
-			return [
-				`${label}: ${format(current[key])}`,
-				() => promptSetting(ctx, current[key], descriptors[key], (value) => update(key, value)),
-			];
-		},
-		toggle(
-			key: {
-				[Key in keyof T]: T[Key] extends boolean ? Key : never;
-			}[keyof T],
-			label: string,
-		): [string, MenuAction] {
-			return [`${label}: ${current[key] ? "On" : "Off"}`, () => update(key, !current[key])];
-		},
-	};
-}
-function editDrafterTemperatureRange(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-): Promise<void> {
-	return promptSetting(
-		ctx,
-		[settings.drafterTemperatureMin, settings.drafterTemperatureMax] as const,
-		DRAFTER_TEMPERATURE_INPUT,
-		([drafterTemperatureMin, drafterTemperatureMax]) =>
-			controller.setSettings({
-				...settings,
-				drafterTemperatureMin,
-				drafterTemperatureMax,
-			}),
-	);
-}
-async function editDraftModel(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-): Promise<void> {
-	const models = ctx.modelRegistry
-		.getAvailable()
-		.sort((left, right) => `${left.provider}/${left.id}`.localeCompare(`${right.provider}/${right.id}`));
-	const providers = new Map<string, typeof models>();
-	for (const model of models)
-		providers.set(model.provider, [...(providers.get(model.provider) ?? []), model]);
-	const providerLabels = new Map(
-		[...providers].map(([provider, providerModels]) => [
-			`${provider} (${providerModels.length} models) ›`,
-			provider,
-		]),
-	);
-	const active = `${USE_ACTIVE_MODEL} (${activeModelReference(ctx)})`;
-	const choice = await ctx.ui.select("Drafter model", [active, ...providerLabels.keys(), CUSTOM_MODEL, BACK]);
-	if (!choice || choice === BACK) return;
-	const { draftModel: _previousDraftModel, ...baseSettings } = settings;
-	if (choice === active) {
-		await controller.setSettings(baseSettings);
-		return;
+		} else if (field === "draftModel") {
+			const models = ctx.modelRegistry
+				.getAvailable()
+				.map((model) => `${model.provider}/${model.id}`)
+				.sort();
+			const active = `${USE_ACTIVE_MODEL} (${activeModelReference(ctx)})`;
+			let model = await ui.select("Drafter model", [active, ...models, CUSTOM_MODEL, BACK]);
+			if (!model || model === BACK) continue;
+			if (model === CUSTOM_MODEL) model = await ui.input("Custom drafter model", "provider/model");
+			if (model !== undefined)
+				draft = normalizeSpeculativeActionSettings({
+					...draft,
+					draftModel: model === active ? undefined : model,
+				});
+		} else {
+			const label = SETTING_LABELS[field]!;
+			const value = fieldValue(draft, field);
+			const bytes = field.endsWith("Bytes");
+			if (field === "executionRouting.primary" && !controller.executionRoutes().primaryIDs.size) {
+				ui.notify("No unified execution environment is installed for this profile.", "info");
+				continue;
+			}
+			let next: unknown = !value;
+			const choices =
+				field === "selfSpeculation.forkTransport"
+					? FORK_TRANSPORT_LABELS
+					: field === "searchExecution"
+						? { native: "Native Pi", captured: "Captured search (shared fixed search engine)" }
+						: undefined;
+			if (choices) {
+				const choice = await ui.select(label, [...Object.values(choices), BACK]);
+				next = Object.entries(choices).find(([, name]) => name === choice)?.[0];
+				if (!next) continue;
+			} else if (typeof value !== "boolean") {
+				const input = await ui.input(
+					label + (bytes ? " (MiB)" : ""),
+					String(bytes ? Number(value) / 1048576 : (value ?? "")),
+				);
+				if (input === undefined) continue;
+				next =
+					typeof value === "number"
+						? input.trim()
+							? Number(input) * (bytes ? 1048576 : 1)
+							: NaN
+						: input.trim() || undefined;
+				if (bytes && !Number.isSafeInteger(Number(input))) {
+					ui.notify(`Invalid ${label}.`, "warning");
+					continue;
+				}
+			}
+			const [group, member] = field.split(".");
+			const patch = member ? { ...Reflect.get(draft, group!), [member]: next } : next;
+			const normalized = normalizeSpeculativeActionSettings({ ...draft, [group!]: patch });
+			if (!isDeepStrictEqual(fieldValue(normalized, field), next)) ui.notify(`Invalid ${label}.`, "warning");
+			else draft = normalized;
+		}
 	}
-	if (choice === CUSTOM_MODEL) {
-		const value = await ctx.ui.input("Custom drafter model", "provider/model");
-		if (value === undefined) return;
-		const draftModel = value.trim();
-		await controller.setSettings({
-			...baseSettings,
-			...(draftModel ? { draftModel } : {}),
-		});
-		return;
-	}
-	const provider = providerLabels.get(choice);
-	if (!provider) return;
-	const labels = new Map(
-		(providers.get(provider) ?? []).map((model) => {
-			const reference = `${model.provider}/${model.id}`;
-			return [
-				`${settings.draftModel === reference ? "[x] " : ""}${model.id}${model.name && model.name !== model.id ? ` — ${model.name}` : ""}`,
-				reference,
-			];
-		}),
-	);
-	const selected = await ctx.ui.select(`${provider} models`, [...labels.keys(), BACK]);
-	if (!selected || selected === BACK) return;
-	const draftModel = labels.get(selected);
-	if (draftModel) await controller.setSettings({ ...baseSettings, draftModel });
-}
-function showRecentEvents(ctx: ExtensionContext, controller: SpeculativeActionController): void {
-	const events = controller.recentEvents();
-	ctx.ui.notify(events.length > 0 ? events.join("\n") : "No speculative action events recorded yet.", "info");
 }
 export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<string>): string {
 	const parts = [
@@ -1758,7 +1206,7 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 				`candidate ${compactEventText(candidate.id)}`,
 				candidate.tool,
 				candidate.source,
-				`${route.backend}/${executionRouteKind(route.isolation)}/${route.reuse}`,
+				`${route.backend}/${executionKinds[route.isolation]}/${route.reuse}`,
 				state.status,
 			);
 			if (state.status === "running")
@@ -1816,13 +1264,7 @@ function findExactModelReferenceMatch(
 	const byID = models.filter((model) => model.id.toLowerCase() === normalized);
 	return byID.length === 1 ? byID[0] : undefined;
 }
-function mebibyteInput(title: string): SettingInputDescriptor<number> {
-	return positiveIntegerInput(`${title} (MiB)`, {
-		error: `${title} must be a positive integer in MiB.`,
-		format: (bytes) => String(Math.max(1, Math.round(bytes / (1024 * 1024)))),
-		transform: (mebibytes) => mebibytes * 1024 * 1024,
-	});
-}
+const onOff = (value: boolean) => (value ? "On" : "Off");
 function sourceSummary(settings: EffectiveSpeculativeActionSettings): string {
 	if (!settings.enabled) return "Predictions off";
 	const sources = [
@@ -1833,13 +1275,6 @@ function sourceSummary(settings: EffectiveSpeculativeActionSettings): string {
 		.filter(Boolean)
 		.join(" + ");
 	return sources || "No source enabled";
-}
-function actorForkSummary(settings: SelfSpeculationSettings): string {
-	if (!settings.enabled || !settings.forkEnabled) return "Off";
-	return `On, ${FORK_TRANSPORT_LABELS[settings.forkTransport]}`;
-}
-function syntaxSettingLabel(value: string): string {
-	return value === "auto" ? "automatic" : value;
 }
 function formatDrafterBudgetStatus(snapshot: ActionDrafterBudgetSnapshot): string {
 	const { budget, observations } = snapshot;
@@ -1870,34 +1305,6 @@ function formatSelfSpeculationStatus(bridge: SelfSpeculationCoordinatorSnapshot)
 function activeModelReference(ctx: ExtensionContext): string {
 	return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "active model";
 }
-function resolveToolCapabilities(
-	registered: ReadonlyMap<string, ReturnType<typeof PI_ACTION_SEMANTICS.requirements>>,
-	routes: ExecutionRoutesSnapshot,
-): ReadonlyMap<string, ToolCapabilityRow> {
-	const { worlds, actorProcessReplay } = routes;
-	return new Map<string, ToolCapabilityRow>(
-		[...registered].map(([tool, requirements]): [string, ToolCapabilityRow] => {
-			if (!requirements) {
-				return [
-					tool,
-					{
-						replay: "unavailable",
-						observe: "unavailable",
-						fork: "unavailable",
-					},
-				];
-			}
-			const fork = executionCapabilityStatus(requirements, worlds, "speculation", tool);
-			const observe = executionCapabilityStatus(requirements, worlds, "observation", tool);
-			const replay = bestCapabilityState([
-				fork.state,
-				observe.state,
-				...(actorProcessReplay ? [processRouteCapability(actorProcessReplay.state)] : []),
-			]);
-			return [tool, { replay, observe: observe.state, fork: fork.state }];
-		}),
-	);
-}
 function bestCapabilityState(states: readonly ExecutionWorldHealthState[]): ExecutionWorldHealthState {
 	return states.includes("ready") ? "ready" : states.includes("registered") ? "registered" : "unavailable";
 }
@@ -1916,26 +1323,16 @@ function processRouteLabel(state: ProcessRouteSnapshot["state"]): string {
 		unavailable: "Unavailable",
 	}[state];
 }
-function executionRouteKind(isolation: SpeculativeExecution): string {
-	switch (isolation) {
-		case "runtime_sandbox":
-			return "isolated runtime";
-		case "resource_snapshot":
-			return "sealed file inputs";
-		case "workspace_branch":
-			return "private workspace";
-	}
-}
-function capabilityLabel(state: ExecutionWorldHealthState): string {
-	switch (state) {
-		case "ready":
-			return "Ready";
-		case "registered":
-			return "Check";
-		case "unavailable":
-			return "Unavailable";
-	}
-}
+const executionKinds: Record<SpeculativeExecution, string> = {
+	runtime_sandbox: "isolated runtime",
+	resource_snapshot: "sealed file inputs",
+	workspace_branch: "private workspace",
+};
+const capabilityLabels: Record<ExecutionWorldHealthState, string> = {
+	ready: "Ready",
+	registered: "Check",
+	unavailable: "Unavailable",
+};
 function formatSpeculativeFooter(
 	settings: EffectiveSpeculativeActionSettings,
 	metrics: SpeculativeActionMetrics,
@@ -1979,7 +1376,7 @@ function executionWorldSummary(
 			: []),
 		...worlds.map(
 			(world) =>
-				`- ${executionRouteKind(world.isolation)} (${world.id}): Fork ${capabilityLabel(world.state)} — ${world.detail}; Observe ${world.observation ? `${capabilityLabel(world.observation.state)} — ${world.observation.detail}` : "Unavailable"}${
+				`- ${executionKinds[world.isolation]} (${world.id}): Fork ${capabilityLabels[world.state]} — ${world.detail}; Observe ${world.observation ? `${capabilityLabels[world.observation.state]} — ${world.observation.detail}` : "Unavailable"}${
 					world.storage
 						? `; storage ${world.storage.entries}/${world.storage.maxEntries}, ${formatBytes(world.storage.bytes)}/${formatBytes(world.storage.maxBytes)}, ${world.storage.orphanArtifacts ?? 0} orphan artifacts${world.storage.overBudget ? "; over budget" : ""}`
 						: ""
@@ -1990,9 +1387,9 @@ function executionWorldSummary(
 function capabilityTable(tools: ReadonlyMap<string, ToolCapabilityRow>): string {
 	const rows = [...tools].map(([tool, capability]) => [
 		tool,
-		capabilityLabel(capability.replay),
-		capabilityLabel(capability.observe),
-		capabilityLabel(capability.fork),
+		capabilityLabels[capability.replay],
+		capabilityLabels[capability.observe],
+		capabilityLabels[capability.fork],
 	]);
 	const table = [["Tool", "Replay", "Observe", "Fork"], ...rows];
 	const widths = table[0]!.map((_, column) => Math.max(...table.map((row) => row[column]!.length)));

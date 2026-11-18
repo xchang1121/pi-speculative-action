@@ -5454,6 +5454,3 @@ export function makeSpeculativeActionRuntime<
 }
 export { diagnosticAction, diagnosticJson, redactDiagnostics } from "./settlement.ts";
 export type * from "./settlement.ts";
-export function candidateExecutionMs(candidate: SpeculativeCandidate): number {
-	return finiteValue(candidate.executionMs);
-}

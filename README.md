@@ -117,7 +117,7 @@ Actor 观测与普通受控执行共享子进程采用通道。纯字节输出�
 
 Windows 使用显式子计算协议及文件资源复用。文件租约由 Python 3 标准库 `ctypes` 调用 `OpenFileById` 持有，支持文件和父目录重命名、删除后身份校验及硬链接。运行环境需要可执行的 Python 3，默认命令为 `python`；可通过 `filesystem.windowsObjectLeaseCommand` 指定，例如 `["py", "-3"]` 或 Python 的绝对路径。
 
-辅助进程按配置共享，最后一个租约释放后退出。GC、工作线程退出和父进程管道关闭会回收句柄。`filesystem.objectLeaseTimeoutMs` 控制请求超时，`filesystem.maxWindowsLeaseRequests` 控制请求并发；批量释放会等待可用容量。实现随包附带，原有 `.node` 模块及其编译步骤已移除。
+辅助进程按解释器命令共享；容量热更新沿用同一进程，最后一个租约释放后按 `filesystem.objectLeaseIdleMs` 等待退出。GC、工作线程退出和父进程管道关闭会回收句柄。`filesystem.objectLeaseTimeoutMs` 控制请求超时，`filesystem.maxWindowsLeaseRequests` 控制请求并发；批量释放会等待可用容量。实现随包附带，原有 `.node` 模块及其编译步骤已移除。
 
 可在 Windows 直接运行文件资源与工作区提交回归：
 

@@ -1,8 +1,10 @@
-import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { expect, test } from "vitest";
-import { inspectLinuxEnvironment } from "../src/linux-process-backend.ts";
+import { FilesystemReadView } from "../src/filesystem-evidence.ts";
+import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
+import { inspectLinuxEnvironment, privateReplay } from "../src/linux-process-backend.ts";
 import {
 	executionDomainCollector,
 	executionDomainProof,
@@ -72,3 +74,63 @@ test("reports the unavailable execution domain without claiming process qualific
 		if (socket !== undefined) process.env.PI_SPEC_DOMAIN_SOCKET = socket;
 	}
 });
+
+test.skipIf(process.platform !== "linux")(
+	"replays creations, deletions and hard links in the private upper",
+	async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-private-replay-"));
+		const storage = path.join(root, "branch");
+		const service = new WorkspaceSandboxService();
+		await using view = FilesystemReadView.ambient();
+		const primary = path.join(root, "original");
+		const alias = path.join(root, "alias");
+		const added = path.join(root, "new");
+		const address = (target: string) => ({ target, root, resource: path.relative(root, target) });
+		const upper = (target: string) => path.join(storage, "writes", "upper", target);
+		const before = Buffer.from("original");
+		const after = Buffer.from("edited");
+		try {
+			await writeFile(primary, before);
+			await link(primary, alias);
+			await expect(
+				privateReplay(service, storage, [{ ...address(added), after }], view, undefined, [
+					{ ...address(primary), before: after },
+				]),
+			).rejects.toThrow();
+			await expect(stat(upper(added))).rejects.toMatchObject({ code: "ENOENT" });
+			await privateReplay(
+				service,
+				storage,
+				[
+					{ ...address(added), after },
+					...[primary, alias].map((target) => ({
+						...address(target),
+						before,
+						after,
+						aliases: [primary, alias],
+						afterAliases: [primary, alias],
+						object: { path: primary, before: true },
+						operation: "write_contents" as const,
+					})),
+				],
+				view,
+			);
+			expect(await readFile(upper(added))).toEqual(after);
+			expect(await readFile(upper(primary))).toEqual(after);
+			expect((await stat(upper(primary))).ino).toBe((await stat(upper(alias))).ino);
+			expect(await readFile(primary)).toEqual(before);
+			await expect(stat(added)).rejects.toMatchObject({ code: "ENOENT" });
+			await expect(
+				privateReplay(service, storage, [{ ...address(primary), before }], view),
+			).rejects.toThrow();
+			await privateReplay(service, storage, [{ ...address(primary), before: after }], view);
+			const log = await readFile(path.join(storage, "writes", "deleted.log"), "utf8");
+			expect(log.split("\n")).toContain(primary.slice(1));
+			await privateReplay(service, storage, [{ ...address(primary), after: before }], view);
+			expect(await readFile(upper(alias))).toEqual(after);
+		} finally {
+			await service.dispose();
+			await rm(root, { recursive: true, force: true });
+		}
+	},
+);

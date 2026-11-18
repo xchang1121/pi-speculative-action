@@ -13,7 +13,7 @@ import {
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { getSystemErrorName } from "node:util";
-import { DEFAULT_SPECULATIVE_CONFIG, speculativeConfig } from "./config-schema.ts";
+import { speculativeConfig } from "./config-schema.ts";
 import { containsFilesystemPath, digestObject, slash, type Sha256Digest } from "./primitives.ts";
 import { ensureNativeFilesystem, nativeFilesystem } from "./process-startup.mjs";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
@@ -73,6 +73,18 @@ const FILESYSTEM_TYPES = [
 export function filesystemEntryType(entry: FilesystemTypeEvidence): string {
 	return FILESYSTEM_TYPES.find(([, check]) => entry[check]())?.[0] ?? "other";
 }
+export function filesystemModeType(mode: number | bigint) {
+	switch (Number(mode) & 0o170000) {
+		case 0o100000:
+			return "file";
+		case 0o040000:
+			return "directory";
+		case 0o120000:
+			return "symlink";
+		default:
+			return "other";
+	}
+}
 export function filesystemMetadataDigest(stat: FilesystemMetadataEvidence): Sha256Digest {
 	const type = Number(stat.mode) & 0o170000;
 	return digestObject({
@@ -80,14 +92,7 @@ export function filesystemMetadataDigest(stat: FilesystemMetadataEvidence): Sha2
 		uid: Number(stat.uid),
 		gid: Number(stat.gid),
 		...(type === 0o100000 ? { size: Number(stat.size), links: Number(stat.nlink) } : {}),
-		type:
-			(
-				{
-					[0o100000]: "file",
-					[0o040000]: "directory",
-					[0o120000]: "symlink",
-				} as Record<number, string>
-			)[type] ?? "other",
+		type: filesystemModeType(stat.mode),
 	});
 }
 export function filesystemObservationDigest(
@@ -480,7 +485,6 @@ export async function withFilesystemReadView<T>(
 		}
 	}
 }
-export const FILESYSTEM_CONCURRENCY = DEFAULT_SPECULATIVE_CONFIG.filesystem.concurrency;
 /** Bound independent filesystem work and drain every admitted operation before propagating failure. */
 export async function mapFilesystem<Input, Output>(
 	values: ReadonlyArray<Input>,

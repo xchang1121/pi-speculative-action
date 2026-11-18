@@ -52,7 +52,7 @@ processTest.for(
 		// Runtime ancestor probes must not depend on unrelated processes creating entries in /tmp.
 		const f = await benchmark(
 			`pi-bash-${kind}-`,
-			"git",
+			"in_memory",
 			{},
 			path.join(os.homedir(), ".cache", "pi-speculative-action", "bash-qualification"),
 		);
@@ -132,7 +132,7 @@ processTest.for([false, true])(
 	"adopts compiled work once and rejects changed source (%s)",
 	{ timeout: 60_000 },
 	async (changed, { benchmark }) => {
-		const f = await benchmark("pi-bash-compile-adoption-", "git");
+		const f = await benchmark("pi-bash-compile-adoption-", "in_memory");
 		const command = "cc -O1 -c unit.c -o unit.o";
 		await f.write("unit.c", "int answer(void) { return 42; }\n");
 		// Establish an ordinary output oracle and warm system executable atimes before qualification.
@@ -175,7 +175,7 @@ processTest.for([false, true])(
 	"revalidates prepared inputs at whole-branch commit (%s)",
 	{ timeout: 30_000 },
 	async (changed, { benchmark }) => {
-		const f = await benchmark("pi-commit-admission-", "git", {}, os.homedir());
+		const f = await benchmark("pi-commit-admission-", "in_memory", {}, os.homedir());
 		const command = "./step";
 		await f.write("input.txt", "before\n");
 		await f.write("marker", "");
@@ -210,7 +210,7 @@ processTest.for(["failure", "timeout", "cancel"])(
 	"preserves default Bash failure and cancellation (%s)",
 	{ timeout: 30_000 },
 	async (mode, { benchmark }) => {
-		const f = await benchmark("pi-bash-default-failure-", "git", {}, os.homedir());
+		const f = await benchmark("pi-bash-default-failure-", "in_memory", {}, os.homedir());
 		const world = createCompletedProcessExecutionWorld({
 			coordinator: f.coordinator,
 			tools: ["bash"],

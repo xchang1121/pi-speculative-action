@@ -106,8 +106,8 @@ def pin(name):
         close_handle(named)
 
 
-maximum_request = int(sys.argv[1])
-maximum_leases = int(sys.argv[2])
+# One escaped Windows path (six bytes per UTF-16 unit) plus the JSON envelope.
+maximum_request = 6 * 32767 + 128
 handles = {}
 try:
     while True:
@@ -122,11 +122,12 @@ try:
             if type(request_id) is not int or request_id <= 0:
                 raise ValueError("invalid request identity")
             if operation == "pin":
+                name, maximum_leases = argument
                 if len(handles) >= maximum_leases:
                     raise ValueError("Windows object lease capacity exceeded")
                 if request_id in handles:
                     raise ValueError("duplicate lease identity")
-                handles[request_id] = pin(argument)
+                handles[request_id] = pin(name)
                 value = request_id
             elif operation == "identity":
                 state = inspect(handles[argument])

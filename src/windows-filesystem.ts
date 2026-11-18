@@ -10,6 +10,7 @@ type Reply = {
 type Pending = {
 	readonly operation: string;
 	readonly argument: unknown;
+	readonly replyBytes: number;
 	readonly promise: Promise<unknown>;
 	readonly resolve: (value: unknown) => void;
 	readonly reject: (error: Error) => void;
@@ -21,8 +22,8 @@ const owners = new WeakMap<object, Lease>();
 const collected = new FinalizationRegistry<Lease>((lease) => {
 	void release(lease).catch(() => {});
 });
-const current = new WeakMap<ReturnType<typeof speculativeConfig>, ObjectConnection>();
-const unavailable = new WeakMap<ReturnType<typeof speculativeConfig>, { retryAt: number; error: unknown }>();
+const current = new Map<string, ObjectConnection>();
+const unavailable = new Map<string, { retryAt: number; error: unknown }>();
 process.once("exit", () => {
 	for (const connection of connections) connection.terminate();
 });
@@ -33,7 +34,7 @@ function failure(code: string, message: string): NodeJS.ErrnoException {
 
 /** One pipe owns all its file-ID handles. EOF also releases them after worker or parent termination. */
 class ObjectConnection {
-	private readonly config = speculativeConfig();
+	private config = speculativeConfig();
 	private readonly child;
 	private readonly pending = new Map<number, Pending>();
 	private readonly leases = new Set<number>();
@@ -49,17 +50,15 @@ class ObjectConnection {
 	private qualified = false;
 	readonly finished = this.completion.promise;
 
-	constructor() {
+	constructor(signature: string) {
 		const [command, ...arguments_] = this.config.filesystem.windowsObjectLeaseCommand;
 		this.child = spawn(
 			command!,
-			[
-				...arguments_,
-				fileURLToPath(new URL("../src/windows-filesystem.py", import.meta.url)),
-				String(this.config.processReuse.maxRequestBytes),
-				String(this.config.filesystem.maxTreeEntries),
-			],
-			{ stdio: ["pipe", "pipe", "pipe"], windowsHide: true },
+			[...arguments_, fileURLToPath(new URL("../src/windows-filesystem.py", import.meta.url))],
+			{
+				stdio: ["pipe", "pipe", "pipe"],
+				windowsHide: true,
+			},
 		);
 		connections.add(this);
 		this.child.stdout.on("data", (bytes: Buffer) => this.receive(bytes));
@@ -73,6 +72,7 @@ class ObjectConnection {
 			clearTimeout(this.exitTimer);
 			clearTimeout(this.idleTimer);
 			connections.delete(this);
+			if (current.get(signature) === this) current.delete(signature);
 			this.completion.resolve();
 		});
 	}
@@ -97,16 +97,18 @@ class ObjectConnection {
 			else pipe.unref?.();
 		}
 	}
-	request(operation: string, argument: unknown = null): Promise<unknown> {
+	request(operation: string, argument: unknown = null, settings = this.config): Promise<unknown> {
 		if (!this.accepting) return Promise.reject(failure("WIN32_6", "Windows object lease is closed"));
-		if (this.pending.size >= this.config.filesystem.maxWindowsLeaseRequests)
+		if (this.pending.size >= settings.filesystem.maxWindowsLeaseRequests)
 			return Promise.reject(failure("ERR_LEASE_CAPACITY", "Windows object lease request capacity exceeded"));
 		const id = ++this.sequence;
 		const frame = Buffer.from(JSON.stringify([id, operation, argument]) + "\n");
-		if (frame.byteLength > this.config.processReuse.maxRequestBytes) {
+		const replyBytes = settings.processReuse.maxRequestBytes;
+		if (frame.byteLength > replyBytes) {
 			this.retireIfIdle();
 			return Promise.reject(failure("ERR_LEASE_REQUEST", "Windows object lease request is too large"));
 		}
+		this.config = settings;
 		const result = Promise.withResolvers<unknown>();
 		clearTimeout(this.idleTimer);
 		this.idleTimer = undefined;
@@ -120,7 +122,7 @@ class ObjectConnection {
 				this.qualified ? Infinity : this.config.filesystem.objectLeaseStartupTimeoutMs,
 			),
 		);
-		this.pending.set(id, { operation, argument, ...result, timer });
+		this.pending.set(id, { operation, argument, replyBytes, ...result, timer });
 		this.child.stdin.write(frame);
 		return result.promise;
 	}
@@ -147,7 +149,8 @@ class ObjectConnection {
 		this.input = Buffer.concat([this.input, bytes]);
 		for (;;) {
 			const end = this.input.indexOf(10);
-			if ((end < 0 ? this.input.byteLength : end + 1) > this.config.processReuse.maxRequestBytes) {
+			const next = this.pending.values().next().value;
+			if ((end < 0 ? this.input.byteLength : end + 1) > (next?.replyBytes ?? 0)) {
 				this.fail(failure("ERR_LEASE_RESPONSE", "Windows object lease response is too large"));
 				return;
 			}
@@ -157,7 +160,8 @@ class ObjectConnection {
 			try {
 				const [id, reply] = JSON.parse(line) as [number, Reply];
 				const pending = this.pending.get(id);
-				if (!pending || !reply || typeof reply !== "object") throw new Error("unexpected lease response");
+				if (!pending || pending !== next || !reply || typeof reply !== "object")
+					throw new Error("unexpected lease response");
 				if (!reply.error && pending.operation === "pin") {
 					if (reply.value !== id) throw new Error("invalid lease identity");
 					this.leases.add(id);
@@ -219,21 +223,29 @@ const provider = {
 	async pin(target: string): Promise<object> {
 		if (typeof target !== "string" || !target || target.includes("\0") || target.length >= 32767)
 			throw failure("ERR_LEASE_PATH", "A nonempty Windows path is required");
-		const config = speculativeConfig();
-		const failed = unavailable.get(config);
+		const settings = speculativeConfig();
+		const signature = JSON.stringify(settings.filesystem.windowsObjectLeaseCommand);
+		const failed = unavailable.get(signature);
 		if (failed && failed.retryAt > Date.now()) throw failed.error;
-		let connection = current.get(config);
+		let connection = current.get(signature);
 		if (!connection?.accepting) {
-			connection = new ObjectConnection();
-			current.set(config, connection);
+			connection = new ObjectConnection(signature);
+			current.set(signature, connection);
 		}
-		const id = (await connection.request("pin", target).catch(async (error) => {
-			if (connection.startupFailed) {
-				unavailable.set(config, { retryAt: Date.now() + config.filesystem.objectLeaseRetryMs, error });
-				await connection.finished;
-			}
-			throw error;
-		})) as number;
+		const id = (await connection
+			.request("pin", [target, settings.filesystem.maxTreeEntries], settings)
+			.catch(async (error) => {
+				if (connection.startupFailed) {
+					const delay = settings.filesystem.objectLeaseRetryMs;
+					const failure = { retryAt: Date.now() + delay, error };
+					unavailable.set(signature, failure);
+					setTimeout(() => {
+						if (unavailable.get(signature) === failure) unavailable.delete(signature);
+					}, delay).unref();
+					await connection.finished;
+				}
+				throw error;
+			})) as number;
 		const value = Object.freeze({});
 		const lease = { connection, id, closed: false };
 		owners.set(value, lease);

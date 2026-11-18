@@ -369,7 +369,15 @@ async function qualifyNamespace() {
 	]) {
 		if (selectedCases.size && !selectedCases.has(label)) continue;
 		const args = { path: "search", pattern: "needle", ...overrides };
-		const reference = () => createGrepTool(workspace).execute("reference", args);
+		const reference = async () => {
+			const previous = process.cwd();
+			process.chdir(workspace);
+			try {
+				return await createGrepTool(workspace).execute("reference", args);
+			} finally {
+				process.chdir(previous);
+			}
+		};
 		const expected = await reference().catch((error) => {
 			if (!rejected) throw error;
 			return error;

@@ -1,3 +1,4 @@
+import { deepFreeze } from "./primitives.ts";
 import { projectProcessEnvironment, speculativeConfig } from "./config-schema.ts";
 import {
 	type ArtifactReference,
@@ -146,20 +147,7 @@ export type DynamicDependency =
 			readonly contentDigest: Sha256Digest;
 			readonly eof: boolean;
 	  };
-export type ProvenanceTaint =
-	| "network"
-	| "ipc"
-	| "clock"
-	| "random"
-	| "pid_observation"
-	| "descriptor_observation"
-	| "interactive_io"
-	| "untracked_fd"
-	| "confinement_observation"
-	| "unsupported_syscall"
-	| "escaped_sandbox"
-	| "mutable_input"
-	| "trace_incomplete";
+export type ProvenanceTaint = (typeof import("./config-schema.ts").PROVENANCE_TAINTS)[number];
 export interface DynamicDependencyCertificate {
 	readonly complete: boolean;
 	readonly dependencies: readonly DynamicDependency[];
@@ -861,9 +849,4 @@ function validAliases(aliases: readonly string[], target: string): boolean {
 		aliases.includes(target) &&
 		aliases.every((name, index) => validLogicalPath(name) && (index === 0 || name > aliases[index - 1]!))
 	);
-}
-function deepFreeze<Value>(value: Value): Value {
-	if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
-	for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
-	return Object.freeze(value);
 }

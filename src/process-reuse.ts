@@ -145,26 +145,6 @@ const OBSERVATION_FIELDS = [
 	"eof",
 	"exclusive",
 ] satisfies readonly DependencyField[];
-export async function validateProcessCertificate(
-	certificate: ProcessProvenanceCertificate,
-	context: ProvenanceValidationContext = {},
-): Promise<ProvenanceValidation> {
-	const { weakKey, strongKey: expectedKey } = certificate;
-	const validation = await validateDynamicDependencyCertificate(certificate.dependencyCertificate, context);
-	if (validation.status !== "valid") return validation;
-	const strongKey = processStrongKey(weakKey, {
-		complete: true,
-		dependencies: validation.dependencies,
-		taints: [],
-	});
-	if (strongKey !== expectedKey)
-		return {
-			...validation,
-			status: "stale",
-			changed: Object.freeze(["strong_key"]),
-		};
-	return { ...validation, strongKey };
-}
 /** Validate reusable dynamic evidence without requiring a persisted process result. */
 export async function validateDynamicDependencyCertificate(
 	certificate: DynamicDependencyCertificate,
@@ -313,20 +293,13 @@ export async function validateDynamicDependencyCertificate(
 }
 /** A lock still holds as a dependency while no one holds one it would conflict with: /proc/locks lists every flock, record and
  * open-file lock by device and inode. A missing file is gone, not made. */
+type DependencyOf<Kind extends DynamicDependency["kind"]> = Extract<DynamicDependency, { kind: Kind }>;
 async function probeLock(
 	physicalPath: string,
 	logicalPath: string,
 	exclusive: boolean,
 	view: FilesystemReadView,
-): Promise<
-	| Extract<
-			DynamicDependency,
-			{
-				kind: "lock";
-			}
-	  >
-	| undefined
-> {
+): Promise<DependencyOf<"lock"> | undefined> {
 	const info = await view.stat(physicalPath);
 	const { dev } = info;
 	const hex = (value: bigint) => value.toString(16).padStart(2, "0");
@@ -343,36 +316,17 @@ export async function captureMetadataDependency(
 	followSymlinks: boolean,
 	fields?: readonly FilesystemObservationField[],
 	view?: FilesystemReadView,
-): Promise<
-	Extract<
-		DynamicDependency,
-		{
-			kind: "metadata";
-		}
-	>
-> {
-	return withFilesystemReadView(
-		view,
-		async (
-			view,
-		): Promise<
-			Extract<
-				DynamicDependency,
-				{
-					kind: "metadata";
-				}
-			>
-		> => {
-			const observed = await view.stat(physicalPath, followSymlinks);
-			return {
-				kind: "metadata",
-				path: logicalPath,
-				followSymlinks,
-				digest: filesystemObservationDigest(observed, fields),
-				...(fields ? { fields } : {}),
-			};
-		},
-	);
+): Promise<DependencyOf<"metadata">> {
+	return withFilesystemReadView(view, async (view) => {
+		const observed = await view.stat(physicalPath, followSymlinks);
+		return {
+			kind: "metadata",
+			path: logicalPath,
+			followSymlinks,
+			digest: filesystemObservationDigest(observed, fields),
+			...(fields ? { fields } : {}),
+		};
+	});
 }
 export async function captureFileDependency(
 	physicalPath: string,
@@ -387,63 +341,44 @@ export async function captureFileDependency(
 		readonly view?: FilesystemReadView;
 	} = {},
 ): Promise<{
-	readonly dependency: Extract<
-		DynamicDependency,
-		{
-			kind: "file";
-		}
-	>;
+	readonly dependency: DependencyOf<"file">;
 	readonly bytesRead: number;
 	readonly filesRead: number;
 }> {
-	return withFilesystemReadView(
-		options.view,
-		async (
-			view,
-		): Promise<{
-			readonly dependency: Extract<
-				DynamicDependency,
-				{
-					kind: "file";
-				}
-			>;
-			readonly bytesRead: number;
-			readonly filesRead: number;
-		}> => {
-			const limit = options.maxFileBytes ?? Infinity;
-			const maxBytes = Number.isFinite(limit) ? Math.max(0, limit) : Infinity;
-			const content = await captureFileDigest(physicalPath, maxBytes, options.signal, true, view);
-			let aliases = options.aliases;
-			if (aliases) {
-				const states = await mapFilesystem(
-					aliases,
-					async (logical) => {
-						const physical = options.resolvePath ? options.resolvePath(logical) : path.resolve(logical);
-						if (!physical) throw new Error(`alias_unmapped:${logical}`);
-						return view.stat(physical);
-					},
-					options.signal,
-				);
-				if (
-					content.stat.nlink !== BigInt(aliases.length) ||
-					states.some((state) => !state.isFile() || !sameFilesystemIdentity(content.stat, state))
-				)
-					aliases = undefined; // Changed topology: a plain file entry.
-			}
-			return {
-				dependency: {
-					kind: "file",
-					path: logicalPath,
-					role,
-					contentDigest: `sha256:${content.hash}`,
-					...(options.includeMetadata ? { metadataDigest: filesystemMetadataDigest(content.stat) } : {}),
-					...(aliases ? { aliases } : {}),
+	return withFilesystemReadView(options.view, async (view) => {
+		const limit = options.maxFileBytes ?? Infinity;
+		const maxBytes = Number.isFinite(limit) ? Math.max(0, limit) : Infinity;
+		const content = await captureFileDigest(physicalPath, maxBytes, options.signal, true, view);
+		let aliases = options.aliases;
+		if (aliases) {
+			const states = await mapFilesystem(
+				aliases,
+				async (logical) => {
+					const physical = options.resolvePath ? options.resolvePath(logical) : path.resolve(logical);
+					if (!physical) throw new Error(`alias_unmapped:${logical}`);
+					return view.stat(physical);
 				},
-				bytesRead: content.shared ? 0 : content.bytesRead,
-				filesRead: content.shared ? 0 : 1,
-			};
-		},
-	);
+				options.signal,
+			);
+			if (
+				content.stat.nlink !== BigInt(aliases.length) ||
+				states.some((state) => !state.isFile() || !sameFilesystemIdentity(content.stat, state))
+			)
+				aliases = undefined; // Changed topology: a plain file entry.
+		}
+		return {
+			dependency: {
+				kind: "file",
+				path: logicalPath,
+				role,
+				contentDigest: `sha256:${content.hash}`,
+				...(options.includeMetadata ? { metadataDigest: filesystemMetadataDigest(content.stat) } : {}),
+				...(aliases ? { aliases } : {}),
+			},
+			bytesRead: content.shared ? 0 : content.bytesRead,
+			filesRead: content.shared ? 0 : 1,
+		};
+	});
 }
 export async function captureDirectoryDependency(
 	physicalPath: string,
@@ -453,44 +388,25 @@ export async function captureDirectoryDependency(
 	listed = true,
 	list?: (target: string) => ReturnType<typeof captureFilesystemEntry>,
 	view?: FilesystemReadView,
-): Promise<
-	Extract<
-		DynamicDependency,
-		{
-			kind: "directory";
-		}
-	>
-> {
-	return withFilesystemReadView(
-		view,
-		async (
-			view,
-		): Promise<
-			Extract<
-				DynamicDependency,
-				{
-					kind: "directory";
-				}
-			>
-		> => {
-			const { info, entries } = await (listed && list
-				? list(physicalPath)
-				: captureFilesystemEntry(physicalPath, listed ? "directory" : undefined, view));
-			if (!info.isDirectory() || (listed && !entries)) throw new Error("not_directory");
-			const excluded = new Set(excludedEntries);
-			return {
-				kind: "directory",
-				path: logicalPath,
-				...(listed
-					? {
-							entriesDigest: directoryEntriesDigest(entries!.filter((entry) => !excluded.has(entry.name))),
-						}
-					: {}),
-				...(includeMetadata || !listed ? { metadataDigest: filesystemMetadataDigest(info) } : {}),
-				...(listed && excluded.size ? { excludedEntries: Object.freeze([...excluded].sort()) } : {}),
-			};
-		},
-	);
+): Promise<DependencyOf<"directory">> {
+	return withFilesystemReadView(view, async (view) => {
+		const { info, entries } = await (listed && list
+			? list(physicalPath)
+			: captureFilesystemEntry(physicalPath, listed ? "directory" : undefined, view));
+		if (!info.isDirectory() || (listed && !entries)) throw new Error("not_directory");
+		const excluded = new Set(excludedEntries);
+		return {
+			kind: "directory",
+			path: logicalPath,
+			...(listed
+				? {
+						entriesDigest: directoryEntriesDigest(entries!.filter((entry) => !excluded.has(entry.name))),
+					}
+				: {}),
+			...(includeMetadata || !listed ? { metadataDigest: filesystemMetadataDigest(info) } : {}),
+			...(listed && excluded.size ? { excludedEntries: Object.freeze([...excluded].sort()) } : {}),
+		};
+	});
 }
 export async function captureAbsenceDependency(
 	physicalPath: string,
@@ -499,92 +415,52 @@ export async function captureAbsenceDependency(
 	parentExcludedEntries: readonly string[] = [],
 	list?: Parameters<typeof captureDirectoryDependency>[5],
 	view?: FilesystemReadView,
-): Promise<
-	| Extract<
-			DynamicDependency,
-			{
-				kind: "absence";
-			}
-	  >
-	| undefined
-> {
-	return withFilesystemReadView(
-		view,
-		async (
-			view,
-		): Promise<
-			| Extract<
-					DynamicDependency,
-					{
-						kind: "absence";
+): Promise<DependencyOf<"absence"> | undefined> {
+	return withFilesystemReadView(view, async (view) => {
+		try {
+			await view.stat(physicalPath);
+			return undefined;
+		} catch (error) {
+			if (!missing(error)) throw error;
+		}
+		const parent = captureParent
+			? await captureDirectoryDependency(
+					path.dirname(physicalPath),
+					path.posix.dirname(logicalPath.replaceAll("\\", "/")),
+					false,
+					parentExcludedEntries,
+					true,
+					list,
+					view,
+				)
+			: undefined;
+		return {
+			kind: "absence",
+			path: logicalPath,
+			...(parent
+				? {
+						parentEntriesDigest: parent.entriesDigest,
+						...(parent.excludedEntries ? { parentExcludedEntries: parent.excludedEntries } : {}),
 					}
-			  >
-			| undefined
-		> => {
-			try {
-				await view.stat(physicalPath);
-				return undefined;
-			} catch (error) {
-				if (!missing(error)) throw error;
-			}
-			const parent = captureParent
-				? await captureDirectoryDependency(
-						path.dirname(physicalPath),
-						path.posix.dirname(logicalPath.replaceAll("\\", "/")),
-						false,
-						parentExcludedEntries,
-						true,
-						list,
-						view,
-					)
-				: undefined;
-			return {
-				kind: "absence",
-				path: logicalPath,
-				...(parent
-					? {
-							parentEntriesDigest: parent.entriesDigest,
-							...(parent.excludedEntries ? { parentExcludedEntries: parent.excludedEntries } : {}),
-						}
-					: {}),
-			};
-		},
-	);
+				: {}),
+		};
+	});
 }
 export async function captureSymlinkDependency(
 	physicalPath: string,
 	logicalPath: string,
 	view?: FilesystemReadView,
-): Promise<
-	Extract<
-		DynamicDependency,
-		{
-			kind: "symlink";
-		}
-	>
-> {
-	return withFilesystemReadView(
-		view,
-		async (
-			view,
-		): Promise<
-			Extract<
-				DynamicDependency,
-				{
-					kind: "symlink";
-				}
-			>
-		> => {
-			const { link: target } = await captureFilesystemEntry(physicalPath, undefined, view);
-			if (target === undefined) throw new Error("not_symlink");
-			return {
-				kind: "symlink",
-				path: logicalPath,
-				target,
-				targetDigest: sha256Digest(target),
-			};
-		},
-	);
+): Promise<DependencyOf<"symlink">> {
+	return withFilesystemReadView(view, async (view) => {
+		const { link: target } = await captureFilesystemEntry(physicalPath, undefined, view);
+		if (target === undefined) throw new Error("not_symlink");
+		return {
+			kind: "symlink",
+			path: logicalPath,
+			target,
+			targetDigest: sha256Digest(target),
+		};
+	});
 }
 export interface ReplayObservationContract {
 	readonly sink: "buffered" | "pipe" | "tty" | "interactive";

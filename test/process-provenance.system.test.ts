@@ -32,7 +32,7 @@ test
 	"public process replay projects stdout only when the program observes bytes ($actorObservationMode, $mode)",
 	{ timeout: 60000 },
 	async ({ mode, actorObservationMode }) => {
-		const fixture = await createLinuxProcessBenchmark("pi-stream-contract-", "git", {}, os.homedir());
+		const fixture = await createLinuxProcessBenchmark("pi-stream-contract-", "in_memory", {}, os.homedir());
 		await fixture.write("input.txt", "first\nsecond\n");
 		await fixture.compile("emit", {
 			code: `#include <fcntl.h>

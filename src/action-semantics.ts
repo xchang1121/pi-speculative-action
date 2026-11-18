@@ -1,12 +1,7 @@
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-	DEFAULT_SPECULATIVE_CONFIG,
-	nonNegativeInteger,
-	positiveInteger,
-	speculativeConfig,
-} from "./config-schema.ts";
+import { nonNegativeInteger, positiveInteger, speculativeConfig } from "./config-schema.ts";
 import type { EffectRequirements } from "./execution-world.ts";
 import {
 	effectRequirements,
@@ -173,11 +168,6 @@ export class ActionSemanticsRegistry {
 		}
 	}
 }
-export const READ_DEFAULT_OFFSET = DEFAULT_SPECULATIVE_CONFIG.search.readOffset;
-export const READ_DEFAULT_LIMIT = DEFAULT_SPECULATIVE_CONFIG.search.readLimit;
-export const GREP_DEFAULT_LIMIT = DEFAULT_SPECULATIVE_CONFIG.search.grepLimit;
-export const FIND_DEFAULT_LIMIT = DEFAULT_SPECULATIVE_CONFIG.search.findLimit;
-export const LS_DEFAULT_LIMIT = DEFAULT_SPECULATIVE_CONFIG.search.lsLimit;
 /** π_read narrows a cached read action to the actor's requested interval. */
 export const READ_RANGE_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKeyProjector({
 	id: "read.range",
@@ -314,13 +304,6 @@ export function buildActionKey(
 		...(input.executionContext !== undefined ? { executionContext: input.executionContext } : {}),
 		...(semantics ? { semantics } : {}),
 	});
-}
-export function actionKeyMatches(
-	speculative: ActionKey,
-	actor: ActionKey,
-	projectors: readonly ActionKeyProjector[] = [],
-): boolean {
-	return actionKeyMatch(speculative, actor, projectors) !== undefined;
 }
 /** K(a_s) covers K(a) without relying on completed-output coverage. */
 export function actionKeyCovers(
@@ -588,7 +571,7 @@ let piPaths: {
 	resolveToCwd: (value: string, cwd: string) => string;
 };
 /** Pi's pure path normalization; runtime filename selection belongs to the resource observation. */
-function resolvePiToolPath(value: string, cwd: string): string {
+export function resolvePiToolPath(value: string, cwd: string): string {
 	piPaths ??= require(
 		fileURLToPath(
 			new URL("./core/tools/path-utils.js", import.meta.resolve("@earendil-works/pi-coding-agent")),
@@ -599,7 +582,6 @@ function resolvePiToolPath(value: string, cwd: string): string {
 function normalizeWorkspacePath(value: string, cwd: string): string | undefined {
 	// An incompatible package layout makes buildKey decline reuse, never invent an identity.
 	const root = path.resolve(cwd);
-	// An incompatible package layout makes buildKey decline reuse, never invent an identity.
 	const target = resolvePiToolPath(value, root);
 	const relative = relativeFilesystemPath(root, target);
 	if (relative === undefined) return undefined;

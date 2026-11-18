@@ -360,6 +360,82 @@ test("a rejected outer mutation retains baseline steps after unrelated private w
 	expect(actor.computation?.reusedComputeMs).toBeGreaterThan(0);
 });
 
+test.each(["parent", "sibling"])("a dirty %s preserves clean nested steps after rollback", async (mode) => {
+	let cleanBuilds = 0;
+	let parentBuilds = 0;
+	let dirtyRead = Promise.withResolvers<void>();
+	let releaseDirty = Promise.withResolvers<void>();
+	const clean = defineSpeculativeStep({
+		id: "rollback.clean-child",
+		version: "1",
+		dependencies: {},
+		run: async ({ fs }) => {
+			cleanBuilds++;
+			return (await fs.readFile("data/rows.json")).toString();
+		},
+	});
+	const dirty = defineSpeculativeStep({
+		id: "rollback.dirty-child",
+		version: "1",
+		dependencies: {},
+		run: async ({ fs }) => {
+			const value = (await fs.readFile("scratch.txt")).toString();
+			dirtyRead.resolve();
+			await releaseDirty.promise;
+			return value;
+		},
+	});
+	const parent = defineSpeculativeStep({
+		id: "rollback.parent",
+		version: "1",
+		dependencies: { clean, dirty },
+		run: async ({ fs, step }) => {
+			parentBuilds++;
+			if (mode === "parent") {
+				await fs.readFile("scratch.txt");
+				return step("clean", {});
+			}
+			dirtyRead = Promise.withResolvers<void>();
+			releaseDirty = Promise.withResolvers<void>();
+			const sibling = step("dirty", {});
+			await dirtyRead.promise;
+			try {
+				return await step("clean", {});
+			} finally {
+				releaseDirty.resolve();
+				await sibling;
+			}
+		},
+	});
+	const tool = defineSpeculativeTool({
+		name: "nested_rollback",
+		label: "Nested rollback",
+		description: "Retain only clean children",
+		parameters: Type.Object({ output: Type.String() }),
+		version: "1",
+		effect: "workspace_mutation",
+		steps: { parent },
+		execute: async ({ fs, step }, args) => {
+			await fs.writeFile("scratch.txt", args.output);
+			const value = await step("parent", {});
+			await fs.writeFile(args.output, value);
+			return { content: [], details: value };
+		},
+	});
+	const f = await fixture([tool], true);
+	await using _cleanup = onExit(f.dispose);
+	const result = await f.execute(tool.name, { output: "actual.txt" }, async (preview) => {
+		await preview({ output: "discarded.txt" });
+		await expect
+			.poll(() => f.events.some((event) => event.type === "candidate" && event.state.status === "succeeded"))
+			.toBe(true);
+	});
+	expect(result.details).toBe("[2,3]");
+	expect({ cleanBuilds, parentBuilds }).toEqual({ cleanBuilds: 1, parentBuilds: 2 });
+	expect(await readFile(path.join(f.cwd, "actual.txt"), "utf8")).toBe("[2,3]");
+	expect(await readFile(path.join(f.cwd, "discarded.txt")).catch(() => undefined)).toBeUndefined();
+});
+
 test("registered templates share declared asynchronous children across tools", async () => {
 	let loads = 0;
 	let indexes = 0;

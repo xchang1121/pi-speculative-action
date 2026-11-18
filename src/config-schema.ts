@@ -1,3 +1,4 @@
+import { asRecord, deepFreeze, isFiniteNumber, isRecord, isSafeCount, positiveCount } from "./primitives.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { ProvenanceTaint } from "./provenance-certificate.ts";
 import type { PatternAwarePresetID } from "./pattern-aware.ts";
@@ -5,7 +6,7 @@ type ReadonlyConfig<Value> = Value extends object
 	? { readonly [Key in keyof Value]: ReadonlyConfig<Value[Key]> }
 	: Value;
 export type SpeculativeConfig = ReadonlyConfig<typeof DEFAULT_SPECULATIVE_CONFIG>;
-export const DEFAULT_SPECULATIVE_CONFIG = freezeConfig({
+export const DEFAULT_SPECULATIVE_CONFIG = deepFreeze({
 	drafter: {
 		drafterMaxDepth: 3,
 		drafterDeterministicCandidates: 1,
@@ -225,8 +226,8 @@ export const DEFAULT_SPECULATIVE_CONFIG = freezeConfig({
 		maxRecordBytes: 8 * 1024 * 1024,
 	},
 	search: {
-		executable: "",
 		braceExpandMax: 10000,
+		executable: "",
 		maxInputBytes: 8 * 1024 * 1024,
 		maxEntries: 65536,
 		maxResultBytes: 1024 * 1024,
@@ -260,12 +261,12 @@ export const DEFAULT_SPECULATIVE_CONFIG = freezeConfig({
 		failedCommands: 4,
 		retryProbability: 0.25,
 		initialProbability: 0.5,
+		smoothing: 0.5,
 		maxBindingVariants: 32,
 		persistIntervalMs: 30000,
 		maxValueCharacters: 4096,
 		maxValueItems: 256,
 		structuralDepth: 4,
-		smoothing: 0.5,
 	},
 	runtime: {
 		strictHostVersionCheck: false,
@@ -289,156 +290,128 @@ export const DEFAULT_SPECULATIVE_CONFIG = freezeConfig({
 		sourceFailureCharacters: 200,
 	},
 });
-function freezeConfig<Value>(value: Value): Value {
-	if (value && typeof value === "object") {
-		for (const child of Object.values(value)) freezeConfig(child);
-		Object.freeze(value);
-	}
-	return value;
-}
 export type SpeculativeConfigInput = {
 	readonly [K in keyof SpeculativeConfig]?: SpeculativeConfig[K] extends object
 		? Partial<SpeculativeConfig[K]>
 		: SpeculativeConfig[K];
 };
-export function resolveSpeculativeConfig(input: SpeculativeConfigInput = {}): SpeculativeConfig {
-	const source = input as Record<string, unknown>;
-	const defaults = DEFAULT_SPECULATIVE_CONFIG as unknown as Record<string, unknown>;
+export const PROVENANCE_TAINTS = Object.freeze([
+	"network",
+	"ipc",
+	"clock",
+	"random",
+	"pid_observation",
+	"descriptor_observation",
+	"interactive_io",
+	"untracked_fd",
+	"confinement_observation",
+	"unsupported_syscall",
+	"escaped_sandbox",
+	"mutable_input",
+	"trace_incomplete",
+] as const);
+const choices: Readonly<Record<string, readonly string[]>> = {
+	"processReuse.actorObservationMode": ["none", "provenance"],
+	"processReuse.environmentMode": ["exact", "allowlist", "denylist", "isolated"],
+	"prediction.concurrentProposalPolicy": ["all", "first_produced"],
+	"selfSpeculation.forkTransport": ["provider", "sidecar", "drafter"],
+	"filesystem.sandboxDriver": ["in_memory", "overlayfs", "git"],
+};
+const positiveFields = new Set([
+	"filesystem.concurrency",
+	"filesystem.directoryMetadataBytes",
+	"filesystem.directoryReadBytes",
+	"filesystem.chunkBytes",
+	"filesystem.stabilityAttempts",
+	"filesystem.objectLeaseTimeoutMs",
+	"filesystem.objectLeaseStartupTimeoutMs",
+	"filesystem.maxWindowsLeaseRequests",
+	"subcomputation.maxPendingRequests",
+	"subcomputation.socketTimeoutMs",
+	"storage.sqliteTimeoutMs",
+	"storage.sqliteRetryInitialMs",
+	"storage.sqliteRetryMaxMs",
+	"storage.sqliteRetryMultiplier",
+]);
+const resolvedConfigs = new WeakSet<object>([DEFAULT_SPECULATIVE_CONFIG]);
+export function resolveSpeculativeConfig(input?: SpeculativeConfigInput): SpeculativeConfig {
+	if (input === undefined) return DEFAULT_SPECULATIVE_CONFIG;
+	if (resolvedConfigs.has(input)) return input as SpeculativeConfig;
 	const fail = (field: string): never => {
-		throw new Error("Invalid speculative configuration: " + field);
+		throw new Error(`Invalid speculative configuration: ${field}`);
 	};
-	for (const key of Object.keys(source)) if (!(key in defaults)) fail(key);
+	const envKey = (name: string) => name.length > 0 && !/[=\0]/u.test(name);
 	const copy = (value: unknown, expected: unknown, field: string): unknown => {
-		if (value === undefined) value = expected;
+		if (value === undefined || value === expected) return expected;
 		if (typeof expected === "number") {
-			if (typeof value !== "number" || !Number.isFinite(value) || value < 0) fail(field);
+			const minimum = field.startsWith("nativeBuild.") || positiveFields.has(field) ? 1 : 0;
+			if (!isFiniteNumber(value) || value < minimum) return fail(field);
 			if (
-				![
-					"runtime.hotFraction",
-					"scheduling.heavyIo",
-					"scheduling.lightIo",
-					"drafter.drafterTemperatureMin",
-					"drafter.drafterTemperatureMax",
-					"prediction.retryProbability",
-					"prediction.initialProbability",
-					"prediction.smoothing",
-					"pattern.futureGapCoverage",
-					"selfSpeculation.forkActionMinConfidence",
-					"selfSpeculation.forkTemperature",
-				].includes(field) &&
+				Number.isInteger(expected) &&
+				field !== "selfSpeculation.forkTemperature" &&
 				!Number.isSafeInteger(value)
 			)
-				fail(field);
-			if (field.endsWith("Ms") && (value as number) > 2147483647) fail(field);
-			return value;
-		}
-		if (Array.isArray(expected)) {
+				return fail(field);
+			if (field.endsWith("Ms") && value > 2147483647) return fail(field);
+			if (/(?:Probability|hotFraction|futureGapCoverage|forkActionMinConfidence)$/.test(field) && value > 1)
+				return fail(field);
+		} else if (Array.isArray(expected)) {
 			if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.includes("\0")))
-				fail(field);
-			return Object.freeze([...(value as string[])]);
-		}
-		if (expected && typeof expected === "object") {
-			if (!value || typeof value !== "object" || Array.isArray(value)) fail(field);
-			const object = value as Record<string, unknown>;
-			const shape = expected as Record<string, unknown>;
-			if (field === "processReuse.isolatedEnvironment") {
-				for (const [key, entry] of Object.entries(object))
-					if (!key || /[=\0]/u.test(key) || typeof entry !== "string" || entry.includes("\0")) fail(field);
-				return Object.freeze({ ...object });
-			}
-			if (field === "filesystem.timestampQuietByFilesystem") {
-				for (const [key, entry] of Object.entries(object)) {
-					if (!/^(?:0x[\da-f]+|\d+)$/iu.test(key)) fail(field);
-					copy(entry, 0, field + "." + key);
+				return fail(field);
+			if (
+				field === "processReuse.replayAcceptedTaints" &&
+				!value.every((item) => PROVENANCE_TAINTS.includes(item))
+			)
+				return fail(field);
+			if (field === "processReuse.environmentKeys" && !value.every(envKey)) return fail(field);
+			if (field === "filesystem.windowsObjectLeaseCommand" && (!value.length || !value.every(Boolean)))
+				return fail(field);
+			return Object.freeze([...value]);
+		} else if (isRecord(expected)) {
+			if (!isRecord(value)) return fail(field);
+			if (field === "processReuse.isolatedEnvironment" || field === "filesystem.timestampQuietByFilesystem") {
+				for (const [key, entry] of Object.entries(value)) {
+					const valid =
+						field === "processReuse.isolatedEnvironment"
+							? envKey(key) && typeof entry === "string" && !entry.includes("\0")
+							: /^(?:0x[\da-f]+|\d+)$/iu.test(key) && isSafeCount(entry);
+					if (!valid) return fail(`${field}.${key}`);
 				}
-				return Object.freeze({ ...object });
+				return Object.freeze({ ...value });
 			}
-			for (const key of Object.keys(object))
-				if (!(key in shape) && !(field === "storage" && key === "root")) fail(field + "." + key);
-			const result = Object.fromEntries(
-				Object.entries(shape).map(([key, fallback]) => [
-					key,
-					copy(object[key], fallback, field ? field + "." + key : key),
-				]),
-			);
-			if (field === "storage" && object.root !== undefined) {
-				if (typeof object.root !== "string" || !path.isAbsolute(object.root)) fail("storage.root");
-				result.root = object.root;
+			const result = { ...expected };
+			for (const [key, entry] of Object.entries(value)) {
+				const name = field ? `${field}.${key}` : key;
+				if (name === "storage.root") {
+					if (entry === undefined) continue;
+					if (typeof entry !== "string" || !path.isAbsolute(entry)) return fail(name);
+					result[key] = entry;
+				} else {
+					if (!Object.hasOwn(expected, key)) return fail(name);
+					result[key] = copy(entry, expected[key], name);
+				}
 			}
 			return Object.freeze(result);
-		}
-		if (typeof value !== typeof expected) fail(field);
+		} else if (
+			typeof value !== typeof expected ||
+			(choices[field] && !choices[field].includes(String(value)))
+		)
+			return fail(field);
 		return value;
 	};
-	const output = copy(source, defaults, "") as SpeculativeConfig;
-	const taints: readonly ProvenanceTaint[] = [
-		"network",
-		"ipc",
-		"clock",
-		"random",
-		"pid_observation",
-		"descriptor_observation",
-		"interactive_io",
-		"untracked_fd",
-		"confinement_observation",
-		"unsupported_syscall",
-		"escaped_sandbox",
-		"mutable_input",
-		"trace_incomplete",
-	];
-	if (output.processReuse.replayAcceptedTaints.some((taint) => !taints.includes(taint)))
-		fail("processReuse.replayAcceptedTaints");
-	if (output.processReuse.environmentKeys.some((key) => !key || /[=\0]/u.test(key)))
-		fail("processReuse.environmentKeys");
-	if (
-		!["none", "provenance"].includes(output.processReuse.actorObservationMode) ||
-		!["exact", "allowlist", "denylist", "isolated"].includes(output.processReuse.environmentMode) ||
-		!["all", "first_produced"].includes(output.prediction.concurrentProposalPolicy) ||
-		!["provider", "sidecar", "drafter"].includes(output.selfSpeculation.forkTransport) ||
-		!["in_memory", "overlayfs", "git"].includes(output.filesystem.sandboxDriver)
-	)
-		fail("process or filesystem policy");
-	const positive = [
-		...Object.values(output.nativeBuild),
-		output.filesystem.concurrency,
-		output.filesystem.directoryMetadataBytes,
-		output.filesystem.chunkBytes,
-		output.filesystem.directoryReadBytes,
-		output.filesystem.stabilityAttempts,
-		output.filesystem.objectLeaseTimeoutMs,
-		output.filesystem.objectLeaseStartupTimeoutMs,
-		output.filesystem.maxWindowsLeaseRequests,
-		output.subcomputation.maxPendingRequests,
-		output.subcomputation.socketTimeoutMs,
-		output.storage.sqliteTimeoutMs,
-		output.storage.sqliteRetryInitialMs,
-		output.storage.sqliteRetryMaxMs,
-		output.storage.sqliteRetryMultiplier,
-	];
-	if (positive.some((value) => !Number.isSafeInteger(value) || value <= 0)) fail("positive capacity");
-	if (
-		!output.filesystem.windowsObjectLeaseCommand.length ||
-		output.filesystem.windowsObjectLeaseCommand.some((part) => !part || part.includes("\0"))
-	)
-		fail("filesystem.windowsObjectLeaseCommand");
-	if (output.storage.sqliteRetryInitialMs > output.storage.sqliteRetryMaxMs) fail("storage.sqliteRetryMaxMs");
-	if (output.prediction.calibrationSuccessPrior + output.prediction.calibrationFailurePrior <= 0)
+	const config = copy(input, DEFAULT_SPECULATIVE_CONFIG, "") as SpeculativeConfig;
+	const { storage, prediction, filesystem, nativeBuild } = config;
+	if (storage.sqliteRetryInitialMs > storage.sqliteRetryMaxMs) fail("storage.sqliteRetryMaxMs");
+	if (prediction.calibrationSuccessPrior + prediction.calibrationFailurePrior <= 0)
 		fail("prediction calibration prior");
-	if (output.nativeBuild.domainValues < 8 || output.nativeBuild.domainValues * 8 + 16 > 2147483647)
+	if (nativeBuild.domainValues < 8 || nativeBuild.domainValues * 8 + 16 > 2147483647)
 		fail("nativeBuild.domainValues");
-	if (Math.log2(output.nativeBuild.domainRingBytes) % 1 || output.nativeBuild.domainRingBytes < 4096)
+	if (nativeBuild.domainRingBytes < 4096 || Math.log2(nativeBuild.domainRingBytes) % 1)
 		fail("nativeBuild.domainRingBytes");
-	if (output.filesystem.chunkBytes < 4 || output.filesystem.chunkBytes > output.filesystem.maxReadBytes)
+	if (filesystem.chunkBytes < 4 || filesystem.chunkBytes > filesystem.maxReadBytes)
 		fail("filesystem.chunkBytes");
-	if (
-		output.runtime.hotFraction > 1 ||
-		output.prediction.retryProbability > 1 ||
-		output.prediction.initialProbability > 1 ||
-		output.pattern.futureGapCoverage > 1 ||
-		output.selfSpeculation.forkActionMinConfidence > 1
-	)
-		fail("probability");
-	return output;
+	resolvedConfigs.add(config);
+	return config;
 }
 const configuration = new AsyncLocalStorage<SpeculativeConfiguration>();
 const configurationScopes = new WeakMap<SpeculativeConfig, SpeculativeConfiguration>();
@@ -513,16 +486,16 @@ export function projectProcessEnvironment(
 		"environmentMode" | "environmentKeys" | "isolatedEnvironment"
 	> = speculativeConfig().processReuse,
 ): Readonly<Record<string, string>> {
-	const keys = new Set(policy.environmentKeys);
+	const { environmentMode: mode, environmentKeys, isolatedEnvironment } = policy;
+	const keys = mode === "allowlist" || mode === "denylist" ? new Set(environmentKeys) : undefined;
+	const entries = Object.entries(mode === "isolated" ? isolatedEnvironment : environment);
 	return Object.freeze(
 		Object.fromEntries(
-			Object.entries(policy.environmentMode === "isolated" ? policy.isolatedEnvironment : environment).filter(
+			entries.filter(
 				([key]) =>
 					key !== "PI_SUBCOMPUTE_SOCKET" &&
 					key !== "PI_SUBCOMPUTE_CONTEXT" &&
-					(policy.environmentMode === "exact" ||
-						policy.environmentMode === "isolated" ||
-						(policy.environmentMode === "allowlist" ? keys.has(key) : !keys.has(key))),
+					(!keys || keys.has(key) === (mode === "allowlist")),
 			),
 		),
 	);
@@ -532,16 +505,16 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { SpeculativeAgentSettingsInput } from "./agent-integration.ts";
-import { isFiniteNumber, isRecord, isSafeCount, positiveCount } from "./primitives.ts";
-export function positiveInteger<F extends number | undefined>(value: unknown, fallback: F): number | F {
-	return typeof value === "number" && Number.isSafeInteger(Math.floor(value)) && value >= 1
-		? Math.floor(value)
-		: fallback;
+export function positiveInteger<F extends number | undefined>(
+	value: unknown,
+	fallback: F,
+	minimum = 1,
+): number | F {
+	const integer = typeof value === "number" ? Math.floor(value) : NaN;
+	return isSafeCount(integer, minimum) ? integer : fallback;
 }
 export function nonNegativeInteger(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isSafeInteger(Math.floor(value)) && value >= 0
-		? Math.floor(value)
-		: fallback;
+	return positiveInteger(value, fallback, 0);
 }
 /** Node timers otherwise turn an overflowing delay into a 1 ms timeout. */
 export function milliseconds<F extends number | undefined>(value: unknown, fallback: F): number | F {
@@ -558,108 +531,25 @@ export function probability<F extends number | undefined>(value: unknown, fallba
 export function booleanOr(value: unknown, fallback: boolean): boolean {
 	return typeof value === "boolean" ? value : fallback;
 }
-/** Every stored field declares its parser; unknown fields never enter the normalized result. */
-export function settingsParser<Defaults extends Record<string, unknown>, Key extends keyof Defaults>(
+/** Defaults provide the shape; only exceptional fields need their own parser. */
+export function settingsParser<Defaults extends Record<string, unknown>>(
 	schema: Defaults,
-	fields: { readonly [K in Key]: (value: unknown, fallback: Defaults[K]) => Defaults[K] },
+	fields: Partial<{
+		readonly [K in keyof Defaults]: (value: unknown, fallback: Defaults[K]) => Defaults[K];
+	}> = {},
 ) {
-	type Settings = Pick<Defaults, Key>;
-	const keys = Object.keys(fields) as Key[];
-	const defaults = Object.fromEntries(keys.map((key) => [key, schema[key]])) as Settings;
-	const parse = (input?: Readonly<Record<string, unknown>>): Settings => {
-		const result = {} as Settings;
-		for (const key of keys) result[key] = fields[key](input?.[String(key)], defaults[key]);
-		return result;
-	};
-	return { defaults, parse };
-}
-export type SettingInputResult<T> =
-	| {
-			readonly ok: true;
-			readonly value: T;
-	  }
-	| {
-			readonly ok: false;
-			readonly error: string;
-	  };
-export interface SettingInputDescriptor<T> {
-	readonly title: string;
-	readonly format: (value: T) => string;
-	readonly parse: (input: string) => SettingInputResult<T>;
-}
-interface NumericInputOptions {
-	readonly error?: string;
-	readonly format?: (value: number) => string;
-	readonly transform?: (value: number) => number;
-}
-export function settingInput<T>(
-	title: string,
-	format: (value: T) => string,
-	parse: (input: string) => SettingInputResult<T>,
-): SettingInputDescriptor<T> {
-	return Object.freeze({ title, format, parse });
-}
-function numericInput(
-	title: string,
-	valid: (value: number) => boolean,
-	error: string,
-	options: NumericInputOptions = {},
-): SettingInputDescriptor<number> {
-	return settingInput(title, options.format ?? String, (input) => {
-		const value = Number(input.trim());
-		const result = options.transform?.(value) ?? value;
-		return input.trim() && Number.isFinite(value) && valid(value) && Number.isFinite(result) && valid(result)
-			? { ok: true, value: result }
-			: { ok: false, error: options.error ?? error };
-	});
-}
-export function positiveIntegerInput(
-	title: string,
-	options: NumericInputOptions = {},
-): SettingInputDescriptor<number> {
-	return numericInput(
-		title,
-		(value) => isSafeCount(value, 1),
-		`${title} must be a positive integer.`,
-		options,
-	);
-}
-export function nonNegativeIntegerInput(title: string): SettingInputDescriptor<number> {
-	return numericInput(title, (value) => isSafeCount(value), `${title} must be a non-negative integer.`);
-}
-export function millisecondsInput(title: string): SettingInputDescriptor<number> {
-	return numericInput(
-		title,
-		(value) => milliseconds(value, -1) >= 1,
-		`${title} must be an integer from 1 to 2147483647.`,
-	);
-}
-export function nonNegativeNumberInput(title: string): SettingInputDescriptor<number> {
-	return numericInput(title, (value) => value >= 0, `${title} must be a non-negative number.`);
-}
-export function probabilityInput(
-	title: string,
-	options: NumericInputOptions = {},
-): SettingInputDescriptor<number> {
-	return numericInput(
-		title,
-		(value) => value >= 0 && value <= 1,
-		`${title} must be between 0 and 1.`,
-		options,
-	);
-}
-export function nonEmptyTextInput(title: string): SettingInputDescriptor<string> {
-	return settingInput(title, String, (input) => {
-		const value = input.trim();
-		return value ? { ok: true, value } : { ok: false, error: `${title} cannot be empty.` };
-	});
-}
-export function optionalTextInput(title: string): SettingInputDescriptor<string | undefined> {
-	return settingInput(
-		title,
-		(value) => value ?? "",
-		(input) => ({ ok: true, value: input.trim() || undefined }),
-	);
+	const parse = (input?: Readonly<Record<string, unknown>>, base?: Defaults): Defaults =>
+		Object.fromEntries(
+			Object.entries(schema).map(([key, fallback]) => {
+				const value = input && Object.hasOwn(input, key) ? input[key] : base?.[key];
+				const parser = fields[key];
+				if (parser) return [key, parser(value, fallback as Defaults[string])];
+				if (typeof fallback === "boolean") return [key, booleanOr(value, fallback)];
+				if (typeof fallback === "number") return [key, positiveInteger(value, fallback)];
+				return [key, typeof value === "string" && value.trim() ? value.trim() : fallback];
+			}),
+		) as Defaults;
+	return { defaults: schema, parse };
 }
 /** Admission and resource sampling hints; none of these fields grant execution or reuse authority. */
 export type SchedulingSettings = Readonly<typeof SCHEDULING_DEFAULTS>;
@@ -667,33 +557,14 @@ export const { defaults: SCHEDULING_DEFAULTS, parse: parseSchedulingSettings } =
 	DEFAULT_SPECULATIVE_CONFIG.scheduling,
 	{
 		resourcePollIntervalMs: positiveMilliseconds,
-
 		gpuPollIntervalMs: positiveMilliseconds,
-
 		gpuProbeTimeoutMs: positiveMilliseconds,
-
-		failureThreshold: positiveInteger,
-
-		failureRetryDecisions: positiveInteger,
-
-		heavyCpu: positiveInteger,
-
-		lightCpu: positiveInteger,
-
-		heavyMemoryBytes: positiveInteger,
-
-		lightMemoryBytes: positiveInteger,
-
 		heavyIo: probability,
-
 		lightIo: probability,
 	},
 );
 export function normalizeSchedulingSettings(input?: Readonly<Record<string, unknown>>) {
-	return parseSchedulingSettings({
-		...speculativeConfig().scheduling,
-		...input,
-	});
+	return parseSchedulingSettings(input, speculativeConfig().scheduling);
 }
 export interface ExecutionRoutingSettings {
 	readonly primary?: boolean;
@@ -712,8 +583,7 @@ export type SpeculativeSettingsScope = "global" | "project";
 type SettingsOverlay = Record<string, unknown>;
 /** Extension-owned configuration; Pi's settings schema remains untouched. */
 export class SpeculativeActionSettingsStore {
-	private global: SettingsOverlay | undefined;
-	private project: SettingsOverlay | undefined;
+	private readonly layers: Partial<Record<SpeculativeSettingsScope, SettingsOverlay>> = {};
 	private scopeValue: SpeculativeSettingsScope = "global";
 	private writeQueue: Promise<void> = Promise.resolve();
 	/** Hand-edited files that failed to parse: ignored when read and never replaced by a save. */
@@ -727,11 +597,11 @@ export class SpeculativeActionSettingsStore {
 	/** An untrusted checkout cannot configure the extension; a trusted one still cannot redirect conversation or keys. */
 	async load(trusted = true): Promise<void> {
 		const read = (file: string) => readSettings(file, this.unreadable);
-		[this.global, this.project] = await Promise.all([
+		[this.layers.global, this.layers.project] = await Promise.all([
 			read(this.globalPath),
 			trusted ? read(this.projectPath).then(userScoped) : undefined,
 		]);
-		this.scopeValue = this.project || this.unreadable.has(this.projectPath) ? "project" : "global";
+		this.scopeValue = this.layers.project || this.unreadable.has(this.projectPath) ? "project" : "global";
 	}
 	get scope(): SpeculativeSettingsScope {
 		return this.scopeValue;
@@ -740,10 +610,10 @@ export class SpeculativeActionSettingsStore {
 		this.scopeValue = scope;
 	}
 	effective(): SpeculativeActionPackageSettings | undefined {
-		return applyOverlay(this.global, this.project);
+		return this.editable("project");
 	}
 	editable(scope = this.scopeValue): SpeculativeActionPackageSettings | undefined {
-		return applyOverlay(this.global, scope === "project" ? this.project : undefined);
+		return applyOverlay(this.layers.global, scope === "project" ? this.layers.project : undefined);
 	}
 	/** Each scope persists only its differences from the layer below: defaults for global, global for project. */
 	setEffective(
@@ -751,17 +621,15 @@ export class SpeculativeActionSettingsStore {
 		inherited = this.scopeValue === "project" ? this.editable("global") : undefined,
 	): void {
 		const overlay = diffRecord((inherited as SettingsOverlay) ?? {}, value as SettingsOverlay);
-		if (this.scopeValue === "project") this.project = userScoped(overlay);
-		else this.global = overlay;
+		this.layers[this.scope] = this.scope === "project" ? userScoped(overlay) : overlay;
 		this.persistSelected();
 	}
 	clear(): void {
-		if (this.scopeValue === "project") this.project = undefined;
-		else this.global = undefined;
+		delete this.layers[this.scope];
 		this.persistSelected();
 	}
 	private persistSelected(): void {
-		const snapshot = structuredClone(this.scopeValue === "project" ? this.project : this.global);
+		const snapshot = this.layers[this.scope];
 		const target = this.scopeValue === "project" ? this.projectPath : this.globalPath;
 		this.writeQueue = this.writeQueue
 			.catch(() => undefined)
@@ -797,17 +665,20 @@ async function readSettings(file: string, unreadable: Set<string>): Promise<Sett
 }
 /** Network endpoints and credential sources remain user-scoped. */
 function userScoped(project: SettingsOverlay | undefined): SettingsOverlay | undefined {
-	const nested = project?.selfSpeculation;
-	if (!project || !isRecord(nested)) return project;
-	const { endpoint: _endpoint, apiKeyEnv: _apiKeyEnv, ...selfSpeculation } = nested;
-	return { ...project, selfSpeculation };
+	if (!project) return;
+	const filter = (layer: SettingsOverlay) => {
+		if (!isRecord(layer.selfSpeculation)) return layer;
+		const { endpoint, apiKeyEnv, ...selfSpeculation } = layer.selfSpeculation;
+		return { ...layer, selfSpeculation };
+	};
+	return filter(isRecord(project.config) ? { ...project, config: filter(project.config) } : project);
 }
 function applyOverlay(
 	base: SettingsOverlay | undefined,
 	overlay: SettingsOverlay | undefined,
 ): SettingsOverlay | undefined {
 	if (!base && !overlay) return undefined;
-	const result: SettingsOverlay = structuredClone(base) ?? {};
+	const result: SettingsOverlay = Object.assign(Object.create(null), structuredClone(base));
 	for (const [key, value] of Object.entries(overlay ?? {})) {
 		if (value === null) {
 			delete result[key];
@@ -819,28 +690,18 @@ function applyOverlay(
 			result[key] = structuredClone(value);
 		}
 	}
-	return Object.keys(result).length ? result : undefined;
+	return Object.keys(result).length ? { ...result } : undefined;
 }
 function diffRecord(base: SettingsOverlay, target: SettingsOverlay): SettingsOverlay | undefined {
-	const result: SettingsOverlay = {};
+	const patch: SettingsOverlay = Object.create(null);
 	for (const key of new Set([...Object.keys(base), ...Object.keys(target)])) {
-		const baseHas = Object.hasOwn(base, key);
-		const targetHas = Object.hasOwn(target, key);
-		if (!targetHas) {
-			if (baseHas) result[key] = null;
-			continue;
-		}
-		const before = base[key];
+		const before = Object.hasOwn(base, key) ? base[key] : undefined;
 		const after = target[key];
-		if (isDeepStrictEqual(before, after)) continue;
-		if (isRecord(before) && isRecord(after)) {
-			const nested = diffRecord(before, after);
-			if (nested) result[key] = nested;
-		} else {
-			result[key] = structuredClone(after);
-		}
+		if (!Object.hasOwn(target, key)) patch[key] = null;
+		else if (!isDeepStrictEqual(before, after))
+			patch[key] = isRecord(before) && isRecord(after) ? diffRecord(before, after) : structuredClone(after);
 	}
-	return Object.keys(result).length ? result : undefined;
+	return Object.keys(patch).length ? { ...patch } : undefined;
 }
 export interface DrafterToolDefinition {
 	readonly name: string;
@@ -851,19 +712,10 @@ export type DrafterRequestSettings = Readonly<typeof DRAFTER_DEFAULTS>;
 const { defaults: DRAFTER_DEFAULTS, parse: parseDrafterSettings } = settingsParser(
 	DEFAULT_SPECULATIVE_CONFIG.drafter,
 	{
-		/** Successor batches predicted from private observations while earlier actions execute. */
 		drafterMaxDepth: nonNegativeInteger,
-
-		/** Number of leading Drafter requests sent at temperature zero. */
 		drafterDeterministicCandidates: nonNegativeInteger,
-
-		/** Inclusive temperature range stratified across the remaining requests. */
 		drafterTemperatureMin: nonNegativeNumber,
-
 		drafterTemperatureMax: nonNegativeNumber,
-
-		/** Show the Drafter the calls PatternAware expects next (for A/B; off by default). */
-		drafterPatternHints: booleanOr,
 	},
 );
 export const DEFAULTS = {
@@ -872,10 +724,7 @@ export const DEFAULTS = {
 };
 export const clampCandidateLimit = positiveCount;
 export function normalizeDrafterRequestSettings(value: unknown): DrafterRequestSettings {
-	const result = parseDrafterSettings({
-		...speculativeConfig().drafter,
-		...(value && typeof value === "object" ? (value as Record<string, unknown>) : {}),
-	});
+	const result = parseDrafterSettings(asRecord(value), speculativeConfig().drafter);
 	const lower = result.drafterTemperatureMin;
 	const upper = result.drafterTemperatureMax;
 	return {

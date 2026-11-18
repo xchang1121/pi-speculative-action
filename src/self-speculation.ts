@@ -5,11 +5,9 @@ import type { AgentPlanSource } from "./agent-integration.ts";
 import {
 	DEFAULT_SPECULATIVE_CONFIG,
 	speculativeConfig,
-	booleanOr,
-	nonNegativeNumber,
-	positiveInteger,
-	positiveMilliseconds,
 	probability,
+	nonNegativeNumber,
+	positiveMilliseconds,
 	settingsParser,
 } from "./config-schema.ts";
 import {
@@ -312,70 +310,20 @@ export interface SelfSpeculationSettings extends Readonly<typeof selfSpeculation
 const { defaults: selfSpeculationDefaults, parse: parseSettings } = settingsParser(
 	DEFAULT_SPECULATIVE_CONFIG.selfSpeculation,
 	{
-		enabled: booleanOr,
-
-		/** Trusted control-plane endpoint exposed by the inference runtime. */
-		endpoint: httpEndpoint,
-
-		/** Top-level field carrying the stable request ID in provider payloads. */
-		requestIDField: textOr,
-
-		candidatePath: httpPath,
-
-		forkPath: httpPath,
-
-		clearPath: httpPath,
-
-		/** Optional declaration of what the control plane serves (client side only; not yet verified against a vLLM sidecar). */
-		capabilitiesPath: httpPath,
-
 		timeoutMs: positiveMilliseconds,
-
-		maxCandidates: positiveInteger,
-
-		maxDraftTokens: positiveInteger,
-
-		/** Actor tool-call protocol Profile; D3 serialization always follows this Profile. */
-		actorProfile: textOr,
-
-		/** Tool-call body format used when concrete K(a) candidates are tokenized. */
-		draftFormat: textOr,
-
-		/** Exact target-model boundary preceding a boundary-relative action draft. */
-		draftBoundary: textOr,
-
-		forkEnabled: booleanOr,
-
-		/** Admit complete sidecar fork tool calls to the ordinary speculative-action runtime. */
-		forkActionEnabled: booleanOr,
-
-		/** Minimum SPORK selected-token top-1 probability required for action execution. */
-		forkActionMinConfidence: probability,
-
-		forkTransport: (value) => (value === "sidecar" || value === "drafter" ? value : "provider"),
-
 		forkTemperature: nonNegativeNumber,
-
-		forkMaxAttempts: positiveInteger,
-
-		forkRetryStreamUpdates: positiveInteger,
-
-		forkBoundaryStreamUpdates: positiveInteger,
-
-		forkDecoder: textOr,
-
-		forkForcedPrefix: textOr,
-
-		/** Require a capable engine to expose token logprobs to its SPORK fork. */
-		requireLogprobs: booleanOr,
+		forkActionMinConfidence: probability,
+		endpoint: httpEndpoint,
+		candidatePath: httpPath,
+		forkPath: httpPath,
+		clearPath: httpPath,
+		capabilitiesPath: httpPath,
+		forkTransport: (value) => (value === "sidecar" || value === "drafter" ? value : "provider"),
 	},
 );
 export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculationSettings {
 	const input = isRecord(value) ? value : {};
-	const result = parseSettings({
-		...speculativeConfig().selfSpeculation,
-		...input,
-	});
+	const result = parseSettings(input, speculativeConfig().selfSpeculation);
 	const apiKeyEnv = nonEmptyString(input.apiKeyEnv);
 	return apiKeyEnv ? { ...result, apiKeyEnv } : result;
 }
@@ -1368,9 +1316,6 @@ function requiresForkLogprobs(settings: SelfSpeculationSettings): boolean {
 		((settings.forkTransport === "provider" || settings.forkActionEnabled) &&
 			settings.forkActionMinConfidence > 0)
 	);
-}
-function textOr(value: unknown, fallback: string): string {
-	return nonEmptyString(value) ?? fallback;
 }
 function nonEmptyString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;

@@ -91,7 +91,7 @@ test.for(["fresh", "stale", "closing", "alias", "alias-stale", "binary"])(
 		if (mode.startsWith("alias")) await link(target, path.join(root, "alias"));
 		const snapshot = await service.capture({
 			cwd: root,
-			driver: "git",
+			driver: "in_memory",
 			execute: async (workspace) => {
 				await writeFile(path.join(workspace.sandboxRoot, "input"), after);
 				return output;
@@ -194,7 +194,7 @@ test.for([false, true])(
 		try {
 			const captured = await service.capture({
 				cwd: root,
-				driver: "git",
+				driver: "in_memory",
 				execute: async (workspace) => {
 					await operate(workspace.sandboxRoot);
 					return output;
@@ -214,7 +214,7 @@ test.for([false, true])(
 					? await service.capture(
 							{
 								cwd: root,
-								driver: "git",
+								driver: "in_memory",
 								execute: async (workspace) => {
 									expect(await readText(workspace.sandboxRoot, "moved/input")).toBe("changed");
 									await writeFile(path.join(workspace.sandboxRoot, "moved/input"), "successor");
@@ -253,7 +253,7 @@ test.skipIf(process.platform !== "win32")(
 			fileURLToPath(new URL("./windows-filesystem.fixture.mjs", import.meta.url)),
 		]);
 		const result = JSON.parse(stdout);
-		expect(result.results).toHaveLength(12);
+		expect(result.results).toHaveLength(13);
 		expect(
 			result.results.every((entry: { status: string }) => entry.status === "passed"),
 			stdout,
@@ -263,3 +263,14 @@ test.skipIf(process.platform !== "win32")(
 		expect(result.processes).toEqual([]);
 	},
 );
+
+test("the legacy git driver selects the same immutable snapshot without a Git executable", async () => {
+	const service = new WorkspaceSandboxService();
+	try {
+		const legacy = await service.qualify({ driver: "git", gitBinary: "not-installed" }, process.cwd());
+		expect(legacy).toEqual(await service.qualify({ driver: "in_memory" }));
+		expect(legacy.driver).toBe("in_memory");
+	} finally {
+		await service.dispose();
+	}
+});

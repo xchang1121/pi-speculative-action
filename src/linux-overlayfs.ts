@@ -12,10 +12,10 @@ import {
 	openAnonymousFilesystemFile,
 } from "./filesystem-evidence.ts";
 import {
+	ignoreMissing,
 	BoundedRecencyMap,
 	errorMessage,
 	execHostText,
-	isMissing,
 	resolveHostExecutable,
 } from "./primitives.ts";
 import { waitForCompletion } from "./runtime-lifecycle.ts";
@@ -263,9 +263,7 @@ async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOv
 			await advanceFilesystemClock(clock, Math.max(changedRoot.ctimeMs, changedFile.ctimeMs), anonymous);
 			await rm(orderProbe);
 		}
-		const removed = await lstat(path.join(root, "whiteout.txt")).catch((error) => {
-			if (!isMissing(error)) throw error;
-		});
+		const removed = await lstat(path.join(root, "whiteout.txt")).catch(ignoreMissing);
 		if (removed) throw new Error("OverlayFS whiteout remained visible");
 		const whiteout = await lstat(path.join(upperRoot, "whiteout.txt"));
 		if (!whiteout.isCharacterDevice() || whiteout.rdev !== 0)

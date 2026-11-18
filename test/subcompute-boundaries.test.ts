@@ -5,11 +5,62 @@ import { createInterface } from "node:readline";
 import { afterEach, expect, test } from "vitest";
 import { Type } from "typebox";
 import { subcomputeEnvironment } from "../src/index.ts";
+import { controlledSubcomputeChannel } from "../src/subcompute.ts";
 import { systemHost } from "./agent-system-fixture.ts";
 import { temporaryDirectories } from "./filesystem.ts";
 
 const directories = temporaryDirectories("pi-subcompute-boundary-");
 afterEach(directories.dispose);
+
+test("disconnecting during computation releases the controlled channel busy count", async () => {
+	const cwd = await directories.create();
+	const tool = {
+		name: "abandoned_step",
+		label: "Abandoned step",
+		description: "Keep the context after an abandoned client",
+		parameters: Type.Object({}),
+		execute: async () => {
+			const environment = await subcomputeEnvironment();
+			const channel = controlledSubcomputeChannel(environment)!;
+			const peer = client(environment);
+			peer.send({
+				protocol: 1,
+				op: "compute",
+				context: environment.PI_SUBCOMPUTE_CONTEXT,
+				namespace: "abandoned",
+				version: "1",
+				key: "work",
+			});
+			try {
+				expect(await peer.read()).toMatchObject({ state: "miss" });
+				await expect(channel.validate()).rejects.toThrow("subcompute_process_inputs_unproven");
+			} finally {
+				peer.close();
+			}
+			await expect
+				.poll(() =>
+					channel.validate().then(
+						() => true,
+						() => false,
+					),
+				)
+				.toBe(true);
+			return { content: [], details: { validated: true } };
+		},
+	};
+	const host = systemHost(
+		cwd,
+		[tool],
+		{ executionWorlds: [], resolveInvocation: () => undefined },
+		{ enabled: false },
+	);
+	try {
+		await host.start();
+		expect((await host.execute(tool.name, {})).details).toEqual({ validated: true });
+	} finally {
+		await host.dispose();
+	}
+});
 
 test("one protocol connection reuses steps, revalidates snapshots and omits large input content by default", async () => {
 	const cwd = await directories.create();

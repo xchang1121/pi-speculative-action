@@ -1,3 +1,4 @@
+import { filesystemModeType } from "./filesystem-evidence.ts";
 import { serialize } from "node:v8";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -904,20 +905,8 @@ export function bindResourceOperation(
 						(view) => view.stat(target, fields, includeSize),
 						async () => {
 							const info = await (fields === "entry" ? fs.lstat(target) : fs.stat(target));
-							let type: "file" | "directory" | "symlink" | "special";
-							if (info.isDirectory()) {
-								type = "directory";
-							} else {
-								if (info.isFile()) {
-									type = "file";
-								} else {
-									if (info.isSymbolicLink()) {
-										type = "symlink";
-									} else {
-										type = "special";
-									}
-								}
-							}
+							const kind = filesystemModeType(info.mode);
+							const type = kind === "other" ? "special" : kind;
 							return {
 								isDirectory: () => info.isDirectory(),
 								size: includeSize ? info.size : undefined,

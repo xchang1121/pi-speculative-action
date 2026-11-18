@@ -39,6 +39,7 @@ import {
 	type FilesystemObjectTransfer,
 } from "./filesystem-evidence.ts";
 import {
+	ignoreMissing,
 	digestObject,
 	isSafeCount,
 	isSha256Digest,
@@ -110,10 +111,6 @@ export interface StoredProcessCheckpoint {
 	readonly computation: SerializedTimelineComputation;
 	readonly image: ArtifactReference;
 }
-export const DEFAULT_PROVENANCE_STORE_LIMITS: ProvenanceStoreLimits = Object.freeze({
-	maxCertificates: speculativeConfig().storage.maxCertificates,
-	maxBytes: speculativeConfig().storage.maxBytes,
-});
 /** Immutable effects; use store.artifacts to participate in a shared store's publication and retention lifecycle. */
 export class ArtifactCAS {
 	readonly root: string;
@@ -359,15 +356,15 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 			let handle: FilesystemObjectHandle | undefined;
 			let snapshot: FileHandle | undefined;
 			try {
-				const imported = supplied && "object" in supplied ? supplied : undefined;
+				if (supplied && "object" in supplied)
+					throw new Error("descriptor transfers are unsupported; use CAS artifacts");
 				let image =
 					supplied && "bytes" in supplied
 						? Buffer.from(supplied.bytes)
 						: !supplied && process.platform !== "linux"
 							? await readOptional(this.cas.artifactPath(reference.digest), reference.size, signal)
 							: undefined;
-				if (imported) throw new Error("descriptor transfers are unsupported; use CAS artifacts");
-				else if (!image && process.platform === "linux")
+				if (!image && process.platform === "linux")
 					handle = await openArtifactFile(this.cas.artifactPath(reference.digest));
 				if (!image && !handle) return false;
 				const stat = handle && (await handle.stat({ bigint: true }));
@@ -376,11 +373,7 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 					(stat && (!stat.isFile() || stat.size !== BigInt(reference.size)))
 				)
 					throw new Error("artifact integrity check failed: length");
-				if (process.platform === "linux") {
-					if (imported) {
-						if (!sealArtifactImage(handle!.fd)) throw new Error("artifact image is not immutable");
-					} else snapshot = await openArtifactImage();
-				}
+				if (process.platform === "linux") snapshot = await openArtifactImage();
 				const hash = createHash("sha256");
 				for (let offset = 0; offset < reference.size; offset += ARTIFACT_BLOCK_BYTES) {
 					signal?.throwIfAborted();
@@ -832,9 +825,7 @@ export class ProvenanceCertificateStore {
 				await this.exclusive(async (database) => {
 					if ([".clear", record.key].some((key) => changeRevision(database, key) > revision)) return;
 					if (record.path) {
-						const current = await stat(record.path).catch((error) => {
-							if (!missing(error)) throw error;
-						});
+						const current = await stat(record.path).catch(ignoreMissing);
 						if (record.digest && (record.modifiedAt > cutoff || (current?.mtimeMs ?? 0) > cutoff)) return;
 						if (current) {
 							await rm(record.path, { force: true });
@@ -904,9 +895,7 @@ export class ProvenanceCertificateStore {
 			...records,
 			...(
 				await mapFilesystem(paths, async (target) => {
-					const value = await stat(target).catch((error) => {
-						if (!missing(error)) throw error;
-					});
+					const value = await stat(target).catch(ignoreMissing);
 					const key = this.objectKey(target);
 					const match = /^cas\/sha256\/([0-9a-f]{2})\/([0-9a-f]{62})$/.exec(key);
 					if (!value) return [];
@@ -1020,9 +1009,7 @@ export class ProvenanceCertificateStore {
 		signal: AbortSignal,
 	): Promise<Record<string, SQLOutputValue>[] | undefined> {
 		const target = path.join(this.root, "metadata.sqlite");
-		const present = await stat(target).catch((error) => {
-			if (!missing(error)) throw error;
-		});
+		const present = await stat(target).catch(ignoreMissing);
 		if (!present) return;
 		signal.throwIfAborted();
 		const database = new DatabaseSync(target, { readOnly: true });

@@ -184,6 +184,7 @@ export class SubcomputeService {
 			this.clients.set(socket, controller);
 			const abort = () => controller.abort(new Error("subcompute_client_disconnected"));
 			socket.on("error", abort);
+			socket.once("end", abort);
 			socket.once("close", abort);
 			socket.setTimeout(this.configuration.current.subcomputation.socketTimeoutMs, () =>
 				socket.destroy(new Error("subcompute_timeout")),
@@ -301,55 +302,58 @@ export class SubcomputeService {
 				};
 				let produced = false;
 				scope.busy++;
-				const query = await scope.run(() =>
-					session.run(() =>
-						evaluateResourceQuery(
-							undefined,
-							{ signal },
-							this.cwd,
-							(view) =>
-								computeStepInView(
-									view,
-									contract,
-									async (inputs) => {
-										produced = true;
-										const captured = await captureDeclaredInputs(inputs, contract);
-										const publication = await TimelineInterval.outside(async () => {
-											await send({ state: "miss", inputResources: captured });
-											return (await read()) as Publication;
-										});
-										if (
-											!publication ||
-											publication.op !== "publish" ||
-											!Number.isFinite(publication.durationMs) ||
-											publication.durationMs < 0
-										)
-											throw new Error("invalid_subcompute_publication");
-										TimelineInterval.own(TimelineInterval.retained(randomUUID(), publication.durationMs));
-										return decodeValue(publication.value);
-									},
-									signal,
-								),
-							PI_ACTION_SEMANTICS,
-							this.maxBytes(),
-							true,
-							"output",
-							undefined,
-							session,
-						),
-					),
-				);
-				if (!query) throw new Error("subcompute_retention_budget_exceeded");
 				try {
-					if (this.scopes.get(request.context) !== scope) throw new Error("subcompute_context_closed");
-					for (const proof of query.versions)
-						scope.proofs.push(session.retain({ ...proof, view: undefined }));
-					await send({
-						state: produced ? "published" : "hit",
-						value: encodeValue(query.output),
-					});
+					const query = await scope.run(() =>
+						session.run(() =>
+							evaluateResourceQuery(
+								undefined,
+								{ signal },
+								this.cwd,
+								(view) =>
+									computeStepInView(
+										view,
+										contract,
+										async (inputs) => {
+											produced = true;
+											const captured = await captureDeclaredInputs(inputs, contract);
+											const publication = await TimelineInterval.outside(async () => {
+												await send({ state: "miss", inputResources: captured });
+												return (await read()) as Publication;
+											});
+											if (
+												!publication ||
+												publication.op !== "publish" ||
+												!Number.isFinite(publication.durationMs) ||
+												publication.durationMs < 0
+											)
+												throw new Error("invalid_subcompute_publication");
+											TimelineInterval.own(TimelineInterval.retained(randomUUID(), publication.durationMs));
+											return decodeValue(publication.value);
+										},
+										signal,
+									),
+								PI_ACTION_SEMANTICS,
+								this.maxBytes(),
+								true,
+								"output",
+								undefined,
+								session,
+							),
+						),
+					);
+					if (!query) throw new Error("subcompute_retention_budget_exceeded");
+					try {
+						if (this.scopes.get(request.context) !== scope) throw new Error("subcompute_context_closed");
+						for (const proof of query.versions)
+							scope.proofs.push(session.retain({ ...proof, view: undefined }));
+						await send({
+							state: produced ? "published" : "hit",
+							value: encodeValue(query.output),
+						});
+					} finally {
+						await Promise.allSettled(query.versions.map((token) => token.release()));
+					}
 				} finally {
-					await Promise.allSettled(query.versions.map((token) => token.release()));
 					scope.busy--;
 				}
 			}

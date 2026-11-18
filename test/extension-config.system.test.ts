@@ -88,8 +88,7 @@ test("extension storage GC retains accepted clock certificates and setSettings r
 		await store.put(certificate);
 		const command = session.extensionRunner.getCommand("speculative-action")!;
 		const context = session.extensionRunner.createCommandContext();
-		const collect = async () => {
-			const choices = ["Advanced settings", "Scheduling and storage", "Reclaim reusable command history"];
+		const interact = async (choices: string[], values: string[] = [], discard = false) => {
 			const notifications: string[] = [];
 			await command.handler("", {
 				...context,
@@ -103,14 +102,40 @@ test("extension storage GC retains accepted clock certificates and setSettings r
 						expect(selected).toBeDefined();
 						return selected;
 					},
+					input: async () => values.shift(),
+					confirm: async () => discard,
 					notify: (message) => {
 						notifications.push(message);
 					},
 				},
 			});
 			expect(choices).toHaveLength(0);
-			expect(notifications).toEqual([expect.stringMatching(/^Reusable command history reclaimed:/)]);
+			expect(values).toHaveLength(0);
+			return notifications;
 		};
+		const collect = async () => {
+			const gc = vi.spyOn(ProvenanceCertificateStore.prototype, "gc");
+			try {
+				expect(
+					await interact(["Advanced settings", "Scheduling and storage", "Reclaim reusable command history"]),
+				).toEqual([expect.stringMatching(/^Reusable command history reclaimed:/)]);
+				expect(gc).toHaveBeenCalledTimes(1);
+			} finally {
+				gc.mockRestore();
+			}
+		};
+		const tuning = ["Prediction sources", "Model Drafter", "Candidate requests"];
+		expect(await interact([...tuning, "Back", "Back", "Apply changes", "Close"], ["3"])).toEqual([
+			"Speculative-action settings applied.",
+		]);
+		expect(settings.effective()?.candidateLimit).toBe(3);
+		expect(await interact([...tuning, "Back", "Back", "Close"], ["0"])).toEqual([
+			"Invalid Candidate requests per Actor decision.",
+		]);
+		expect(settings.effective()?.candidateLimit).toBe(3);
+		const applied = settings.effective();
+		await interact(["Speculative production", "Close"], [], true);
+		expect(settings.effective()).toEqual(applied);
 		await collect();
 		expect(await store.get(certificate.id)).toBeDefined();
 		const plan = await new ProcessReusePlanner({ store }).plan({
