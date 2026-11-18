@@ -474,6 +474,44 @@ static __always_inline int pure_syscall(unsigned long nr) {
   switch (nr) {
   case __NR_brk:
   case __NR_munmap:
+  case __NR_mremap:
+  case __NR_mprotect:
+  case __NR_pkey_mprotect:
+  case __NR_membarrier:
+  case __NR_memfd_create:
+  case __NR_poll:
+  case __NR_ppoll:
+  case __NR_select:
+  case __NR_pselect6:
+  case __NR_epoll_create:
+  case __NR_epoll_create1:
+  case __NR_epoll_ctl:
+  case __NR_epoll_wait:
+  case __NR_epoll_pwait:
+  case __NR_epoll_pwait2:
+  case __NR_eventfd:
+  case __NR_eventfd2:
+  case __NR_timerfd_create:
+  case __NR_timerfd_settime:
+  case __NR_timerfd_gettime:
+  case __NR_signalfd:
+  case __NR_signalfd4:
+  case __NR_nanosleep:
+  case __NR_clock_nanosleep:
+  case __NR_clock_getres:
+  case __NR_alarm:
+  case __NR_getitimer:
+  case __NR_setitimer:
+  case __NR_pause:
+  case __NR_rt_sigsuspend:
+  case __NR_rt_sigpending:
+  case __NR_rt_sigtimedwait:
+  case __NR_restart_syscall:
+  case __NR_getresuid:
+  case __NR_getresgid:
+#ifdef __NR_futex_waitv
+  case __NR_futex_waitv:
+#endif
   case __NR_exit:
   case __NR_exit_group:
   case __NR_set_tid_address:
@@ -773,18 +811,44 @@ int execution_filename(unsigned long long *context) {
   return 0;
 }
 
+/* An unflagged pthread join can still use an mm-local key. Check the key the
+ * kernel actually resolved; an inode-backed key can wait on another process. */
+union futex_key {
+  struct { unsigned int offset; } both;
+} __attribute__((preserve_access_index));
+SEC("fexit/get_futex_key")
+int observe_futex_key(unsigned long long *args) {
+  __u64 owner = 0;
+  struct pi_domain_state *state = metadata_state(&owner);
+  if (!state || !metadata_tracee(owner))
+    return 0;
+  struct pt_regs *registers = (void *)bpf_task_pt_regs(bpf_get_current_task_btf());
+  if (BPF_CORE_READ(registers, orig_ax) != __NR_futex)
+    return 0;
+  union futex_key *key = (void *)args[2];
+  unsigned offset;
+  __u64 result;
+  if (bpf_get_func_ret(args, &result) || (int)result ||
+      BPF_CORE_READ_INTO(&offset, key, both.offset) ||
+      ((offset & 3) != 0 && (offset & 3) != 2 /* FUT_OFF_MMSHARED */))
+    unsupported_syscall(state, owner, __NR_futex);
+  return 0;
+}
+
 static int metadata_enter(struct pt_regs *registers, unsigned secure) {
   unsigned long number = BPF_CORE_READ(registers, orig_ax);
-  unsigned layout = call_layout(number);
-  if (!layout && (pure_syscall(number) ||
-                  ((number == __NR_mprotect || number == __NR_pkey_mprotect) &&
-                   !(BPF_CORE_READ(registers, dx) & PROT_WRITE)) ||
-                  (number == __NR_arch_prctl && BPF_CORE_READ(registers, di) == ARCH_SET_FS)))
+  if (pure_syscall(number) ||
+      (number == __NR_madvise && (int)BPF_CORE_READ(registers, dx) != MADV_REMOVE))
     return 0;
+  if (number == __NR_arch_prctl) {
+    int operation = BPF_CORE_READ(registers, di);
+    if (operation == ARCH_SET_FS || operation == ARCH_GET_FS ||
+        operation == ARCH_GET_CPUID || operation == 0x3001 /* ARCH_CET_STATUS */)
+      return 0;
+  }
   if (number == __NR_futex) {
-    unsigned op = BPF_CORE_READ(registers, si) & ~FUTEX_CLOCK_REALTIME;
-    if (op == FUTEX_WAIT_PRIVATE || op == FUTEX_WAKE_PRIVATE ||
-        op == FUTEX_WAIT_BITSET_PRIVATE || op == FUTEX_WAKE_BITSET_PRIVATE)
+    unsigned op = BPF_CORE_READ(registers, si) & FUTEX_CMD_MASK;
+    if (op == FUTEX_WAIT || op == FUTEX_WAKE || op == FUTEX_WAIT_BITSET || op == FUTEX_WAKE_BITSET)
       return 0;
   }
   __u64 owner = 0;
@@ -793,6 +857,7 @@ static int metadata_enter(struct pt_regs *registers, unsigned secure) {
     return 0;
   /* Normal, random and sequential fadvise affect only the open description's
    * read-ahead policy. Other advice can change the shared page cache. */
+  unsigned layout = call_layout(number);
   if (!layout || (number == __NR_fadvise64 && BPF_CORE_READ(registers, r10) > 2)) {
     unsupported_syscall(state, owner, number);
     return 0;
@@ -1583,9 +1648,17 @@ SEC("fentry/security_mmap_file") int map_file(unsigned long long *args) {
 }
 SEC("fentry/security_file_mprotect")
 int protect_file(unsigned long long *args) {
-  return (args[2] & 2) && (BPF_CORE_READ((struct vm_area_struct *)args[0], vm_flags) & 8)
-             ? file_watch(BPF_CORE_READ((struct vm_area_struct *)args[0], vm_file), 4)
-             : 0;
+  struct vm_area_struct *vma = (void *)args[0];
+  if (!(args[2] & PROT_WRITE) || !(BPF_CORE_READ(vma, vm_flags) & 8 /* VM_SHARED */))
+    return 0;
+  struct file *file = BPF_CORE_READ(vma, vm_file);
+  if (!file)
+    return 0;
+  __u64 owner = 0;
+  struct pi_domain_state *state = metadata_state(&owner);
+  if (state && metadata_tracee(owner))
+    unsupported_syscall(state, owner, __NR_mprotect);
+  return file_watch(file, 4);
 }
 /* The preliminary atime predicate can succeed on a read-only mount; the
  * update path runs only after the kernel has acquired mount write access. */

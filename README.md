@@ -74,7 +74,7 @@ export default function extension(pi) {
 
 环境契约支持 `exact`、`allowlist`、`denylist`、`isolated`。投影列表由 `environmentKeys` 提供，隔离环境由 `isolatedEnvironment` 提供。默认比较完整业务环境；`PI_SUBCOMPUTE_SOCKET`、`PI_SUBCOMPUTE_CONTEXT` 两个协议句柄排除在环境摘要之外，受控通道读取的输入纳入进程证书。`replayAcceptedTaints` 默认空列表；用户可显式允许负载所需的 `clock`、`random`、`pid_observation`、`descriptor_observation` 等标记。
 
-Linux 进程证据按执行域记录未知系统调用，并标记实际调用它的进程映像。未知调用和请求写权限的 `mprotect`、`pkey_mprotect` 会产生 `unsupported_syscall`。对继承文件描述符的写操作若无法定位到文件路径，证书会记录 `unresolved_fd_write`，由原生进程执行该命令。
+Linux 进程证据按执行域记录未知系统调用，并标记实际调用它的进程映像。未知调用、`MADV_REMOVE`，以及对共享文件映射请求写权限的 `mprotect` 或 `pkey_mprotect` 会产生 `unsupported_syscall`。对继承文件描述符的写操作若无法定位到文件路径，证书会记录 `unresolved_fd_write`，由原生进程执行该命令。
 
 运行时服务共享随设置更新的配置引用，后台回收使用当前策略。ext4、XFS、Btrfs、F2FS 默认使用 100 ms 文件静置窗，其他文件系统保留 2000 ms 默认值。Windows 对象租约助手默认空闲保活 30 秒，可通过 `filesystem.objectLeaseIdleMs` 调整；解释器启动失败进入重试冷却期，文件工具继续正常执行。
 

@@ -1,6 +1,6 @@
 import { statfsSync, type BigIntStats } from "node:fs";
 import { expect, test, vi } from "vitest";
-import { cachedCapture, fileIdentity, rememberCapture, settledIdentity } from "../src/filesystem-evidence.ts";
+import { cachedCapture, fileIdentity, rememberCapture, settledFilesystemStat, settledIdentity } from "../src/filesystem-evidence.ts";
 
 vi.mock("node:fs", async (original) => ({
 	...(await original<typeof import("node:fs")>()),
@@ -43,4 +43,14 @@ test("digest hits query the filesystem type once per device", () => {
 	rememberCapture({ identity: fileIdentity(remote), hash: "remote" }, 1100);
 	for (let read = 0; read < 3; read++) expect(cachedCapture(remote, "/remote/input")).toBeUndefined();
 	expect(query).toHaveBeenCalledTimes(3);
+});
+
+test("directory entries settle only after both timestamps pass the device quiet window", () => {
+	vi.mocked(statfsSync).mockReturnValue({ type: 0xef53n } as ReturnType<typeof statfsSync>);
+	const dir = Object.assign(identity(123404n), { isFile: () => false, isDirectory: () => true });
+	for (const field of ["mtimeNs", "ctimeNs"] as const) {
+		const stat = Object.assign(Object.create(dir) as BigIntStats, { [field]: 1_000_000_001n });
+		expect(settledFilesystemStat(stat, 1100, "/dir")).toBe(false);
+		expect(settledFilesystemStat(stat, 1101, "/dir")).toBe(true);
+	}
 });

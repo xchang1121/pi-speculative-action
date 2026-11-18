@@ -615,7 +615,18 @@ const filesystemTypes = new Map<bigint, bigint>();
 /** A capture standing for re-reading this file, by its identity. */
 export function cachedCapture(stat: BigIntStats, realPath: string): StableFilesystemCapture | undefined {
 	const cached = stat.isFile() ? fileDigests.get(fileIdentity(stat)) : undefined;
-	if (!cached) return undefined;
+	if (!cached || !settledFilesystemStat(stat, cached.takenAtMs, realPath)) return undefined;
+	return {
+		hash: cached.hash,
+		bytesRead: Number(stat.size),
+		realPath,
+		stat,
+		shared: true,
+	};
+}
+/** A timestamp can stand for a read only if it had already settled when that read began. */
+export function settledFilesystemStat(stat: BigIntStats, takenAtMs: number, realPath: string): boolean {
+	if (!stat.isFile() && !stat.isDirectory()) return false;
 	let filesystemType = filesystemTypes.get(stat.dev);
 	if (
 		filesystemType === undefined &&
@@ -625,24 +636,12 @@ export function cachedCapture(stat: BigIntStats, realPath: string): StableFilesy
 			filesystemType = statfsSync(realPath, { bigint: true }).type;
 			filesystemTypes.set(stat.dev, filesystemType);
 		} catch {
-			return undefined;
+			return false;
 		}
 	}
-	if (!settledIdentity(stat, cached.takenAtMs, filesystemType)) return undefined;
-	return {
-		hash: cached.hash,
-		bytesRead: Number(stat.size),
-		realPath,
-		stat,
-		shared: true,
-	};
+	return timestampsSettled(stat, takenAtMs, filesystemType);
 }
-/** Reuse a digest after the configured settlement window for the observed filesystem type. */
-export function settledIdentity(
-	stat: BigIntStats,
-	takenAtMs: number,
-	filesystemType?: bigint,
-): string | undefined {
+function timestampsSettled(stat: BigIntStats, takenAtMs: number, filesystemType?: bigint): boolean {
 	const settings = speculativeConfig().filesystem;
 	const override =
 		filesystemType === undefined
@@ -650,11 +649,12 @@ export function settledIdentity(
 			: Object.entries(settings.timestampQuietByFilesystem).find(
 					([type]) => BigInt(type) === filesystemType,
 				)?.[1];
-	return stat.isFile() &&
-		takenAtMs - Number((stat.mtimeNs > stat.ctimeNs ? stat.mtimeNs : stat.ctimeNs) / 1000000n) >=
-			(override ?? settings.timestampQuietMs)
-		? fileIdentity(stat)
-		: undefined;
+	const latest = stat.mtimeNs > stat.ctimeNs ? stat.mtimeNs : stat.ctimeNs;
+	return Number.isFinite(takenAtMs) &&
+		(BigInt(Math.floor(takenAtMs)) - BigInt(override ?? settings.timestampQuietMs)) * 1_000_000n >= latest;
+}
+export function settledIdentity(stat: BigIntStats, takenAtMs: number, filesystemType?: bigint): string | undefined {
+	return stat.isFile() && timestampsSettled(stat, takenAtMs, filesystemType) ? fileIdentity(stat) : undefined;
 }
 /** `takenAtMs`: when the read began. An identity string stands for bytes already hashed (see `settledIdentity`). */
 export function rememberCapture(

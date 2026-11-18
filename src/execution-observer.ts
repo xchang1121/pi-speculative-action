@@ -90,7 +90,7 @@ const syscallNames: Readonly<Record<number, string>> = Object.fromEntries(
 	`0 read write open close stat fstat lstat
 8 lseek mmap mprotect
 16 ioctl pread64 pwrite64 readv writev access pipe
-29 shmget shmat shmctl dup dup2
+28 madvise shmget shmat shmctl dup dup2
 39 getpid sendfile socket connect accept sendto recvfrom sendmsg recvmsg
 48 shutdown bind listen getsockname getpeername socketpair setsockopt getsockopt
 56 clone fork vfork execve
@@ -120,6 +120,7 @@ const syscallNames: Readonly<Record<number, string>> = Object.fromEntries(
 186 gettid
 188 setxattr lsetxattr fsetxattr getxattr lgetxattr fgetxattr listxattr
 195 llistxattr flistxattr removexattr lremovexattr fremovexattr tkill
+202 futex
 204 sched_getaffinity
 206 io_setup
 209 io_submit

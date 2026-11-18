@@ -6,6 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
+import { ContentChunkPool } from "./content-chunks.ts";
+import { settledFilesystemStat } from "./filesystem-evidence.ts";
 import { evaluateResourceQuery } from "./agent-execution-world.ts";
 import { currentSpeculativeConfiguration, withSpeculativeConfig } from "./config-schema.ts";
 import {
@@ -26,7 +28,7 @@ import {
 } from "./resource-version.ts";
 import { ProvenanceCertificateStore } from "./reuse-store.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
-import { containsFilesystemPath, filesystemPathKey } from "./primitives.ts";
+import { containsFilesystemPath, filesystemPathKey, hasErrorCode } from "./primitives.ts";
 import { subcomputeTiming, TaskTimeline, TimelineInterval, type SubcomputeCounts } from "./task-timing.ts";
 import type { ObservedProcessPath, ExecutionObservation } from "./execution-observer.ts";
 type WireValue =
@@ -117,19 +119,21 @@ export class SubcomputeService {
 	private readonly scopes = new Map<string, SubcomputeScope>();
 	private readonly owners = new AsyncLocalStorage<Set<string>>();
 	private readonly inputManager: ResourceVersionManager;
+	private readonly inputStorage: { store: ProvenanceCertificateStore; contents: ContentChunkPool };
+	private releaseChunks: () => Promise<void>;
 	private readonly files = new Map<
 		string,
-		{ statSig: string; token: Promise<ResourceVersionToken>; bytes: number }
+		{ statSig: string; takenAtMs: number; token: Promise<ResourceVersionToken>; bytes: number }
 	>();
 	private cacheBytes = 0;
 	private readonly counts = new Map<string, SubcomputeCounts>();
 	private readonly cwd: string;
-	private readonly store: ProvenanceCertificateStore;
 	private readonly maxBytes: () => number;
 	constructor(cwd: string, store: ProvenanceCertificateStore, maxBytes: () => number) {
 		this.cwd = cwd;
-		this.store = store;
-		this.inputManager = new ResourceVersionManager(cwd, { watch: false, persistentInputs: { store } });
+		this.inputStorage = { store, contents: new ContentChunkPool(store) };
+		this.releaseChunks = this.inputStorage.contents.retain();
+		this.inputManager = new ResourceVersionManager(cwd, { watch: false, persistentInputs: this.inputStorage });
 		this.maxBytes = maxBytes;
 		this.configuration.bind(this);
 	}
@@ -156,6 +160,12 @@ export class SubcomputeService {
 		this.cacheBytes -= entry.bytes;
 		this.lifetime.track(entry.token.then((token) => token.release(), () => {}));
 	}
+	private renewChunkPool(): void {
+		for (const key of this.files.keys()) this.evict(key);
+		this.lifetime.track(this.releaseChunks());
+		this.inputStorage.contents = new ContentChunkPool(this.inputStorage.store);
+		this.releaseChunks = this.inputStorage.contents.retain();
+	}
 	invalidate(paths: readonly string[]): void {
 		for (const key of this.files.keys())
 			if (paths.some((target) => containsFilesystemPath(target, key) || containsFilesystemPath(key, target)))
@@ -167,11 +177,12 @@ export class SubcomputeService {
 		if (stat.isFile() && stat.size > budget) return;
 		const statSig = resourceStatSignature(stat, key);
 		let entry = this.files.get(key);
-		if (entry && entry.statSig !== statSig) {
+		if (entry && (entry.statSig !== statSig || !settledFilesystemStat(stat, entry.takenAtMs, dependency.path))) {
 			this.evict(key);
 			entry = undefined;
 		}
 		if (!entry) {
+			const takenAtMs = Date.now();
 			const capture = async () => {
 				const token = await this.inputManager.capture(undefined, this.maxBytes());
 				try {
@@ -185,7 +196,7 @@ export class SubcomputeService {
 					throw error;
 				}
 			};
-			entry = { statSig, token: capture(), bytes: 0 };
+			entry = { statSig, takenAtMs, token: capture(), bytes: 0 };
 		}
 		this.files.delete(key);
 		this.files.set(key, entry);
@@ -194,12 +205,18 @@ export class SubcomputeService {
 			const token = await entry.token;
 			if (this.files.get(key) !== entry) return;
 			if (!entry.bytes) {
-				entry.bytes = token.view!.bytes + (token.view!.contents?.storedBytes ?? 0) + resourceProofBytes([token]);
+				entry.bytes = token.view!.bytes + resourceProofBytes([token]);
 				this.cacheBytes += entry.bytes;
 			}
-			while (this.cacheBytes > budget && this.files.size) this.evict(this.files.keys().next().value!);
-			if (this.files.get(key) === entry) return token;
+			while (this.cacheBytes + this.inputStorage.contents.storedBytes > budget && this.files.size)
+				this.evict(this.files.keys().next().value!);
+			if (!this.files.size) this.renewChunkPool();
+			else if (this.files.get(key) === entry) return token;
 		} catch (error) {
+			if (hasErrorCode(error, "ERR_ARTIFACT_LEASE_BUDGET")) {
+				if (this.files.get(key) === entry) this.renewChunkPool();
+				return;
+			}
 			if (this.files.get(key) === entry) this.evict(key);
 			throw error;
 		}
@@ -396,7 +413,7 @@ export class SubcomputeService {
 			TimelineInterval.own(TimelineInterval.retained(randomUUID(), publication.durationMs));
 			return decodeValue(publication.value);
 		};
-		const session = new ResourceInputSession({ store: this.store, inputs: this.inputs }, this.maxBytes());
+		const session = new ResourceInputSession({ store: this.inputStorage.store, inputs: this.inputs }, this.maxBytes());
 		let scope: SubcomputeScope | undefined;
 		try {
 			for (;;) {
@@ -494,6 +511,7 @@ export class SubcomputeService {
 			await this.lifetime.drain();
 			for (const key of this.files.keys()) this.evict(key);
 			await this.lifetime.drain();
+			await this.releaseChunks();
 			this.inputManager.close();
 			if (this.directory) await rm(this.directory, { recursive: true, force: true });
 		});

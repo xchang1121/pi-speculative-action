@@ -115,10 +115,10 @@ processTest.for(
 			await h.ready();
 			expect(await snapshot(), "public producer changed the source").toEqual(before);
 			expect(textOutput(await h.execute("bash", { command })), JSON.stringify(h.events)).toBe(output);
-			expect(h.fallbacks, JSON.stringify(h.events)).toEqual(kind === "node" ? ["bash"] : []);
+			expect(h.fallbacks, JSON.stringify(h.events)).toEqual([]);
 			if (artifact) expect(await readFile(path.join(f.workspace, artifact))).toEqual(expectedArtifact);
 			expect(textOutput(await h.execute("bash", { command }))).toBe(output);
-			expect(h.fallbacks).toEqual(kind === "node" ? ["bash", "bash"] : ["bash"]);
+			expect(h.fallbacks).toEqual(["bash"]);
 			await h.finish();
 			return;
 		}
@@ -130,14 +130,6 @@ processTest.for(
 		expect(await snapshot(), "producer changed the source").toEqual(before);
 		expect(textOutput(branch.output.result), JSON.stringify(f.backend.metrics())).toBe(output);
 		const validation = await branch.validate!();
-		if (kind === "node") {
-			expect(validation).toMatchObject({
-				status: "indeterminate",
-				cause: { detail: expect.stringContaining("unsupported_syscall") },
-			});
-			expect(f.backend.metrics().lastError).toContain("mprotect");
-			return;
-		}
 		expect(validation, JSON.stringify({ validation, metrics: f.backend.metrics() })).toMatchObject({
 			status: "valid",
 		});

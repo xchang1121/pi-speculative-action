@@ -120,14 +120,15 @@ test.skipIf(process.platform !== "linux")(
 			]);
 			execFileSync(probe, ["quota"]);
 			await using inherited = await open(path.join(root, "inherited"), "w+");
-			for (const mode of ["read", "write", "write", "fd"]) {
+			await inherited.truncate(4096);
+			for (const mode of ["private", "shared", "shared-pkey", "shared-futex", "remove", "unknown", "unknown", "fd"]) {
 				const domain = collector.open();
 				try {
 					const read = domain.trace();
 					const [launch, ...args] = domain.launch([probe, mode]);
 					execFileSync(launch, args, { stdio: ["ignore", "pipe", "pipe", inherited.fd] });
 					const definitions: number[] = [];
-					const numbers = [10, 329, 254, 301, 241, 244, 129, 297, 444, 70000];
+					const numbers = [254, 301, 241, 244, 129, 297, 444, 70000];
 					const records = executionRecords(() => {
 						const bytes = read();
 						for (let offset = 0; offset < bytes.length; ) {
@@ -148,14 +149,16 @@ test.skipIf(process.platform !== "linux")(
 						continue;
 					}
 					expect(observation.complete, observation.incompleteReasons.join(",")).toBe(true);
-					if (mode === "read") {
+					if (mode === "private") {
 						expect(observation.taints).not.toContain("unsupported_syscall");
+					} else if (mode !== "unknown") {
+						expect(observation.taints).toContain("unsupported_syscall");
+						const diagnostic = mode === "shared-futex" ? "futex" : mode === "remove" ? "madvise" : "mprotect";
+						expect(observation.unsupportedSyscalls).toEqual([diagnostic]);
 					} else {
 						expect(definitions).toEqual(expect.arrayContaining(numbers));
 						expect(observation.taints).toContain("unsupported_syscall");
-						expect(observation.unsupportedSyscalls).toEqual(expect.arrayContaining([
-							"mprotect", "pkey_mprotect", "syscall_70000",
-						]));
+						expect(observation.unsupportedSyscalls).toContain("syscall_70000");
 						for (const pid of observation.pids!) {
 							const uses = records.journal.filter((r) => r.pid === pid && r.unsupported?.name === "syscall_70000");
 							expect(uses).toHaveLength(1);

@@ -2,13 +2,15 @@ import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import * as evidence from "../src/filesystem-evidence.ts";
-import { writeFile } from "node:fs/promises";
+import { lstat, writeFile } from "node:fs/promises";
 import { connect } from "node:net";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { afterEach, expect, test, vi } from "vitest";
 import { Type } from "typebox";
 import { subcomputeEnvironment } from "../src/index.ts";
+import { SpeculativeConfiguration } from "../src/config-schema.ts";
+import { ContentChunkPool } from "../src/content-chunks.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
 import { controlledSubcomputeChannel, SubcomputeService } from "../src/subcompute.ts";
 import { systemHost } from "./agent-system-fixture.ts";
@@ -222,6 +224,9 @@ test("different step keys borrow the same signed file token until a write or exp
 	const service = new SubcomputeService(cwd, store, () => 1024 * 1024);
 	const target = path.join(cwd, "source");
 	await writeFile(target, "initial");
+	const realNow = Date.now;
+	const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 10_000);
+	const pools = vi.spyOn(ContentChunkPool.prototype, "capture");
 	const capture = vi.spyOn(evidence, "captureStableFile");
 	const reads = () => capture.mock.calls.filter(([file]) => file === target).length;
 	try {
@@ -241,13 +246,115 @@ test("different step keys borrow the same signed file token until a write or exp
 				expect(await peer.read()).toMatchObject({ state: "published" });
 				expect(reads()).toBe(key < 3 ? 1 : key - 1);
 			}
+			expect(new Set(pools.mock.contexts).size).toBe(1);
+			expect(pools.mock.contexts[0]).toMatchObject({ openChunks: 2 });
 		} finally {
 			peer.close();
 		}
 	} finally {
+		clock.mockRestore();
+		pools.mockRestore();
 		capture.mockRestore();
 		await service.dispose();
 		await store.dispose();
+	}
+});
+
+test("a full shared chunk pool keeps outstanding snapshots readable and admits the next file", async () => {
+	const cwd = await directories.create();
+	const store = new ProvenanceCertificateStore(await directories.create());
+	const settings = new SpeculativeConfiguration({ filesystem: { maxOpenChunks: 2 } });
+	const service = settings.run(() => new SubcomputeService(cwd, store, () => 1024 * 1024));
+	await writeFile(path.join(cwd, "a"), "first");
+	await writeFile(path.join(cwd, "b"), "second");
+	await writeFile(path.join(cwd, "c"), "third");
+	const env = await service.environment();
+	const first = client(env);
+	const second = client(env);
+	const request = (file: string) => ({
+		op: "compute", context: env.PI_SUBCOMPUTE_CONTEXT, namespace: "bounded-pool", key: file,
+		inputResources: [{ path: file, scope: "content" }], includeInputContent: true,
+	});
+	try {
+		first.send(request("a"));
+		const pending = await first.read();
+		expect(pending.state).toBe("miss");
+		second.send(request("b"));
+		const other = await second.read();
+		expect(other.state).toBe("miss");
+		expect(Buffer.from(other.inputResources[0].content.value, "base64").toString()).toBe("second");
+		second.send({ op: "publish", token: other.token, durationMs: 1, value: { encoding: "json", value: "second" } });
+		expect(await second.read()).toMatchObject({ state: "published" });
+		second.send(request("c"));
+		const overflow = await second.read();
+		expect(overflow.state).toBe("miss");
+		expect(Buffer.from(overflow.inputResources[0].content.value, "base64").toString()).toBe("third");
+		first.send({ op: "publish", token: pending.token, durationMs: 1, value: { encoding: "json", value: "first" } });
+		expect(await first.read()).toMatchObject({ state: "published" });
+		first.send(request("a"));
+		expect(await first.read()).toMatchObject({ state: "hit", value: { value: "first" } });
+	} finally {
+		first.close();
+		second.close();
+		await service.dispose();
+		await store.dispose();
+	}
+});
+
+test("publication rereads a same-size rewrite whose timestamps matched at capture", async () => {
+	const cwd = await directories.create();
+	const store = new ProvenanceCertificateStore(await directories.create());
+	const service = new SubcomputeService(cwd, store, () => 1024 * 1024);
+	const target = path.join(cwd, "source");
+	await writeFile(target, "before");
+	const tick = await lstat(target, { bigint: true });
+	// Model a coarse filesystem that reports one stat tuple for both real file images.
+	const captureEntry = evidence.captureFilesystemEntry;
+	const captureFile = evidence.captureStableFile;
+	const entries = vi.spyOn(evidence, "captureFilesystemEntry").mockImplementation(async (...args) => {
+		const entry = await captureEntry(...args);
+		return args[0] === target ? { ...entry, info: tick } : entry;
+	});
+	const files = vi.spyOn(evidence, "captureStableFile").mockImplementation(async (file, limit, retain, observed, signal) => {
+		if (file !== target) return captureFile(file, limit, retain, observed, signal);
+		const capture = await captureFile(file, limit, retain, { ...observed, stat: undefined }, signal);
+		return { ...capture, stat: tick };
+	});
+	const takenAt = Number((tick.mtimeNs > tick.ctimeNs ? tick.mtimeNs : tick.ctimeNs) / 1_000_000n);
+	const clock = vi.spyOn(Date, "now").mockReturnValue(takenAt);
+	const env = await service.environment();
+	const open = () => {
+		const peer = client(env);
+		peer.send({
+			op: "compute", context: env.PI_SUBCOMPUTE_CONTEXT, namespace: "coarse", key: 1,
+			inputResources: [{ path: "source", scope: "content" }], includeInputContent: true,
+		});
+		return peer;
+	};
+	const first = open();
+	try {
+		const miss = await first.read();
+		expect(miss.state).toBe("miss");
+		expect(Buffer.from(miss.inputResources[0].content.value, "base64").toString()).toBe("before");
+		await writeFile(target, "edited");
+		clock.mockReturnValue(takenAt + 10_000);
+		first.send({ op: "publish", token: miss.token, durationMs: 1, value: { encoding: "json", value: "before" } });
+		expect(await first.read()).toMatchObject({ state: "error", error: "subcompute_inputs_changed" });
+		const next = open();
+		try {
+			const retry = await next.read();
+			expect(retry.state).toBe("miss");
+			expect(Buffer.from(retry.inputResources[0].content.value, "base64").toString()).toBe("edited");
+		} finally {
+			next.close();
+		}
+	} finally {
+		first.close();
+		await service.dispose();
+		await store.dispose();
+		clock.mockRestore();
+		files.mockRestore();
+		entries.mockRestore();
 	}
 });
 

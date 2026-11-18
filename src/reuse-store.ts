@@ -38,6 +38,7 @@ import {
 	type FilesystemObjectTransfer,
 } from "./filesystem-evidence.ts";
 import {
+	hasErrorCode,
 	ignoreMissing,
 	digestObject,
 	isSafeCount,
@@ -104,6 +105,17 @@ const metadataDDL = {
 	input_preparations_recent: "CREATE INDEX input_preparations_recent ON input_preparations(root, binding, prep_key, updated_at DESC, input_id DESC)",
 	input_preparations_owner: "CREATE INDEX input_preparations_owner ON input_preparations(input_id)",
 };
+/** An empty database may be initialized. Any existing schema must match in full. */
+function hasMetadataSchema(database: DatabaseSync): boolean {
+	const objects = database.prepare("SELECT name, sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'").all();
+	if (!objects.length) return false;
+	const matches = objects.length === Object.keys(metadataDDL).length && objects.every(({ name, sql }) =>
+		Object.hasOwn(metadataDDL, String(name)) && metadataDDL[name as keyof typeof metadataDDL] === sql
+	);
+	if (!matches)
+		throw Object.assign(new Error("incompatible provenance store schema"), { code: "ERR_PROVENANCE_SCHEMA" });
+	return true;
+}
 /** Immutable effects; use store.artifacts to participate in a shared store's publication and retention lifecycle. */
 export class ArtifactCAS {
 	readonly root: string;
@@ -235,6 +247,7 @@ interface ArtifactReadLimits {
 }
 /** One verified content lease, shared by effect closures and input chunks. Linux owns objects; other adapters retain their existing byte images. */
 export class ArtifactReadView implements VerifiedArtifactClosure {
+	private storedBytes = 0;
 	private readonly lifetime = new RuntimeLifecycleLane();
 	private readonly values = new Map<
 		Sha256Digest,
@@ -266,7 +279,7 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 		return this.values.size;
 	}
 	get bytes(): number {
-		return [...this.values.values()].reduce((sum, value) => sum + value.reference.size, 0);
+		return this.storedBytes;
 	}
 	get memoryBytes(): number {
 		return [...this.values.values()].reduce(
@@ -285,7 +298,7 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 			(this.bytes + reference.size > this.limits.maxStoredBytes ||
 				this.artifacts >= this.limits.maxOpenChunks)
 		)
-			throw new Error("artifact stored-byte or descriptor budget exceeded");
+			throw Object.assign(new Error("artifact stored-byte or descriptor budget exceeded"), { code: "ERR_ARTIFACT_LEASE_BUDGET" });
 	}
 	async restore(
 		references: readonly ArtifactReference[],
@@ -337,6 +350,7 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 					const value = supplied.value(reference);
 					value.owners++;
 					this.values.set(reference.digest, value);
+					this.storedBytes += reference.size;
 					return true;
 				}
 				supplied = undefined;
@@ -394,6 +408,7 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 					image,
 					owners: 1,
 				});
+				this.storedBytes += reference.size;
 				handle = undefined;
 				return true;
 			} finally {
@@ -440,6 +455,7 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 				[...this.values.values()].map((value) => (--value.owners ? undefined : value.object?.dispose())),
 			);
 			this.values.clear();
+			this.storedBytes = 0;
 			this.released?.();
 		});
 	}
@@ -620,7 +636,7 @@ export class ProvenanceCertificateStore {
 			`SELECT i.id, i.value FROM input_preparations p JOIN input_versions i ON i.id = p.input_id
 			 WHERE p.root = ? AND p.binding = ? AND p.prep_key = ?
 			 ORDER BY p.updated_at DESC, p.input_id DESC LIMIT ?`,
-			[query.root, query.binding, query.prepKey, limit], decodeInputVersion, "input_preparations", signal,
+			[query.root, query.binding, query.prepKey, limit], decodeInputVersion, signal,
 		)) candidates.push(record);
 		return candidates;
 	}
@@ -632,7 +648,6 @@ export class ProvenanceCertificateStore {
 			"SELECT id, value FROM input_versions WHERE root = ? ORDER BY rowid DESC LIMIT ?",
 			[root, limit],
 			decodeInputVersion,
-			"input_versions",
 			signal,
 		);
 	}
@@ -657,7 +672,6 @@ export class ProvenanceCertificateStore {
 			"SELECT id, value FROM certificates WHERE weakKey = ? AND executable = ? ORDER BY createdAt DESC, id DESC",
 			[weakKey, executablePath],
 			decodeCertificate,
-			"certificates",
 			signal,
 		))
 			if (certificate.weakKey === weakKey && !excludedCertificates?.has(certificate.id)) yield certificate;
@@ -672,12 +686,12 @@ export class ProvenanceCertificateStore {
 							? "SELECT 1 FROM certificates LIMIT 1"
 							: "SELECT 1 FROM certificates WHERE executable = ? LIMIT 1",
 						executablePath === undefined ? [] : [executablePath],
-						"certificates",
 						signal,
 					)
 				).length,
 			);
-		} catch {
+		} catch (error) {
+			if (hasErrorCode(error, "ERR_PROVENANCE_SCHEMA")) throw error;
 			return false;
 		}
 	}
@@ -705,7 +719,7 @@ export class ProvenanceCertificateStore {
 			this.lifecycle
 				.admit(async () => {
 					const revision = Number(
-						(await this.query("SELECT revision FROM changes WHERE path = ''", [], "changes"))[0]?.revision ?? 0,
+						(await this.query("SELECT revision FROM changes WHERE path = ''", []))[0]?.revision ?? 0,
 					);
 					return this.collect(await this.inventory(), revision);
 				})
@@ -834,12 +848,11 @@ export class ProvenanceCertificateStore {
 		return result;
 	}
 	private async inventory(control?: DatabaseSync): Promise<StoreInventory> {
-		const read = (sql: string, table: keyof typeof metadataDDL) =>
-			control ? Promise.resolve(control.prepare(sql).all()) : this.query(sql, [], table);
+		const read = (sql: string) =>
+			control ? Promise.resolve(control.prepare(sql).all()) : this.query(sql, []);
 		const records: StoredRoot[] = (
 			await read(
 				"SELECT 'certificate' AS kind, id, value FROM certificates UNION ALL SELECT 'input', id, value FROM input_versions",
-				"input_versions",
 			)
 		).map(({ kind: storedKind, id, value }) => {
 			const kind = storedKind === "certificate" ? "certificate" : "input";
@@ -864,7 +877,7 @@ export class ProvenanceCertificateStore {
 				references,
 			};
 		});
-		const keys = await read("SELECT path FROM changes WHERE path NOT IN ('', '.clear')", "changes");
+		const keys = await read("SELECT path FROM changes WHERE path NOT IN ('', '.clear')");
 		const roots = await this.payloadRoots();
 		const paths = (await mapFilesystem(roots, filesUnder)).flat();
 		const artifacts = new Map<Sha256Digest, StoredFile>();
@@ -935,7 +948,7 @@ export class ProvenanceCertificateStore {
 	): Promise<T | undefined> {
 		digestHex(id);
 		const value = (
-			await this.query(`SELECT value FROM ${table} WHERE id = ?`, [id], table, signal)
+			await this.query(`SELECT value FROM ${table} WHERE id = ?`, [id], signal)
 		)[0]?.value;
 		const record = decode(value);
 		if (value !== undefined && record?.id !== id) throw new Error(`record integrity check failed for ${id}`);
@@ -950,10 +963,9 @@ export class ProvenanceCertificateStore {
 		sql: string,
 		parameters: SQLInputValue[],
 		decode: (value: unknown) => T | undefined,
-		table: keyof typeof metadataDDL,
 		signal?: AbortSignal,
 	): AsyncGenerator<T> {
-		for (const { id, value } of await this.query(sql, parameters, table, signal)) {
+		for (const { id, value } of await this.query(sql, parameters, signal)) {
 			signal?.throwIfAborted();
 			this.signal.throwIfAborted();
 			const record = decode(value);
@@ -964,13 +976,12 @@ export class ProvenanceCertificateStore {
 	private query(
 		sql: string,
 		parameters: SQLInputValue[],
-		table: keyof typeof metadataDDL,
 		signal?: AbortSignal,
 	): Promise<Record<string, SQLOutputValue>[]> {
 		return this.read(async (signal) => {
 			const publication = this.publication.getStore();
 			if (publication?.active) return publication.database.prepare(sql).all(...parameters);
-			const rows = await this.queryReadonly(sql, parameters, table, signal);
+			const rows = await this.queryReadonly(sql, parameters, signal);
 			signal.throwIfAborted();
 			return rows ?? [];
 		}, signal);
@@ -978,7 +989,6 @@ export class ProvenanceCertificateStore {
 	private async queryReadonly(
 		sql: string,
 		parameters: SQLInputValue[],
-		table: keyof typeof metadataDDL,
 		signal: AbortSignal,
 	): Promise<Record<string, SQLOutputValue>[] | undefined> {
 		const target = path.join(this.root, "metadata.sqlite");
@@ -987,9 +997,8 @@ export class ProvenanceCertificateStore {
 		signal.throwIfAborted();
 		const database = new DatabaseSync(target, { readOnly: true });
 		try {
-			if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table))
-				return;
-			database.exec("PRAGMA query_only=ON");
+			database.exec("PRAGMA query_only=ON; BEGIN");
+			if (!hasMetadataSchema(database)) return;
 			const rows: Record<string, SQLOutputValue>[] = [];
 			let bytes = 0;
 			for (const row of database.prepare(sql).iterate(...parameters)) {
@@ -1060,16 +1069,9 @@ export class ProvenanceCertificateStore {
 			await sqliteReady(() => database.exec("PRAGMA auto_vacuum=FULL; PRAGMA journal_mode=WAL"), signal);
 			database.exec("PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON");
 			await sqliteReady(() => database.exec("BEGIN IMMEDIATE"), signal);
-			const objects = database.prepare("SELECT name, sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'").all();
-			for (const { name, sql } of objects) {
-				if (!Object.hasOwn(metadataDDL, String(name)) || metadataDDL[name as keyof typeof metadataDDL] !== sql)
-					throw new Error("incompatible provenance store schema: " + name);
-			}
-			for (const [name, ddl] of Object.entries(metadataDDL)) {
-				if (objects.length && ddl.startsWith("CREATE TABLE") && !objects.some((row) => row.name === name))
-					throw new Error("incompatible provenance store schema: missing " + name);
-				database.exec(ddl.replace(/^(CREATE (?:TABLE|INDEX)) /, "$1 IF NOT EXISTS "));
-			}
+			if (!hasMetadataSchema(database))
+				for (const ddl of Object.values(metadataDDL))
+					database.exec(ddl.replace(/^(CREATE (?:TABLE|INDEX)) /, "$1 IF NOT EXISTS "));
 			database.exec("INSERT OR IGNORE INTO changes VALUES ('', 0); COMMIT");
 			return database;
 		} catch (error) {

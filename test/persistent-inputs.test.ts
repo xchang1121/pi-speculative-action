@@ -116,13 +116,35 @@ test("preparation lookup uses ordered SQLite keys, exact scopes, and cascading e
 	}
 });
 
-test("opening incompatible metadata preserves the existing database and refuses publication", async () => {
+test("reads and publication reject incompatible metadata and preserve the original database", async () => {
 	const f = await fixture();
 	try {
 		await mkdir(f.cache);
 		storeMetadata(f.cache, (db) => db.exec("CREATE TABLE input_versions(id TEXT); INSERT INTO input_versions VALUES ('keep')"));
-		await expect(f.store.putInputVersion({ root: f.root, preparations: [] }, [])).rejects.toThrow(/incompatible.*schema/);
+		const error = "incompatible provenance store schema";
+		await expect(f.store.findPreparedInputCandidates({ root: f.root, binding: "tool", prepKey: "key" })).rejects.toThrow(error);
+		await expect(f.store.stats()).rejects.toThrow(error);
+		await expect(f.store.mayHaveCertificates()).rejects.toThrow(error);
+		await expect(f.store.putInputVersion({ root: f.root, preparations: [] }, [])).rejects.toThrow(error);
 		expect(storeMetadata(f.cache, (db) => db.prepare("SELECT id FROM input_versions").get()?.id)).toBe("keep");
+	} finally {
+		await f.close();
+	}
+});
+
+test("reads leave an empty SQLite database untouched and reject a missing current index", async () => {
+	const f = await fixture();
+	try {
+		await mkdir(f.cache);
+		storeMetadata(f.cache, () => {});
+		const lookup = () => f.store.findPreparedInputCandidates({ root: f.root, binding: "tool", prepKey: "key" });
+		expect(await lookup()).toEqual([]);
+		expect(storeMetadata(f.cache, (db) => db.prepare("SELECT name FROM sqlite_master").all())).toEqual([]);
+		await f.store.putInputVersion({ root: f.root, preparations: [] }, []);
+		await f.store.drain();
+		storeMetadata(f.cache, (db) => db.exec("DROP INDEX input_preparations_recent"));
+		await expect(lookup()).rejects.toThrow("incompatible provenance store schema");
+		await expect(f.store.putInputVersion({ root: f.root, preparations: [] }, [])).rejects.toThrow("incompatible provenance store schema");
 	} finally {
 		await f.close();
 	}

@@ -2,6 +2,10 @@
 #include "../src/linux-execution-domain.c"
 #undef main
 #include <assert.h>
+#include <asm/prctl.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <linux/futex.h>
 #include <sys/syscall.h>
 
 static void quotas(void) {
@@ -25,10 +29,8 @@ static void quotas(void) {
   }
 }
 
-static void probe(void *page) {
+static void unknown_calls(void) {
   for (int i = 0; i < 32; i++) {
-    assert(!mprotect(page, 4096, PROT_READ | PROT_WRITE));
-    syscall(SYS_pkey_mprotect, page, 4096, PROT_READ | PROT_WRITE, 0);
     syscall(SYS_inotify_add_watch, -1, ".", 0);
     syscall(SYS_fanotify_mark, -1, 0, 0, -1, NULL);
     syscall(SYS_mq_unlink, NULL);
@@ -53,17 +55,44 @@ int main(int argc, char **argv) {
     assert(shared != MAP_FAILED && !munmap(shared, 4096));
     return 0;
   }
-  void *page = mmap(NULL, 4096, PROT_READ, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-  assert(page != MAP_FAILED && !mprotect(page, 4096, PROT_READ));
-  syscall(SYS_pkey_mprotect, page, 4096, PROT_READ, 0);
-  if (!strcmp(argv[1], "write")) {
+  if (!strcmp(argv[1], "unknown")) {
     pid_t child = fork();
     assert(child >= 0);
-    probe(page);
+    unknown_calls();
     if (!child)
       _exit(0);
     int status;
     assert(waitpid(child, &status, 0) == child && status == 0);
+    return 0;
+  }
+  int shared = !strncmp(argv[1], "shared", 6);
+  void *page = mmap(NULL, 4096, PROT_READ, shared ? MAP_SHARED : MAP_PRIVATE | MAP_ANONYMOUS,
+                    shared ? 3 : -1, 0);
+  assert(page != MAP_FAILED);
+  if (!strcmp(argv[1], "shared-futex")) {
+    assert(syscall(SYS_futex, page, FUTEX_WAKE, 1, NULL, NULL, 0) == 0);
+  } else if (!strcmp(argv[1], "remove")) {
+    madvise(page, 4096, MADV_REMOVE);
+  } else {
+    assert(!madvise(page, 4096, MADV_NORMAL));
+    if (strcmp(argv[1], "shared-pkey"))
+      assert(!mprotect(page, 4096, PROT_READ | PROT_WRITE));
+    if (strcmp(argv[1], "shared"))
+      assert(!syscall(SYS_pkey_mprotect, page, 4096, PROT_READ | PROT_WRITE, -1));
+    if (!shared) {
+      assert(mremap(page, 4096, 4096, 0) == page);
+      unsigned long fs;
+      assert(!syscall(SYS_arch_prctl, ARCH_GET_FS, &fs));
+      syscall(SYS_arch_prctl, ARCH_GET_CPUID, 0);
+      syscall(SYS_arch_prctl, 0x3001 /* ARCH_CET_STATUS */, &fs);
+      int epoll = epoll_create1(EPOLL_CLOEXEC), event = eventfd(1, EFD_CLOEXEC);
+      struct epoll_event ready = {.events = EPOLLIN};
+      assert(epoll >= 0 && event >= 0 && !epoll_ctl(epoll, EPOLL_CTL_ADD, event, &ready));
+      assert(epoll_wait(epoll, &ready, 1, 0) == 1);
+      assert(!close(event) && !close(epoll));
+      *(volatile int *)page = 1;
+      assert(syscall(SYS_futex, page, FUTEX_WAKE, 1, NULL, NULL, 0) == 0);
+    }
   }
   assert(!munmap(page, 4096));
   return 0;
