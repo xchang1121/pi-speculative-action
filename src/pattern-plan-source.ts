@@ -45,6 +45,7 @@ export interface PatternPlanSourceController {
 	readonly hints: (input: {
 		readonly sessionID: string;
 		readonly schemaHashes: Readonly<Record<string, string>>;
+		readonly patternIdentities?: Readonly<Record<string, string>>;
 		readonly settings: SpeculativeActionSettings;
 	}) => Promise<readonly Pick<PatternAwareCandidate, "tool" | "input" | "horizon">[]>;
 	readonly dispose: () => Promise<void>;
@@ -168,30 +169,43 @@ export function createPatternPlanSource({
 		input: Readonly<Record<string, unknown>>,
 		output: ToolSettlement | undefined,
 		durationMs: number,
-	) => ({
-		tool,
-		input: structuredClone(input),
-		outcome: output?.isError ? ("failure" as const) : ("success" as const),
-		...projectPatternAwareObservation(output?.result, [], cwd, []),
-		...(output?.isError
-			? {
-					errorClass: output.exitCode === undefined ? "failed" : `exit:${output.exitCode}`,
-				}
-			: {}),
-		durationMs,
-		...(typeof input.operation === "string" ? { operation: input.operation } : {}),
-	});
+		patternIdentity?: string,
+	) => {
+		const facts = projectPatternAwareObservation(output?.result, { tool, input, failed: output?.isError }, cwd);
+		const exit = output?.exitCode === undefined ? undefined : `exit:${output.exitCode}`;
+		return {
+			tool,
+			...(patternIdentity ? { patternIdentity } : {}),
+			input: structuredClone(input),
+			durationMs,
+			...facts,
+			outcome: output?.isError ? ("failure" as const) : ("success" as const),
+			...(output?.isError
+				? { errorClass: [exit, facts.errorClass].filter(Boolean).join(" ") || "failed" }
+				: {}),
+			...(typeof input.operation === "string" ? { operation: input.operation } : {}),
+		};
+	};
 	const predictedEvent = (
 		startInput: AgentStartInput,
 		action: Pick<SpeculativeCandidate, "key" | "input">,
 		output: ToolSettlement,
 		durationMs: number,
+		identities?: Readonly<Record<string, string>>,
 	): PatternAwareEventInput => {
 		if (!action.key) throw new Error("prediction_key_required");
 		return {
 			sessionID: startInput.sessionID,
 			turnID: startInput.turnID,
-			...eventData(action.key.tool, action.input, output, durationMs),
+			...eventData(
+				action.key.tool,
+				action.input,
+				output,
+				durationMs,
+				identities && Object.hasOwn(identities, action.key.tool)
+					? identities[action.key.tool]
+					: action.key.semantics?.patternIdentity,
+			),
 			schemaHash: action.key.schemaHash,
 			learnTarget: false,
 		};
@@ -231,7 +245,12 @@ export function createPatternPlanSource({
 				const turn = turnState(startInput.sessionID, startInput.turnID);
 				const store = await predictionStore(patternSettings, signal);
 				if (!store) return undefined;
-				const candidates = await store.predict(startInput.sessionID, data.schemaHashes, patternSettings);
+				const candidates = await store.predict(
+					startInput.sessionID,
+					data.schemaHashes,
+					patternSettings,
+					data.patternIdentities,
+				);
 				const carried = carriedPredictions.get(startInput.sessionID);
 				if (signal.aborted) return undefined;
 				carriedPredictions.delete(startInput.sessionID);
@@ -256,12 +275,19 @@ export function createPatternPlanSource({
 				const candidates = await store.predictAfterBatch(
 					startInput.sessionID,
 					batch.map(({ candidate, output }) =>
-						predictedEvent(startInput, candidate, output, nonNegativeFinite(candidate.executionMs)),
+						predictedEvent(
+							startInput,
+							candidate,
+							output,
+							nonNegativeFinite(candidate.executionMs),
+							data.patternIdentities,
+						),
 					),
 					data.schemaHashes,
 					patternSettings,
 					// No calibrated joint confidence is supplied for the foreign batch; use a neutral prior.
 					{ visitedPatternIDs: [id], pathProbability: 0.5 },
+					data.patternIdentities,
 				);
 				if (!candidates.length) return undefined;
 				const dependencies = batch.map(({ identity }) => ({
@@ -307,22 +333,19 @@ export function createPatternPlanSource({
 						adoptedAction ?? candidate,
 						output,
 						nonNegativeFinite(candidate.executionMs),
+						data.patternIdentities,
 					),
 					data.schemaHashes,
 					trigger === "actor_adopted",
 					patternSettings,
+					data.patternIdentities,
 				);
 				if (!next.length) return undefined;
 				return {
 					proposalID,
 					source: "pattern_aware",
 					revision,
-					upsert: planActions(
-						next,
-						context.store,
-						[{ actionID, condition: "execution_succeeded" }],
-						actionID,
-					),
+					upsert: planActions(next, context.store, [{ actionID, condition: "execution_succeeded" }], actionID),
 				};
 			}),
 	};
@@ -343,7 +366,15 @@ export function createPatternPlanSource({
 	) =>
 		admit(settings, async (patternSettings) => {
 			const schemaHash = action?.schemaHash ?? data.schemaHashes[tool];
-			const observed = eventData(tool, concrete, output, durationMs);
+			const observed = eventData(
+				tool,
+				concrete,
+				output,
+				durationMs,
+				data.patternIdentities && Object.hasOwn(data.patternIdentities, tool)
+					? data.patternIdentities[tool]
+					: action?.semantics?.patternIdentity,
+			);
 			const turn = turnState(consumeInput.sessionID, consumeInput.turnID);
 			const batch = turn.events;
 			batch.set(order, {
@@ -365,6 +396,8 @@ export function createPatternPlanSource({
 					ordered,
 					data.schemaHashes,
 					patternSettings,
+					undefined,
+					data.patternIdentities,
 				);
 				const predicted = planActions(candidates, store);
 				// An observation can finish after its turn closes, or lose individual actions during admission.
@@ -413,7 +446,7 @@ export function createPatternPlanSource({
 				const store = await resolveStore(patternSettings);
 				if (events.length) store.observeBatch(events);
 				store.observeTurn();
-				if (terminal) store.finishSession(startInput.sessionID);
+				if (terminal) store.finishSession(startInput.sessionID, true);
 			})
 			.catch(() => {
 				// Optional learning cannot poison later observations or the Actor lifecycle.
@@ -443,8 +476,7 @@ export function createPatternPlanSource({
 					if (state?.context) {
 						state.carried?.pending.delete(state.context);
 						if (issued)
-							for (const support of [state.context.continuation, ...state.context.supportingPatternIDs])
-								state.context.store.issued(support);
+							for (const support of state.context.supportingPatternIDs) state.context.store.issued(support);
 					}
 				},
 				prediction_feedback: ({ feedback, settlement, served }) => {
@@ -452,7 +484,7 @@ export function createPatternPlanSource({
 					const { context, carried } = feedbacks.get(feedback as object) ?? {};
 					if (carried && settlement.observation === "unobserved") carried.abandoned = true;
 					if (context)
-						for (const support of [context.continuation, ...context.supportingPatternIDs])
+						for (const support of context.supportingPatternIDs)
 							context.store.settled(support, settlement, served);
 				},
 				turn_started: ({ startInput, settings }) => observeTurn(startInput, settings),
@@ -466,11 +498,11 @@ export function createPatternPlanSource({
 						await flushStores(true);
 					}),
 			}),
-		hints: ({ sessionID, schemaHashes, settings }) =>
+		hints: ({ sessionID, schemaHashes, settings, patternIdentities }) =>
 			admit(settings, async (patternSettings) => {
 				if (!settings.enabled || !patternSettings.enabled) return [];
 				const store = await predictionStore(patternSettings);
-				return (await store!.predict(sessionID, schemaHashes, patternSettings))
+				return (await store!.predict(sessionID, schemaHashes, patternSettings, patternIdentities))
 					.slice(0, speculativeConfig().prediction.maxHints)
 					.map(({ tool, input, horizon }) => ({ tool, input, horizon }));
 			}),

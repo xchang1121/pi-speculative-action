@@ -709,7 +709,7 @@ export function bindResourceOperation(
 	execute: NonNullable<ToolInvocation["filesystem"]>,
 	root: string,
 	native?: NonNullable<ToolInvocation["authoritative"]>,
-	completeObservation = false,
+	completeObservation: boolean | "single_query" = false,
 ): Pick<ToolInvocation, "authoritative" | "captureInputs" | "filesystem" | "filesystemRoot"> {
 	type Capture = {
 		maxBytes: number;
@@ -831,7 +831,10 @@ export function bindResourceOperation(
 						),
 					);
 				try {
-					const result = await (session ? session.run(evaluate) : evaluate());
+					const run = () => (session ? session.run(evaluate) : evaluate());
+					const result = await (completeObservation === "single_query"
+						? withFilesystemReadView(undefined, run)
+						: run());
 					if (!result?.versions.length) unproven();
 					return result;
 				} finally {
@@ -971,6 +974,12 @@ export function bindResourceOperation(
 				},
 			};
 			try {
+				// The stock reader checks access, sniffs the type and reads the body from one validated input.
+				if (completeObservation === "single_query" && (owned || scope))
+					return await read(
+						(view) => execute(view, request),
+						() => execute(host, request),
+					);
 				return await (native && completeObservation
 					? collectResourceComputation(() => execute(host, request))
 					: execute(host, request));

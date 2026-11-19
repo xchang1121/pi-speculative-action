@@ -81,6 +81,8 @@ export interface CanonicalAction {
 	readonly resources: readonly string[];
 }
 export interface ActionSemanticsDefinition {
+	/** Explicit name shared by compatible prediction histories across tool renames. */
+	readonly patternIdentity?: string;
 	readonly tool: string;
 	readonly epoch: string;
 	/** Effects an isolation backend must contain or validate. */
@@ -534,6 +536,8 @@ function normalizeDefinition(source: ActionSemanticsDefinition): ActionSemantics
 	const tool = source.tool.trim();
 	const epoch = source.epoch.trim();
 	if (!tool) throw new Error("action semantics tool must not be empty");
+	if (source.patternIdentity !== undefined && !source.patternIdentity.trim())
+		throw new Error("Empty tool pattern identity");
 	if (!epoch) throw new Error(`action semantics epoch must not be empty for ${tool}`);
 	const definition = Object.freeze({
 		...source,

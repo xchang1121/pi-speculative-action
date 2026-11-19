@@ -167,7 +167,7 @@ export function resolvePiToolInvocation(
 				filesystem,
 				path.parse(cwd).root,
 				undefined,
-				PI_ACTION_SEMANTICS.definition(tool)?.effect === "observation",
+				tool === "read" ? "single_query" : PI_ACTION_SEMANTICS.definition(tool)?.effect === "observation",
 			),
 		};
 	}

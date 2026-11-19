@@ -16,9 +16,15 @@ import {
 	defineSpeculativeTool,
 	registerSpeculativeTool,
 } from "@earendil-works/pi-speculative-action";
+import {
+	PATTERN_AWARE_DEFAULTS,
+	PatternAwareStore,
+	projectPatternAwareObservation,
+} from "../src/pattern-aware.ts";
 import { createSpeculativeActionExtension } from "@earendil-works/pi-speculative-action/extension";
 import { afterEach, expect, test, vi } from "vitest";
 import type { SpeculativeActionEvent } from "../src/runtime-engine.ts";
+import { definitionSchemaHashes } from "../src/agent-integration.ts";
 import { temporaryDirectories } from "./filesystem.ts";
 import { deferred, onExit } from "./async.ts";
 import { inspectDataset, writeDatasetReport } from "../examples/speculative-tool.ts";
@@ -32,6 +38,7 @@ async function fixture(
 	tools: ToolDefinition<any, any>[],
 	enabled = false,
 	config: import("../src/config-schema.ts").SpeculativeConfigInput = {},
+	patternStore?: PatternAwareStore,
 ) {
 	const cwd = await directories.create();
 	const agentDir = await directories.create();
@@ -44,7 +51,7 @@ async function fixture(
 			reuseEnabled: true,
 			drafterEnabled: false,
 			prepareObservedOperations: false,
-			patternAware: { enabled: false },
+			patternAware: { enabled: !!patternStore },
 			resourceCacheMaxBytes: 16 * 1024 * 1024,
 			config,
 		}),
@@ -63,6 +70,7 @@ async function fixture(
 		createHost: (id, options) => {
 			host = createSpeculativeActionHost(id, {
 				...options,
+				patternStore,
 				getSettings: () => ({
 					...options.getSettings?.(),
 					reuseEnabled: reuse,
@@ -689,3 +697,54 @@ test.each(["observation", "workspace_mutation", "actor"] as const)(
 		);
 	},
 );
+
+
+test("registered SDK tools route a learned transition through declared identities after a rename", async () => {
+	const store = new PatternAwareStore(PATTERN_AWARE_DEFAULTS);
+	const source = "sdk.catalog";
+	const target = "sdk.open";
+	const parameters = Type.Object({ path: Type.String() });
+	const schemaHash = definitionSchemaHashes([{ name: "old_open", inputSchema: parameters }]).old_open;
+	const rows = (value: string) => ({ content: [{ type: "text" as const, text: value }], details: {} });
+	for (let i = 0; i < 8; i++) {
+		const id = "training-" + i;
+		const file = "data/" + i + ".json";
+		const event = { sessionID: id, turnID: id, outcome: "success" as const, durationMs: 1 };
+		store.observe({
+			...event,
+			tool: "old_catalog",
+			patternIdentity: source,
+			input: {},
+			...projectPatternAwareObservation(rows(file), { tool: "old_catalog", input: {} }),
+		});
+		store.observe({ ...event, tool: "old_open", patternIdentity: target, schemaHash, input: { path: file } });
+		store.finishSession(id, true);
+	}
+	const catalog = defineSpeculativeTool({
+		name: "listing",
+		label: "Listing",
+		description: "Show a dataset",
+		patternIdentity: source,
+		parameters: Type.Object({}),
+		effect: "observation",
+		steps: {},
+		execute: async () => rows("data/rows.json"),
+	});
+	const open = defineSpeculativeTool({
+		name: "show_dataset",
+		label: "Show",
+		description: "Read a dataset",
+		patternIdentity: target,
+		parameters,
+		effect: "observation",
+		steps: {},
+		execute: async ({ fs }, input) => rows((await fs.readFile(input.path)).toString()),
+	});
+	const plans = vi.spyOn(store, "predictAfterBatch");
+	const f = await fixture([catalog, open], true, {}, store);
+	await using _cleanup = onExit(f.dispose);
+	await f.execute(catalog.name, {});
+	await expect
+		.poll(() => plans.mock.results.flatMap((entry) => entry.value ?? []))
+		.toContainEqual(expect.objectContaining({ tool: open.name, input: { path: "data/rows.json" } }));
+});

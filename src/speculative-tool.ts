@@ -67,7 +67,10 @@ type StepDefinition = {
 	readonly run: (context: SpeculativeStepContext, input: any) => Promise<unknown> | unknown;
 };
 const stepDefinitions = new WeakMap<object, StepDefinition>();
-const toolInvocations = new WeakMap<Function, (cwd: string) => ToolInvocation>();
+const toolInvocations = new WeakMap<
+	Function,
+	{ invocation: (cwd: string) => ToolInvocation; patternIdentity?: string }
+>();
 const dependencies = (steps: Steps): Steps => {
 	const snapshot = Object.freeze({ ...steps });
 	for (const step of Object.values(snapshot))
@@ -185,6 +188,7 @@ export function defineSpeculativeTool<
 >(
 	definition: Omit<ToolDefinition<Parameters, Details>, "execute"> & {
 		readonly identity?: unknown;
+		readonly patternIdentity?: string;
 		readonly effect: Effect;
 		readonly steps: Dependencies;
 		/** Pure ordering hints only. Actual reads, not these paths, authorize adoption. */
@@ -195,7 +199,8 @@ export function defineSpeculativeTool<
 		) => Promise<AgentToolResult<Details>>;
 	},
 ): ToolDefinition<Parameters, Details> {
-	const { identity: explicitIdentity, effect, steps, resources, execute, ...tool } = definition;
+	const { identity: explicitIdentity, patternIdentity, effect, steps, resources, execute, ...tool } = definition;
+	if (patternIdentity !== undefined && !patternIdentity.trim()) throw new Error("Empty tool pattern identity");
 	if (!tool.name?.trim()) throw new Error("Speculative tool requires a name");
 	if (!["observation", "workspace_mutation", "actor"].includes(effect))
 		throw new Error("Unknown speculative tool effect");
@@ -225,6 +230,7 @@ export function defineSpeculativeTool<
 			identity,
 			...(effect === "actor" ? { authoritativeOnly: true as const } : {}),
 			semantics: {
+				patternIdentity,
 				tool: tool.name,
 				epoch: `pi.speculative-tool:${tool.name}`,
 				effect: effect === "actor" ? "unbounded" : effect,
@@ -263,9 +269,11 @@ export function defineSpeculativeTool<
 				signal: signal ?? new AbortController().signal,
 			})
 		).result as AgentToolResult<Details>;
-	toolInvocations.set(callback, invocation);
+	toolInvocations.set(callback, { invocation, patternIdentity });
 	return Object.freeze({ ...tool, execute: callback });
 }
 /** SDK bridge: only the exact registered callback carries the explicit contract. */
 export const speculativeToolInvocation = (callback: Function, cwd: string): ToolInvocation | undefined =>
-	toolInvocations.get(callback)?.(cwd);
+	toolInvocations.get(callback)?.invocation(cwd);
+export const speculativeToolPatternIdentity = (callback: Function) =>
+	toolInvocations.get(callback)?.patternIdentity;

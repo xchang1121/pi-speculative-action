@@ -44,6 +44,8 @@ export default function register(pi: ExtensionAPI) {
 
 同名工具在不同 Host 实例中使用同一份参数 schema 即可获得同一身份。工具定义可以显式提供确定性的 `identity`，例如业务规则的内容摘要。
 
+工具更名后若仍履行同一职责，可以在新旧定义上声明相同的 `patternIdentity`，例如 `"workspace.symbols.open"`。PatternAware 将学到的调用顺序映射到当前注册名。目标参数 schema 必须一致，同一身份同时对应多个启用的目标工具时会跳过该预测。执行、证书和采纳仍使用当前工具自己的身份。
+
 ## 工具的效果边界
 
 | `effect` | 工具作者的约定 | 运行方式 |

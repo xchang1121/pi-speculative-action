@@ -2,6 +2,12 @@
 
 日常回归、后端资格和真实模型评估使用同一生产 Host。常规检查见[计量与验证](../README.md#计量与验证)，Windows 与 WSL 顺序运行；研究笔记、临时场景和构建快照在本地临时目录保存，结束后清理。
 
+## PatternAware 预测回放
+
+`node --import tsx bench/pattern-workflows.mjs` 运行可复现的合成工作流、混噪训练与位置偏好切换实验。
+
+`node --import tsx bench/pattern-trace-replay.mjs /path/to/tasks/*/record.session.jsonl` 读取每条原始会话及同名的 `record.json`。每折留出一个完整仓库，按原始 Actor 批次先预测再学习。报告按宿主的工具契约区分原始参数相同、规范键精确匹配和范围投影，统计首位命中、误报及覆盖的调用数。每个被覆盖的调用只累计一次原录制耗时。测量 Actor 实际等待需在运行中的 Host 重放相同调用。
+
 ## 后端资格
 
 ```sh

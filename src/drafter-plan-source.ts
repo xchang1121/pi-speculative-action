@@ -149,6 +149,7 @@ export function createDrafterPlanSource(
 		readonly patternHints?: (input: {
 			readonly sessionID: string;
 			readonly schemaHashes: Readonly<Record<string, string>>;
+			readonly patternIdentities?: Readonly<Record<string, string>>;
 			readonly settings: SpeculativeActionSettings;
 		}) => Promise<
 			readonly {
@@ -368,6 +369,7 @@ export function createDrafterPlanSource(
 						const hints = await input.patternHints?.({
 							sessionID: startInput.sessionID,
 							schemaHashes: data.schemaHashes,
+							patternIdentities: data.patternIdentities,
 							settings,
 						});
 						const selected: Context = settings.tools

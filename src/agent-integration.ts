@@ -66,7 +66,7 @@ import { createExecutionPreparation, makeSpeculativeActionRuntime } from "./runt
 import type { ActorForkPlanSource, SelfSpeculationSettingsInput } from "./self-speculation.ts";
 import { normalizeSelfSpeculationSettings } from "./self-speculation.ts";
 import type { ToolOperation } from "./settlement.ts";
-import { speculativeToolInvocation } from "./speculative-tool.ts";
+import { speculativeToolInvocation, speculativeToolPatternIdentity } from "./speculative-tool.ts";
 import { SubcomputeService } from "./subcompute.ts";
 import type { ExecutionResourceMonitor } from "./system-resources.ts";
 import { createSystemResourceMonitor } from "./system-resources.ts";
@@ -106,6 +106,7 @@ export interface AgentConsumeInput extends Omit<ActualToolCall, "input">, TurnIn
 	readonly tools: readonly AgentTool[];
 }
 export interface AgentStateData {
+	readonly patternIdentities?: Readonly<Record<string, string>>;
 	readonly tools: ReadonlyMap<string, AgentTool>;
 	readonly schemaHashes: Readonly<Record<string, string>>;
 }
@@ -701,6 +702,14 @@ function assembleAgentExecutionHost(
 				inputSchema: tool.parameters,
 			})),
 		stateData: (input) => ({
+			patternIdentities: Object.fromEntries(
+				input.tools.flatMap((tool) => {
+					const source = callbackTools.get(tool)?.source ?? tool;
+					const id = speculativeToolPatternIdentity(currentDefinition(source)?.execute ?? source.execute)
+						?? actionSemantics.definition(tool.name)?.patternIdentity;
+					return id ? [[tool.name, id]] : [];
+				}),
+			),
 			tools: new Map(input.tools.map((tool) => [tool.name, tool])),
 			// Concrete candidates prepare their routes inside the runtime's resource budget.
 			// Warming every possible tool here would bypass that budget before a proposal exists.

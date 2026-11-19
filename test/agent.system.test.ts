@@ -7,7 +7,7 @@ import { bindResourceOperation, createResourceSnapshotExecutionWorld } from "../
 import { DrafterTaskBudget } from "../src/drafter-plan-source.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
 import { TimelineInterval } from "../src/task-timing.ts";
-import { ResourceInputSession, ResourceReadView } from "../src/resource-version.ts";
+import { ResourceInputSession, ResourceReadView, ResourceVersionManager } from "../src/resource-version.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import {
 	ActionSemanticsRegistry,
@@ -16,7 +16,7 @@ import {
 } from "../src/action-semantics.ts";
 import { readText, temporaryDirectories } from "./filesystem.ts";
 import { expectHiddenCompute, idleResources, resourceWorld, systemHost } from "./agent-system-fixture.ts";
-import { onExit, deferred, gated, nextTurn } from "./async.ts";
+import { onExit, deferred, disposable, gated, nextTurn } from "./async.ts";
 import { textOutput } from "./linux-process-fixture.ts";
 import { testModel, toolUse } from "./model.ts";
 
@@ -105,6 +105,32 @@ test.skipIf(process.platform !== "linux")(
 		}
 	},
 );
+
+test("validates one stock read as a single query and detects a same-length overwrite", async () => {
+	const cwd = await directories.create();
+	const args = { path: "value.txt" };
+	await writeText(cwd, args.path, "first\n");
+	const callID = "read-value";
+	const invocation = resolvePiToolInvocation("read", args, { cwd, environment: {} })!;
+	const action = PI_ACTION_SEMANTICS.buildKey("read", args, cwd);
+	const request = { callID, args, signal: new AbortController().signal };
+	await using capture = disposable(invocation.captureInputs!(action, 1024 * 1024, callID));
+	const validation = vi.spyOn(ResourceVersionManager.prototype, "validate");
+	try {
+		const output = await invocation.authoritative!(request);
+		expect(textOutput(output.result)).toBe("first\n");
+		expect(validation).toHaveBeenCalledTimes(1);
+		await using branch = disposable(await capture.seal(output));
+		expect((await branch.validate!()).status).toBe("valid");
+		await writeText(cwd, args.path, "other\n");
+		expect((await branch.validate!()).status).toBe("stale");
+		await using _small = disposable(invocation.captureInputs!(action, 64, callID));
+		const fallback = await invocation.authoritative!(request);
+		expect(textOutput(fallback.result)).toBe("other\n");
+	} finally {
+		validation.mockRestore();
+	}
+});
 
 test.for(["producer", "borrower", "both"])(
 	"cancels a preparation waiter without waiting for shared computation (%s)",
