@@ -10,7 +10,7 @@ type TraceEvent<SessionID, Kind extends SpeculativeActionEvent<SessionID>["type"
 export function benchmarkTraceReport<SessionID>(events: readonly SpeculativeActionEvent<SessionID>[]) {
 	const requests = events.filter((event) => event.type === "source_request");
 	const predictions = events.filter(
-		(event) => event.type === "prediction" || event.type === "operation_prediction",
+		(event) => event.type === "prediction",
 	);
 	const candidateEvents = events.filter((event) => event.type === "candidate");
 	const candidates = candidateEvents.filter((event) => event.state.status === "running");
@@ -69,7 +69,7 @@ export function benchmarkTraceReport<SessionID>(events: readonly SpeculativeActi
 			(event) => event.tool,
 		),
 		sourceRequestTrace: traceEvents<SessionID, "source_request">(requests),
-		predictionTrace: traceEvents<SessionID, "prediction" | "operation_prediction">(predictions),
+		predictionTrace: traceEvents<SessionID, "prediction">(predictions),
 		candidateTrace: traceEvents<SessionID, "candidate">(candidateEvents),
 		actorActionTrace: traceEvents<SessionID, "actor_action">(actors),
 	};
@@ -119,13 +119,12 @@ export function slowCallReport<SessionID>(
 		const { settlement, computation } = actor;
 		const identity = settlement.actorAction;
 		const predictions = events
-			.filter((event) => event.type === "prediction" || event.type === "operation_prediction")
+			.filter((event) => event.type === "prediction")
 			.filter(
 				(event) =>
 					event.sessionID === actor.sessionID &&
 					event.settlement.observation === "observed" &&
 					event.settlement.actorAction.id === identity.id &&
-					event.settlement.actorAction.kind === identity.kind &&
 					event.settlement.actorAction.sequence === identity.sequence &&
 					event.settlement.actorAction.turnID === identity.turnID,
 			);

@@ -11,7 +11,7 @@ import {
 	processTest,
 	textOutput,
 } from "./linux-process-fixture.ts";
-import { idleResources, systemHost } from "./agent-system-fixture.ts";
+import { systemHost } from "./agent-system-fixture.ts";
 
 const cases = [
 	{
@@ -153,7 +153,7 @@ processTest.for([false, true])(
 			f,
 			"compile",
 			{ patternAware: { enabled: false }, prepareObservedOperations: false },
-			{ resources: idleResources(2) },
+			{},
 		);
 		await using _host = onExit(() => h.host.dispose());
 		await h.start("actor");
@@ -238,14 +238,16 @@ processTest.for(["failure", "timeout", "cancel"])(
 				? { command: "printf expected; exit 7" }
 				: { command: "sleep 5; printf unexpected > effect", timeout: 0.1 };
 		const controller = new AbortController();
-		await h.preview("bash", args, controller.signal);
+		const run = await h.preview("bash", args, controller.signal);
 		if (mode === "failure") {
 			await h.ready();
 			await expect(h.execute("bash", args)).rejects.toThrow("7");
 			expect(h.fallbacks, JSON.stringify(h.events)).toEqual([]);
 		} else {
-			if (mode === "cancel") controller.abort();
-			await expect
+			if (mode === "cancel") {
+				controller.abort();
+				expect(await run!.completion).toMatchObject({status:"cancelled"});
+			} else await expect
 				.poll(
 					() =>
 						h.events.some(

@@ -26,12 +26,11 @@ import {
 } from "./execution-world.ts";
 import {
 	CapturedFilesystemObject,
-	mapFilesystem,
 	sameFilesystemIdentity,
 	withFilesystemReadView,
 	type StableFilesystemCapture,
 } from "./filesystem-evidence.ts";
-import { containsFilesystemPath, relativeFilesystemPath } from "./primitives.ts";
+import { relativeFilesystemPath } from "./primitives.ts";
 import {
 	captureResourceVersion,
 	collectResourceComputation,
@@ -81,53 +80,6 @@ export type AgentExecutionWorld = ExecutionWorld<
 >;
 export type SpeculativeAgentExecutionWorld = AgentExecutionWorld &
 	Required<Pick<AgentExecutionWorld, "speculation">>;
-/** Known path independence permits early work; captured versions still decide whether its output is usable. */
-export async function filesystemExecutionDependsOn(action: ActionKey, parent: ActionKey): Promise<boolean> {
-	const paths = (key: ActionKey) =>
-		(key.executionContext as ToolInvocation | undefined)?.filesystemResources ??
-		(key.resourceRoot ? key.resources.map((target) => path.resolve(key.resourceRoot!, target)) : []);
-	const current = paths(action);
-	const previous = paths(parent);
-	if (!current.length || !previous.length) return true;
-	const overlaps = (left: string, right: string) =>
-		containsFilesystemPath(left, right) || containsFilesystemPath(right, left);
-	if (current.some((target) => previous.some((prior) => overlaps(target, prior)))) return true;
-	try {
-		return await withFilesystemReadView(undefined, async (view) => {
-			const resolved = new Map(
-				await mapFilesystem([...new Set([...current, ...previous])], async (target) => {
-					const info = await view.stat(target, true).catch((error) => {
-						if (error.code !== "ENOENT") throw error;
-					});
-					const real = await view.realpath(target).catch((error) => {
-						if (error.code !== "ENOENT") throw error;
-						return view
-							.realpath(path.dirname(target))
-							.then((parent) => path.join(parent, path.basename(target)));
-					});
-					return [target, { info, real }] as const;
-				}),
-			);
-			return current.some((target) =>
-				previous.some((prior) => {
-					const a = resolved.get(target)!;
-					const b = resolved.get(prior)!;
-					return (
-						!!(
-							a.info &&
-							b.info &&
-							a.info.ino !== 0n &&
-							a.info.dev === b.info.dev &&
-							a.info.ino === b.info.ino
-						) || overlaps(a.real, b.real)
-					);
-				}),
-			);
-		});
-	} catch {
-		return true;
-	}
-}
 /** Observe Actor reads; only explicitly bound operations may execute ahead over sealed resource data. */
 export function createResourceSnapshotExecutionWorld(
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
@@ -193,7 +145,6 @@ export function createResourceSnapshotExecutionWorld(
 		},
 		speculation: {
 			...route,
-			dependsOn: filesystemExecutionDependsOn,
 			fingerprint: (request) => {
 				if (request.action && !readonlyResourceInvocation(request.action, actionSemantics))
 					throw new Error("Resource execution requires an explicitly bound read-only operation");

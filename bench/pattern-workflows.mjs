@@ -32,8 +32,6 @@ controller.connect({
 		events = listeners;
 		return () => {};
 	},
-	reservePlanRevision: (_session, _id, minimum) => minimum,
-	submitPlan: () => {},
 });
 
 function workflows(index, training) {

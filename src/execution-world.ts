@@ -469,7 +469,7 @@ function sealEffectTransaction<Output>(
 		});
 	return Object.freeze(transaction);
 }
-/** Host-neutral result consumed by the speculative scheduler. */
+/** Tool outcome shared by speculative runs and the Actor. */
 export interface ToolSettlement<TDetails = unknown> {
 	readonly result: AgentToolResult<TDetails>;
 	readonly isError: boolean;
@@ -550,8 +550,6 @@ export interface ToolInvocation {
 	readonly process?: ToolProcessInvocation;
 	/** Explicit read-only input boundary; omitted operations remain confined to the host workspace. */
 	readonly filesystemRoot?: string;
-	/** Absolute potential access paths for ordering only; captured observations still decide validity. */
-	readonly filesystemResources?: readonly string[];
 	/** Explicit selected Actor semantics; the host invokes this inside its original execution callback. */
 	readonly authoritative?: (
 		request: Parameters<NonNullable<ToolInvocation["filesystem"]>>[1],
@@ -618,8 +616,6 @@ export interface SpeculativeExecutionRoute {
 	readonly fingerprint: string;
 	/** Backend-authenticated parent state this route can materialize; never a result-freshness proof. */
 	readonly acceptsCheckpoint?: (checkpoint: WorldCheckpoint) => boolean;
-	/** Scheduling hint only; false permits preparing against the current world. */
-	readonly dependsOn?: (parent: ActionKey) => Promise<boolean>;
 }
 export function sameSpeculativeExecutionRoute(
 	left: SpeculativeExecutionRoute,
@@ -706,14 +702,10 @@ export interface ExecutionOperationBinding {
 	readonly available?: boolean;
 	/** Retrieval hint only. The issuing backend must check the current enclosing action's complete K(a). */
 	readonly permissionHash: string;
-	readonly executionMs: number;
-	/** Isolated service estimate, including observed preparation and capture. */
 	/** Whether a run now would redo it: no result of it the backend holds is still valid for the workspace. */
 	readonly stale?: () => Promise<boolean>;
 	/** It reads what another process writes while it runs: alone, it runs only up to that input. */
 	readonly fed?: true;
-	/** Eligible to launch on current filesystem inputs without captured resources; not proof of parent independence or Actor freshness. */
-	readonly preparation?: "current_workspace";
 }
 /** Delivered only after the authoritative OS boundary confirms the internal result was consumed. */
 export interface ExecutionOperationAdoption {
@@ -732,8 +724,6 @@ export interface ExecutionResourceContext {
 	readonly inputs?: (path?: string) => Iterable<object>;
 	readonly onInputSource?: (source: object) => void;
 	readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
-	/** Scheduling hint only; the backend still proves every join. */
-	readonly onOperationJoinable?: (available: () => boolean) => void;
 	readonly acceptOperationScope?: (scope: ExecutionScope, salvage?: boolean) => boolean;
 }
 /** Input-only owners omit output and can serve proven queries, never the source action's result or effects. */
@@ -946,7 +936,6 @@ export interface ExecutionWorldOperation {
 export interface ExecutionWorldSpeculation<Context, Output> extends ExecutionWorldOperation {
 	/** Explicit ancestry interoperability across routes; implementations must authenticate the checkpoint and workspace. */
 	readonly acceptsCheckpoint?: (checkpoint: WorldCheckpoint, cwd: string) => boolean;
-	readonly dependsOn?: (action: ActionKey, parent: ActionKey) => Promise<boolean>;
 	readonly execute: (context: Context) => Promise<WorldBranch<Output>>;
 }
 export interface ExecutionWorldObservation<Context, Output> extends ExecutionWorldOperation {
@@ -1314,13 +1303,6 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 						Object.defineProperty(route, "acceptsCheckpoint", {
 							value: (checkpoint: WorldCheckpoint) =>
 								lifetime.deref()?.sealed === false && owner.deref()?.(checkpoint, cwd) === true,
-						});
-					}
-					if (kind === "speculation" && request.action && world.speculation?.dependsOn) {
-						const action = request.action;
-						const dependsOn = world.speculation.dependsOn;
-						Object.defineProperty(route, "dependsOn", {
-							value: (parent: ActionKey) => dependsOn(action, parent),
 						});
 					}
 					Object.freeze(route);

@@ -23,7 +23,7 @@ import {
 } from "../src/pattern-aware.ts";
 import { createSpeculativeActionExtension } from "@earendil-works/pi-speculative-action/extension";
 import { afterEach, expect, test, vi } from "vitest";
-import type { SpeculativeActionEvent } from "../src/runtime-engine.ts";
+import type { SpeculativeActionEvent } from "../src/settlement.ts";
 import { definitionSchemaHashes } from "../src/agent-integration.ts";
 import { temporaryDirectories } from "./filesystem.ts";
 import { deferred, onExit } from "./async.ts";
@@ -75,10 +75,6 @@ async function fixture(
 					...options.getSettings?.(),
 					reuseEnabled: reuse,
 				}),
-				resources: {
-					initial: { cpuCount: 2, idleCpuCount: 2 },
-					sample: () => new Promise(() => {}),
-				},
 				onEvent: (event) => {
 					events.push(event);
 					return options.onEvent?.(event);

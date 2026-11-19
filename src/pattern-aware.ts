@@ -398,7 +398,6 @@ export type PatternAwareCandidate = {
 	readonly confidence: number;
 	/** Confidence contributed by gap zero when several horizons share this action. */
 	readonly immediateConfidence?: number;
-	readonly expectedDurationMs?: number;
 	readonly background?: boolean;
 	readonly dependencies: ReadonlyArray<PatternAwareDependency>;
 	readonly continuation: PatternAwareContinuation;
@@ -425,7 +424,6 @@ type MutablePattern = {
 	historicalStops: number;
 	historicalMatches: number;
 	bindingPrecision: number;
-	expectedDurationMs?: number;
 	rowCounts?: RowCounts;
 	gap: number;
 	feedback: MutablePatternFeedback;
@@ -854,7 +852,6 @@ export class PatternAwareStore {
 					empiricalProbability,
 					adoptionProbability,
 					confidence,
-					expectedDurationMs: pattern.expectedDurationMs,
 					...(confused(feedback) || calibrated.historicalStops > calibrated.historicalOpportunities / 2
 						? { background: true }
 						: {}),
@@ -877,15 +874,12 @@ export class PatternAwareStore {
 					gaps.set(horizon, candidate);
 			}
 		}
-		const savings = (candidate: PatternAwareCandidate) =>
-			candidate.confidence * (candidate.expectedDurationMs ?? 0);
 		const counts = new Map<string, number>();
 		return [...predictions.values()]
 			.map((gaps) => mergePredictionGaps(gaps, settings.futureGapCoverage, continuation.pathProbability))
 			.sort(
 				(left, right) =>
 					Number(left.background ?? false) - Number(right.background ?? false) ||
-					savings(right) - savings(left) ||
 					right.confidence - left.confidence ||
 					left.horizon - right.horizon ||
 					left.actionIdentity.localeCompare(right.actionIdentity),
@@ -1233,17 +1227,7 @@ export class PatternAwareStore {
 				(latest, { target }) => Math.max(latest, target.sequence),
 				-Infinity,
 			);
-			let duration = 0;
-			let mass = 0;
-			for (const { target } of support) {
-				if (!isFiniteNumber(target.durationMs) || target.durationMs <= 0) continue;
-				const weight = recencyWeight(target.sequence, lastSeenSequence, this.settings.decayHalfLifeEvents);
-				if (!weight) continue;
-				mass += weight;
-				duration += (target.durationMs - duration) * (weight / mass);
-			}
 			const observed = {
-				expectedDurationMs: mass ? duration : undefined,
 				bindings,
 				dependencies,
 				occurrences: support.length,
@@ -2303,8 +2287,6 @@ function mutablePattern(value: unknown): MutablePattern | undefined {
 						row.length <= speculativeConfig().prediction.maxValueItems &&
 						row.every((n) => isSafeCount(n)),
 				))) ||
-		(record.expectedDurationMs !== undefined &&
-			(!isFiniteNumber(record.expectedDurationMs) || record.expectedDurationMs <= 0)) ||
 		!isFiniteNumber(record.bindingPrecision) ||
 		record.bindingPrecision < 0 ||
 		record.bindingPrecision > 1 ||
@@ -2329,7 +2311,6 @@ function mutablePattern(value: unknown): MutablePattern | undefined {
 		...(typeof record.targetSchemaHash === "string" ? { targetSchemaHash: record.targetSchemaHash } : {}),
 		gap: record.gap,
 		bindingPrecision: record.bindingPrecision,
-		expectedDurationMs: record.expectedDurationMs,
 		occurrences: Number(record.occurrences),
 		historicalOpportunities: Number(record.historicalOpportunities),
 		historicalStops: Number(record.historicalStops),

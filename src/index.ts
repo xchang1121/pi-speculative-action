@@ -10,7 +10,6 @@ export {
 } from "./agent-execution-world.ts";
 export {
 	createSpeculativeActionHost,
-	patternPlanActionID,
 	type ActionDrafterBudgetSnapshot,
 	type CreateSpeculativeActionHostOptions,
 	type DraftOptionsContext,

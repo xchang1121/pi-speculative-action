@@ -20,26 +20,12 @@ import { createSpeculativeActionHost, registerSpeculativeTool } from "../src/age
 import { ProcessExecutionCoordinator } from "../src/linux-process-world.ts";
 import { currentExecutionScope } from "../src/execution-world.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
-import type { PredictionSettlement } from "../src/settlement.ts";
 import { inspectProcessOwner } from "./linux-process-fixture.ts";
-import type { SpeculativeActionEvent } from "../src/runtime-engine.ts";
+import type { SpeculativeActionEvent } from "../src/settlement.ts";
 import { readText, temporaryDirectories } from "./filesystem.ts";
-import { idleResources } from "./agent-system-fixture.ts";
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import { deferred, onExit } from "./async.ts";
 import { toolUse as response } from "./model.ts";
-
-const adoptions = (settlement: PredictionSettlement) =>
-	settlement.observation === "observed" &&
-	settlement.match.matched &&
-	settlement.match.adoption.status === "adopted"
-		? [
-				{
-					prediction: settlement.prediction,
-					relation: settlement.match.relation,
-				},
-			]
-		: [];
 
 const directories = temporaryDirectories("pi-extension-system-");
 afterEach(async () => {
@@ -155,7 +141,7 @@ test
 		createHost: (id, options) => {
 			host = createSpeculativeActionHost(id, {
 				...options,
-				resources: idleResources(2),
+
 				onEvent: (event) => {
 					events.push(event);
 					return options.onEvent?.(event);
@@ -168,10 +154,14 @@ test
 					return host.startTurn(input, signal);
 				},
 				execute: (input, signal, executor) =>
-					host.execute(input, signal, (operation) => {
-						fallbacks.push(input.tool);
-						return executor(operation);
-					}),
+					host.execute(
+						input,
+						signal,
+						executor && ((operation) => {
+							fallbacks.push(input.tool);
+							return executor(operation);
+						}),
+					),
 			};
 		},
 	});
@@ -404,25 +394,14 @@ test.each(["off", "on"])(
 			},
 		});
 		const events: SpeculativeActionEvent<string>[] = [];
-		const served: [string, boolean][] = [];
 
 		const extension = createSpeculativeActionExtension({
 			createHost: (id, options) => {
 				const host = createSpeculativeActionHost(id, {
 					...options,
-					resources: {
-						initial: { cpuCount: 4, idleCpuCount: 4 },
-						sample: () => new Promise(() => {}),
-					},
 					onEvent: (event) => {
 						events.push(event);
 						return options.onEvent?.(event);
-					},
-				});
-				host.runtime.subscribe({
-					prediction_feedback: ({ settlement, served: consumed }) => {
-						if (settlement.prediction.source === "execution_preparation" && adoptions(settlement).length)
-							served.push([settlement.prediction.id, consumed]);
 					},
 				});
 				return host;

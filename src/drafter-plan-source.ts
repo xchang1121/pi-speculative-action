@@ -10,8 +10,8 @@ import type {
 } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, fauxAssistantMessage, Type, validateToolArguments } from "@earendil-works/pi-ai";
 import type { ActionKey } from "./action-semantics.ts";
-import type { AgentPlanSource, AgentRuntime, DrafterModelOptions } from "./agent-integration.ts";
-import { agentBatchKey } from "./agent-integration.ts";
+import type { DrafterModelOptions } from "./agent-integration.ts";
+import type { CallGenerator, CompletedCall, GeneratedCall, GeneratorTurn } from "./call-generators.ts";
 import type { DrafterRequestSettings } from "./config-schema.ts";
 import {
 	clampCandidateLimit,
@@ -21,11 +21,10 @@ import {
 	normalizeDrafterRequestSettings,
 } from "./config-schema.ts";
 import type { ToolSettlement } from "./execution-world.ts";
-import { canonicalToolObservation, toolObservationContract, toolObservationKey } from "./execution-world.ts";
+import { canonicalToolObservation, toolObservationContract } from "./execution-world.ts";
 import { BoundedRecencyMap, immutableSnapshot, stableValueHash } from "./primitives.ts";
 import { coversDrafterRoot, type PatternPlanSourceController } from "./pattern-plan-source.ts";
-import { SharedAbortScope, waitForCompletion } from "./runtime-lifecycle.ts";
-import type { PlanAction, PlanProposal } from "./settlement.ts";
+import { waitForCompletion } from "./runtime-lifecycle.ts";
 import { predictionLearning, SourceRequestSuppressed } from "./settlement.ts";
 export interface DrafterBudgetSnapshot {
 	readonly requests: number;
@@ -112,19 +111,6 @@ interface DrafterBatch {
 }
 interface DrafterPlanFeedback extends DrafterBatch {
 	readonly message: AssistantMessage;
-	readonly depth: number;
-	readonly calls: ReadonlyMap<string, DrafterCall>;
-	readonly continuations: readonly {
-		readonly actionIDs: readonly string[];
-		readonly feedback: DrafterContinuation;
-	}[];
-}
-interface DrafterContinuation {
-	readonly forecasts: Map<string, DrafterObservation>;
-	request?: {
-		readonly controller: AbortController;
-		observations?: readonly string[];
-	};
 }
 interface DrafterObservation {
 	readonly message: ToolResultMessage;
@@ -149,16 +135,9 @@ export function createDrafterPlanSource(
 		readonly patternHints?: PatternPlanSourceController["hints"];
 	},
 ) {
-	const batches = new Map<
-		string,
-		{
-			lifetime: SharedAbortScope;
-			ready: Promise<(DrafterBatch & { skipRoot: boolean }) | undefined>;
-		}
-	>();
+	const batches = new WeakMap<GeneratorTurn, Promise<(DrafterBatch & { skipRoot: boolean }) | undefined>>();
 	const budget = input.drafterBudget ?? new DrafterTaskBudget();
 	const observations = { forecasted: 0, compared: 0, matched: 0 };
-	const feedbacks = new WeakMap<object, DrafterPlanFeedback>();
 	// Separate Beta(1, 1) estimates over the latest 32 eligible outcomes per model and tool contract.
 	const calibration = new BoundedRecencyMap<
 		string,
@@ -167,7 +146,6 @@ export function createDrafterPlanSource(
 			adoptions: number[];
 		}
 	>(speculativeConfig().prediction.calibrationBuckets);
-	const durations = new BoundedRecencyMap<string, number[]>(speculativeConfig().prediction.calibrationBuckets);
 	const calibrationKey = (batch: DrafterBatch, tool: string) => JSON.stringify([batch.key, tool]);
 	const probability = (samples: readonly number[] = []) =>
 		(samples.reduce((sum, value) => sum + value, 0) +
@@ -178,11 +156,6 @@ export function createDrafterPlanSource(
 	const observe = (samples: number[], value: number) => {
 		samples.push(value);
 		if (samples.length > speculativeConfig().prediction.calibrationWindow) samples.shift();
-	};
-	const finishBatch = (key: string) => {
-		const batch = batches.get(key);
-		batches.delete(key);
-		batch?.lifetime.abort();
 	};
 	const completeRequest = async (
 		batch: DrafterBatch,
@@ -223,425 +196,357 @@ export function createDrafterPlanSource(
 		);
 		return response.status === "completed" ? response.value : undefined;
 	};
-	const completeDraft = async (
+	const prepare = (turn: GeneratorTurn) => {
+		const existing = batches.get(turn);
+		if (existing) return existing;
+		const { startInput, data, settings, signal } = turn;
+		const drafter = normalizeDrafterRequestSettings(settings.sourceConfig);
+		const ready = (async () => {
+			const { draftModel, getDraftOptions } = input;
+			const { actorModel, actorOptions } = startInput;
+			// Optional pattern hints follow the Actor history to preserve its prefix.
+			const hints = await input
+				.patternHints?.({
+					sessionID: startInput.sessionID,
+					startInput,
+					schemaHashes: data.schemaHashes,
+					patternIdentities: data.patternIdentities,
+					settings,
+				})
+				.catch(() => []);
+			if (signal.aborted) return undefined;
+			const selected: Context = settings.tools
+				? {
+						...startInput.context,
+						tools: startInput.context.tools?.filter((tool) => settings.tools!.includes(tool.name)),
+					}
+				: startInput.context;
+			const context: Context =
+				drafter.drafterPatternHints && hints?.length
+					? {
+							...selected,
+							messages: [
+								...selected.messages,
+								{
+									role: "user",
+									timestamp: Date.now(),
+									content: `(Speculation hint, not from the user.) Calls that followed similar steps in this workspace:\n${hints.map((hint) => `- ${hint.tool} ${JSON.stringify(hint.input)}${hint.horizon === undefined ? "" : `; expected after ${hint.horizon} batches`}`).join("\n")}`,
+								},
+							],
+						}
+					: selected;
+			const model =
+				(typeof draftModel === "function" ? await draftModel(actorModel) : draftModel) ?? actorModel;
+			if (signal.aborted) return undefined;
+			const key = drafterOpportunityKey(model, startInput.context, data.schemaHashes, hints);
+			const configuredDraftOptions = getDraftOptions
+				? await getDraftOptions({
+						actorModel,
+						draftModel: model,
+						actorOptions,
+						signal,
+					})
+				: actorOptions;
+			if (signal.aborted) return undefined;
+			const { reasoning: requestedReasoning, ...requestOptions } = configuredDraftOptions ?? {};
+			const reasoning = clampThinkingLevel(model, getDraftOptions ? (requestedReasoning ?? "off") : "off");
+			return {
+				model,
+				context,
+				options: {
+					...requestOptions,
+					reasoning: reasoning === "off" ? undefined : reasoning,
+				},
+				key,
+				budgetPolicy: drafter,
+				skipRoot: hints?.some(coversDrafterRoot) ?? false,
+			};
+		})();
+		batches.set(turn, ready);
+		return ready;
+	};
+	const draft = async (
+		turn: GeneratorTurn,
 		batch: DrafterBatch,
 		signal: AbortSignal,
-		report: ((tokens: number) => void) | undefined,
-		prefix: string,
+		group: string,
 		depth = 0,
-		dependsOn?: PlanAction["dependsOn"],
-	) => {
-		const message = await completeRequest(
-			batch,
-			batch.context,
-			signal,
-			report,
-			depth === 0 ? true : undefined,
-		);
-		if (!message) return undefined;
-		const calls = message.content.filter((item): item is AgentToolCall => item.type === "toolCall");
-		if (!calls.length || new Set(calls.map((call) => call.id)).size !== calls.length) return undefined;
-		let scopes = [calls.map((call) => call.id)];
-		if (calls.length > 1 && depth < batch.budgetPolicy.drafterMaxDepth) {
-			// Decide visibility before any observations exist; post-hoc dependency labels could hide inputs already read.
-			const context = scopeContext(batch, message, calls);
-			try {
-				const args = privateToolArguments(
-					await completeRequest(batch, context, signal, report, CONTINUATION_TOOL),
-					context,
+		after?: string,
+		admitted?: () => void,
+	): Promise<void> => {
+		await turn.request("drafter", depth ? "continuation" : "proposal", signal, async (signal, report) => {
+			const message = await completeRequest(
+				batch,
+				batch.context,
+				signal,
+				report,
+				depth === 0 ? true : undefined,
+			);
+			if (!message) return 0;
+			const calls = message.content.filter((item): item is AgentToolCall => item.type === "toolCall");
+			if (!calls.length || new Set(calls.map((call) => call.id)).size !== calls.length) return 0;
+			let scopes = [calls.map((call) => call.id)];
+			if (calls.length > 1 && depth < batch.budgetPolicy.drafterMaxDepth) {
+				const context = scopeContext(batch, message, calls);
+				const reply = await completeRequest(batch, context, signal, report, CONTINUATION_TOOL).catch(
+					() => undefined,
 				);
+				const args = privateToolArguments(reply, context);
 				if (args) scopes = args.scopes as string[][];
-			} catch {
-				/* An unavailable or invalid scope selection conservatively reads the full batch. */
 			}
-		}
-		if (signal.aborted) return undefined;
-		const unique = new Map(
-			scopes.map((scope) => {
-				const ids = calls.flatMap((call, index) => (scope.includes(call.id) ? [`${prefix}:${index}`] : []));
-				return [JSON.stringify(ids), ids];
-			}),
-		);
-		const feedback: DrafterPlanFeedback = {
-			...batch,
-			depth,
-			message,
-			calls: new Map(calls.map((call, member) => [`${prefix}:${member}`, { call }])),
-			continuations: [...unique.values()].map((actionIDs) => ({
-				actionIDs,
-				feedback: { forecasts: new Map() },
-			})),
-		};
-		feedbacks.set(feedback, feedback);
-		for (const continuation of feedback.continuations) feedbacks.set(continuation.feedback, feedback);
-		return {
-			actions: [...feedback.calls].map(([id, { call }]): PlanAction => {
-				const samples = calibration.get(calibrationKey(batch, call.name));
-				const times = durations.get(call.name);
-				return {
-					id,
-					type: "tool_call",
-					tool: call.name,
-					input: call.arguments,
-					depth,
-					feedback,
-					dependsOn,
-					expectedDurationMs: times?.length ? times.reduce((sum, ms) => sum + ms, 0) / times.length : undefined,
-					empiricalProbability: probability(samples?.matches),
-					adoptionProbability: probability(samples?.adoptions),
-				};
-			}),
-		};
-	};
-	const source: AgentPlanSource = {
-		id: "drafter",
-		enabled: (settings) =>
-			(settings.drafterEnabled ?? DEFAULTS.drafterEnabled) && settings.tools?.length !== 0,
-		timeoutMs: (settings) => settings.predictionTimeoutMs,
-		requestLifetime: "turn",
-		continuationBatch: ({ feedback }) => {
-			const batch = feedbacks.get(feedback as object);
-			return batch ? [...batch.calls.keys()] : undefined;
-		},
-		multiStepEnabled: (settings, feedback) => {
-			const maxDepth = normalizeDrafterRequestSettings(settings.sourceConfig).drafterMaxDepth;
-			if (maxDepth === 0) return false;
-			if (feedback === undefined) return true;
-			const previous = feedbacks.get(feedback as object);
-			return previous !== undefined && previous.depth < maxDepth;
-		},
-		continueOn: ({ actionID, action, feedback, output }) => {
-			const previous = feedbacks.get(feedback as object);
-			const member = previous?.calls.get(actionID);
-			if (!previous || !member) return false;
-			const result = output && privateObservation(member.call, output, action);
-			if (result) member.result = result;
-			member.action ??= action;
-			return previous.continuations.filter(({ actionIDs, feedback: continuation }) => {
-				if (!actionIDs.includes(actionID)) return false;
-				const forecast = continuation.forecasts.get(actionID);
-				if (result && forecast) {
-					observations.compared++;
-					observations.matched += Number(forecast.key === result.key);
-					continuation.forecasts.delete(actionID);
-				}
-				if (!actionIDs.every((id) => previous.calls.get(id)!.action)) return false;
-				const request = continuation.request;
-				if (!request) return true;
-				if (!result || result.key === request.observations?.[actionIDs.indexOf(actionID)]) return false;
-				request.controller.abort();
-				return true;
-			});
-		},
-		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
-		concurrentProposalPolicy: () => speculativeConfig().prediction.concurrentProposalPolicy,
-		propose: async ({
-			startInput,
-			data,
-			proposalIndex,
-			proposalCount,
-			signal,
-			settings,
-			reportDraftTokens,
-		}): Promise<PlanProposal | undefined> => {
-			if (signal.aborted) return undefined;
-			const drafter = normalizeDrafterRequestSettings(settings.sourceConfig);
-			const batchKey = agentBatchKey(startInput.sessionID, startInput.turnID);
-			let batch = batches.get(batchKey);
-			if (!batch) {
-				const lifetime = new SharedAbortScope();
-				const signal = lifetime.signal;
-				batch = {
-					lifetime,
-					ready: Promise.resolve().then(async () => {
-						if (signal.aborted) return undefined;
-						const { draftModel, getDraftOptions } = input;
-						const { actorModel, actorOptions } = startInput;
-						// Optional pattern hints follow the Actor history to preserve its prefix.
-						const hints = await input.patternHints?.({
-							sessionID: startInput.sessionID,
-							startInput,
-							schemaHashes: data.schemaHashes,
-							patternIdentities: data.patternIdentities,
-							settings,
-						}).catch(() => []);
-						if (signal.aborted) return undefined;
-						const selected: Context = settings.tools
-							? {
-									...startInput.context,
-									tools: startInput.context.tools?.filter((tool) => settings.tools!.includes(tool.name)),
-								}
-							: startInput.context;
-						const context: Context =
-							drafter.drafterPatternHints && hints?.length
-								? {
-										...selected,
-										messages: [
-											...selected.messages,
-											{
-												role: "user",
-												timestamp: Date.now(),
-												content: `(Speculation hint, not from the user.) Calls that followed similar steps in this workspace:\n${hints.map((hint) => `- ${hint.tool} ${JSON.stringify(hint.input)}${hint.horizon === undefined ? "" : `; expected after ${hint.horizon} batches`}`).join("\n")}`,
-											},
-										],
-									}
-								: selected;
-						const model =
-							(typeof draftModel === "function" ? await draftModel(actorModel) : draftModel) ?? actorModel;
-						if (signal.aborted) return undefined;
-						const key = drafterOpportunityKey(model, startInput.context, data.schemaHashes, hints);
-						const configuredDraftOptions = getDraftOptions
-							? await getDraftOptions({
-									actorModel,
-									draftModel: model,
-									actorOptions,
-									signal,
-								})
-							: actorOptions;
-						if (signal.aborted) return undefined;
-						const { reasoning: requestedReasoning, ...requestOptions } = configuredDraftOptions ?? {};
-						const reasoning = clampThinkingLevel(
-							model,
-							getDraftOptions ? (requestedReasoning ?? "off") : "off",
-						);
-						return {
-							model,
-							context,
-							options: {
-								...requestOptions,
-								reasoning: reasoning === "off" ? undefined : reasoning,
-							},
-							key,
-							budgetPolicy: drafter,
-							skipRoot: hints?.some(coversDrafterRoot) ?? false,
-						};
-					}),
-				};
-				batches.set(batchKey, batch);
-			}
-			const release = batch.lifetime.acquire(signal);
-			signal = AbortSignal.any([signal, batch.lifetime.signal]);
-			let draft: Awaited<ReturnType<typeof completeDraft>>;
-			try {
-				const prepared = await batch.ready;
-				if (!prepared || signal.aborted) return undefined;
-				if (prepared.skipRoot)
-					throw new SourceRequestSuppressed({ stage: "source", code: "pattern_covers_root" });
-				draft = await completeDraft(
+			const members: (DrafterCall & { issued?: GeneratedCall })[] = [];
+			let previousWrite: string | undefined;
+			for (const [index, call] of calls.entries()) {
+				const bucket = calibrationKey(batch, call.name);
+				const samples = calibration.get(bucket);
+				const issued = await turn.issue(
 					{
-						...prepared,
-						options: {
-							...prepared.options,
-							temperature: drafterRequestTemperature(proposalIndex, proposalCount, drafter),
+						group,
+						id: String(index),
+						source: "drafter",
+						tool: call.name,
+						input: call.arguments,
+						depth,
+						empiricalProbability: probability(samples?.matches),
+						adoptionProbability: probability(samples?.adoptions),
+						onFeedback: (settlement, served) => {
+							const result = predictionLearning(settlement, served);
+							const row = calibration.getOrCreate(bucket, () => ({ matches: [], adoptions: [] }));
+							if (result.matched !== undefined) observe(row.matches, Number(result.matched));
+							if (result.adopted !== undefined) observe(row.adoptions, Number(result.adopted));
 						},
 					},
-					signal,
-					reportDraftTokens,
-					String(proposalIndex),
+					{ after, previousWrite, signal },
 				);
-				return (
-					draft && {
-						id: `drafter:${startInput.turnID}:${proposalIndex}`,
-						source: "drafter",
-						revision: 0,
-						...draft,
-					}
-				);
-			} finally {
-				if (!draft) release();
+				members.push({ call, action: issued?.key, issued });
+				if (issued) {
+					// The Drafter owns every run whose arguments depend on this private forecast.
+					const withdraw = () => {
+						if (!turn.signal.aborted) void turn.session.release(issued.run.runID);
+					};
+					if (signal.aborted) withdraw();
+					else signal.addEventListener("abort", withdraw, { once: true });
+					if (!signal.aborted) admitted?.();
+				}
+				if (issued && issued.effect !== "observation") previousWrite = issued.run.runID;
 			}
-		},
-		continue: async ({
-			proposalID,
-			revision,
-			reserveRevision,
-			feedback,
-			signal,
-			reportDraftTokens,
-			settings,
-		}) => {
-			const previous = feedbacks.get(feedback as object);
-			const branch = previous?.continuations.find((branch) => branch.feedback === feedback);
-			if (!previous || !branch || signal.aborted) return undefined;
-			const continuation = branch.feedback;
-			if (continuation.request && !continuation.request.controller.signal.aborted) return undefined;
-			const request: NonNullable<DrafterContinuation["request"]> = {
-				controller: new AbortController(),
-			};
-			continuation.request = request;
-			signal = AbortSignal.any([signal, request.controller.signal]);
-			const policy = normalizeDrafterRequestSettings(settings.sourceConfig);
-			if (previous.depth >= policy.drafterMaxDepth) return undefined;
-			const current = (id: string) => previous.calls.get(id)!.result ?? continuation.forecasts.get(id);
-			const missing = branch.actionIDs
-				.filter((id) => !current(id))
-				.map((id) => [id, previous.calls.get(id)!] as const);
-			if (missing.length) {
-				const context = observationContext(
-					previous,
-					missing.map(([, member]) => member),
-					branch.actionIDs.flatMap((id) => (current(id) ? [current(id)!.message] : [])),
-				);
-				const message = await completeRequest(
-					{ ...previous, budgetPolicy: policy },
-					context,
-					signal,
-					reportDraftTokens,
-					OBSERVATION_TOOL,
-				);
-				if (signal.aborted) return undefined;
-				const values = privateToolArguments(message, context)?.results as
-					| (Pick<ToolResultMessage, "content" | "isError"> & {
-							callID: string;
-							exitCode?: number;
-					  })[]
-					| undefined;
-				if (!values || new Set(values.map((value) => value.callID)).size !== missing.length) return undefined;
-				for (const [id, member] of missing) {
-					const { content, isError, exitCode } = values.find((value) => value.callID === member.call.id)!;
-					continuation.forecasts.set(
-						id,
-						privateObservation(
-							member.call,
-							{ result: { content, details: {} }, isError, exitCode },
-							member.action,
-						),
-					);
-					observations.forecasted++;
+			if (signal.aborted) return 0;
+			const results = members.map(async (member) => {
+				if (!member.issued) return;
+				const result = await member.issued.run.completion;
+				if (result.status !== "completed") return;
+				member.result = privateObservation(member.call, result.output, member.action);
+				return { ...member.issued, output: result.output };
+			});
+			void Promise.all(results).then((peers) => {
+				if (!signal.aborted && peers.every((p): p is CompletedCall => !!p)) turn.peers("drafter", peers);
+			});
+			if (depth < batch.budgetPolicy.drafterMaxDepth) {
+				for (const ids of new Map(scopes.map((ids) => [JSON.stringify([...ids].sort()), ids])).values()) {
+					const visible = members.filter((m) => ids.includes(m.call.id));
+					if (!visible.length || visible.some((m) => !m.issued)) continue;
+					const reconcile = async () => {
+						const actual = Promise.all(visible.map((m) => results[members.indexOf(m)]!));
+						const forecasts = new Map<string, DrafterObservation>();
+						const pending = visible.filter((m) => !m.result);
+						const guessed = new AbortController();
+						const suffixSignal = AbortSignal.any([signal, guessed.signal]);
+						const suffix = async (
+							observed: ReadonlyMap<string, DrafterObservation>,
+							suffixSignal: AbortSignal,
+						) => {
+							// A private write is a state dependency even when its model observation was withheld.
+
+							const context = continuationContext(
+								batch.context,
+								message,
+								members.map(
+									(m) =>
+										(ids.includes(m.call.id) && observed.get(m.call.id)?.message) ||
+										privateObservation(m.call, {
+											result: {
+												content: [
+													{ type: "text", text: "Observation withheld from this continuation branch." },
+												],
+												details: {},
+											},
+											isError: false,
+										}).message,
+								),
+							);
+							await draft(
+								turn,
+								{ ...batch, context },
+								suffixSignal,
+								group + "/" + ids.join(",") + "/" + depth,
+								depth + 1,
+								previousWrite ?? after,
+							);
+						};
+						let forecasted = false;
+						const compared = new Set<string>();
+						let mismatch = false;
+						const compare = (member: DrafterCall) => {
+							const predicted = forecasts.get(member.call.id);
+							if (!predicted || !member.result || compared.has(member.call.id)) return;
+							compared.add(member.call.id);
+							observations.compared++;
+							if (member.result.key === predicted.key) observations.matched++;
+							else {
+								mismatch = true;
+								guessed.abort();
+							}
+						};
+						if (pending.length) {
+							const stopForecast = new AbortController();
+							void actual.then(() => stopForecast.abort());
+							await turn.request(
+								"drafter",
+								"observation",
+								AbortSignal.any([signal, stopForecast.signal]),
+								async (observationSignal, report) => {
+									const context = observationContext(
+										{ ...batch, message },
+										pending,
+										visible.flatMap((m) => (m.result ? [m.result.message] : [])),
+									);
+									const reply = await completeRequest(
+										batch,
+										context,
+										observationSignal,
+										report,
+										OBSERVATION_TOOL,
+									);
+									const values = privateToolArguments(reply, context)?.results as
+										| (Pick<ToolResultMessage, "content" | "isError"> & {
+												callID: string;
+												exitCode?: number;
+										  })[]
+										| undefined;
+									if (!values || new Set(values.map((v) => v.callID)).size !== pending.length) return 0;
+									for (const m of visible) {
+										const value = values.find((v) => v.callID === m.call.id);
+										if (value) {
+											forecasts.set(
+												m.call.id,
+												privateObservation(
+													m.call,
+													{
+														result: { content: value.content, details: {} },
+														isError: value.isError,
+														exitCode: value.exitCode,
+													},
+													m.action,
+												),
+											);
+											observations.forecasted++;
+										} else if (m.result) forecasts.set(m.call.id, m.result);
+									}
+									if (forecasts.size !== visible.length || signal.aborted) return 0;
+									forecasted = true;
+									for (const m of pending) {
+										compare(m);
+										void results[members.indexOf(m)]!.then(() => compare(m));
+									}
+									if (mismatch) return 0;
+									void suffix(forecasts, suffixSignal).catch(() => {});
+									return values.length;
+								},
+							);
+						}
+						const settled = await actual;
+						if (signal.aborted || settled.some((v) => !v)) {
+							guessed.abort();
+							return;
+						}
+						if (!forecasted || mismatch)
+							await suffix(new Map(visible.map((m) => [m.call.id, m.result!])), signal);
+					};
+					void reconcile().catch(() => {});
 				}
 			}
-			if (signal.aborted) return undefined;
-			// Freeze the exact private observations used for this prediction, even if real results arrive during inference.
-			const context = continuationContext(
-				previous.context,
-				previous.message,
-				[...previous.calls].map(([id, { call }]) =>
-					branch.actionIDs.includes(id)
-						? current(id)!.message
-						: privateObservation(call, {
-								result: {
-									content: [
-										{
-											type: "text",
-											text: "Observation withheld from this continuation branch.",
-										},
-									],
-									details: {},
-								},
-								isError: false,
-							}).message,
+			return members.filter((m) => m.issued).length;
+		});
+	};
+	const enabled = (turn: GeneratorTurn) =>
+		turn.settings.enabled &&
+		(turn.settings.drafterEnabled ?? DEFAULTS.drafterEnabled) &&
+		turn.settings.tools?.length !== 0;
+	const source: CallGenerator = {
+		async start(turn) {
+			if (!enabled(turn)) return;
+			const batch = await prepare(turn);
+			if (!batch || turn.signal.aborted) return;
+			if (batch.skipRoot) {
+				await turn.request("drafter", "proposal", turn.signal, async () => {
+					throw new SourceRequestSuppressed({ stage: "source", code: "pattern_covers_root" });
+				});
+				return;
+			}
+			const count = clampCandidateLimit(turn.settings.candidateLimit ?? DEFAULTS.candidateLimit);
+			const controllers = Array.from({ length: count }, () => new AbortController());
+			await Promise.all(
+				controllers.map((controller, index) =>
+					draft(
+						turn,
+						{
+							...batch,
+							options: {
+								...batch.options,
+								temperature: drafterRequestTemperature(index, count, batch.budgetPolicy),
+							},
+						},
+						AbortSignal.any([turn.signal, controller.signal]),
+						"drafter:" + turn.startInput.turnID + ":" + index,
+						0,
+						undefined,
+						() => {
+							if (
+								!controller.signal.aborted &&
+								speculativeConfig().prediction.concurrentProposalPolicy === "first_produced"
+							)
+								for (const peer of controllers) if (peer !== controller) peer.abort();
+						},
+					),
 				),
 			);
-			request.observations = branch.actionIDs.map((id) => current(id)!.key);
-			const draft = await completeDraft(
-				{ ...previous, context, budgetPolicy: policy },
-				signal,
-				reportDraftTokens,
-				`rollout:${revision}`,
-				previous.depth + 1,
-				[...previous.calls.keys()].map((actionID) => {
-					const index = branch.actionIDs.indexOf(actionID);
-					return {
-						actionID,
-						...(index < 0
-							? { condition: "resource" as const }
-							: {
-									condition: "prediction" as const,
-									observation: request.observations![index]!,
-								}),
-					};
-				}),
-			);
-			return (
-				draft && {
-					proposalID,
-					source: "drafter",
-					revision: reserveRevision?.() ?? revision,
-					upsert: draft.actions,
-				}
-			);
 		},
-		// A peer's executed batch, such as a fork's early calls, rolls out as the Drafter's own does: its calls and results extend the Actor context.
-		continueFrom: async ({ startInput, settings, batch: peers, signal, reportDraftTokens }) => {
-			const prepared = await batches
-				.get(agentBatchKey(startInput.sessionID, startInput.turnID))
-				?.ready.catch(() => undefined);
-			const drafter = normalizeDrafterRequestSettings(settings.sourceConfig);
-			const ids = peers.map((_, index) => `peer:${index}`);
-			if (!prepared || signal.aborted) return undefined;
-			const calls = peers.map(({ candidate }, index) => ({
+		async peers(turn, source, peers) {
+			if (source === "drafter" || !enabled(turn) || !peers.length) return;
+			const batch = await prepare(turn);
+			if (!batch || turn.signal.aborted || batch.budgetPolicy.drafterMaxDepth < 1) return;
+			const calls = peers.map(({ key }, index) => ({
 				type: "toolCall" as const,
-				id: ids[index]!,
-				name: candidate.tool,
-				arguments: { ...candidate.input },
+				id: "peer:" + index,
+				name: key.tool,
+				arguments: { ...key.input },
 			}));
 			const context = continuationContext(
-				prepared.context,
+				batch.context,
 				{
 					...fauxAssistantMessage(calls, { stopReason: "toolUse" }),
-					api: prepared.model.api,
-					provider: prepared.model.provider,
-					model: prepared.model.id,
+					api: batch.model.api,
+					provider: batch.model.provider,
+					model: batch.model.id,
 				},
-				peers.map(
-					({ candidate, output }, index) => privateObservation(calls[index]!, output, candidate.key).message,
-				),
+				peers.map((p, i) => privateObservation(calls[i]!, p.output, p.key).message),
 			);
-			const options = {
-				...prepared.options,
-				temperature: drafterRequestTemperature(0, 1, drafter),
-			};
-			const id = `drafter:peer:${stableValueHash(peers.map(({ identity }) => identity.id))}`;
-			const draft = await completeDraft(
-				{ ...prepared, context, options, budgetPolicy: drafter },
-				signal,
-				reportDraftTokens,
-				id,
-				1,
-				peers.map(({ identity, candidate, output }) => ({
-					proposalID: identity.proposalID,
-					actionID: identity.actionID,
-					identity: identity.id,
-					condition: "prediction" as const,
-					observation: toolObservationKey(output, candidate.key) ?? "",
-				})),
-			);
-			return draft && { id, source: "drafter", revision: 0, actions: draft.actions };
+			const writers = peers.filter((p) => p.effect !== "observation");
+			if (writers.length <= 1)
+				await draft(
+					turn,
+					{ ...batch, context },
+					turn.signal,
+					"drafter:peer:" + peers.map((p) => p.run.runID).join(","),
+					1,
+					writers[0]?.run.runID,
+				);
 		},
 	};
 	return {
 		source,
-		connect: (runtime: AgentRuntime) =>
-			runtime.subscribe({
-				actor_observed: ({ tool, durationMs }) => {
-					if (Number.isFinite(durationMs) && durationMs > 0)
-						observe(durations.getOrCreate(tool, () => []), durationMs);
-				},
-				prediction_feedback: ({ actionID, feedback, settlement, served }) => {
-					const batch = feedbacks.get(feedback as object);
-					const tool = batch?.calls.get(actionID)?.call.name;
-					const { matched, adopted } = predictionLearning(settlement, served);
-					if (!batch || !tool || (matched === undefined && adopted === undefined)) return;
-					const key = calibrationKey(batch, tool);
-					const samples = calibration.getOrCreate(key, () => ({
-						matches: [],
-						adoptions: [],
-					}));
-					if (matched !== undefined) observe(samples.matches, Number(matched));
-					if (adopted !== undefined) observe(samples.adoptions, Number(adopted));
-				},
-				turn_finished: ({ startInput }) => {
-					finishBatch(agentBatchKey(startInput.sessionID, startInput.turnID));
-				},
-				session_closed: () => {
-					for (const key of batches.keys()) finishBatch(key);
-					budget.finishTask();
-				},
-			}),
-		snapshot: (): DrafterPlanSnapshot => ({
-			budget: budget.snapshot(),
-			observations: { ...observations },
-		}),
+		finish: () => budget.finishTask(),
+		snapshot: (): DrafterPlanSnapshot => ({ budget: budget.snapshot(), observations: { ...observations } }),
 	};
 }
 /** Simple streams drop toolChoice for most APIs; spell a forced call on the final payload where the API has one. */

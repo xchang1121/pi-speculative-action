@@ -12,7 +12,6 @@ import { expect, test } from "vitest";
 import { patternAwareSettings } from "../src/pattern-aware.ts";
 import { resolveSpeculativeConfig } from "../src/config-schema.ts";
 import { toolSpeedup } from "../src/task-timing.ts";
-import { idleResources } from "./agent-system-fixture.ts";
 import {
 	createLinuxProcessBenchmark,
 	holdOwnedProcessPublication,
@@ -138,7 +137,7 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 		const route = await fixture.prepareActorReplay();
 		const writer = createWriteTool(workspace);
 		const tools = [fixture.tool, writer];
-		// Retained producers need capacity alongside the Actor; CPU preemption has separate coverage.
+		// Allow the learned children to run concurrently. The Actor has independent admission.
 		const { host, events, start } = patternProcessHost(
 			fixture,
 			"chain",
@@ -151,7 +150,7 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 				}),
 			},
 			{
-				resources: idleResources(4),
+
 				executionWorlds: [fixture.world, fixture.workspaceSandbox.createExecutionWorld()],
 				config: resolveSpeculativeConfig({
 					processReuse: {
@@ -358,17 +357,9 @@ test
 		expect(
 			states(),
 			JSON.stringify(
-				events.filter((event) => event.type === "candidate" || event.type === "operation_prediction"),
+				events.filter((event) => event.type === "candidate"),
 			),
 		).toEqual(["running"]);
-		expect(
-			events.filter((event) => event.type === "operation_prediction").map((event) => event.settlement),
-		).toContainEqual(
-			expect.objectContaining({
-				observation: "unobserved",
-				cause: expect.objectContaining({ code: "operation_not_observed" }),
-			}),
-		);
 		await publication.close();
 		publication = undefined;
 		await expect.poll(states, { timeout: 15_000 }).toEqual(["running", "succeeded"]);
@@ -399,7 +390,7 @@ test
 	expect(
 		[measured.text.trim(), measured.hits, measured.hiddenMs > 0],
 		JSON.stringify({
-			events: events.filter((event) => event.type === "candidate" || event.type === "operation_prediction"),
+			events: events.filter((event) => event.type === "candidate"),
 			metrics: fixture.backend.metrics(),
 		}),
 	).toEqual([

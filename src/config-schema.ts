@@ -14,23 +14,6 @@ export const DEFAULT_SPECULATIVE_CONFIG = deepFreeze({
 		drafterTemperatureMax: 0.7,
 		drafterPatternHints: false,
 	},
-	scheduling: {
-		gpuProbeBytes: 64 * 1024,
-		failureEntries: 1024,
-		maxCpuID: 1048575,
-		maxAffinityCPUs: 16384,
-		resourcePollIntervalMs: 250,
-		gpuPollIntervalMs: 1000,
-		gpuProbeTimeoutMs: 1000,
-		failureThreshold: 2,
-		failureRetryDecisions: 4,
-		heavyCpu: 2,
-		lightCpu: 1,
-		heavyMemoryBytes: 64 * 1024 * 1024,
-		lightMemoryBytes: 8 * 1024 * 1024,
-		heavyIo: 0.25,
-		lightIo: 0.125,
-	},
 	nativeBuild: {
 		domainValues: 4096,
 		domainLimit: 256,
@@ -549,21 +532,6 @@ export function settingsParser<Defaults extends Record<string, unknown>>(
 			}),
 		) as Defaults;
 	return { defaults: schema, parse };
-}
-/** Admission and resource sampling hints; none of these fields grant execution or reuse authority. */
-export type SchedulingSettings = Readonly<typeof SCHEDULING_DEFAULTS>;
-export const { defaults: SCHEDULING_DEFAULTS, parse: parseSchedulingSettings } = settingsParser(
-	DEFAULT_SPECULATIVE_CONFIG.scheduling,
-	{
-		resourcePollIntervalMs: positiveMilliseconds,
-		gpuPollIntervalMs: positiveMilliseconds,
-		gpuProbeTimeoutMs: positiveMilliseconds,
-		heavyIo: probability,
-		lightIo: probability,
-	},
-);
-export function normalizeSchedulingSettings(input?: Readonly<Record<string, unknown>>) {
-	return parseSchedulingSettings(input, speculativeConfig().scheduling);
 }
 export interface ExecutionRoutingSettings {
 	readonly primary?: boolean;

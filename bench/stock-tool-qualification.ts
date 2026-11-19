@@ -20,7 +20,7 @@ import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { createSpeculativeActionExtension } from "../src/extension.ts";
 import { isPoisonedEffectCommit } from "../src/execution-world.ts";
 import { slash } from "../src/primitives.ts";
-import type { SpeculativeActionEvent } from "../src/runtime-engine.ts";
+import type { SpeculativeActionEvent } from "../src/settlement.ts";
 import { toolErrorSettlement, type ToolSettlement } from "../src/execution-world.ts";
 
 export const STOCK_TOOL_CASES = [
@@ -102,7 +102,7 @@ export async function qualifyStockTool(
 			createHost: (id, options) => {
 				host = createSpeculativeActionHost(id, {
 					...options,
-					resources: { initial: { cpuCount: 2, idleCpuCount: 2 }, sample: () => new Promise(() => {}) },
+
 					resolveInvocation: async (...args) => {
 						const invocation = await options.resolveInvocation?.(...args);
 						resolved.push({

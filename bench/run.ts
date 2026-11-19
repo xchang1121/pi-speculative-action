@@ -23,7 +23,7 @@ import {
 	type SpeculativeActionExtensionDependencies,
 } from "../src/extension.ts";
 import type { DrafterTaskBudget } from "../src/drafter-plan-source.ts";
-import type { SpeculativeActionEvent } from "../src/runtime-engine.ts";
+import type { SpeculativeActionEvent } from "../src/settlement.ts";
 import { summarizeSpeculativeTrace } from "../src/task-timing.ts";
 import { incrementCounts } from "../src/primitives.ts";
 import { TaskTimeline, toolSpeedup } from "../src/task-timing.ts";

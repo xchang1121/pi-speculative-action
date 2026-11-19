@@ -32,7 +32,6 @@ import type {
 import {
 	createCommittedResourceInputs,
 	evaluateResourceQuery,
-	filesystemExecutionDependsOn,
 	resourceSnapshotBranch,
 } from "./agent-execution-world.ts";
 import { currentSpeculativeConfiguration, speculativeConfig } from "./config-schema.ts";
@@ -1556,7 +1555,6 @@ export class WorkspaceSandboxService {
 			isolation: "workspace_branch",
 			speculation: {
 				capabilities: [...WORKSPACE_PATH_MUTATION_EFFECTS.capabilities, "validation.resource_snapshot"],
-				dependsOn: filesystemExecutionDependsOn,
 				acceptsCheckpoint: (checkpoint, cwd) => this.acceptsCheckpoint(checkpoint, cwd),
 				fingerprint: async ({ action, effect, parentCheckpoint }) => {
 					this.assertOpen();

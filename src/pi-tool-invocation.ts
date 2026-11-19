@@ -155,7 +155,6 @@ export function resolvePiToolInvocation(
 		return {
 			executor,
 			identity: { executor, cwd, autoResizeImages, modelSupportsImages },
-			...(typeof requested === "string" ? { filesystemResources: [resolvePiToolPath(requested, cwd)] } : {}),
 			...bindResourceOperation(
 				filesystem,
 				path.parse(cwd).root,

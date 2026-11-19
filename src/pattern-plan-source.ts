@@ -1,12 +1,6 @@
 import path from "node:path";
-import { type ActionSemanticsRegistry } from "./action-semantics.ts";
-import {
-	agentBatchKey,
-	type AgentPlanSource,
-	type AgentRuntime,
-	type AgentRuntimeEvents,
-	type AgentStartInput,
-} from "./agent-integration.ts";
+import type { ActionKey, ActionSemanticsRegistry } from "./action-semantics.ts";
+import type { AgentRuntime, AgentRuntimeEvents, AgentStartInput } from "./agent-integration.ts";
 import type { ToolSettlement } from "./execution-world.ts";
 import {
 	acquirePatternAwareStore,
@@ -20,31 +14,18 @@ import {
 	type PatternAwareStore,
 	type PatternAwareStoreLease,
 } from "./pattern-aware.ts";
-import { nonNegativeFinite, stableValueHash } from "./primitives.ts";
-import type { SpeculativeActionSettings, SpeculativeCandidate } from "./runtime-engine.ts";
+import { stableValueHash } from "./primitives.ts";
+import type { SpeculativeActionSettings } from "./settlement.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
-import type { PlanAction } from "./settlement.ts";
-type PatternPlanFeedback = Pick<PatternAwareCandidate, "continuation" | "supportingPatternIDs"> & {
-	readonly store: PatternAwareStore;
-	readonly drafterRoot: boolean;
-};
-type CarriedPrediction = {
-	readonly signature: string;
-	readonly pending: Set<PatternPlanFeedback>;
-	abandoned: boolean;
-};
-type PatternTurn = {
-	readonly events: Map<number, PatternAwareEventInput>;
-	revision: number;
-	observationRevision: number;
-};
+import type { CallGenerator, CompletedCall, GeneratorTurn } from "./call-generators.ts";
+import { speculativeConfig } from "./config-schema.ts";
 export function coversDrafterRoot(
 	hint: Pick<PatternAwareCandidate, "horizon" | "confidence" | "background" | "immediateConfidence">,
 ) {
 	return !hint.background && hint.horizon === 0 && (hint.immediateConfidence ?? hint.confidence) >= 0.8;
 }
 export interface PatternPlanSourceController {
-	readonly source: AgentPlanSource;
+	readonly source: CallGenerator;
 	readonly connect: (runtime: AgentRuntime) => () => void;
 	/** The calls PatternAware expects next, without proposing them. */
 	readonly hints: (input: {
@@ -83,15 +64,8 @@ export function createPatternPlanSource({
 		| undefined;
 	const ownedStores = new Map<string, Promise<PatternAwareStoreLease>>();
 	const lifecycle = new RuntimeLifecycleLane();
-	const turns = new Map<string, PatternTurn>();
-	const carriedPredictions = new Map<string, CarriedPrediction>();
-	const feedbacks = new WeakMap<
-		object,
-		{
-			readonly context?: PatternPlanFeedback;
-			carried?: CarriedPrediction;
-		}
-	>();
+	const turns = new Map<string, Map<number, PatternAwareEventInput>>();
+	const generators = new WeakMap<AgentStartInput, GeneratorTurn>();
 	let analysisTail: Promise<void> = Promise.resolve();
 	const sourceSettings = (settings: SpeculativeActionSettings): PatternAwareSettings => {
 		const pattern = patternAwareSettings(settings.sourceConfig?.patternAware);
@@ -107,12 +81,6 @@ export function createPatternPlanSource({
 		} catch (error) {
 			return Promise.reject(error);
 		}
-	};
-	const turnState = (sessionID: string, turnID: string): PatternTurn => {
-		const key = agentBatchKey(sessionID, turnID);
-		let turn = turns.get(key);
-		if (!turn) turns.set(key, (turn = { events: new Map(), revision: -1, observationRevision: -1 }));
-		return turn;
 	};
 	const resolveStore = async (patternSettings: PatternAwareSettings): Promise<PatternAwareStore> => {
 		if (providedStore) return providedStore;
@@ -197,7 +165,11 @@ export function createPatternPlanSource({
 		durationMs: number,
 		patternIdentity?: string,
 	) => {
-		const facts = projectPatternAwareObservation(output?.result, { tool, input, failed: output?.isError }, cwd);
+		const facts = projectPatternAwareObservation(
+			output?.result,
+			{ tool, input, failed: output?.isError },
+			cwd,
+		);
 		const exit = output?.exitCode === undefined ? undefined : `exit:${output.exitCode}`;
 		return {
 			tool,
@@ -214,255 +186,185 @@ export function createPatternPlanSource({
 	};
 	const predictedEvent = (
 		startInput: AgentStartInput,
-		action: Pick<SpeculativeCandidate, "key" | "input">,
+		key: ActionKey,
 		output: ToolSettlement,
 		durationMs: number,
 		identities?: Readonly<Record<string, string>>,
 	): PatternAwareEventInput => {
-		if (!action.key) throw new Error("prediction_key_required");
 		return {
 			sessionID: startInput.sessionID,
 			turnID: startInput.turnID,
 			...eventData(
-				action.key.tool,
-				action.input,
+				key.tool,
+				key.input,
 				output,
 				durationMs,
-				identities && Object.hasOwn(identities, action.key.tool)
-					? identities[action.key.tool]
-					: action.key.semantics?.patternIdentity,
+				identities && Object.hasOwn(identities, key.tool)
+					? identities[key.tool]
+					: key.semantics?.patternIdentity,
 			),
-			schemaHash: action.key.schemaHash,
+			schemaHash: key.schemaHash,
 			learnTarget: false,
 		};
 	};
-	const planActions = (
-		candidates: readonly PatternAwareCandidate[],
+	const emit = async (
+		turn: GeneratorTurn,
 		store: PatternAwareStore,
-		dependsOn?: PlanAction["dependsOn"],
-		parentID?: string,
-	) =>
-		candidates.map((candidate) => {
-			const action = patternPlanAction(
-				candidate,
-				store,
-				patternPlanActionID(candidate.actionIdentity, parentID),
-				dependsOn,
-			);
-			feedbacks.set(action.feedback, { context: action.feedback });
-			return action;
-		});
-	const source: AgentPlanSource = {
-		id: "pattern_aware",
-		enabled: (settings) => !lifecycle.sealed && sourceSettings(settings).enabled,
-		multiStepEnabled: (settings, feedback) => {
-			const pattern = sourceSettings(settings);
-			return (
-				pattern.multiStepEnabled &&
-				(feedback === undefined ||
-					(feedbacks.get(feedback as object)?.context?.continuation.visitedPatternIDs.length ?? Infinity) <
-						pattern.maxPredictionDepth)
-			);
-		},
-		continuationBatch: ({ feedback, actionID }) =>
-			feedbacks.get(feedback as object)?.context?.drafterRoot ? [actionID] : undefined,
-		requestLifetime: "actor_decision",
-		propose: ({ startInput, data, settings, signal }) =>
-			admit(settings, async (patternSettings) => {
-				if (!patternSettings.enabled) return undefined;
-				const turn = turnState(startInput.sessionID, startInput.turnID);
-				if (signal.aborted) return undefined;
-				const { store, candidates } = await rootPrediction(
-					startInput.sessionID,
-					startInput,
-					patternSettings,
-					data.schemaHashes,
-					data.patternIdentities,
-				);
-				const carried = carriedPredictions.get(startInput.sessionID);
-				if (signal.aborted) return undefined;
-				carriedPredictions.delete(startInput.sessionID);
-				const repeated =
-					!candidates.length ||
-					(carried?.signature === patternPredictionSignature(candidates) &&
-						!carried.pending.size &&
-						!carried.abandoned);
-				if (repeated) return undefined;
-				return {
-					id: `pattern:${startInput.turnID}`,
-					source: "pattern_aware",
-					revision: ++turn.revision,
-					actions: planActions(candidates, store),
-				};
-			}),
-		continueFrom: ({ startInput, data, settings, batch, signal }) =>
-			admit(settings, async (patternSettings) => {
-				const store = await predictionStore(patternSettings, signal);
-				if (!store) return undefined;
-				const id = `pattern:peer:${stableValueHash(batch.map(({ identity }) => identity.id))}`;
-				const candidates = await store.predictAfterBatch(
-					startInput.sessionID,
-					batch.map(({ candidate, output }) =>
-						predictedEvent(
-							startInput,
-							candidate,
-							output,
-							nonNegativeFinite(candidate.executionMs),
-							data.patternIdentities,
-						),
-					),
-					data.schemaHashes,
-					patternSettings,
-					// No calibrated joint confidence is supplied for the foreign batch; use a neutral prior.
-					{ visitedPatternIDs: [id], pathProbability: 0.5 },
-					data.patternIdentities,
-				);
-				if (!candidates.length) return undefined;
-				const dependencies = batch.map(({ identity }) => ({
-					proposalID: identity.proposalID,
-					actionID: identity.actionID,
-					identity: identity.id,
-					condition: "execution_succeeded" as const,
-				}));
-				return {
-					id,
-					source: "pattern_aware",
-					revision: 0,
-					actions: planActions(candidates, store, dependencies),
-				};
-			}),
-		continue: ({
-			startInput,
-			data,
-			settings,
-			candidate,
-			adoptedAction,
-			proposalID,
-			actionID,
-			revision,
-			feedback,
-			output,
-			trigger,
-			signal,
-		}) =>
-			admit(settings, async (patternSettings) => {
-				const context = feedbacks.get(feedback as object)?.context;
-				if (
-					!context ||
-					signal.aborted ||
-					output === undefined ||
-					context.continuation.visitedPatternIDs.length >= patternSettings.maxPredictionDepth
-				)
-					return undefined;
-				const next = await context.store.continue(
-					context.continuation,
-					predictedEvent(
-						startInput,
-						adoptedAction ?? candidate,
-						output,
-						nonNegativeFinite(candidate.executionMs),
-						data.patternIdentities,
-					),
-					data.schemaHashes,
-					trigger === "actor_adopted",
-					patternSettings,
-					data.patternIdentities,
-				);
-				if (!next.length) return undefined;
-				return {
-					proposalID,
-					source: "pattern_aware",
-					revision,
-					upsert: planActions(next, context.store, [{ actionID, condition: "execution_succeeded" }], actionID),
-				};
-			}),
+		candidates: readonly PatternAwareCandidate[],
+		group: string,
+		after?: string,
+	) => {
+		await Promise.all(
+			candidates
+				.filter((c) => !c.background)
+				.map(async (c) => {
+					const id = patternPredictionID(c.actionIdentity, group);
+					const issued = await turn.issue(
+						{
+							...c,
+							group,
+							id,
+							source: "pattern_aware",
+							mode: c.presetID,
+							onIssued: () => {
+								for (const support of c.supportingPatternIDs) store.issued(support);
+							},
+							onFeedback: (settlement, served) => {
+								for (const support of c.supportingPatternIDs) store.settled(support, settlement, served);
+							},
+						},
+						{ after },
+					);
+					if (!issued) return;
+					void issued.run.completion
+						.then(async (result) => {
+							if (result.status !== "completed" || turn.signal.aborted) return;
+							if (coversDrafterRoot(c) && group === "pattern:" + turn.startInput.turnID)
+								turn.peers("pattern_aware", [{ ...issued, output: result.output }]);
+							const policy = sourceSettings(turn.settings);
+							if (
+								!policy.multiStepEnabled ||
+								c.continuation.visitedPatternIDs.length >= policy.maxPredictionDepth
+							)
+								return;
+							const event = predictedEvent(
+								turn.startInput,
+								issued.key,
+								result.output,
+								result.toolExecution.completedAt - result.toolExecution.startedAt,
+								turn.data.patternIdentities,
+							);
+							const next = await store.continue(
+								c.continuation,
+								event,
+								turn.data.schemaHashes,
+								false,
+								policy,
+								turn.data.patternIdentities,
+							);
+							if (next.length)
+								await emit(turn, store, next, id, issued.effect === "observation" ? after : issued.run.runID);
+						})
+						.catch(() => {});
+				}),
+		);
 	};
-	const observe = (
-		{
-			data,
-			settings,
-			consumeInput,
-			action,
-			tool,
-			concrete,
-			output,
-			durationMs,
-			order,
-			signal,
-		}: AgentRuntimeEvents["actor_observed"],
-		reserveRevision: (id: string, minimum: number) => number,
-	) =>
-		admit(settings, async (patternSettings) => {
-			const schemaHash = action?.schemaHash ?? data.schemaHashes[tool];
-			const observed = eventData(
+	const source: CallGenerator = {
+		async start(turn) {
+			generators.set(turn.startInput, turn);
+			const policy = sourceSettings(turn.settings);
+			if (!turn.settings.enabled || !policy.enabled) return;
+			await turn.request("pattern_aware", "proposal", turn.signal, async () => {
+				const { store, candidates } = await rootPrediction(
+					sessionID,
+					turn.startInput,
+					policy,
+					turn.data.schemaHashes,
+					turn.data.patternIdentities,
+				);
+				await emit(turn, store, candidates, "pattern:" + turn.startInput.turnID);
+				return candidates.filter((c) => !c.background).length;
+			});
+		},
+		async peers(turn, source, calls: readonly CompletedCall[]) {
+			const policy = sourceSettings(turn.settings);
+			if (
+				source === "pattern_aware" ||
+				!policy.enabled ||
+				!policy.multiStepEnabled ||
+				!turn.settings.enabled ||
+				!calls.length
+			)
+				return;
+			const store = await predictionStore(policy, turn.signal);
+			if (!store) return;
+			const group = "pattern:peer:" + calls.map((p) => p.run.runID).join(",");
+			const next = await store.predictAfterBatch(
+				sessionID,
+				calls.map((p) =>
+					predictedEvent(
+						turn.startInput,
+						p.key,
+						p.output,
+						0,
+						turn.data.patternIdentities,
+					),
+				),
+				turn.data.schemaHashes,
+				policy,
+				{ visitedPatternIDs: [group], pathProbability: 0.5 },
+				turn.data.patternIdentities,
+			);
+			const writers = calls.filter((p) => p.effect !== "observation");
+			if (writers.length <= 1) await emit(turn, store, next, group, writers[0]?.run.runID);
+		},
+	};
+	const observe = async (event: AgentRuntimeEvents["actor_observed"]) => {
+		const { settings, data, consumeInput, action, tool, concrete, output, durationMs, order } = event;
+		const schemaHash = action?.schemaHash ?? data.schemaHashes[tool];
+		const key = consumeInput.turnID;
+		let batch = turns.get(key);
+		if (!batch) turns.set(key, (batch = new Map()));
+		batch.set(order, {
+			sessionID: consumeInput.sessionID,
+			turnID: consumeInput.turnID,
+			...eventData(
 				tool,
 				concrete,
 				output,
 				durationMs,
-				data.patternIdentities && Object.hasOwn(data.patternIdentities, tool)
-					? data.patternIdentities[tool]
-					: action?.semantics?.patternIdentity,
-			);
-			const turn = turnState(consumeInput.sessionID, consumeInput.turnID);
-			const batch = turn.events;
-			batch.set(order, {
-				sessionID: consumeInput.sessionID,
-				turnID: consumeInput.turnID,
-				...observed,
-				...(schemaHash === undefined ? {} : { schemaHash }),
-				learnTarget: data.tools.has(tool),
-			});
-			if (!settings.enabled || !patternSettings.enabled) return undefined;
-			let actions: PlanAction[] = [];
-			if ((!patternSettings.multiStepEnabled && !actions.length) || signal?.aborted) return undefined;
-			if (patternSettings.multiStepEnabled) {
-				const store = await predictionStore(patternSettings, signal);
-				if (!store) return undefined;
-				const ordered = [...batch.entries()].sort(([left], [right]) => left - right).map(([, item]) => item);
-				const candidates = await store.predictAfterBatch(
-					consumeInput.sessionID,
-					ordered,
-					data.schemaHashes,
-					patternSettings,
-					undefined,
-					data.patternIdentities,
-				);
-				const predicted = planActions(candidates, store);
-				// An observation can finish after its turn closes, or lose individual actions during admission.
-				const carried = {
-					signature: patternPredictionSignature(candidates),
-					pending: new Set(predicted.map((action) => action.feedback)),
-					abandoned: false,
-				};
-				for (const action of predicted) feedbacks.get(action.feedback)!.carried = carried;
-				carriedPredictions.set(consumeInput.sessionID, carried);
-				actions = [...predicted, ...actions];
-			}
-			// Its own namespace never supersedes the turn's still-pending predictions; the runtime's revision covers continuations.
-			const id = `pattern:${consumeInput.turnID}:after`;
-			const minimum = ++turn.observationRevision;
-			const revision = reserveRevision(id, minimum);
-			turn.observationRevision = revision;
-			return {
-				id,
-				source: "pattern_aware",
-				revision,
-				actions,
-				retainDescendants: true as const,
-			};
+				data.patternIdentities?.[tool] ?? action?.semantics?.patternIdentity,
+			),
+			schemaHash,
+			learnTarget: data.tools.has(tool),
 		});
+		const turn = generators.get(event.startInput);
+		const policy = sourceSettings(settings);
+		if (!turn || turn.signal.aborted || !settings.enabled || !policy.enabled || !policy.multiStepEnabled)
+			return;
+		const store = await predictionStore(policy, turn.signal);
+		if (!store) return;
+		const ordered = [...batch.entries()].sort(([a], [b]) => a - b).map(([, v]) => v);
+		const next = await store.predictAfterBatch(
+			sessionID,
+			ordered,
+			data.schemaHashes,
+			policy,
+			undefined,
+			data.patternIdentities,
+		);
+		await emit(turn, store, next, "pattern:" + consumeInput.turnID + ":after");
+	};
 	const observeTurn = (
 		startInput: AgentStartInput,
 		settings: SpeculativeActionSettings,
 		terminal?: boolean,
 	): void => {
 		if (lifecycle.sealed) return;
-		const key = agentBatchKey(startInput.sessionID, startInput.turnID);
-		const batch = turns.get(key)?.events;
+		const key = startInput.turnID;
+		const batch = turns.get(key);
 		turns.delete(key);
-		if (terminal) carriedPredictions.delete(startInput.sessionID);
 		const patternSettings = sourceSettings(settings);
-		if (!settings.enabled || !patternSettings.enabled) carriedPredictions.delete(startInput.sessionID);
 		// Only a completed turn contributes its authoritative batch; entry discards any stale batch.
 		const events =
 			terminal !== undefined && batch?.size
@@ -482,39 +384,12 @@ export function createPatternPlanSource({
 	};
 	const clearSession = async () => {
 		await lifecycle.drain();
-		carriedPredictions.clear();
-		for (const [key, turn] of turns) {
-			turn.revision = turn.observationRevision = -1;
-			if (!turn.events.size || turn.events.values().next().value?.sessionID === sessionID) turns.delete(key);
-		}
 	};
 	return {
 		source,
 		connect: (runtime) =>
 			runtime.subscribe({
-				actor_observed: async (event) => {
-					const update = await observe(event, (id, minimum) =>
-						runtime.reservePlanRevision(event.sessionID, id, minimum),
-					);
-					await runtime.submitPlan(event.startInput, update);
-				},
-				prediction_admitted: ({ feedback, issued }) => {
-					if (lifecycle.sealed) return;
-					const state = feedbacks.get(feedback as object);
-					if (state?.context) {
-						state.carried?.pending.delete(state.context);
-						if (issued)
-							for (const support of state.context.supportingPatternIDs) state.context.store.issued(support);
-					}
-				},
-				prediction_feedback: ({ feedback, settlement, served }) => {
-					if (lifecycle.sealed) return;
-					const { context, carried } = feedbacks.get(feedback as object) ?? {};
-					if (carried && settlement.observation === "unobserved") carried.abandoned = true;
-					if (context)
-						for (const support of context.supportingPatternIDs)
-							context.store.settled(support, settlement, served);
-				},
+				actor_observed: observe,
 				turn_started: ({ startInput, settings }) => observeTurn(startInput, settings),
 				turn_finished: async ({ startInput, settings, terminal }) => {
 					observeTurn(startInput, settings, terminal);
@@ -547,7 +422,7 @@ export function createPatternPlanSource({
 						tool,
 						input,
 						horizon,
-						confidence: horizon === 0 ? immediateConfidence ?? confidence : confidence,
+						confidence: horizon === 0 ? (immediateConfidence ?? confidence) : confidence,
 					}))
 					.sort((a, b) => a.horizon - b.horizon || b.confidence - a.confidence)
 					.slice(0, speculativeConfig().prediction.maxHints);
@@ -564,61 +439,6 @@ export function createPatternPlanSource({
 			}),
 	};
 }
-export function patternPlanActionID(actionIdentity: string, parentActionID = "root"): string {
+function patternPredictionID(actionIdentity: string, parentActionID = "root"): string {
 	return `pattern:${stableValueHash({ actionIdentity, parentActionID }).slice(0, 16)}`;
 }
-function patternPredictionSignature(candidates: readonly PatternAwareCandidate[]): string {
-	return JSON.stringify(
-		candidates
-			.map((candidate) => [candidate.actionIdentity, candidate.horizon, candidate.latestHorizon] as const)
-			.sort(([left], [right]) => left.localeCompare(right)),
-	);
-}
-function patternPlanAction(
-	candidate: PatternAwareCandidate,
-	store: PatternAwareStore,
-	id: string,
-	dependsOn?: PlanAction["dependsOn"],
-): PlanAction & {
-	readonly feedback: PatternPlanFeedback;
-} {
-	const {
-		tool,
-		input,
-		horizon,
-		latestHorizon,
-		empiricalProbability,
-		conditionalProbability,
-		adoptionProbability,
-		confidence,
-		expectedDurationMs,
-		background,
-		depth,
-		presetID,
-		supportingPatternIDs,
-	} = candidate;
-	return {
-		id,
-		type: "tool_call",
-		tool,
-		input,
-		horizon,
-		latestHorizon,
-		empiricalProbability,
-		conditionalProbability,
-		adoptionProbability,
-		confidence,
-		expectedDurationMs,
-		depth,
-		...(presetID ? { mode: presetID } : {}),
-		...(background ? { background: true } : {}),
-		...(dependsOn?.length ? { dependsOn } : {}),
-		feedback: {
-			store,
-			drafterRoot: !dependsOn && coversDrafterRoot(candidate),
-			continuation: candidate.continuation,
-			supportingPatternIDs,
-		},
-	};
-}
-import { speculativeConfig } from "./config-schema.ts";

@@ -56,7 +56,7 @@ export default function register(pi: ExtensionAPI) {
 
 `execute` 返回原生 Pi 的 `{ content, details }`；异常照常成为工具错误。工具名、参数 schema、描述、显示配置等继续交给 Pi 注册。模板提供 `cwd`、`callID`、`signal`、`fs`、`step`；只有 `actor` 工具可使业务结果依赖调用编号或其他环境状态。需要完整 Pi 上下文或流式更新的现有工具，可继续使用普通注册，或在外层 Actor 适配器中安排这些行为。
 
-`resources(input)` 是纯函数，返回潜在访问路径，用于调度顺序；应列出可能读取或写入的路径。它不代替实际读取证据，也不授予访问权限。全部路径相对当前工作区，越出根目录的路径会被拒绝。`fs` 提供 `readFile/access/exists/stat/readdir`；可写模式另有 `writeFile/mkdir`。步骤始终只拿到只读接口。`readFile(path, maxBytes)` 返回最多指定字节的前缀，需要完整内容的步骤应像完整示例一样检查长度。
+`resources(input)` 是纯函数，返回潜在访问路径，用于查找可复用的资源输入；应列出可能读取或写入的路径。它不代替实际读取证据，也不授予访问权限。全部路径相对当前工作区，越出根目录的路径会被拒绝。`fs` 提供 `readFile/access/exists/stat/readdir`；可写模式另有 `writeFile/mkdir`。步骤始终只拿到只读接口。`readFile(path, maxBytes)` 返回最多指定字节的前缀，需要完整内容的步骤应像完整示例一样检查长度。
 
 只读视图和修改沙箱都提供 `prepare`、`computeStep`、`stat` 和 `readdir`。外层修改回滚后，只依赖基线只读输入的步骤继续保留；依赖私有写入的结果随分支释放。
 

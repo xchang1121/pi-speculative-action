@@ -1115,8 +1115,6 @@ export function emptySpeculativeTraceSummary(
 		modesBySource: {} as ModesBySource,
 		predictionUnobserved: {} as Readonly<Record<string, number>>,
 		predictionRejectedAfterMatch: {} as Readonly<Record<string, number>>,
-		operationPredictionsSettled: 0,
-		operationPredictionsAdopted: 0,
 		candidateStarted: 0,
 		candidateSucceeded: 0,
 		candidateFailed: 0,
@@ -1162,7 +1160,7 @@ export function reduceSpeculativeTrace<SessionID>(
 		next.subcomputations = summarizeSubcomputations([current.subcomputations, event.subcomputations]);
 	// Prediction support and execution ownership are different: shared work is charged to its producer only.
 	if (
-		(event.type === "prediction" || event.type === "operation_prediction") &&
+		event.type === "prediction" &&
 		event.mode &&
 		event.settlement.observation === "observed"
 	) {
@@ -1186,15 +1184,6 @@ export function reduceSpeculativeTrace<SessionID>(
 			});
 	}
 	switch (event.type) {
-		case "operation_prediction":
-			next.operationPredictionsSettled++;
-			if (
-				event.settlement.observation === "observed" &&
-				event.settlement.match.matched &&
-				event.settlement.match.adoption.status === "adopted"
-			)
-				next.operationPredictionsAdopted++;
-			break;
 		case "task":
 			next.tasks++;
 			for (const key of ["toolComputeMs", "adoptionWaitMs"] as const)
@@ -1271,7 +1260,10 @@ export function reduceSpeculativeTrace<SessionID>(
 				const match = event.settlement.provider.match;
 				if (match.kind === "inputs") next.inputReuseHits++;
 				else next.exactReuseHits++;
-			} else next[event.settlement.provider.origin === "preview" ? "actorPreviews" : "actorFallbacks"]++;
+			} else if (event.settlement.provider.origin === "preview") {
+				next.actorPreviews++;
+				next.exactReuseHits++;
+			} else next.actorFallbacks++;
 			break;
 	}
 	next.hitRate = ratio(next.speculativeHits, next.actorActions);

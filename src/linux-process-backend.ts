@@ -49,7 +49,6 @@ import {
 	writeContent,
 } from "./content-chunks.ts";
 import type {
-	ExecutionOperationBinding,
 	ExecutionResourceContext,
 	ExecutionScope,
 	ExecutionWorldStorageControl,
@@ -813,10 +812,6 @@ export class LinuxProcessReuseBackend {
 		if (!invocation) throw new Error("process execution binding is unavailable in this scope");
 		return invocation;
 	}
-	/** Ordinary-stdio child bindings can prepare directly against the current workspace. */
-	operationHints(_binding: ProcessExecutionBinding): Pick<ExecutionOperationBinding, "fed" | "preparation"> {
-		return { preparation: "current_workspace" };
-	}
 	executionBindings(scope: ExecutionScope): readonly ProcessExecutionBinding[] {
 		return this.handoffs.bindings(scope);
 	}
@@ -839,7 +834,7 @@ export class LinuxProcessReuseBackend {
 					TimelineInterval.collect(() =>
 						validateDynamicDependencyCertificate(
 							evidence,
-							// This scheduling observation grants no adoption authority; failed runs also suppress repeated preparation while their inputs hold.
+							// A recorded run suppresses repeated preparation while its inputs hold, including after failure.
 							{ acceptedTaints: evidence.taints, signal },
 						),
 					).then(
@@ -1207,9 +1202,6 @@ export class LinuxProcessReuseBackend {
 		return this.withProducer(async (): Promise<LinuxProcessSession> => {
 			const { session, ready, readyAt, controller } = await this.allocateSession(input);
 			let executionKind: "tool" | "operation" | undefined;
-			input.onOperationJoinable?.(
-				() => !session.signal.aborted && this.handoffs.hasJoinableWork(session.ownership),
-			);
 			this.producers++;
 			let dispatch: Promise<void> | undefined;
 			const execute = <Value>(
@@ -3011,7 +3003,7 @@ export class LinuxProcessReuseBackend {
 		await chmod(dispatcher, 0o755);
 		return dispatcher;
 	}
-	/** Retain the learned launch authority, then propose a separate input version shared by scheduling and execution. */
+	/** Retain the learned launch authority and the input evidence used for local preparation. */
 	private async boundRequest(
 		binding: ProcessExecutionBinding,
 		invocation: BoundProcessInvocation,

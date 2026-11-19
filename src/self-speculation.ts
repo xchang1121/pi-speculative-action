@@ -1,7 +1,7 @@
 import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
 import { hash, randomUUID } from "node:crypto";
 import type { ActionKey } from "./action-semantics.ts";
-import type { AgentPlanSource } from "./agent-integration.ts";
+import type { CallGenerator, CompletedCall } from "./call-generators.ts";
 import {
 	DEFAULT_SPECULATIVE_CONFIG,
 	speculativeConfig,
@@ -22,7 +22,7 @@ import {
 	asRecord as record,
 	stableStringify,
 } from "./primitives.ts";
-import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "./runtime-engine.ts";
+import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "./settlement.ts";
 import { PendingTasks } from "./runtime-lifecycle.ts";
 import type { ActorActionSettlement } from "./settlement.ts";
 interface EvidenceState {
@@ -161,40 +161,28 @@ export class ActorForkPlanSource {
 		}
 		return Object.freeze(normalized);
 	}
-	readonly source: AgentPlanSource = {
-		id: "self-speculation",
-		enabled: (settings) => settings.sourceConfig?.actorForkActionEnabled === true,
-		timeoutMs: (settings) => settings.predictionTimeoutMs,
-		requestLifetime: "actor_decision",
-		// A forked batch is one decision, as a Drafter batch is: peers such as PatternAware continue from all of it.
-		continuationBatch: ({ feedback }) => {
-			const calls = (
-				feedback as
-					| {
-							batchCalls?: unknown;
-					  }
-					| undefined
-			)?.batchCalls;
-			return Array.isArray(calls) && calls.every((id) => typeof id === "string") ? calls : undefined;
-		},
-		propose: async ({ startInput, signal }) => {
-			const pending = this.pending.get(startInput.turnID);
-			const batches = await this.waitForBatches(startInput.turnID, signal);
-			return batches
-				.filter((batch) => batch.calls.length)
-				.map((batch) => ({
-					id: `self-speculation:${startInput.turnID}:${batch.id}`,
-					source: "self-speculation",
-					revision: 0,
-					actions: batch.calls.map((call) => ({
-						id: call.id,
-						type: "tool_call" as const,
-						tool: call.tool,
-						input: call.input,
-						reuseFeedback: pending?.reuseFeedback,
-						feedback: { batchCalls: batch.calls.map(({ id }) => id) },
-					})),
-				}));
+	readonly source: CallGenerator = {
+		start: async turn => {
+			if (!turn.settings.enabled || !turn.settings.sourceConfig?.actorForkActionEnabled) return;
+			const turnID = turn.startInput.turnID;
+			const feedback = this.pending.get(turnID)?.reuseFeedback;
+			await turn.request("self-speculation","proposal",turn.signal, async signal => {
+				const batches = await this.waitForBatches(turnID,signal);
+				let count = 0;
+				for (const batch of batches) {
+					const issued = await Promise.all(batch.calls.map(call => turn.issue({
+						...call, source:"self-speculation", group:"self-speculation:"+turnID+":"+batch.id, feedback,
+					},{signal})));
+					count += issued.filter(Boolean).length;
+					void Promise.all(issued.map(async p => {
+						const result = await p?.run.completion;
+						return p && result?.status === "completed" ? {...p,output:result.output} : undefined;
+					})).then(peers => {
+						if (peers.every((p): p is CompletedCall => !!p)) turn.peers("self-speculation",peers);
+					});
+				}
+				return count;
+			});
 		},
 	};
 	startTurn(turnID: string, reuseFeedback?: unknown): void {
@@ -393,13 +381,12 @@ interface CandidateRecord {
 		readonly actionID: string;
 	}>;
 	readonly sequence: number;
-	readonly expectedDecisionSequence: number;
+	readonly targetDecision: number;
 	depth: number;
 	horizon: number;
-	latestDecisionSequence: number;
+	lastDecision: number;
 	conditionalProbability: number;
 	empiricalProbability: number;
-	expectedDurationMs?: number;
 }
 interface CandidateCalibration {
 	readonly decoderProbability: number;
@@ -542,7 +529,7 @@ export class SelfSpeculationCoordinator {
 	addCandidate(candidate: MaterializedSpeculativeCandidate<string>): void {
 		const state = this.active;
 		if (!this.settings().enabled || !this.latestStartedDecisionSequence) return;
-		const targetDecisionSequence = candidate.expectedDecisionSequence;
+		const targetDecisionSequence = candidate.targetDecision;
 		if (!isSafeCount(targetDecisionSequence, 1)) return;
 		if (targetDecisionSequence < this.latestStartedDecisionSequence) return;
 		const candidates =
@@ -589,13 +576,13 @@ export class SelfSpeculationCoordinator {
 				});
 			for (const field of ["depth", "horizon"] as const)
 				existing[field] = Math.min(existing[field], finiteNumber(candidate[field]) ?? 0);
-			for (const field of ["conditionalProbability", "empiricalProbability", "expectedDurationMs"] as const) {
+			for (const field of ["conditionalProbability", "empiricalProbability"] as const) {
 				const supplied = finiteNumber(candidate[field]);
 				if (supplied !== undefined) existing[field] = Math.max(existing[field] ?? 0, supplied);
 			}
-			existing.latestDecisionSequence = Math.max(
-				existing.latestDecisionSequence,
-				candidate.latestDecisionSequence,
+			existing.lastDecision = Math.max(
+				existing.lastDecision,
+				candidate.lastDecision,
 			);
 			return existing;
 		} else {
@@ -607,13 +594,12 @@ export class SelfSpeculationCoordinator {
 				sources: new Set([source]),
 				provenance: [{ proposalID: candidate.proposalID, actionID: candidate.actionID }],
 				sequence: this.candidateSequence++,
-				expectedDecisionSequence: candidate.expectedDecisionSequence,
+				targetDecision: candidate.targetDecision,
 				depth: finiteNumber(candidate.depth) ?? 0,
 				horizon: finiteNumber(candidate.horizon) ?? 0,
-				latestDecisionSequence: candidate.latestDecisionSequence,
+				lastDecision: candidate.lastDecision,
 				conditionalProbability: finiteNumber(candidate.conditionalProbability) ?? 0,
 				empiricalProbability: finiteNumber(candidate.empiricalProbability) ?? 0,
-				expectedDurationMs: finiteNumber(candidate.expectedDurationMs),
 			};
 			candidates.set(predictedAction.key, record);
 			return record;
@@ -1104,11 +1090,10 @@ function candidatePayload(
 			joint_speculation_probability: calibration.jointProbability,
 			depth: candidate.depth,
 			horizon: candidate.horizon,
-			expected_decision_sequence: candidate.expectedDecisionSequence,
-			latest_decision_sequence: candidate.latestDecisionSequence,
+			expected_decision_sequence: candidate.targetDecision,
+			latest_decision_sequence: candidate.lastDecision,
 			conditional_probability: candidate.conditionalProbability,
 			empirical_probability: candidate.empiricalProbability,
-			expected_duration_ms: candidate.expectedDurationMs,
 		},
 	};
 }

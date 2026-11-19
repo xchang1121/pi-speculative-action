@@ -67,9 +67,22 @@ export default function extension(pi) {
 }
 ```
 
+### 执行与复用会话
+
+PatternAware、Drafter 和 Self-Speculation 向同一会话提交额外调用。宿主可通过 `executionSession` 注入自己的实现，接口类型从包的 `/core` 入口导出。
+
+| 方法 | 行为 |
+| --- | --- |
+| `speculate(call, { after?, signal? })` | 返回带有 `runID` 和 `completion` 的句柄。等价调用共享执行。新调用达到并发上限时返回 `rejected`。 |
+| `execute(call, { signal? })` | 执行 Actor 调用，返回结果、复用来源和计时。Actor 可消费已有工作，也可为后续调用留下可验证的资源。 |
+| `release(runID)` | 撤回调用方对分支的使用。共享执行的其他使用者可以继续等待。 |
+| `flush()`、`close()` | 等待已接收的工作，或关闭会话并释放资源。 |
+
+Drafter 在私有上下文内预测前驱的输出。独立后继可以提前执行，依赖私有写入的调用通过 `after` 绑定到前驱分支。实际输出与预期有出入时，Drafter 撤回受影响的后继并根据实际输出续推。跨回合保留的资源受输入有效性和缓存容量限制。
+
 规范动作键相同的调用按 `exact` 复用结果。读取范围等参数变化时，运行时可以用已封存的资源输入重建并校验本次结果，计为 `inputs`。
 
-PatternAware 用序列 PPM 和结构化字段绑定预测调用，同时用近期观测耗时估算候选可节省的时间。当前台模式对本轮动作的校准置信度达到 0.80 时，Drafter 跳过本轮根请求，仍可根据该动作的结果预测下一步。
+PatternAware 用序列 PPM 和结构化字段绑定预测调用。当前台模式对本轮动作的校准置信度达到 0.80 时，Drafter 跳过本轮根请求，仍可根据该动作的结果预测下一步。
 
 环境契约支持 `exact`、`allowlist`、`denylist`、`isolated`。投影列表由 `environmentKeys` 提供，隔离环境由 `isolatedEnvironment` 提供。默认比较完整业务环境；`PI_SUBCOMPUTE_SOCKET`、`PI_SUBCOMPUTE_CONTEXT` 两个协议句柄排除在环境摘要之外，受控通道读取的输入纳入进程证书。`replayAcceptedTaints` 默认空列表；用户可显式允许负载所需的 `clock`、`random`、`pid_observation`、`descriptor_observation` 等标记。
 

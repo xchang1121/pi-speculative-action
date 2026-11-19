@@ -9,7 +9,7 @@ import {
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
-import type { MaterializedSpeculativeCandidate, SpeculativeActionEvent } from "../src/runtime-engine.ts";
+import type { MaterializedSpeculativeCandidate, SpeculativeActionEvent } from "../src/settlement.ts";
 import type { ToolComputationTiming } from "../src/task-timing.ts";
 import { testModel } from "./model.ts";
 
@@ -52,7 +52,7 @@ export function systemHost(
 		cwd,
 		complete: async () => fauxAssistantMessage("done"),
 		preflight: () => true,
-		resources: idleResources(2),
+
 		getSettings: () => ({
 			enabled: true,
 			drafterEnabled: false,

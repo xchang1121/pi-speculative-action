@@ -907,11 +907,6 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		for (const record of this.executions.values()) if (record.state.status !== "retained") return true;
 		return false;
 	}
-	hasJoinableWork(ownership: ProcessHandoffOwnership): boolean {
-		for (const record of this.executions.values())
-			if (record.ownership === ownership && !record.signal.aborted && record.advance) return true;
-		return false;
-	}
 	/** Retrieval hint for both running and completed records; it grants no adoption authority. */
 	mayHaveExecutable(executablePath: string): boolean {
 		for (const record of this.executions.values())

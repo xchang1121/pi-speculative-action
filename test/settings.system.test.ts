@@ -18,7 +18,7 @@ it("loads the documented workspace driver and existing search and prediction pol
 	};
 	const resolved = resolveSpeculativeConfig(config);
 	expect(resolved).toMatchObject(config);
-	expect(resolved.scheduling).toBe(resolveSpeculativeConfig().scheduling);
+	expect(resolved.storage).toBe(resolveSpeculativeConfig().storage);
 	expect(resolveSpeculativeConfig(resolved)).toBe(resolved);
 	config.processReuse.excludedPaths.push("/later");
 	expect(resolved.processReuse.excludedPaths).toEqual(["/cache"]);
@@ -50,7 +50,7 @@ describe("settings publication and reopening on disk", () => {
 			tools: ["read", "ls"],
 			candidateLimit: 4,
 			patternAware: { beamWidth: 2, enabled: true },
-			scheduling: { heavyCpu: 3, resourcePollIntervalMs: 50 },
+
 		});
 		await store.flush();
 		store.setScope("project");
@@ -60,14 +60,14 @@ describe("settings publication and reopening on disk", () => {
 			tools: ["read", "ls"],
 			candidateLimit: 2,
 			patternAware: { enabled: true, beamWidth: 5 },
-			scheduling: { heavyCpu: 3, resourcePollIntervalMs: 75 },
+
 		});
 		await store.flush();
 		expect(JSON.parse(await readText(cwd, ".pi", "speculative-action.json"))).toEqual({
 			reuseEnabled: false,
 			candidateLimit: 2,
 			patternAware: { beamWidth: 5 },
-			scheduling: { resourcePollIntervalMs: 75 },
+
 		});
 
 		const reloaded = new SpeculativeActionSettingsStore(cwd, agent);
@@ -78,7 +78,7 @@ describe("settings publication and reopening on disk", () => {
 			reuseEnabled: false,
 			candidateLimit: 2,
 			patternAware: { enabled: true, beamWidth: 5 },
-			scheduling: { heavyCpu: 3, resourcePollIntervalMs: 75 },
+
 		});
 		await expect(readText(root, ".pi", "settings.json")).rejects.toMatchObject({
 			code: "ENOENT",

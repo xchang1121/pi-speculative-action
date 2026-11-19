@@ -1,5 +1,4 @@
 import { fauxAssistantMessage, type Context } from "@earendil-works/pi-ai";
-import { SpeculationScheduler } from "../src/system-resources.ts";
 import { afterEach, expect, test, vi } from "vitest";
 import path from "node:path";
 import { existsSync, globSync } from "node:fs";
@@ -70,72 +69,6 @@ test.each([1, 2])("preserves constant prediction support when another session ch
 	await store.load();
 	assertSupport();
 	await loading;
-});
-
-test("scopes reserved observation revisions to each PatternAware turn", async () => {
-	const f = systemHost(
-		process.cwd(),
-		[createReadTool(process.cwd())],
-		{
-			patternStore: new PatternAwareStore({
-				...PATTERN_AWARE_DEFAULTS,
-				presets: [],
-			}),
-		},
-		{ patternAware: { enabled: true, presets: [] } },
-	);
-	let extra = 0;
-	let prior: Parameters<typeof f.host.runtime.submitPlan>[0] | undefined;
-	const admitted: string[] = [];
-	f.host.runtime.subscribe({
-		prediction_admitted: (event) => {
-			admitted.push(event.proposalID);
-		},
-	});
-	const reserve = vi
-		.spyOn(f.host.runtime, "reservePlanRevision")
-		.mockImplementation((_session, _id, minimum) => minimum + extra);
-	const submit = vi.spyOn(f.host.runtime, "submitPlan");
-	try {
-		for (let round = 0; round < 2; round++) {
-			await f.start("same");
-			if (prior)
-				await f.host.runtime.submitPlan(prior, {
-					id: "stale-turn",
-					source: "pattern_aware",
-					revision: 0,
-					actions: [
-						{
-							id: "read",
-							type: "tool_call",
-							tool: "read",
-							input: { path: "package.json" },
-						},
-					],
-				});
-			for (const [offset, revision] of [
-				[0, 0],
-				[5, 6],
-				[0, 7],
-			]) {
-				extra = offset!;
-				submit.mockClear();
-				await f.host.execute(
-					{ turnID: "same", tool: "inspect", args: {}, tools: [] },
-					undefined,
-					async () => ({ content: [], details: {} }),
-				);
-				await expect.poll(() => submit.mock.calls.at(-1)?.[1]).toMatchObject({ revision });
-				prior = submit.mock.calls.at(-1)?.[0];
-			}
-			await f.finish();
-		}
-		expect(admitted).toEqual([]);
-	} finally {
-		await f.dispose();
-		reserve.mockRestore();
-		submit.mockRestore();
-	}
 });
 
 const locations: PatternAwareEvent = {
@@ -1016,44 +949,6 @@ test("checks portable confusion on the source clock and rebases aged feedback on
 	expect(candidate?.background).toBeFalsy();
 });
 
-test("ranks actionable savings using decayed pattern durations after reopening the store", async () => {
-	const file = path.join(await directories.create(), "durations.json");
-	const settings = { ...immediate, decayHalfLifeEvents: 6 };
-	const store = new PatternAwareStore(settings, file);
-	await store.load();
-	const report = (id: string) => event(id, "locate", {}, { outputPaths: [id + ".ts"] });
-	const samples: PatternAwareEvent[] = [];
-	for (let i = 0; i < 6; i++) {
-		const id = String(i);
-		store.observe(report(id));
-		store.observeBatch(
-			["fast", "slow"].map((tool) => ({
-				...event(id, tool, { path: id + ".ts" }, { durationMs: tool === "fast" ? 0.25 : i < 3 ? 10 : 90 }),
-				turnID: "actions",
-			})),
-		);
-		samples.push(store.recent(id).find((e) => e.tool === "slow")!);
-		store.finishSession(id);
-	}
-	const fast = store.snapshot().find((pattern) => pattern.targetTool === "fast")!;
-	store.settled(fast.id, accepted);
-	const weights = samples.map(
-		(e) => 2 ** ((e.sequence - samples.at(-1)!.sequence) / settings.decayHalfLifeEvents),
-	);
-	const expected =
-		samples.reduce((sum, e, i) => sum + weights[i]! * e.durationMs, 0) / weights.reduce((a, b) => a + b);
-	await store.flush();
-	const reopened = new PatternAwareStore(settings, file);
-	await reopened.load();
-	for (const model of [store, reopened]) {
-		const candidates = model.predictAfterBatch("held", [report("held")]);
-		expect(candidates.map((p) => p.tool)).toEqual(["slow", "fast"]);
-		expect(candidates[0]!.confidence).toBeLessThan(candidates[1]!.confidence);
-		expect(candidates[0]!.expectedDurationMs).toBeCloseTo(expected);
-		expect(candidates[1]!.expectedDurationMs).toBe(0.25);
-	}
-});
-
 test.each(["strong", "uncalibrated", "background"] as const)(
 	"coordinates the %s PatternAware forecast with concurrent Drafter roots",
 	async (quality) => {
@@ -1096,7 +991,6 @@ test.each(["strong", "uncalibrated", "background"] as const)(
 			"live",
 		);
 		const predictions = vi.spyOn(store, "predict");
-		const evaluate = vi.spyOn(SpeculationScheduler.prototype, "evaluate");
 		try {
 			await f.start();
 			const roots = () =>
@@ -1107,7 +1001,7 @@ test.each(["strong", "uncalibrated", "background"] as const)(
 						? [e.request]
 						: [],
 				);
-			await expect.poll(() => roots().length).toBe(2);
+			await expect.poll(() => roots().length).toBe(quality === "strong" ? 1 : 2);
 			expect(predictions).toHaveBeenCalledTimes(1);
 			if (quality === "strong") {
 				expect(
@@ -1119,10 +1013,7 @@ test.each(["strong", "uncalibrated", "background"] as const)(
 				expect(contexts[0]!.messages.some((m) => m.role === "toolResult")).toBe(true);
 				expect(f.drafter.budget.requests).toBe(1);
 				expect(f.materialized).toContainEqual(
-					expect.objectContaining({ source: "pattern_aware", expectedDurationMs: 42 }),
-				);
-				expect(evaluate.mock.calls.flatMap(([forecasts]) => forecasts)).toContainEqual(
-					expect.objectContaining({ tool: "read", expectedDurationMs: 42 }),
+					expect.objectContaining({ source: "pattern_aware", tool:"read" }),
 				);
 			} else {
 				expect(f.drafter.budget.requests).toBe(2);
@@ -1132,7 +1023,6 @@ test.each(["strong", "uncalibrated", "background"] as const)(
 		} finally {
 			await f.dispose();
 			predictions.mockRestore();
-			evaluate.mockRestore();
 		}
 	},
 );

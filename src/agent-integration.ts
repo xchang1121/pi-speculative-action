@@ -14,14 +14,13 @@ import { rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ActionKey, ActionSemanticsRegistry } from "./action-semantics.ts";
-import { buildActionKey, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
+import { actionKeyMatch, buildActionKey, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import type { AgentExecutionWorld, SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import { createResourceSnapshotExecutionWorld } from "./agent-execution-world.ts";
 import type { DrafterRequestSettings } from "./config-schema.ts";
 import {
 	booleanOr,
 	normalizeDrafterRequestSettings,
-	normalizeSchedulingSettings,
 	positiveInteger,
 	positiveMilliseconds,
 } from "./config-schema.ts";
@@ -38,38 +37,39 @@ import type {
 import {
 	isRegisteredExecutionWorld,
 	ToolExecutionGateway,
-	toolObservationKey,
 	UNRESTRICTED_PROCESS_EFFECTS,
 } from "./execution-world.ts";
 import type { PatternAwareSettings, PatternAwareStore } from "./pattern-aware.ts";
 import { patternAwareSettings } from "./pattern-aware.ts";
 import { createPatternPlanSource } from "./pattern-plan-source.ts";
-import {
-	piToolErrorSettlement,
-} from "./pi-tool-invocation.ts";
+import { piToolErrorSettlement } from "./pi-tool-invocation.ts";
 import { asRecord, immutableSnapshot, isImmutableSnapshot, stableValueHash } from "./primitives.ts";
+import { observeResourceChanges } from "./resource-version.ts";
 import { ProvenanceCertificateStore } from "./reuse-store.ts";
 import type {
 	ActualToolCall,
 	CandidatePreflight,
-	PreparedActorCall,
+	CandidateEventDescriptor,
+	CandidateRejection,
+	PredictionIdentity,
+	PredictionSettlement,
+	SpeculativeCacheSnapshot,
 	RuntimeEventMap,
 	SpeculativeActionEvent,
-	SpeculativeActionRuntime,
 	SpeculativeActionSettings,
-	SpeculativePlanSource,
 	TurnInput,
-} from "./runtime-engine.ts";
-import { createExecutionPreparation, makeSpeculativeActionRuntime } from "./runtime-engine.ts";
+} from "./settlement.ts";
+import { LocalExecutionSession } from "./runtime-engine.ts";
+import type { ExecutionCall, ExecutionSession, SpeculativeRun } from "./execution-session.ts";
+import type { CallGenerator, GeneratorTurn, Prediction } from "./call-generators.ts";
+import { cause, diagnosticAction, RuntimeSubscriptions, runSourceRequest } from "./settlement.ts";
+import { PendingTasks } from "./runtime-lifecycle.ts";
 import type { ActorForkPlanSource, SelfSpeculationSettingsInput } from "./self-speculation.ts";
 import { normalizeSelfSpeculationSettings } from "./self-speculation.ts";
 import type { ToolOperation } from "./settlement.ts";
 import { speculativeToolInvocation, speculativeToolPatternIdentity } from "./speculative-tool.ts";
 import { SubcomputeService } from "./subcompute.ts";
-import type { ExecutionResourceMonitor } from "./system-resources.ts";
-import { createSystemResourceMonitor } from "./system-resources.ts";
-import type { TimelineDependency } from "./task-timing.ts";
-import { TimelineInterval } from "./task-timing.ts";
+import { TaskTimeline, TimelineInterval } from "./task-timing.ts";
 export interface DraftOptionsContext {
 	readonly actorModel: Model<Api>;
 	readonly draftModel: Model<Api>;
@@ -77,7 +77,8 @@ export interface DraftOptionsContext {
 	readonly signal: AbortSignal;
 }
 export type DraftModelSelection =
-	Model<Api> | ((actorModel: Model<Api>) => Model<Api> | undefined | Promise<Model<Api> | undefined>);
+	| Model<Api>
+	| ((actorModel: Model<Api>) => Model<Api> | undefined | Promise<Model<Api> | undefined>);
 /** Model services supplied by the host; prediction hints remain private source wiring. */
 export interface DrafterModelOptions {
 	/** Defaults to the Actor model when omitted or unresolved. */
@@ -95,7 +96,8 @@ export interface DrafterModelOptions {
 	readonly drafterBudget?: DrafterTaskBudget;
 }
 export interface AgentStartInput
-	extends Pick<DraftOptionsContext, "actorModel" | "actorOptions">, Omit<TurnInput<string>, "terminal"> {
+	extends Pick<DraftOptionsContext, "actorModel" | "actorOptions">,
+		Omit<TurnInput<string>, "terminal"> {
 	readonly context: Context;
 	readonly tools: readonly AgentTool[];
 }
@@ -108,15 +110,6 @@ export interface AgentStateData {
 	readonly tools: ReadonlyMap<string, AgentTool>;
 	readonly schemaHashes: Readonly<Record<string, string>>;
 }
-export type AgentPlanSource = SpeculativePlanSource<string, ToolSettlement, AgentStartInput, AgentStateData>;
-export type AgentRuntime = SpeculativeActionRuntime<
-	string,
-	ToolSettlement,
-	AgentStartInput,
-	AgentConsumeInput,
-	AgentConsumeInput,
-	AgentStateData
->;
 export type AgentRuntimeEvents = RuntimeEventMap<
 	string,
 	ToolSettlement,
@@ -124,8 +117,9 @@ export type AgentRuntimeEvents = RuntimeEventMap<
 	AgentConsumeInput,
 	AgentStateData
 >;
-export function agentBatchKey(sessionID: string, turnID: string): string {
-	return JSON.stringify([sessionID, turnID]);
+export interface AgentRuntime {
+	subscribe: RuntimeSubscriptions<AgentRuntimeEvents>["subscribe"];
+	settingsChanged(): Promise<void>;
 }
 export function definitionSchemaHashes(
 	definitions: readonly {
@@ -288,17 +282,12 @@ export function attachSdkTools(
 		},
 	};
 }
-const ACTOR_OPERATION = Symbol("actor-operation");
-const RAW_ACTOR_CALL = Symbol("raw-actor-call");
 type AgentToolOperation = ToolOperation & {
 	readonly invocation?: ToolInvocation;
 };
-type BoundActorCall = AgentConsumeInput & {
-	readonly [ACTOR_OPERATION]?: () => Promise<AgentToolOperation>;
-	readonly [RAW_ACTOR_CALL]?: true;
-};
 export interface SpeculativeAgentSettingsInput
-	extends Partial<DrafterRequestSettings>, Partial<Omit<SpeculativeActionSettings, "sourceConfig">> {
+	extends Partial<DrafterRequestSettings>,
+		Partial<Omit<SpeculativeActionSettings, "sourceConfig">> {
 	readonly patternAware?: Partial<PatternAwareSettings>;
 	readonly selfSpeculation?: SelfSpeculationSettingsInput;
 }
@@ -324,22 +313,18 @@ export function normalizeSpeculativeAgentSettings(input: SpeculativeAgentSetting
 		resourceCacheMaxEntries: positiveInteger(input.resourceCacheMaxEntries, defaults.resourceCacheMaxEntries),
 		resourceCacheMaxBytes: positiveInteger(input.resourceCacheMaxBytes, defaults.resourceCacheMaxBytes),
 		predictionTimeoutMs: positiveMilliseconds(input.predictionTimeoutMs, undefined),
-		scheduling: normalizeSchedulingSettings(input.scheduling),
 		patternAware: patternAwareSettings(input.patternAware),
 		selfSpeculation: normalizeSelfSpeculationSettings(input.selfSpeculation),
 	} as const;
 }
-export interface SpeculativeAgentPreflightContext extends Pick<
-	SpeculativeToolExecutionContext,
-	"tool" | "toolName" | "args" | "action" | "signal"
-> {
+export interface SpeculativeAgentPreflightContext
+	extends Pick<SpeculativeToolExecutionContext, "tool" | "toolName" | "args" | "action" | "signal"> {
 	readonly route: SpeculativeExecutionRoute;
 }
 export interface CreateSpeculativeActionHostOptions extends DrafterModelOptions {
+	readonly executionSession?: ExecutionSession<ToolSettlement>;
 	readonly config?: SpeculativeConfigInput;
 	readonly configuration?: SpeculativeConfiguration;
-	/** Override host observations for embedding or deterministic tests. */
-	readonly resources?: ExecutionResourceMonitor;
 	/** Canonical K(a) and resource-version semantics for this host. */
 	readonly actionSemantics?: ActionSemanticsRegistry;
 	/** Workspace root used for action canonicalization and resource validation. */
@@ -382,23 +367,16 @@ export interface SpeculativeActionHost {
 		refresh?: boolean,
 	) => Promise<readonly ExecutionWorldDiagnosticSnapshot[]>;
 	readonly startTurn: (input: Omit<AgentStartInput, "sessionID">, signal?: AbortSignal) => Promise<void>;
-	readonly previewActorTool: (
-		input: {
-			readonly turnID: string;
-			readonly tool: string;
-		},
-		signal?: AbortSignal,
-	) => Promise<void>;
 	/** Raw streamed arguments; preparation is provisional and never binds the final Actor call. */
 	readonly previewActorCall: (
 		input: Omit<AgentConsumeInput, "sessionID">,
 		signal?: AbortSignal,
-	) => Promise<void>;
+	) => Promise<SpeculativeRun<ToolSettlement> | undefined>;
 	/** One tool outlet: reuse lookup, Actor fallback, timing, and settlement reporting. */
 	readonly execute: (
 		input: SpeculativeToolExecutionInput,
-		signal: AbortSignal | undefined,
-		executor: (operation: AgentToolOperation) => Promise<AgentToolResult<unknown>>,
+		signal?: AbortSignal,
+		executor?: (operation: AgentToolOperation) => Promise<AgentToolResult<unknown>>,
 	) => Promise<AgentToolResult<unknown>>;
 	readonly finishTurn: (turnID: string, terminal?: boolean) => Promise<void>;
 	readonly drafterBudgetSnapshot: () => ActionDrafterBudgetSnapshot;
@@ -413,9 +391,8 @@ export interface SpeculativeToolExecutionInput {
 	readonly tools: readonly AgentTool[];
 }
 export type ActionDrafterBudgetSnapshot = DrafterPlanSnapshot;
-export { patternPlanActionID } from "./pattern-plan-source.ts";
 /**
- * Build source-neutral speculative plan execution for a host. The host owns lifecycle and tool interception.
+ * Connect the additional-call generators and the Actor outlet to one execution session.
  */
 export function createSpeculativeActionHost(
 	sessionID: string,
@@ -442,18 +419,26 @@ export function createAgentExecutionHost(
 	const config = options.configuration ?? new SpeculativeConfiguration(options.config);
 	const ownsRoot = !config.current.storage.root;
 	const storeRoot = config.current.storage.root ?? path.join(os.tmpdir(), "pi-host-reuse-" + randomUUID());
-	const store = withSpeculativeConfig(config, () => new ProvenanceCertificateStore(storeRoot));
-	const service = withSpeculativeConfig(
-		config,
-		() => new SubcomputeService(options.cwd, store, () => config.current.runtime.resourceCacheMaxBytes),
-	);
+	const store = options.executionSession
+		? undefined
+		: withSpeculativeConfig(config, () => new ProvenanceCertificateStore(storeRoot));
+	const service = !store
+		? undefined
+		: withSpeculativeConfig(
+				config,
+				() => new SubcomputeService(options.cwd, store, () => config.current.runtime.resourceCacheMaxBytes),
+			);
 	const bind = <T extends object>(target: T): T =>
 		new Proxy(target, {
 			get(object, key) {
 				const value = Reflect.get(object, key, object);
 				if (typeof value !== "function") return value;
 				return (...args: unknown[]) =>
-					withSpeculativeConfig(config, () => service.run(() => Reflect.apply(value, object, args)));
+					withSpeculativeConfig(config, () =>
+						service
+							? service.run(() => Reflect.apply(value, object, args))
+							: Reflect.apply(value, object, args),
+					);
 			},
 		});
 	const host = withSpeculativeConfig(config, () =>
@@ -467,10 +452,10 @@ export function createAgentExecutionHost(
 				await host.dispose();
 			} finally {
 				try {
-					await service.dispose();
+					await service?.dispose();
 				} finally {
-					await store.dispose();
-					if (ownsRoot) await rm(storeRoot, { recursive: true, force: true });
+					await store?.dispose();
+					if (store && ownsRoot) await rm(storeRoot, { recursive: true, force: true });
 				}
 			}
 		},
@@ -479,8 +464,8 @@ export function createAgentExecutionHost(
 function assembleAgentExecutionHost(
 	sessionID: string,
 	options: CreateSpeculativeActionHostOptions,
-	store: ProvenanceCertificateStore,
-	service: SubcomputeService,
+	store: ProvenanceCertificateStore | undefined,
+	service: SubcomputeService | undefined,
 	admission?: (
 		world: AgentExecutionWorld,
 		operation: "speculation" | "observation" | "observeOperations",
@@ -488,8 +473,9 @@ function assembleAgentExecutionHost(
 ): SpeculativeActionHost {
 	const actionSemantics = options.actionSemantics ?? PI_ACTION_SEMANTICS;
 	let inputMaxBytes = speculativeConfig().runtime.resourceCacheMaxBytes;
-	const executionWorlds = [...new Set(options.executionWorlds ?? [])];
+	const executionWorlds = options.executionSession ? [] : [...new Set(options.executionWorlds ?? [])];
 	if (
+		store &&
 		!executionWorlds.some(
 			(world) =>
 				world.id === "resource_version" &&
@@ -585,13 +571,21 @@ function assembleAgentExecutionHost(
 		drafterBudget: options.drafterBudget,
 		patternHints: patternPlans.hints,
 	});
-	const executionPreparation = createExecutionPreparation(options.cwd, actionSemantics);
 	const resolveBinding = async (
 		tool: string,
 		input: unknown,
 		schemaHash?: string,
 		definition?: AgentTool,
 	) => {
+		if (options.executionSession) {
+			const value = asRecord(input);
+			return {
+				action:
+					value &&
+					(actionSemantics.buildKey(tool, value, options.cwd, schemaHash) ??
+						buildActionKey({ tool, input: value, resources: [], schemaHash })),
+			};
+		}
 		// A candidate runs its key's canonical input (a redundant `cd <cwd> &&` dropped): its invocation is resolved from that input.
 		const resolved =
 			(await options.resolveInvocation?.(
@@ -662,376 +656,772 @@ function assembleAgentExecutionHost(
 		if (typeof result === "boolean") return result ? { ok: true } : { ok: false, reason };
 		return recheck && !result.ok ? { ...result, reason } : result;
 	};
-	const runtime = makeSpeculativeActionRuntime<
+	type Binding = Awaited<ReturnType<typeof resolveBinding>>;
+	type Bound = {
+		binding: Binding;
+		tool?: AgentTool;
+		turnID: string;
+		tools?: readonly AgentTool[];
+		executor?: Parameters<SpeculativeActionHost["execute"]>[2];
+		error?: { value: unknown };
+		rejections: CandidateRejection[];
+	};
+	const bound = new WeakMap<ExecutionCall, Bound>();
+	const attribution = new WeakMap<ExecutionCall, Prediction>();
+	const subscriptions = new RuntimeSubscriptions<AgentRuntimeEvents>();
+	const pending = new PendingTasks();
+	const turns = new Map<string, GeneratorTurn>();
+	const previews = new WeakMap<
+		GeneratorTurn,
+		Map<string, { input: string; run: Promise<SpeculativeRun<ToolSettlement> | undefined> }>
+	>();
+	const controllers = new WeakMap<GeneratorTurn, AbortController>();
+	let currentSettings: SpeculativeActionSettings = {
+		enabled: false,
+		resourceCacheMaxEntries: speculativeConfig().runtime.resourceCacheMaxEntries,
+	};
+	let timeline = new TaskTimeline(performance.now());
+	let sequence = 0;
+	let decision = 0;
+	let requestIndex = 0;
+	let tokenTotal = 0;
+	let closed = false;
+	const owners = new Map<string, CandidateEventDescriptor>();
+	const predictions = new Map<
 		string,
-		ToolSettlement,
-		AgentStartInput,
-		AgentConsumeInput,
-		AgentConsumeInput,
-		AgentStateData
-	>({
-		actionSemantics,
-		resources:
-			options.resources ??
-			createSystemResourceMonitor(async () => (await options.getSettings?.())?.scheduling),
-		sources: [
-			patternPlans.source,
-			drafterPlans.source,
-			executionPreparation.source,
-			...(options.actorForkPlanSource ? [options.actorForkPlanSource.source] : []),
-		],
-		settings: resolveSettings,
-		definitions: (input) =>
-			input.tools.map((tool) => ({
+		{
+			prediction: Prediction;
+			identity: PredictionIdentity;
+			key: ActionKey;
+			turnID: string;
+			lastDecision: number;
+			producer?: string;
+		}
+	>();
+	const lastActor = new Map<string, AgentRuntimeEvents["actor_materialized"]["identity"]>();
+	const emptyCache = (): SpeculativeCacheSnapshot => ({
+		cacheCapacity: currentSettings.resourceCacheMaxEntries,
+		cacheCold: 0,
+		cacheHot: 0,
+		inFlightJobs: 0,
+		resultEntries: 0,
+		resultBytes: 0,
+		branchEntries: 0,
+		branchBytes: 0,
+		exclusiveCandidates: 0,
+		sharedCandidates: 0,
+	});
+	type Envelope = "sessionID" | "turnID" | "timestamp" | "cache";
+	type Payload =
+		SpeculativeActionEvent<string> extends infer E ? (E extends {} ? Omit<E, Envelope> : never) : never;
+	const event = (turnID: string, payload: Payload) => {
+		if (!options.onEvent) return;
+		const subcomputations = service?.drainMetrics();
+		const full = {
+			...payload,
+			sessionID,
+			turnID,
+			timestamp: Date.now(),
+			cache: local?.snapshot() ?? emptyCache(),
+			...(subcomputations && Object.keys(subcomputations).length ? { subcomputations } : {}),
+		} as SpeculativeActionEvent<string>;
+		try {
+			void Promise.resolve(options.onEvent(full)).catch(() => {});
+		} catch {
+			/* Optional diagnostics. */
+		}
+	};
+	const catalog = (tools: readonly AgentTool[]): AgentStateData => ({
+		tools: new Map(tools.map((tool) => [tool.name, tool])),
+		schemaHashes: definitionSchemaHashes(tools.map((t) => ({ name: t.name, inputSchema: t.parameters }))),
+		patternIdentities: Object.fromEntries(
+			tools.flatMap((tool) => {
+				const source = callbackTools.get(tool)?.source ?? tool;
+				const id =
+					speculativeToolPatternIdentity(currentDefinition(source)?.execute ?? source.execute) ??
+					actionSemantics.definition(tool.name)?.patternIdentity;
+				return id ? [[tool.name, id]] : [];
+			}),
+		),
+	});
+	const generators: CallGenerator[] = [
+		patternPlans.source,
+		drafterPlans.source,
+		...(options.actorForkPlanSource ? [options.actorForkPlanSource.source] : []),
+	];
+	const remembered = new Map<string, { key: ActionKey; binding: ExecutionOperationBinding }>();
+	const remember = (
+		key: ActionKey | undefined,
+		tool: AgentTool | undefined,
+		bindings: readonly ExecutionOperationBinding[] = [],
+	) => {
+		if (!key || !tool) return;
+		for (const binding of bindings) {
+			if (binding.permissionHash !== key.hash || binding.available === false || binding.fed) continue;
+			const id = JSON.stringify([key.hash, binding.identity]);
+			remembered.delete(id);
+			remembered.set(id, { key, binding });
+			if (
+				remembered.size >
+				Math.min(currentSettings.resourceCacheMaxEntries, speculativeConfig().runtime.preparedOperations)
+			)
+				remembered.delete(remembered.keys().next().value!);
+		}
+		const commands = new Set([...remembered.values()].map((row) => row.key.key));
+		if (commands.size > speculativeConfig().runtime.preparedCommands) {
+			const oldest = commands.values().next().value;
+			for (const [id, row] of remembered) if (row.key.key === oldest) remembered.delete(id);
+		}
+	};
+	const local: LocalExecutionSession<ToolSettlement> | undefined = options.executionSession
+		? undefined
+		: new LocalExecutionSession({
+				settings: () => ({
+					reuseEnabled: currentSettings.reuseEnabled,
+					maxConcurrentActions: currentSettings.maxConcurrentActions,
+					resourceCacheMaxEntries: currentSettings.resourceCacheMaxEntries,
+					resourceCacheMaxBytes: currentSettings.resourceCacheMaxBytes,
+				}),
+				effect: (key) => actionSemantics.effect(key),
+				key: async (call) => bound.get(call)?.binding.action,
+				route: async (_call, key, signal, parent) =>
+					resolveExecutionRoute(key.tool, signal, key, parent?.checkpoint),
+				authorize: async (call, key, route, signal, recheck) => {
+					const action = (key.executionContext as ToolInvocation | undefined)?.operation?.permission ?? key;
+					return checkPermission(
+						bound.get(call)?.tool,
+						{ toolName: call.tool, args: action.input, action, route, signal },
+						recheck,
+					);
+				},
+				fork: async (call, action, route, callID, signal, resources, parent) => {
+					const { tool, turnID } = bound.get(call)!;
+					if (!tool) throw new Error("tool_unavailable");
+					const scope = { sessionID, turnID, callID };
+					return executionGateway.executeSpeculative(
+						{ tool: call.tool, callID, input: action.input, signal, action, scope },
+						route,
+						{
+							...resources,
+							cwd: options.cwd,
+							tool,
+							toolName: call.tool,
+							args: structuredClone(action.input),
+							action,
+							callID,
+							signal,
+							executionScope: scope,
+							acceptOperationScope: (s) => s.sessionID === sessionID,
+							parentCheckpoint: parent?.checkpoint,
+						},
+					);
+				},
+				capture: async (call, action, signal) => {
+					const { tool, turnID, binding } = bound.get(call)!;
+					if (!tool) return;
+					const definition = binding.invocation?.semantics ?? actionSemantics.definition(action ?? call.tool);
+					const captured = await executionGateway.captureAuthoritativeResult(
+						{
+							tool: call.tool,
+							callID: call.id,
+							action,
+							executionContext: binding.invocation,
+							effect: definition?.effect ?? "unbounded",
+							requirements: definition?.requirements ?? UNRESTRICTED_PROCESS_EFFECTS,
+						},
+						{ cwd: options.cwd, signal },
+						{
+							cwd: options.cwd,
+							tool,
+							toolName: call.tool,
+							args: call.input,
+							action,
+							executionContext: binding.invocation,
+							callID: call.id ?? call.tool,
+							signal,
+							executionScope: { sessionID, turnID },
+						},
+					);
+					return (
+						captured && {
+							...captured.capture,
+							route: captured.route,
+							computationDependencies: captured.computationDependencies,
+						}
+					);
+				},
+				native: async (call, action, signal, resources, dependencies) => {
+					const state = bound.get(call)!;
+					const { tool, turnID, binding, executor } = state;
+					const scope = { sessionID, turnID, callID: call.id };
+					const operation: AgentToolOperation = {
+						tool: call.tool,
+						input: call.input,
+						scope,
+						callID: call.id,
+						signal,
+						...binding,
+					};
+					const invoke = async () => {
+						if (executor) return executor(operation);
+						if (!tool) throw new Error("tool_unavailable");
+						const callID = call.id ?? call.tool;
+						if (binding.invocation?.authoritative)
+							return (await binding.invocation.authoritative({ callID, args: call.input, signal })).result;
+						return tool.execute(callID, call.input, signal);
+					};
+					try {
+						const result = await executionGateway.executeAuthoritative(
+							operation,
+							() =>
+								executionGateway.observeOperations(
+									action,
+									scope,
+									invoke,
+									(bindings, steps) => {
+										remember(action, tool, bindings);
+										if (steps) dependencies.push(...steps);
+									},
+									true,
+									resources.inputs,
+									{ cwd: options.cwd, signal, reuseEnabled: currentSettings.reuseEnabled },
+								),
+							{
+								settled: (receipt) => {
+									dependencies.push({ computation: receipt.toolExecution, shared: [receipt.toolExecution] });
+								},
+							},
+						);
+						return { result, isError: false };
+					} catch (error) {
+						state.error = { value: error };
+						return piToolErrorSettlement(call.tool, error);
+					} finally {
+						if (
+							(binding.invocation?.semantics ?? actionSemantics.definition(action ?? call.tool))?.effect !==
+							"observation"
+						)
+							await TimelineInterval.outside(() =>
+								Promise.allSettled(
+									executionWorlds.filter(inClosure).map(async (w) => w.actorFallbackSettled?.()),
+								),
+							);
+					}
+				},
+				reject: (output) => output.isError && output.exitCode === undefined,
+				writes: (paths) => service?.invalidate(paths),
+				observed: async (call, key, branch) => {
+					const state = bound.get(call)!;
+					remember(key, state.tool, branch?.operations);
+					if (state.tools)
+						await prepareOperations(
+							state.turnID,
+							state.tools,
+							actionSemantics.effect(key) === "workspace_mutation",
+						);
+				},
+				rejection: (call, rejection) => bound.get(call)?.rejections.push(rejection),
+				event: (call, id, route, status, ms, branch, failure) => {
+					const state = bound.get(call)!;
+					const pred = attribution.get(call);
+					const operation = (state.binding.action?.executionContext as ToolInvocation | undefined)?.operation;
+					const source = operation ? "backend" : (pred?.source ?? "actor_result");
+					const descriptor: CandidateEventDescriptor = {
+						id,
+						route,
+						tool: call.tool,
+						depth: pred?.depth ?? 0,
+						source,
+						mode: pred?.mode,
+						...(operation ? { kind: "operation" as const } : {}),
+						origin: operation
+							? "backend"
+							: source === "actor_result"
+								? "actor_result"
+								: source === "actor_preview"
+									? "actor_preview"
+									: "prediction",
+						predictedAction: diagnosticAction(call.tool, call.input, state.binding.action),
+						...(branch?.executionMetrics
+							? { world: { backend: branch.backend, executionMetrics: branch.executionMetrics } }
+							: {}),
+					};
+					owners.set(id, descriptor);
+					if (
+						owners.size >
+						currentSettings.resourceCacheMaxEntries + (currentSettings.maxConcurrentActions ?? 1)
+					)
+						owners.delete(owners.keys().next().value!);
+
+					event(state.turnID, {
+						type: "candidate",
+						candidate: descriptor,
+						state:
+							status === "running"
+								? { status }
+								: status === "succeeded"
+									? { status, executionMs: ms }
+									: { status, cause: failure ?? cause("execution", status), executionMs: ms },
+					});
+					if (status !== "running")
+						void subscriptions.publish("execution_settled", {
+							sessionID,
+							turnID: state.turnID,
+							candidate: descriptor,
+							reuseFeedback: pred?.feedback,
+							status,
+							executionMs: ms,
+						});
+				},
+			});
+	const session = options.executionSession ?? local!;
+	const disconnect = patternPlans.connect({
+		subscribe: (h) => subscriptions.subscribe(h),
+		settingsChanged: async () => {},
+	});
+	const refresh = async () => {
+		currentSettings = await resolveSettings();
+	};
+	const settlePrediction = (
+		id: string,
+		p: NonNullable<ReturnType<typeof predictions.get>>,
+		settlement: PredictionSettlement,
+		served: boolean,
+	) => {
+		predictions.delete(id);
+		p.prediction.onFeedback?.(settlement, served);
+		const info = { sessionID, turnID: p.turnID, tool: p.prediction.tool, action: p.key, settlement };
+		void subscriptions.publish("prediction_settled", info);
+		void subscriptions.publish("prediction_feedback", {
+			actionID: p.prediction.id,
+			feedback: p.prediction.feedback,
+			settlement,
+			served,
+		});
+		event(p.turnID, {
+			type: "prediction",
+			settlement,
+			tool: p.key.tool,
+			predictedAction: diagnosticAction(p.key.tool, p.key.input, p.key),
+			mode: p.prediction.mode,
+		});
+	};
+	const startTurn = async (startInput: AgentStartInput, external?: AbortSignal) => {
+		if (closed) return;
+		await refresh();
+		const { turnID } = startInput;
+		const controller = new AbortController();
+		const signal = external ? AbortSignal.any([controller.signal, external]) : controller.signal;
+		const data = catalog(startInput.tools);
+		const sequenceAtStart = ++decision;
+		const settings = currentSettings;
+		const turn: GeneratorTurn = {
+			startInput,
+			data,
+			signal,
+			session,
+			settings,
+			async issue(prediction, opts = {}) {
+				const preview = prediction.source === "actor_preview";
+				if (
+					signal.aborted ||
+					opts.signal?.aborted ||
+					(!preview && (!settings.enabled || (settings.tools && !settings.tools.includes(prediction.tool))))
+				)
+					return;
+				const tool = data.tools.get(prediction.tool);
+				if (!tool) return;
+				const args = prepareToolArguments(tool, prediction.input);
+				if (args === undefined) return;
+				const binding = await resolveBinding(tool.name, args, data.schemaHashes[tool.name], tool);
+				const key = binding.action;
+				if (!key || signal.aborted || opts.signal?.aborted) return;
+				const call: ExecutionCall = { tool: tool.name, input: asRecord(args) ?? {}, id: prediction.id };
+				bound.set(call, { tool, turnID, binding, rejections: [] });
+				attribution.set(call, prediction);
+				const effect = actionSemantics.effect(key) ?? "unbounded";
+				const run = session.speculate(call, {
+					after: effect !== "observation" ? (opts.previousWrite ?? opts.after) : opts.after,
+					signal: preview && opts.signal ? opts.signal : external,
+				});
+				if (!preview) {
+					const identity = {
+						id: run.runID,
+						source: prediction.source,
+						proposalID: prediction.group,
+						actionID: prediction.id,
+					};
+					const p = {
+						identity,
+						prediction,
+						key,
+						turnID,
+						lastDecision: sequenceAtStart + (prediction.latestHorizon ?? prediction.horizon ?? 0),
+						producer: undefined as string | undefined,
+					};
+					predictions.set(run.runID, p);
+					prediction.onIssued?.();
+					void subscriptions.publish("prediction_admitted", {
+						feedback: prediction.feedback,
+						actionID: prediction.id,
+						source: prediction.source,
+						issued: true,
+					});
+					void subscriptions.publish("candidate_materialized", {
+						sessionID,
+						turnID,
+						tool: key.tool,
+						predictedAction: key,
+						input: prediction.input,
+						source: prediction.source,
+						proposalID: prediction.group,
+						actionID: prediction.id,
+						depth: prediction.depth,
+						horizon: prediction.horizon,
+						targetDecision: sequenceAtStart + (prediction.horizon ?? 0),
+						lastDecision: sequenceAtStart + (prediction.latestHorizon ?? prediction.horizon ?? 0),
+						adoptionProbability: prediction.adoptionProbability,
+						empiricalProbability: prediction.empiricalProbability,
+						conditionalProbability: prediction.conditionalProbability,
+					});
+					void run.completion.then((result) => {
+						if (result.status === "completed") p.producer = result.producerRunID ?? run.runID;
+						else if (predictions.has(run.runID))
+							settlePrediction(
+								run.runID,
+								p,
+								{ prediction: identity, observation: "unobserved", cause: cause("admission", result.reason) },
+								false,
+							);
+					});
+				}
+				return { key, run, effect };
+			},
+			peers: (source, calls) => {
+				if (!signal.aborted)
+					for (const generator of generators)
+						if (generator.peers)
+							void pending.track(Promise.resolve(generator.peers(turn, source, calls))).catch(() => {});
+			},
+			async request(source, kind, signal, produce) {
+				let tokens = 0;
+				const report = await runSourceRequest({
+					request: { source, kind, turnID, index: requestIndex++, targetDecisionSequence: sequenceAtStart },
+					signal,
+					timeoutMs: settings.predictionTimeoutMs,
+					produce: (s) =>
+						produce(s, (n) => {
+							tokens += n;
+						}),
+					count: (n) => n,
+				});
+				const { value: _, ...record } = report;
+				const request = { ...record, draftTokens: tokens };
+				tokenTotal += tokens;
+				event(turnID, { type: "source_request", request, totalDraftTokens: tokenTotal });
+				await subscriptions.publish("source_request", { sessionID, turnID, request });
+			},
+		};
+		turns.set(turnID, turn);
+		controllers.set(turn, controller);
+		await subscriptions.publish("turn_started", {
+			startInput,
+			data,
+			settings,
+			decisionSequence: sequenceAtStart,
+			definitions: startInput.tools.map((tool) => ({
 				name: tool.name,
 				description: tool.description,
 				inputSchema: tool.parameters,
 			})),
-		stateData: (input) => ({
-			patternIdentities: Object.fromEntries(
-				input.tools.flatMap((tool) => {
-					const source = callbackTools.get(tool)?.source ?? tool;
-					const id = speculativeToolPatternIdentity(currentDefinition(source)?.execute ?? source.execute)
-						?? actionSemantics.definition(tool.name)?.patternIdentity;
-					return id ? [[tool.name, id]] : [];
-				}),
-			),
-			tools: new Map(input.tools.map((tool) => [tool.name, tool])),
-			// Concrete candidates prepare their routes inside the runtime's resource budget.
-			// Warming every possible tool here would bypass that budget before a proposal exists.
-			schemaHashes: definitionSchemaHashes(
-				input.tools.map((tool) => ({
-					name: tool.name,
-					inputSchema: tool.parameters,
-				})),
-			),
-		}),
-		actionKey: async (toolName, input, context) => {
-			let tool: AgentTool | undefined;
-			let validated: unknown;
-			if (context.type === "consume") {
-				const call = context.consumeInput as BoundActorCall;
-				const bind = call[ACTOR_OPERATION];
-				if (bind) return (await bind()).action;
-				tool = call.tools.find((candidate) => candidate.name === toolName);
-				validated = call[RAW_ACTOR_CALL]
-					? tool && prepareToolArguments(tool, input)
-					: immutableSnapshot(input);
-			} else {
-				tool = context.data.tools.get(toolName);
-				validated = tool && prepareToolArguments(tool, input);
-			}
-			if (!tool || validated === undefined) return undefined;
-			const schemaHash =
-				context.type === "consume"
-					? stableValueHash(tool.parameters ?? null)
-					: context.data.schemaHashes[toolName];
-			const { action, invocation } = await resolveBinding(toolName, validated, schemaHash, tool);
-			const operation = context.type === "start" ? context.operation : undefined;
-			if (!operation) return action;
-			const definition = action && actionSemantics.definition(action);
-			if (!action || !invocation || !definition || operation.permissionHash !== action.hash) return undefined;
-			const epoch = `${definition.epoch}:operation:${operation.backend}`;
-			return buildActionKey({
-				...action,
-				input: { operation: operation.identity },
-				semanticsEpoch: epoch,
-				semantics: {
-					...definition,
-					resourceScope: undefined,
-					...operation.semantics,
-					epoch,
-				},
-				executionContext: Object.freeze({
-					...invocation,
-					operation: Object.freeze({ binding: operation, permission: action }),
-				}),
-			});
-		},
-		resolveExecution: ({ tool, action, signal, parentWorld }) =>
-			resolveExecutionRoute(tool, signal, action, parentWorld?.checkpoint),
-		captureAuthoritativeResult: async ({
-			startInput,
-			consumeInput,
-			tool: toolName,
-			concrete,
-			action,
-			callID,
 			signal,
-		}) => {
-			const tool = consumeInput.tools.find((tool) => tool.name === toolName);
-			if (!tool) return undefined;
-			const invocation =
-				(await (consumeInput as BoundActorCall)[ACTOR_OPERATION]?.())?.invocation ??
-				(action?.executionContext as ToolInvocation | undefined);
-			const definition = invocation?.semantics ?? actionSemantics.definition(action ?? toolName);
-			const captured = await executionGateway.captureAuthoritativeResult(
-				{
-					tool: toolName,
-					callID,
-					action,
-					executionContext: invocation,
-					effect: definition?.effect ?? "unbounded",
-					requirements: definition?.requirements ?? UNRESTRICTED_PROCESS_EFFECTS,
-				},
-				{ cwd: options.cwd, signal },
-				{
-					cwd: options.cwd,
-					tool,
-					toolName,
-					args: concrete,
-					action,
-					executionContext: invocation,
-					callID,
-					signal,
-					executionScope: {
-						sessionID: startInput.sessionID,
-						turnID: startInput.turnID,
-					},
-				},
-			);
-			return (
-				captured && {
-					route: captured.route,
-					computationDependencies: captured.computationDependencies,
-					...captured.capture,
+		});
+		for (const generator of generators)
+			void pending.track(Promise.resolve(generator.start(turn))).catch(() => {});
+	};
+	let workspaceCursor: import("./resource-version.ts").ResourceVersionToken | undefined;
+	let maintenance = Promise.resolve();
+	const prepareOperations = (turnID: string, tools: readonly AgentTool[], write: boolean) => {
+		maintenance = maintenance
+			.then(async () => {
+				const settings = currentSettings;
+				if (
+					!local ||
+					closed ||
+					!settings.enabled ||
+					settings.reuseEnabled === false ||
+					!settings.prepareObservedOperations ||
+					!remembered.size
+				)
+					return;
+				const before = workspaceCursor;
+				workspaceCursor = await observeResourceChanges(options.cwd).catch(() => undefined);
+				const changed = before?.manager.changesSince(before);
+				await before?.release();
+				if (
+					!write &&
+					(!changed ||
+						(!changed.uncertain &&
+							!changed.paths.some((p) => !path.relative(options.cwd, p).split(path.sep).includes(".git"))))
+				)
+					return;
+				for (const { key, binding } of remembered.values()) {
+					const tool = tools.find((t) => t.name === key.tool);
+					if (
+						!tool ||
+						stableValueHash(tool.parameters ?? null) !== key.schemaHash ||
+						binding.available === false ||
+						binding.fed
+					)
+						continue;
+					void pending
+						.track(
+							(async () => {
+								if ((await binding.stale?.()) !== true || closed) return;
+								const permission = (await resolveBinding(tool.name, key.input, key.schemaHash, tool)).action;
+								const definition = permission && actionSemantics.definition(permission);
+								if (!permission || permission.hash !== binding.permissionHash || !definition) return;
+								const epoch = definition.epoch + ":operation:" + binding.backend;
+								const op = buildActionKey({
+									...permission,
+									input: { operation: binding.identity },
+									semanticsEpoch: epoch,
+									semantics: { ...definition, resourceScope: undefined, ...binding.semantics, epoch },
+									executionContext: {
+										...(permission.executionContext as ToolInvocation),
+										operation: { binding, permission },
+									},
+								});
+								const call: ExecutionCall = { tool: tool.name, input: key.input };
+								bound.set(call, { tool, turnID, binding: { action: op }, rejections: [] });
+								local.speculate(call);
+							})(),
+						)
+						.catch(() => {});
 				}
-			);
-		},
-		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),
-		preflightCandidate: ({ data, tool: toolName, concrete, action, route, signal }) => {
-			const permission =
-				(action.executionContext as ToolInvocation | undefined)?.operation?.permission ?? action;
-			return checkPermission(data.tools.get(toolName), {
-				toolName,
-				args: permission === action ? concrete : permission.input,
-				action: permission,
-				route,
-				signal,
-			});
-		},
-		authorizeCandidate: ({ stateData, tool: toolName, concrete, action, route, signal }) =>
-			checkPermission(
-				stateData.tools.get(toolName),
-				{
-					toolName,
-					args: concrete,
-					action,
-					route,
-					signal: signal ?? new AbortController().signal,
-				},
-				true,
-			),
-		executeCandidate: async ({
-			startInput,
-			data,
-			tool: toolName,
-			concrete,
-			route,
-			parentWorld,
-			candidate: _candidate,
-			index: _index,
-			...context
-		}) => {
-			const { action, callID, signal } = context;
-			const tool = data.tools.get(toolName);
-			if (!tool) throw new Error(`Tool ${toolName} not found`);
-			const args = structuredClone(concrete);
-			const executionScope = {
-				sessionID: startInput.sessionID,
-				turnID: startInput.turnID,
-				callID,
-			};
-			return executionGateway.executeSpeculative(
-				{
-					tool: toolName,
-					callID,
-					input: args,
-					signal,
-					action,
-					scope: executionScope,
-				},
-				route,
-				{
-					...context,
-					cwd: options.cwd,
-					tool,
-					toolName,
-					args,
-					executionScope,
-					...(parentWorld?.checkpoint ? { parentCheckpoint: parentWorld.checkpoint } : {}),
-				},
-			);
-		},
-		observationKey: toolObservationKey,
-		rejectCandidateOutput: ({ output }) =>
-			output.isError && output.exitCode === undefined ? "tool_error_result" : undefined,
-		onResourceWrites: (paths) => service.invalidate(paths),
-		onEvent: options.onEvent && ((event) => {
-			const subcomputations = service.drainMetrics();
-			return options.onEvent!(Object.keys(subcomputations).length ? { ...event, subcomputations } : event);
-		}),
-	});
-	const disconnect = [
-		patternPlans.connect(runtime),
-		drafterPlans.connect(runtime),
-		executionPreparation.connect(runtime),
-	];
+			})
+			.catch(() => {});
+		return maintenance;
+	};
+	const finishTurn = async (turnID: string, terminal = false) => {
+		const turn = turns.get(turnID);
+		if (turn) {
+			controllers.get(turn)?.abort();
+			turns.delete(turnID);
+			const actor = lastActor.get(turnID);
+			for (const [id, p] of predictions)
+				if (terminal || p.lastDecision <= decision) {
+					settlePrediction(
+						id,
+						p,
+						actor
+							? {
+									prediction: p.identity,
+									observation: "observed",
+									actorAction: actor,
+									match: { matched: false },
+								}
+							: {
+									prediction: p.identity,
+									observation: "unobserved",
+									cause: cause("control", "turn_finished"),
+								},
+						false,
+					);
+				}
+			lastActor.delete(turnID);
+			await subscriptions.publish("turn_finished", { ...turn, terminal });
+		}
+		await Promise.all(executionWorlds.filter(inClosure).map((w) => w.finishTurn?.(turnID)));
+		if (terminal) {
+			event(turnID, { type: "task", timing: timeline.measure(performance.now()) });
+			timeline = new TaskTimeline(performance.now());
+		}
+	};
 	return {
 		sessionID,
-		runtime,
+		runtime: { subscribe: (h) => subscriptions.subscribe(h), settingsChanged: refresh },
 		executionWorldDiagnostics: (refresh = false) =>
-			executionGateway.diagnostics({
-				cwd: options.cwd,
-				...(refresh ? { refresh: true } : {}),
-			}),
-		startTurn: (input, signal) => runtime.startTurn({ ...input, sessionID }, signal),
-		previewActorTool: (input, signal) => runtime.previewActorTool({ ...input, sessionID }, signal),
-		previewActorCall: (input, signal) =>
-			runtime.previewActorCall({ ...input, sessionID, [RAW_ACTOR_CALL]: true } as BoundActorCall, signal),
-		execute: (input, signal, executor) =>
-			runtime.trackActorTool(sessionID, async (issuedAt) => {
-				const scope = input.turnID
-					? {
-							sessionID,
-							turnID: input.turnID,
-							...(input.id !== undefined ? { callID: input.id } : {}),
-						}
-					: undefined;
-				const operation: AgentToolOperation = {
-					tool: input.tool,
-					scope,
-					input: immutableSnapshot(input.args),
-					...(input.id ? { callID: input.id } : {}),
-					...(signal ? { signal } : {}),
-				};
-				let binding: Promise<AgentToolOperation> | undefined;
-				// One invocation owns its binding; prepare after Actor arrival so timing includes binding cost.
-				const bind = () =>
-					(binding ??= (async () => {
-						const tool = input.tools.find((tool) => tool.name === input.tool);
-						return Object.freeze({
-							...operation,
-							...(await resolveBinding(
-								operation.tool,
-								operation.input,
-								tool ? stableValueHash(tool.parameters ?? null) : undefined,
-								tool,
-							)),
-						});
-					})());
-				const actorCall = input.turnID
-					? {
-							...input,
-							sessionID,
-							turnID: input.turnID,
-							args: operation.input,
-							[ACTOR_OPERATION]: bind,
-						}
-					: undefined;
-				let prepared: PreparedActorCall<ToolSettlement> | undefined;
-				let operations: ExecutionOperationBinding[] | undefined;
-				const computations: TimelineDependency[] = [];
-				return executionGateway.executeAuthoritative(
-					operation,
-					async () => {
-						const bound = await bind();
-						const execute = (inputs?: (path?: string) => Iterable<object>) =>
-							scope
-								? executionGateway.observeOperations(
-										bound.action,
-										scope,
-										() => executor(bound),
-										(bindings, dependencies) => {
-											if (bindings.length) (operations ??= []).push(...bindings);
-											if (dependencies) computations.push(...dependencies);
-										},
-										prepared?.observeOperations,
-										inputs,
-										{
-											cwd: options.cwd,
-											signal,
-											reuseEnabled: prepared?.reuseEnabled,
-										},
-									)
-								: executor(bound);
-						try {
-							return await (prepared?.withInputs ? prepared.withInputs(execute) : execute());
-						} finally {
-							if (
-								(bound.invocation?.semantics ?? actionSemantics.definition(bound.action ?? bound.tool))
-									?.effect !== "observation"
-							) {
-								await TimelineInterval.outside(() =>
-									Promise.allSettled(
-										executionWorlds.filter(inClosure).map(async (world) => world.actorFallbackSettled?.()),
-									),
-								);
-							}
-						}
-					},
-					{
-						computationDependencies: () => computations,
-						...(actorCall
-							? {
-									reuse: async () => {
-										prepared = await runtime.prepareActorCall(actorCall, signal, issuedAt);
-										const output = prepared?.output;
-										if (output?.isError)
-											throw ToolExecutionGateway.reusedFailure(
-												output.result.content
-													.flatMap((item) => (item.type === "text" ? [item.text] : []))
-													.join("\n"),
-											);
-										return output?.result;
-									},
-									settled: async (settlement) => {
-										if (!prepared) return;
-										// The Actor's own failed command carries its exit code, as a speculative one does.
-										const output =
-											settlement.status === "succeeded"
-												? { result: settlement.output, isError: false }
-												: piToolErrorSettlement(input.tool, settlement.error);
-										await prepared.settle(settlement.toolExecution, output, operations);
-									},
-								}
-							: {}),
-					},
-				);
-			}),
-		drafterBudgetSnapshot: drafterPlans.snapshot,
-		finishTurn: async (turnID, terminal = false) => {
+			executionGateway.diagnostics({ cwd: options.cwd, refresh }),
+		startTurn: (input, signal) => startTurn({ ...input, sessionID }, signal),
+		previewActorCall: async (input, signal) => {
+			const turn = turns.get(input.turnID);
+			if (!turn || currentSettings.reuseEnabled === false || signal?.aborted) return;
+			const submit = () =>
+				turn
+					.issue(
+						{
+							source: "actor_preview",
+							group: "preview",
+							id: input.id ?? "preview",
+							tool: input.tool,
+							input: asRecord(input.args) ?? {},
+						},
+						{ signal },
+					)
+					.then((p) => p?.run);
+			if (!input.id) return submit();
+			let issued = previews.get(turn);
+			if (!issued) previews.set(turn, (issued = new Map()));
+			const signature = stableValueHash([input.tool, input.args]);
+			const prior = issued.get(input.id);
+			if (prior?.input === signature) return prior.run;
+			if (prior) void prior.run.then((run) => run && session.release(run.runID));
+			const run = submit();
+			issued.set(input.id, { input: signature, run });
+			return run;
+		},
+		execute: async (input, signal, executor) => {
+			const issued = performance.now();
+			const finish = timeline.startToolWait(issued);
 			try {
-				await runtime.finishTurn({
-					sessionID,
+				const turnID = input.turnID ?? "";
+				const turn = turns.get(turnID);
+				const tool = input.tools.find((t) => t.name === input.tool);
+				const args = immutableSnapshot(input.args);
+				const identity = {
+					id: input.id ?? "actor-" + (sequence + 1),
+					sequence: ++sequence,
+					decisionSequence: decision,
 					turnID,
-					tool: "",
-					args: {},
-					tools: [],
-					terminal,
-				});
-			} finally {
-				const closed = await Promise.allSettled(
-					executionWorlds.filter(inClosure).map(async (world) => world.finishTurn?.(turnID)),
+				};
+				const call: ExecutionCall = { tool: input.tool, input: asRecord(args) ?? {}, id: identity.id };
+				const binding = await resolveBinding(
+					input.tool,
+					args,
+					tool && stableValueHash(tool.parameters ?? null),
+					tool,
 				);
-				const failures = closed.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
-				if (failures.length) throw new AggregateError(failures, "Execution world turn cleanup failed");
+				const state: Bound = { binding, tool, turnID, tools: input.tools, executor, rejections: [] };
+				bound.set(call, state);
+				const action = binding.action;
+				if (action)
+					void subscriptions.publish("actor_materialized", {
+						sessionID,
+						turnID,
+						identity,
+						action,
+						tool: call.tool,
+						input: action.input,
+					});
+				const result = await session.execute(call, { signal });
+				const durationMs = result.toolExecution.completedAt - result.toolExecution.startedAt;
+				const roots = [{ computation: result.toolExecution, reused: result.reusedInterval ?? result.served }];
+				const computation = timeline.recordCall(roots, issued, performance.now());
+				const candidate = (result.producerRunID && owners.get(result.producerRunID)) || undefined;
+				const adopted = TimelineInterval.reusedProducers(roots);
+				const matched: PredictionIdentity[] = [];
+				const match = {
+					kind: result.reuseKind ?? "exact",
+					distance: result.reuseKind === "inputs" ? 1 : 0,
+				} as const;
+				for (const [id, p] of predictions) {
+					const relation = action && actionKeyMatch(p.key, action);
+					const producer = p.producer ?? id;
+					const served = (result.served && producer === result.producerRunID) || adopted.has(producer);
+					if (!relation && !served) continue;
+					if (relation) matched.push(p.identity);
+					const fact = { prediction: p.identity, observation: "observed" as const, actorAction: identity };
+					const settlement: PredictionSettlement = relation
+						? {
+								...fact,
+								match: {
+									matched: true,
+									relation,
+									adoption: served
+										? { status: "adopted", candidateID: result.producerRunID ?? id }
+										: {
+												status: "rejected",
+												cause: state.rejections[0]?.cause ?? cause("matching", "actor_fallback"),
+											},
+								},
+							}
+						: { ...fact, match: { matched: false } };
+					settlePrediction(id, p, settlement, served);
+				}
+				lastActor.set(turnID, identity);
+
+				const settlement: AgentRuntimeEvents["actor_settled"]["settlement"] = {
+					actorAction: identity,
+					tool: call.tool,
+					actionKeyHash: action?.hash,
+					matchedPredictions: matched,
+					rejections: state.rejections,
+					provider: result.served
+						? candidate?.origin === "actor_preview" && match.kind === "exact"
+							? {
+									kind: "actor",
+									origin: "preview",
+									candidateID: candidate.id,
+									durationMs,
+									isError: false,
+									toolExecution: result.toolExecution,
+								}
+							: {
+									kind: "speculative",
+									candidateID: result.producerRunID ?? identity.id,
+									match: match as import("./action-semantics.ts").ActionKeyMatch,
+									toolExecution: result.toolExecution,
+								}
+						: {
+								kind: "actor",
+								origin: "fallback",
+								cause:
+									state.rejections[0]?.cause ??
+									cause("matching", action ? "no_reusable_candidate" : "action_not_keyable"),
+								durationMs,
+								isError: result.output.isError,
+								toolExecution: result.toolExecution,
+							},
+				};
+				const feedback = { sessionID, turnID, action, settlement, computation, candidate };
+				event(turnID, {
+					type: "actor_action",
+					settlement,
+					computation,
+					candidate,
+					actualAction: diagnosticAction(call.tool, call.input, action),
+				});
+				void subscriptions.publish("actor_settled", feedback);
+				if (turn)
+					await subscriptions.publish("actor_observed", {
+						...feedback,
+						...turn,
+						consumeInput: { ...input, turnID, sessionID },
+						tool: call.tool,
+						concrete: call.input,
+						output: result.output,
+						durationMs,
+						order: identity.sequence,
+						signal: turn.signal,
+					});
+				if (state.error) throw state.error.value;
+				if (result.output.isError)
+					throw ToolExecutionGateway.reusedFailure(
+						result.output.result.content.flatMap((i) => (i.type === "text" ? [i.text] : [])).join("\n"),
+					);
+				return result.output.result;
+			} finally {
+				finish(performance.now());
 			}
 		},
+		finishTurn,
+		drafterBudgetSnapshot: drafterPlans.snapshot,
 		dispose: async () => {
+			if (closed) return;
+			closed = true;
 			try {
-				await runtime.disposeSession(sessionID);
+				for (const id of turns.keys()) await finishTurn(id);
+				await session.close();
+				await maintenance;
+				await workspaceCursor?.release();
+				await pending.drain();
+				await subscriptions.publish("session_closed", { sessionID, terminal: true });
 			} finally {
-				for (const unsubscribe of disconnect) unsubscribe();
-				try {
-					await patternPlans.dispose();
-				} finally {
-					try {
-						await executionPreparation.dispose();
-					} finally {
-						await executionGateway.dispose();
-					}
-				}
+				disconnect();
+				drafterPlans.finish();
+				await patternPlans.dispose();
+				await executionGateway.dispose();
 			}
 		},
 	};

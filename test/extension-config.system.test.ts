@@ -117,7 +117,7 @@ test("extension storage GC retains accepted clock certificates and setSettings r
 			const gc = vi.spyOn(ProvenanceCertificateStore.prototype, "gc");
 			try {
 				expect(
-					await interact(["Advanced settings", "Scheduling and storage", "Reclaim reusable command history"]),
+					await interact(["Advanced settings", "Concurrency and storage", "Reclaim reusable command history"]),
 				).toEqual([expect.stringMatching(/^Reusable command history reclaimed:/)]);
 				expect(gc).toHaveBeenCalledTimes(1);
 			} finally {
@@ -147,7 +147,7 @@ test("extension storage GC retains accepted clock certificates and setSettings r
 				.soft(settings.effective())
 				.toMatchObject({ drafterTemperatureMin: value, drafterTemperatureMax: value });
 		}
-		const storagePage = ["Advanced settings", "Scheduling and storage"];
+		const storagePage = ["Advanced settings", "Concurrency and storage"];
 		expect
 			.soft(await edit(storagePage, "Live result memory", "0.5"))
 			.toEqual(["Speculative-action settings applied."]);

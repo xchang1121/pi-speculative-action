@@ -255,10 +255,6 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 				effect: "unbounded" as const,
 				requirements: UNRESTRICTED_PROCESS_EFFECTS,
 			}),
-			...backend.operationHints(binding),
-			get executionMs() {
-				return reference.deref()?.executionMs ?? 0;
-			},
 			get available() {
 				return reference.deref()?.available ?? false;
 			},
@@ -412,7 +408,6 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 											signal: context.signal,
 											onOperationAdopted: context.onOperationAdopted,
 											acceptOperationScope: context.acceptOperationScope,
-											onOperationJoinable: context.onOperationJoinable,
 										});
 										try {
 											if (operation) {

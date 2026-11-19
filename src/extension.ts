@@ -68,7 +68,7 @@ import {
 	resolvePiToolInvocation,
 } from "./pi-tool-invocation.ts";
 import { asRecord, errorMessage } from "./primitives.ts";
-import type { SpeculativeActionEvent } from "./runtime-engine.ts";
+import type { SpeculativeActionEvent } from "./settlement.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import {
 	SelfSpeculationCoordinator,
@@ -126,17 +126,6 @@ const SETTING_LABELS: Readonly<Record<string, string>> = {
 	"selfSpeculation.forkDecoder": "Forked tool-call decoder",
 	"selfSpeculation.forkForcedPrefix": "Forced tool-call prefix override ('auto' to derive)",
 	"selfSpeculation.apiKeyEnv": "Authentication token environment variable name (not the token)",
-	"scheduling.resourcePollIntervalMs": "Resource sampling interval (ms)",
-	"scheduling.gpuPollIntervalMs": "GPU sampling interval (ms)",
-	"scheduling.gpuProbeTimeoutMs": "GPU query timeout (ms)",
-	"scheduling.failureThreshold": "Failures before circuit opens",
-	"scheduling.failureRetryDecisions": "Retry every N eligible Actor decisions",
-	"scheduling.heavyCpu": "Process/tree CPU units",
-	"scheduling.lightCpu": "File snapshot CPU units",
-	"scheduling.heavyMemoryBytes": "Process/tree memory",
-	"scheduling.lightMemoryBytes": "File snapshot memory",
-	"scheduling.heavyIo": "Process/tree I/O fraction",
-	"scheduling.lightIo": "File snapshot I/O fraction",
 	"patternAware.maxContextLength": "Previous actions used as context",
 	"patternAware.maxFutureGap": "Maximum skipped Actor decisions",
 	"patternAware.futureGapCoverage": "Early-prediction coverage (0-1)",
@@ -227,7 +216,6 @@ export function formatSpeculativeActionStatus(input: {
 		`Candidate requests per Actor decision: ${settings.candidateLimit}`,
 		`Model Drafter policy: ${settings.drafterMaxDepth} out-of-order follow-up batches; ${settings.drafterDeterministicCandidates} temperature-0 candidates; sampling ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
 		`Speculative resource units per session: ${settings.maxConcurrentActions}`,
-		`Scheduler: sampling ${formatDuration(settings.scheduling.resourcePollIntervalMs)}; failure circuit ${settings.scheduling.failureThreshold} failures / ${settings.scheduling.failureRetryDecisions} eligible decisions`,
 		`Storage policy: ${settings.resourceCacheMaxEntries} live results/${formatBytes(settings.resourceCacheMaxBytes)}; ${settings.executionStoreMaxEntries} reusable commands/${formatBytes(settings.executionStoreMaxBytes)}`,
 		`Pattern predictions: ${onOff(settings.patternAware.enabled)}; learning active; follow-up steps: ${onOff(settings.patternAware.multiStepEnabled)} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
 
@@ -296,16 +284,12 @@ export function createSpeculativeActionExtension(
 		pi.on("message_update", (event, ctx) => {
 			controller?.observeActorOutput(event.assistantMessageEvent);
 			for (const preview of actorStream.observe(event.assistantMessageEvent)) {
-				if (preview.type === "tool") {
-					controller?.previewActorTool(preview.tool, ctx.signal);
-				} else {
 					controller?.previewActorCall(
 						preview.call.name,
 						preview.call.id,
 						preview.call.arguments,
 						ctx.signal,
 					);
-				}
 			}
 		});
 		pi.on("message_end", (event) => {
@@ -792,11 +776,6 @@ async function installController(
 				host.previewActorCall({ turnID, id: callID, tool, args: input, tools: turnTools }, signal),
 			);
 		},
-		previewActorTool: (tool: string, signal?: AbortSignal) => {
-			const turnID = currentTurnID;
-			if (!turnID) return;
-			void recoverSpeculation(() => host.previewActorTool({ turnID, tool }, signal));
-		},
 		decorateActorPayload: (payload: unknown) => selfSpeculation.decorateActorPayload(payload),
 		observeActorOutput: (event: Parameters<SelfSpeculationCoordinator["observeActorOutput"]>[0]) =>
 			selfSpeculation.observeActorOutput(event),
@@ -939,7 +918,7 @@ const SETTINGS_PAGES: Readonly<Record<string, readonly string[]>> = {
 		"Restore defaults",
 	],
 	"Prediction sources": ["Model Drafter", "Prediction tools", "Actor probe", "Learned patterns"],
-	"Advanced settings": ["Model Drafter", "Actor probe", "Learned patterns", "Scheduling and storage"],
+	"Advanced settings": ["Model Drafter", "Actor probe", "Learned patterns", "Concurrency and storage"],
 	"Model Drafter": [
 		"draftModel",
 		...Object.keys(SETTING_LABELS).filter((key) => key.startsWith("drafter") || key === "candidateLimit"),
@@ -959,15 +938,13 @@ const SETTINGS_PAGES: Readonly<Record<string, readonly string[]>> = {
 	],
 	"Actor probe": Object.keys(SETTING_LABELS).filter((key) => key.startsWith("selfSpeculation.")),
 	"Learned patterns": Object.keys(SETTING_LABELS).filter((key) => key.startsWith("patternAware.")),
-	"Scheduling and storage": [
+	"Concurrency and storage": [
 		...Object.keys(SETTING_LABELS).filter((key) =>
 			/^(maxConcurrentActions|resourceCache|executionStore)/.test(key),
 		),
-		"Scheduler policy",
 		"Reclaim reusable command history",
 		"Clear reusable command history",
 	],
-	"Scheduler policy": Object.keys(SETTING_LABELS).filter((key) => key.startsWith("scheduling.")),
 };
 
 async function openSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
@@ -995,7 +972,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 				? {
 						"Apply changes": dirty ? "Apply changes (pending)" : "Apply changes",
 						"Prediction sources": `Prediction sources › ${sourceSummary(draft)}`,
-						"Advanced settings": "Advanced settings › tuning, decoding, scheduling, storage",
+						"Advanced settings": "Advanced settings › tuning, decoding, concurrency, storage",
 						"Save settings to": `Save settings to: ${global ? "All projects" : "This project"}${isDeepStrictEqual(applied, controller.settings()) ? "" : " (this project overrides shared settings)"}`,
 					}
 				: page === "Model Drafter"
@@ -1197,7 +1174,6 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 				formatDuration(event.request.durationMs),
 			);
 			break;
-		case "operation_prediction":
 		case "prediction": {
 			const settlement = event.settlement;
 			parts.push(settlement.prediction.source, settlement.prediction.actionID);

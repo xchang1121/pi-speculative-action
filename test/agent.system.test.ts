@@ -1,12 +1,12 @@
 import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fauxAssistantMessage, fauxToolCall, fauxText, type Context } from "@earendil-works/pi-ai";
-import { createReadTool } from "@earendil-works/pi-coding-agent";
+import { createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, test, vi } from "vitest";
 import { bindResourceOperation, createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
+import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 import { DrafterTaskBudget } from "../src/drafter-plan-source.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
-import { SpeculationScheduler } from "../src/system-resources.ts";
 import { TimelineInterval } from "../src/task-timing.ts";
 import { ResourceInputSession, ResourceReadView, ResourceVersionManager } from "../src/resource-version.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
@@ -16,7 +16,7 @@ import {
 	type ActionSemanticsDefinition,
 } from "../src/action-semantics.ts";
 import { readText, temporaryDirectories } from "./filesystem.ts";
-import { expectHiddenCompute, idleResources, resourceWorld, systemHost } from "./agent-system-fixture.ts";
+import { expectHiddenCompute, resourceWorld, systemHost } from "./agent-system-fixture.ts";
 import { onExit, deferred, disposable, gated, nextTurn } from "./async.ts";
 import { textOutput } from "./linux-process-fixture.ts";
 import { testModel, toolUse } from "./model.ts";
@@ -80,47 +80,80 @@ test("settles canonical read defaults exactly and rebuilds another range from se
 	expect(f.fallbacks).toEqual([]);
 });
 
-test("schedules a Drafter call with the measured duration of recent Actor calls to its tool", async () => {
+test("keeps Actor and speculative read evidence across intervening turns and rejects a changed input", async () => {
 	const cwd = await directories.create();
-	for (const file of ["one", "two", "next"]) await writeText(cwd, file, file);
-	let trained = false;
+	await writeText(cwd, "early.txt", "early\nsecond\n");
+	await writeText(cwd, "actor.txt", "actor\nsecond\n");
+	const tools = [createReadTool(cwd)];
+	const f = systemHost(cwd, tools);
+	await using _close = onExit(f.dispose);
+	await f.start();
+	await f.preview("read", { path: "early.txt" });
+	await f.ready();
+	expect(await f.host.execute({ turnID: "first", tool: "read", args: { path: "actor.txt" }, tools })).toEqual(
+		await f.oracle("read", { path: "actor.txt" }),
+	);
+	await f.finish();
+	for (let index = 0; index < 4; index++) {
+		await f.start("detour-" + index);
+		await writeText(cwd, "detour.txt", String(index));
+		await f.execute("read", { path: "detour.txt" });
+		await f.finish();
+	}
+	await f.start("consume");
+	for (const file of ["early.txt", "actor.txt"]) {
+		const args = { path: file, offset: 2, limit: 1 };
+		expect(await f.execute("read", args)).toEqual(await f.oracle("read", args));
+		expect(f.actors.at(-1)?.settlement.provider).toMatchObject({
+			kind: "speculative",
+			match: { kind: "inputs" },
+		});
+		const run = await f.preview("read", args);
+		expect(await run?.completion).toMatchObject({ status: "completed", served: true, reuseKind: "inputs" });
+	}
+	await writeText(cwd, "early.txt", "fresh\nchanged\n");
+	const changed = { path: "early.txt", offset: 2, limit: 1 };
+	expect(await f.execute("read", changed)).toEqual(await f.oracle("read", changed));
+});
+test("the Drafter reads its predecessor's private workspace before either Actor call", async () => {
+	const cwd = await directories.create();
+	const sandbox = new WorkspaceSandboxService();
+	const file = "state.txt";
+	await writeText(cwd, file, "old");
 	const f = systemHost(
 		cwd,
-		[createReadTool(cwd)],
+		[createReadTool(cwd), createWriteTool(cwd)],
 		{
-			complete: async () => (trained ? toolUse("read", { path: "next" }) : fauxAssistantMessage("done")),
+			executionWorlds: [sandbox.createExecutionWorld(), resourceWorld()],
+			complete: async (_model, context) => {
+				if (context.tools?.[0]?.name === "speculative_observations")
+					return fauxAssistantMessage("wait for the actual result");
+				if (context.messages.some((m) => m.role === "toolResult"))
+					return toolUse("read", { path: file }, { id: "child" });
+				return toolUse("write", { path: file, content: "private" }, { id: "parent" });
+			},
 		},
-		{ drafterEnabled: true, drafterMaxDepth: 0 },
+		{ drafterEnabled: true, drafterMaxDepth: 1, maxConcurrentActions: 2 },
 	);
-	await using _close = onExit(() => f.dispose());
-	const observed: number[] = [];
-	f.host.runtime.subscribe({
-		actor_observed: ({ durationMs }) => {
-			observed.push(durationMs);
-		},
+	await using _close = onExit(async () => {
+		await f.dispose();
+		await sandbox.dispose();
 	});
 	await f.start();
-	for (const file of ["one", "two"]) await f.execute("read", { path: file });
-	await f.finish();
-	expect(observed).toHaveLength(2);
-	expect(observed.every((ms) => ms > 0)).toBe(true);
-	const expected = (observed[0]! + observed[1]!) / 2;
-	const evaluate = vi.spyOn(SpeculationScheduler.prototype, "evaluate");
-	try {
-		trained = true;
-		await f.start("next");
-		await f.ready(1, "drafter");
-		expect(f.materialized).toContainEqual(
-			expect.objectContaining({ source: "drafter", expectedDurationMs: expected }),
-		);
-		expect(evaluate.mock.calls.flatMap(([forecasts]) => forecasts)).toContainEqual(
-			expect.objectContaining({ tool: "read", expectedDurationMs: expected }),
-		);
-	} finally {
-		evaluate.mockRestore();
-	}
+	await f.ready(2);
+	const child = f.completed(file).find((e) => e.candidate.tool === "read")!.candidate.id;
+	expect(await readText(cwd, file)).toBe("old");
+	expect(textOutput(await f.execute("read", { path: file }))).toBe("old");
+	expect(f.actors.at(-1)?.settlement.provider.candidateID).not.toBe(child);
+	await f.execute("write", { path: file, content: "private" });
+	expect(await readText(cwd, file)).toBe("private");
+	expect(textOutput(await f.execute("read", { path: file }))).toBe("private");
+	expect(f.actors.at(-1)?.settlement.provider).toMatchObject({
+		kind: "speculative",
+		candidateID: child,
+		match: { kind: "exact" },
+	});
 });
-
 test.skipIf(process.platform !== "linux")(
 	"consumes live inputs before opening persistent history",
 	async () => {
@@ -520,7 +553,7 @@ test.for([
 		reuseEnabled: !noReuse,
 		drafterEnabled: source === "prediction",
 		resourceCacheMaxBytes: 32 * 1024,
-		...(live ? { scheduling: { heavyCpu: 1 } } : {}),
+
 	}; // Each live call owns one slot.
 	const render = (tool: string, count: unknown, actual = true) => {
 		if (actual) renders++;
@@ -852,7 +885,7 @@ test.for(["matched", "mismatch", "stale", "cancel"])(
 			{
 				actionSemantics,
 				resolveInvocation,
-				resources: idleResources(3),
+
 				executionWorlds: [
 					{
 						...world,
