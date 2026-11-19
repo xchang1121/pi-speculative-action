@@ -60,7 +60,7 @@ export default function extension(pi) {
       "timestampQuietMs": 2000, "timestampQuietByFilesystem": { "0xef53": 10 }
     },
     "processReuse": {
-      "actorObservationMode": "none", "persistCompletedCertificates": true,
+      "actorObservationMode": "provenance", "persistCompletedCertificates": true,
       "environmentMode": "exact", "replayAcceptedTaints": []
     }
   }
@@ -122,7 +122,9 @@ sudo ~/.local/bin/pi-speculative-domain --user "$(id -u)" env PATH="$PATH" "$(co
 
 执行域需要 cgroup v2、内核 BTF、eBPF tracing/kprobe hooks 和 `bpf_loop`。构建依赖 Clang、libbpf、libelf、zlib 及安装脚本报告的工具。使用 Linux 原生文件系统上的 checkout。
 
-Linux 后端保留已完成进程的输出和可验证效果，并发布 SQLite L2 证书。`actorObservationMode: "provenance"` 为真实 Actor 执行采集依赖；当前 Actor 沉淀支持可完整验证的只读命令。写入、外部状态或不完整观测会阻止该次证书发布。
+Linux 后端把工具与 Bash 实际读取的工作区文件按路径和内容摘要存入共享输入库。后续调用验证文件版本后可借用同一份不可变内容。真实 Actor 还会为已退出、输出完整且输入可验证的只读子进程发布证书，其他 Bash 命令可复用其中相同的子进程。文件输入的成功发布与复用分别计入 `fileInputsPublished` 和 `fileInputHits`。
+
+`actorObservationMode: "provenance"` 为真实 Actor 执行采集依赖；当前 Actor 沉淀支持可完整验证的只读命令。写入、外部状态或不完整观测会阻止该次进程证书发布。独立文件输入按各自的版本验证。编辑后主动重跑旧命令的 `prepareObservedOperations` 默认关闭。
 
 Actor 观测与普通受控执行共享子进程采用通道。纯字节输出的子进程可以多次重放，环境和非确定性接纳范围由显式契约控制。内核观测容量位于 `nativeBuild`；观测历史丢失时诊断报告 `observer_history_incomplete` 及原因位。
 

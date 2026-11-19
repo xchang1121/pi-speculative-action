@@ -1460,7 +1460,7 @@ function formatRatio(numerator: number, denominator: number): string {
 	return `${numerator}/${denominator} (${denominator > 0 ? formatPercent(numerator / denominator) : "n/a"})`;
 }
 function hasProcessReuse(reuse: WorldReuseMetrics): boolean {
-	return reuse.requests + reuse.wholeCommandRequests > 0;
+	return reuse.requests + reuse.wholeCommandRequests + reuse.fileInputHits + reuse.fileInputsPublished > 0;
 }
 function formatProcessWorkReuse(reuse: WorldReuseMetrics): string {
 	const hits = reuse.hits + reuse.wholeCommandHits;
@@ -1470,6 +1470,9 @@ function formatProcessWorkReuse(reuse: WorldReuseMetrics): string {
 			? `whole ${formatRatio(reuse.wholeCommandHits, reuse.wholeCommandRequests)}`
 			: "",
 		reuse.requests ? `child ${formatRatio(reuse.hits, reuse.requests)}` : "",
+		reuse.fileInputHits || reuse.fileInputsPublished
+			? `${reuse.fileInputHits} file inputs reused, ${reuse.fileInputsPublished} published`
+			: "",
 		hits > 0
 			? workMs > 0
 				? `${formatDuration(workMs)} recorded process work reused`

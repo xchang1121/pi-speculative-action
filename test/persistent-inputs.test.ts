@@ -8,7 +8,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ArtifactReference } from "../src/content-chunks.ts";
 import { digestObject, type Sha256Digest } from "../src/primitives.ts";
-import { CONTENT_CHUNK_BYTES } from "../src/content-chunks.ts";
+import { captureFileContent, CONTENT_CHUNK_BYTES, readContent } from "../src/content-chunks.ts";
+import { ResourceObjectInputs } from "../src/agent-execution-world.ts";
+import { SpeculativeConfiguration } from "../src/config-schema.ts";
+import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 import { FILESYSTEM_METADATA_FIELDS } from "../src/filesystem-evidence.ts";
 import {
 	ResourceInputSession,
@@ -66,6 +69,71 @@ const searchFixture = async (f: Awaited<ReturnType<typeof fixture>>, mode: strin
 			])
 		).stdout,
 	);
+
+linux("native workspace captures and filesystem tools exchange independent file versions", async () => {
+	const f = await fixture();
+	const root = path.parse(f.root).root;
+	const tool = new ResourceVersionManager(root, { watch: false, persistentInputs: { store: f.store, internalCache: true } });
+	const signal = new AbortController().signal;
+	const target = path.join(f.root, "header");
+	const other = path.join(f.root, "second");
+	try {
+		await writeFile(target, "format_as");
+		await writeFile(other, "another input");
+		const now = Date.now();
+		vi.spyOn(Date, "now").mockReturnValue(now + 3000);
+		const source = await tool.capture([{ path: target, scope: "content" }], memoryBudget);
+		try {
+			await tool.persist(source);
+		} finally {
+			await source.release();
+		}
+		await using native = new ResourceObjectInputs(f.root, f.store, signal);
+		const borrowed = await native.borrow(target, await lstat(target, { bigint: true }), native.contents);
+		expect(borrowed?.shared).toBe(true);
+		expect((await readContent(borrowed!.content)).toString()).toBe("format_as");
+		expect(borrowed!.computation).toBeDefined();
+		for (const name of [target, other])
+			native.remember(name, await captureFileContent(name, memoryBudget, native.contents));
+		await writeFile(target, "format_is");
+		await native.publish();
+		expect(await native.borrow(target, await lstat(target, { bigint: true }), native.contents)).toBeUndefined();
+		const reader = new ResourceInputSession({ store: f.store, internalCache: true }, memoryBudget);
+		try {
+			const values: string[] = [];
+			for await (const token of reader.recover(root, signal, other)) {
+				const input = token.view?.snapshotInput(other);
+				if (input && "content" in input) values.push((await readContent(input.content)).toString());
+			}
+			expect(values).toEqual(["another input"]);
+		} finally {
+			await reader.dispose();
+		}
+	} finally {
+		tool.close();
+		await f.close();
+	}
+});
+
+test("a private workspace materializes distinct blocks beyond its open descriptor budget", async () => {
+	const f = await fixture();
+	const configuration = new SpeculativeConfiguration({ filesystem: { maxOpenChunks: 2 } });
+	const sandbox = configuration.run(() => new WorkspaceSandboxService(f.store));
+	try {
+		for (let i = 0; i < 8; i++) await writeFile(path.join(f.root, String(i)), String(i));
+		await sandbox.withWorkspace(f.root, async (workspace) => {
+			for (let i = 0; i < 8; i++) {
+				const file = workspace.baselineFile!(String(i))!;
+				expect((await readContent(file.content)).toString()).toBe(String(i));
+			}
+			await writeFile(path.join(workspace.sandboxRoot, "7"), "private");
+			expect((await readContent(workspace.baselineFile!("7")!.content)).toString()).toBe("7");
+		});
+	} finally {
+		await sandbox.dispose();
+		await f.close();
+	}
+});
 
 test("preparation lookup uses ordered SQLite keys, exact scopes, and cascading eviction", async () => {
 	const f = await fixture();

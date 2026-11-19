@@ -884,7 +884,7 @@ function assembleAgentExecutionHost(
 										remember(action, tool, bindings);
 										if (steps) dependencies.push(...steps);
 									},
-									true,
+									currentSettings.prepareObservedOperations,
 									resources.inputs,
 									{ cwd: options.cwd, signal, reuseEnabled: currentSettings.reuseEnabled },
 								),

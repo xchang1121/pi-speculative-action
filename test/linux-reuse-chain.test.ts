@@ -144,6 +144,7 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 			{
 				candidateLimit: 4,
 				maxConcurrentActions: 4,
+				prepareObservedOperations: true,
 				patternAware: patternAwareSettings({
 					enabled: true,
 					multiStepEnabled: false,

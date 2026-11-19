@@ -26,6 +26,7 @@ import os from "node:os";
 import path from "node:path";
 import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import type {
+	ResourceObjectInputs,
 	SpeculativeAgentExecutionWorld,
 	SpeculativeToolExecutionContext,
 } from "./agent-execution-world.ts";
@@ -511,6 +512,7 @@ export class WorkspaceStructureCapture {
 	/** Each boundary borrows the original entries and content versions; a later capture replaces only changed entries. */
 	async captureVersions(
 		observeStat?: WorkspaceStructureCaptureOptions["observeStat"],
+		inputs?: ResourceObjectInputs,
 	): Promise<WorkspaceCapturedVersions> {
 		const options = this.options;
 		const absoluteRoot = path.resolve(this.root);
@@ -598,10 +600,13 @@ export class WorkspaceStructureCapture {
 			? await captureWorkspaceContent(
 					snapshot,
 					retained,
-					(relative, entry) =>
-						captureFileContent(path.join(absoluteRoot, relative), entry.size, options.content!.pool, {
-							stat: capturedEntries.get(relative)!.captured.info,
-						}),
+					async (relative, entry) => {
+						const target = path.join(absoluteRoot, relative);
+						const stat = capturedEntries.get(relative)!.captured.info;
+						const pool = options.content!.pool;
+						const retained = pool && await inputs?.borrow(target, stat, pool);
+						return retained ?? captureFileContent(target, entry.size, pool, { stat });
+					},
 					options.content,
 				)
 			: { snapshot, files: new Map<string, FileContentVersion | undefined>() };
@@ -1101,6 +1106,7 @@ export interface WorkspaceExecutionSnapshot extends SandboxExecutionDelta {
 }
 export type WorkspaceSandboxDriver = "auto" | "git" | "overlayfs" | "in_memory";
 export interface WorkspaceSandboxOptions extends LinuxOverlayfsOptions {
+	readonly inputs?: ResourceObjectInputs;
 	/** Kept for existing callers; immutable snapshots no longer invoke Git. */
 	readonly gitBinary?: string;
 	/** Auto uses an immutable CAS snapshot unless a trace-guarded runtime explicitly qualifies a COW driver. */
@@ -1115,6 +1121,7 @@ export interface SandboxWorkspaceContext {
 	readonly sourceRoot: string;
 	readonly sandboxRoot: string;
 	readonly processRoot: string;
+	readonly baselineFile?: (relative: string) => FileContentVersion | undefined;
 	/** Native metadata for pinned snapshot objects; shared by every process in this private workspace. */
 	readonly metadataImage?: string;
 	/** Mount policy used to project source access times; adoption must revalidate it. */
@@ -1213,6 +1220,7 @@ function createWorkspaceObservation(
 		...data,
 		contents,
 		structure,
+		baselineFile: (relative) => data.baseline.files.get(relative),
 		transactions: {
 			begin: async () => {
 				if (!disposal) {
@@ -1420,14 +1428,6 @@ export class WorkspaceSandboxService {
 		readonly store: ProvenanceCertificateStore;
 		readonly ownedRoot?: string;
 	}>;
-	private readonly trees = new Map<
-		string,
-		Promise<{
-			capture: WorkspaceStructureCapture;
-			contents?: ContentChunkPool;
-			release?: () => Promise<void>;
-		}>
-	>();
 	private readonly contents = new Set<ContentChunkPool>();
 	/** Checkpoints belong to this service, including its sibling execution worlds. */
 	private readonly checkpoints = new WeakMap<WorldCheckpoint, WorkspaceCheckpoint>();
@@ -1489,17 +1489,13 @@ export class WorkspaceSandboxService {
 	}
 	dispose(): Promise<void> {
 		return this.lifetime.dispose(async () => {
-			try {
-				await this.closePools();
-			} finally {
-				this.overlayfsCapabilities.dispose();
-				await Promise.allSettled([...this.contents].map((pool) => pool.dispose()));
-				this.contents.clear();
-				const storage = await this.storage;
-				if (storage?.ownedRoot) {
-					await storage.store.dispose();
-					await removeOwnedTree(storage.ownedRoot);
-				}
+			this.overlayfsCapabilities.dispose();
+			await Promise.allSettled([...this.contents].map((pool) => pool.dispose()));
+			this.contents.clear();
+			const storage = await this.storage;
+			if (storage?.ownedRoot) {
+				await storage.store.dispose();
+				await removeOwnedTree(storage.ownedRoot);
 			}
 		});
 	}
@@ -1548,7 +1544,6 @@ export class WorkspaceSandboxService {
 		// qualify a live lower from their invocation cwd to preserve native metadata.
 		const resolvedOptions: WorkspaceSandboxOptions =
 			options.driver === "overlayfs" ? options : { ...options, driver: "in_memory" };
-		const roots = new Set<string>();
 		return {
 			id: "workspace_branch",
 			scope: "fallback",
@@ -1568,20 +1563,12 @@ export class WorkspaceSandboxService {
 					this.assertOpen();
 					throwIfAborted(signal);
 					if (resolvedOptions.inPlaceMutations !== false) return;
-					roots.add(path.resolve(cwd));
 					await this.prepare(cwd, { ...resolvedOptions, signal });
 				},
 				execute: async (context) => {
 					this.assertOpen();
-					const sourceRoot = path.resolve(context.cwd);
-					roots.add(sourceRoot);
 					return this.executeMutation(context, resolvedOptions);
 				},
-			},
-			dispose: async () => {
-				const ownedRoots = [...roots];
-				roots.clear();
-				await this.lifetime.run(() => this.closePools(ownedRoots));
 			},
 		};
 	}
@@ -2156,7 +2143,7 @@ export class WorkspaceSandboxService {
 		this.assertOpen();
 		options.signal?.throwIfAborted();
 		const qualified = await this.resolveDriver(options);
-		await (await this.tree(path.resolve(cwd))).capture.captureVersions();
+		if (!(await lstat(path.resolve(cwd))).isDirectory()) throw new Error("workspace root is not a directory");
 		options.signal?.throwIfAborted();
 		return Object.freeze(qualified);
 	}
@@ -2570,8 +2557,6 @@ export class WorkspaceSandboxService {
 		options: WorkspaceSandboxOptions,
 	) {
 		const sourceRoot = path.resolve(cwd);
-		const tree = await this.tree(sourceRoot);
-		const releaseContents = tree.contents?.retain();
 		const versions = new ResourceVersionManager(sourceRoot);
 		const cursor = await versions.observeChanges();
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-workspace-"));
@@ -2583,24 +2568,36 @@ export class WorkspaceSandboxService {
 			pins.push(handle);
 			return handle.stat;
 		};
+		let releaseContents: (() => Promise<void>) | undefined;
 		let overlay: LinuxOverlayfsMount | undefined;
 		let workspace: WorkspaceObservation | undefined;
 		let disposal: Promise<void> | undefined;
 		const dispose = () =>
 			(disposal ??= (async () => {
 				try {
-					await workspace?.transactions.dispose();
-					await overlay?.close();
+					try {
+						await workspace?.transactions.dispose();
+					} finally {
+						try {
+							await Promise.all(pins.map((handle) => handle.close()));
+						} finally {
+							await overlay?.close();
+						}
+					}
 					await removeOwnedTree(root);
 				} finally {
-					await Promise.all(pins.map((handle) => handle.close()));
 					await cursor.release();
 					versions.close();
 					await releaseContents?.();
 				}
 			})());
 		try {
-			const captured = await tree.capture.captureVersions();
+			const contents = await this.createContentPool();
+			releaseContents = contents?.retain();
+			const configured = speculativeConfig().filesystem;
+			const captured = await new WorkspaceStructureCapture(sourceRoot, {
+				content: { pool: contents, maxBytes: configured.maxTreeBytes, maxFileBytes: configured.maxTreeBytes },
+			}).captureVersions(undefined, options.inputs);
 			if (!captured.snapshot.complete || [...captured.files.values()].some((file) => !file))
 				throw new Error("workspace snapshot exceeds configured limits");
 			const original = new Map([...captured.entries].map(([name, entry]) => [name, entry.captured.info]));
@@ -2624,6 +2621,7 @@ export class WorkspaceSandboxService {
 				process.platform === "linux" && !!options.liveLower,
 				original,
 				pinObject,
+				live ? sandboxRoot : undefined,
 			);
 			const clock = overlay
 				? {
@@ -2660,33 +2658,12 @@ export class WorkspaceSandboxService {
 				sourceDevice: original.get("")!.dev,
 				hints: sourceChanges(),
 			};
-			workspace = createWorkspaceObservation(data, sourceChanges, tree.contents);
+			workspace = createWorkspaceObservation(data, sourceChanges, contents);
 			return { ...workspace, dispose, pinObject };
 		} catch (error) {
 			await dispose();
 			throw error;
 		}
-	}
-	private tree(sourceRoot: string) {
-		let tree = this.trees.get(sourceRoot);
-		if (!tree) {
-			tree = this.createContentPool().then((contents) => {
-				const release = contents?.retain();
-				const capture = new WorkspaceStructureCapture(sourceRoot, {
-					maxFiles: speculativeConfig().filesystem.maxTreeEntries,
-					exclude: speculativeConfig().filesystem.excludes,
-					content: {
-						pool: contents,
-						maxBytes: speculativeConfig().filesystem.maxTreeBytes,
-						maxFileBytes: speculativeConfig().filesystem.maxTreeBytes,
-					},
-				});
-				return { capture, contents, release };
-			});
-			this.trees.set(sourceRoot, tree);
-			void tree.catch(() => this.trees.delete(sourceRoot));
-		}
-		return tree;
 	}
 	private assertOpen(): void {
 		if (this.lifetime.sealed) throw new Error("Workspace sandbox service is disposed");
@@ -2704,15 +2681,6 @@ export class WorkspaceSandboxService {
 			return await run(workspace);
 		} finally {
 			await workspace.dispose();
-		}
-	}
-	private async closePools(roots?: readonly string[]): Promise<void> {
-		for (const [root, pending] of this.trees) {
-			if (roots && !roots.includes(root)) continue;
-			this.trees.delete(root);
-			const tree = await pending;
-			tree.capture.clear();
-			await tree.release?.();
 		}
 	}
 	private async materializeCheckpoint(
@@ -2878,6 +2846,7 @@ async function preserveSnapshotMetadata(
 	native: boolean,
 	captured?: ReadonlyMap<string, BigIntStats>,
 	pin?: (target: string) => Promise<BigIntStats>,
+	mergedRoot?: string,
 ) {
 	const original = captured ?? (await captureSnapshotMetadata(sourceRoot));
 	const names = [...original.keys()].sort((a, b) => a.length - b.length);
@@ -2943,12 +2912,15 @@ async function preserveSnapshotMetadata(
 	for (const [target, source] of translated) {
 		if (!native && (!pin || !source.isFile())) continue;
 		const physical = await pin!(target);
-		if (native)
-			rows.push([
-				physical,
-				source,
-				atimePolicy(path.join(sourceRoot, path.relative(sandboxRoot, target)), source.isDirectory()),
-			]);
+		if (native) {
+			const relative = path.relative(sandboxRoot, target);
+			const policy = atimePolicy(path.join(sourceRoot, relative), source.isDirectory());
+			rows.push([physical, source, policy]);
+			if (mergedRoot) {
+				const merged = await pin!(path.join(mergedRoot, relative));
+				if (merged.dev !== physical.dev || merged.ino !== physical.ino) rows.push([merged, source, policy]);
+			}
+		}
 	}
 	const image = native ? path.join(processRoot, "metadata.json") : undefined;
 	if (image) {

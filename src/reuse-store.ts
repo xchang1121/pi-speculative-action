@@ -249,6 +249,7 @@ interface ArtifactReadLimits {
 /** One verified content lease, shared by effect closures and input chunks. Linux owns objects; other adapters retain their existing byte images. */
 export class ArtifactReadView implements VerifiedArtifactClosure {
 	private storedBytes = 0;
+	private descriptors = 0;
 	private readonly lifetime = new RuntimeLifecycleLane();
 	private readonly values = new Map<
 		Sha256Digest,
@@ -294,12 +295,8 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 	}
 	checkBudget(reference: ArtifactReference): void {
 		validateArtifact(reference);
-		if (
-			!this.has(reference) &&
-			(this.bytes + reference.size > this.limits.maxStoredBytes ||
-				this.artifacts >= this.limits.maxOpenChunks)
-		)
-			throw Object.assign(new Error("artifact stored-byte or descriptor budget exceeded"), { code: "ERR_ARTIFACT_LEASE_BUDGET" });
+		if (!this.has(reference) && this.bytes + reference.size > this.limits.maxStoredBytes)
+			throw Object.assign(new Error("artifact stored-byte budget exceeded"), { code: "ERR_ARTIFACT_LEASE_BUDGET" });
 	}
 	async restore(
 		references: readonly ArtifactReference[],
@@ -349,12 +346,19 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 			if (supplied instanceof ArtifactReadView) {
 				if (supplied.has(reference)) {
 					const value = supplied.value(reference);
-					value.owners++;
-					this.values.set(reference.digest, value);
-					this.storedBytes += reference.size;
-					return true;
+					if (!value.object || this.descriptors < this.limits.maxOpenChunks) {
+						value.owners++;
+						if (value.object) this.descriptors++;
+						this.values.set(reference.digest, value);
+						this.storedBytes += reference.size;
+						return true;
+					}
+					const bytes = Buffer.allocUnsafe(reference.size);
+					await value.object.borrow((handle) => readArtifactRange(handle, bytes, 0, signal));
+					supplied = { reference, bytes };
+				} else {
+					supplied = undefined;
 				}
-				supplied = undefined;
 			}
 			if (
 				supplied &&
@@ -366,13 +370,14 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 			try {
 				if (supplied && "object" in supplied)
 					throw new Error("descriptor transfers are unsupported; use CAS artifacts");
+				const pin = process.platform === "linux" && this.descriptors < this.limits.maxOpenChunks;
 				let image =
 					supplied && "bytes" in supplied
 						? Buffer.from(supplied.bytes)
-						: !supplied && process.platform !== "linux"
+						: !supplied && !pin
 							? await readOptional(this.cas.artifactPath(reference.digest), reference.size, signal)
 							: undefined;
-				if (!image && process.platform === "linux")
+				if (!image && pin)
 					handle = await openArtifactFile(this.cas.artifactPath(reference.digest));
 				if (!image && !handle) return false;
 				const stat = handle && (await handle.stat({ bigint: true }));
@@ -381,7 +386,7 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 					(stat && (!stat.isFile() || stat.size !== BigInt(reference.size)))
 				)
 					throw new Error("artifact integrity check failed: length");
-				if (process.platform === "linux") snapshot = await openArtifactImage();
+				if (pin) snapshot = await openArtifactImage();
 				const hash = createHash("sha256");
 				for (let offset = 0; offset < reference.size; offset += ARTIFACT_BLOCK_BYTES) {
 					signal?.throwIfAborted();
@@ -403,6 +408,7 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 				}
 				signal?.throwIfAborted();
 				const object = handle && new FilesystemObjectLease(handle, await handle.stat({ bigint: true }), true);
+				if (object) this.descriptors++;
 				this.values.set(reference.digest, {
 					reference: Object.freeze({ ...reference }),
 					object,
@@ -456,6 +462,7 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 				[...this.values.values()].map((value) => (--value.owners ? undefined : value.object?.dispose())),
 			);
 			this.values.clear();
+			this.descriptors = 0;
 			this.storedBytes = 0;
 			this.released?.();
 		});

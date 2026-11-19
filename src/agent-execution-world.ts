@@ -6,7 +6,9 @@ import type { BigIntStats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { PI_ACTION_SEMANTICS, type ActionKey, type ActionSemanticsRegistry } from "./action-semantics.ts";
-import { DEFAULTS } from "./config-schema.ts";
+import { DEFAULTS, speculativeConfig } from "./config-schema.ts";
+import { captureContent, contentDigest, type ContentChunkPool, type FileContentVersion } from "./content-chunks.ts";
+import type { ProvenanceCertificateStore } from "./reuse-store.ts";
 import type {
 	ExecutionResourceContext,
 	ExecutionScope,
@@ -25,12 +27,12 @@ import {
 	RESOURCE_OBSERVATION_EFFECTS,
 } from "./execution-world.ts";
 import {
-	CapturedFilesystemObject,
+	cachedCapture,
+	openFilesystemFile,
 	sameFilesystemIdentity,
 	withFilesystemReadView,
-	type StableFilesystemCapture,
 } from "./filesystem-evidence.ts";
-import { relativeFilesystemPath } from "./primitives.ts";
+import { containsFilesystemPath, relativeFilesystemPath } from "./primitives.ts";
 import {
 	captureResourceVersion,
 	collectResourceComputation,
@@ -204,58 +206,101 @@ function readonlyResourceInvocation(
 const resourceVersions = new WeakMap<object, () => readonly ResourceVersionToken[]>();
 const inputBytes = (versions: readonly ResourceVersionToken[]) =>
 	versions.reduce((bytes, token) => bytes + (token.view?.bytes ?? 0), 0);
-/** Native inputs use the same owners and exact object validation on either side of a thread boundary. */
+/** A native call borrows and publishes the same file-content records as filesystem tools. */
 export class ResourceObjectInputs {
-	private readonly views: (target?: string) => Iterable<ResourceReadView>;
+	private readonly reader: ReturnType<ResourceInputSession["reader"]>;
+	private readonly session: ResourceInputSession;
+	private readonly captured = new Map<string, ResourceInput>();
+	private bytes = 0;
+	hits = 0;
+	private readonly root: string;
+	private readonly workspace: string;
+	private readonly signal: AbortSignal;
+	private readonly lookup?: ExecutionResourceContext["inputs"];
+
 	constructor(
-		inputs: ((target?: string) => Iterable<object>) | ResourceReadView,
-		_produced?: WeakSet<CapturedFilesystemObject>,
+		workspace: string,
+		store: ProvenanceCertificateStore,
+		signal: AbortSignal,
+		lookup?: ExecutionResourceContext["inputs"],
 	) {
-		this.views =
-			inputs instanceof ResourceReadView
-				? () => [inputs]
-				: function* (target) {
-						for (const source of inputs(target))
-							for (const version of resourceVersions.get(source)?.() ?? [])
-								if (version.view?.retained) yield version.view;
-					};
+		this.workspace = workspace;
+		this.signal = signal;
+		this.lookup = lookup;
+		this.root = path.parse(workspace).root;
+		this.session = new ResourceInputSession({ store, internalCache: true }, speculativeConfig().runtime.resourceCacheMaxBytes);
+		this.reader = this.session.reader(this.root, signal);
 	}
-	async borrow(
-		target: string,
-		expected: BigIntStats,
-		maxBytes: number,
-		accept: (capture: StableFilesystemCapture) => boolean | Promise<boolean> = () => true,
-	): Promise<StableFilesystemCapture | undefined> {
-		for (const view of this.views(target)) {
-			if (!view.retained) continue;
+	private async *versions(target: string) {
+		for (const source of this.lookup?.(target) ?? []) yield* resourceVersions.get(source)?.() ?? [];
+		yield* this.reader(target);
+	}
+	async borrow(target: string, stat: BigIntStats, destination: ContentChunkPool): Promise<FileContentVersion | undefined> {
+		if (!stat.isFile() || !containsFilesystemPath(this.workspace, target)) return;
+		const current = cachedCapture(stat, target);
+		if (!current) return;
+		try {
+			for await (const token of this.versions(target)) {
+				const input = token.view?.snapshotInput(target);
+				if (!input || !("content" in input) || contentDigest(input.content) !== `sha256:${current.hash}`) continue;
+				const { handle, binding, stat: opened } = await openFilesystemFile(target, true);
+				try {
+					if (!sameFilesystemIdentity(stat, opened)) return;
+					const content = await captureContent(destination, input.content);
+					this.signal.throwIfAborted();
+					if (!sameFilesystemIdentity(stat, await fs.lstat(target, { bigint: true }))) return;
+					return { ...current, content, computation: input.computation };
+				} finally {
+					try {
+						await handle.close();
+					} finally {
+						await binding?.close();
+					}
+				}
+			}
+		} catch {
+			this.signal.throwIfAborted();
+		}
+	}
+	/** Only publish immutable inputs from the current workspace; each consumer validates its own read. */
+	remember(target: string, file: Pick<FileContentVersion, "content" | "computation" | "shared">) {
+		if (this.captured.has(target) || !containsFilesystemPath(this.workspace, target)) return;
+		if (file.content.byteLength > this.session.maxBytes - this.bytes) return;
+		this.bytes += file.content.byteLength;
+		if (file.shared) this.hits++;
+		this.captured.set(target, file.computation ? { content: file.content, computation: file.computation } : file.content);
+		return true;
+	}
+	get remainingBytes() {
+		return this.session.maxBytes - this.bytes;
+	}
+	get contents() {
+		return this.session.contents;
+	}
+	async publish() {
+		let published = 0;
+		for (const entry of this.captured) {
+			this.signal.throwIfAborted();
 			try {
-				const captured = await view.borrowObject(target, (capture, handle) =>
-					TimelineInterval.outside(async () => {
-						if (
-							!capture.content ||
-							capture.bytesRead > maxBytes ||
-							!sameFilesystemIdentity(expected, capture.stat) ||
-							!sameFilesystemIdentity(capture.stat, await handle.stat({ bigint: true })) ||
-							!(await accept(capture))
-						)
-							return undefined;
-						return {
-							...capture,
-							content: Buffer.from(capture.content),
-							shared: true as const,
-						};
-					}),
+				const token = await this.session.capture(
+					undefined, this.root, PI_ACTION_SEMANTICS, this.session.maxBytes, new Map([entry]),
 				);
-				if (captured) return captured;
+				try {
+					token.view?.seal();
+					if (!(await validateResourceVersion([token], true)).expired && await this.session.publish(token, this.signal))
+						published++;
+				} finally {
+					await token.release();
+				}
 			} catch {
-				/* Revocation or a different version leaves the normal FD capture authoritative. */
+				this.signal.throwIfAborted();
 			}
 		}
-		return undefined;
+		return published;
 	}
-	retain(target: string, capture: StableFilesystemCapture): boolean {
-		for (const view of this.views(target)) if (view.retainObject(target, capture)) return true;
-		return false;
+	[Symbol.asyncDispose]() {
+		this.captured.clear();
+		return this.session.dispose();
 	}
 }
 /** Whole queries and independent Actor inputs share proof composition; completed inputs survive consumer failure. */

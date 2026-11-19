@@ -3,7 +3,7 @@ import { serialize } from "node:v8";
 import type { FileHandle } from "node:fs/promises";
 import { DEFAULT_SPECULATIVE_CONFIG, speculativeConfig } from "./config-schema.ts";
 import type { StableFilesystemCapture } from "./filesystem-evidence.ts";
-import { captureStableFile } from "./filesystem-evidence.ts";
+import { captureStableFile, rememberCapture } from "./filesystem-evidence.ts";
 import type { Sha256Digest } from "./primitives.ts";
 import { isSafeCount, isSha256Digest, sha256Digest, sha256DigestAsync } from "./primitives.ts";
 import type { ArtifactSource, ProvenanceCertificateStore, VerifiedArtifactClosure } from "./reuse-store.ts";
@@ -224,6 +224,7 @@ export async function captureFileContent(
 	observed?: Omit<NonNullable<Parameters<typeof captureStableFile>[3]>, "onChunk">,
 ): Promise<FileContentVersion> {
 	if (pool) {
+		const takenAt = Date.now();
 		const { capture, content } = await pool.capture((onChunk) =>
 			captureStableFile(target, Math.min(maxBytes, pool.limits.maxLogicalBytes), false, {
 				...observed,
@@ -231,6 +232,7 @@ export async function captureFileContent(
 				onChunk,
 			}),
 		);
+		rememberCapture(capture, takenAt);
 		return { ...capture, content };
 	}
 	const captured = await captureStableFile(target, maxBytes, true, observed);

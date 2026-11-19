@@ -4,11 +4,15 @@ import { mkdir, mkdtemp, open, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { ResourceInputSession } from "../src/resource-version.ts";
+import { readContent } from "../src/content-chunks.ts";
 import { fileURLToPath } from "node:url";
 import { nativeBuildDefinitions } from "../src/config-schema.ts";
 import { executionDomainCollector, resolveLinuxExecHelper } from "../src/linux-held-exec.ts";
 import { executionRecords, observeExecution, traceTail } from "../src/execution-observer.ts";
-import { createBashTool } from "@earendil-works/pi-coding-agent";
+import { createBashTool, createReadTool } from "@earendil-works/pi-coding-agent";
+import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
+import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { expect, test } from "vitest";
 import {
 	createControlledBashOperations,
@@ -249,6 +253,87 @@ test.skipIf(process.platform !== "linux")(
 		}
 	},
 );
+
+test.skipIf(process.platform !== "linux")("native Actor children feed later Bash calls across command keys", { timeout: 60000 }, async () => {
+	const fixture = await createLinuxProcessBenchmark("pi-native-child-", "in_memory", {}, os.homedir());
+	const host = systemHost(fixture.workspace, [fixture.tool], {
+		executionWorlds: [fixture.world],
+		resolveInvocation: (_tool, input) => fixture.invocation(input as Record<string, unknown>),
+		config: { processReuse: { environmentMode: "allowlist", environmentKeys: ["PATH", "LANG", "HOME"],
+			replayAcceptedTaints: ["clock", "random", "pid_observation", "descriptor_observation"] } },
+	}, { enabled: false, prepareObservedOperations: false });
+	try {
+		await fixture.write("source.txt", "one\n");
+		await fixture.read("source.txt");
+		await fixture.prepare();
+		await host.start();
+		const run = (command: string) => host.execute("bash", { command }).then(textOutput);
+		expect(await run("cat source.txt; printf A")).toBe("one\nA");
+		const first = fixture.backend.actorMetrics();
+		expect(first.published, first.lastError).toBeGreaterThan(0);
+		expect(await run("cat source.txt; printf B")).toBe("one\nB");
+		const second = fixture.backend.actorMetrics();
+		expect(second.hits, second.lastError).toBeGreaterThan(first.hits);
+		expect(second.wholeCommandHits).toBe(first.wholeCommandHits);
+		expect(host.actors.at(-1)?.computation?.reusedComputeMs).toBeGreaterThan(0);
+		await fixture.write("source.txt", "two\n");
+		expect(await run("cat source.txt; printf C")).toBe("two\nC");
+		expect(fixture.backend.actorMetrics().hits).toBe(second.hits);
+	} finally {
+		await host.dispose();
+		await fixture.dispose();
+	}
+});
+
+test.skipIf(process.platform !== "linux")("a Bash write preserves independent file inputs for other tools", { timeout: 60000 }, async () => {
+	const fixture = await createLinuxProcessBenchmark("pi-actor-input-", "in_memory", {}, os.homedir());
+	const reader = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, {
+		maxBytes: () => 1024 * 1024,
+		persistentInputs: { store: fixture.backend.store, internalCache: true },
+	});
+	const host = systemHost(fixture.workspace, [fixture.tool, createReadTool(fixture.workspace)], {
+		executionWorlds: [fixture.world, reader],
+		resolveInvocation: (tool, input) => tool === "bash"
+			? fixture.invocation(input as Record<string, unknown>)
+			: resolvePiToolInvocation(tool, input, { cwd: fixture.workspace, environment: {} }),
+		config: { processReuse: { replayAcceptedTaints: [] } },
+	});
+	const session = new ResourceInputSession({ store: fixture.backend.store, internalCache: true }, 1024 * 1024);
+	try {
+		await fixture.write("header.h", "original\n");
+		await fixture.write("from-tool.h", "previewed\n");
+		await fixture.prepare();
+		await host.start();
+		expect(textOutput(await host.execute("bash", { command: "cat header.h; printf created > generated" }))).toBe("original\n");
+		expect(fixture.backend.actorMetrics().wholeCommandPublished).toBe(0);
+		const target = path.join(fixture.workspace, "header.h");
+		const inputs: string[] = [];
+		for await (const token of session.recover(path.parse(target).root, new AbortController().signal, target)) {
+			const file = token.view?.snapshotInput(target);
+			if (file && "content" in file) inputs.push((await readContent(file.content)).toString());
+		}
+		expect(inputs).toEqual(["original\n"]);
+		const first = fixture.backend.actorMetrics();
+		expect(first.fileInputsPublished).toBeGreaterThan(0);
+		expect(textOutput(await host.execute("bash", { command: "printf next-; cat header.h" }))).toBe("next-original\n");
+		expect(fixture.backend.actorMetrics().fileInputHits).toBeGreaterThan(first.fileInputHits);
+		expect(fixture.backend.actorMetrics().hits).toBe(0);
+
+		await host.preview("read", { path: "from-tool.h" });
+		await host.ready();
+		const before = fixture.backend.actorMetrics().fileInputHits;
+		expect(textOutput(await host.execute("bash", { command: "cat from-tool.h" }))).toBe("previewed\n");
+		expect(fixture.backend.actorMetrics().fileInputHits).toBeGreaterThan(before);
+		const previous = fixture.backend.metrics().fileInputHits;
+		await host.preview("bash", { command: "cat from-tool.h; printf speculative" });
+		await host.ready(2);
+		expect(fixture.backend.metrics().fileInputHits).toBeGreaterThan(previous);
+	} finally {
+		await session.dispose();
+		await host.dispose();
+		await fixture.dispose();
+	}
+});
 
 test.skipIf(process.platform !== "linux").for([false, true])(
 	"public Actor persists and replays provenance (exact environment with subcompute=%s)",

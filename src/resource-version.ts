@@ -365,6 +365,7 @@ type PersistentResourceEntry = readonly [
 	string,
 	Omit<CapturedResource, "computation" | "object" | "objectBytes" | "metadata" | "content"> & {
 		readonly content?: ChunkedContentManifest;
+		readonly computation?: SerializedTimelineComputation;
 		readonly metadata?: {
 			readonly dependency?: string;
 			readonly size?: number;
@@ -546,6 +547,7 @@ function parsePersistentResourcePayload(value: unknown, root: string): Persisten
 		targets.add(target);
 		if (
 			(entry.content && entry.type !== "file") ||
+			(entry.computation !== undefined && (!entry.content || !normalizeTimelineComputation(entry.computation))) ||
 			(entry.entries && entry.type !== "directory") ||
 			(entry.type === "alias" &&
 				(typeof entry.link !== "string" ||
@@ -574,7 +576,7 @@ function parsePersistentResourcePayload(value: unknown, root: string): Persisten
 					dependency: entry.metadata.dependency,
 					size: entry.metadata.size,
 				},
-				...(entry.content ? { content: parseContentManifest(entry.content) } : {}),
+				...(entry.content ? { content: parseContentManifest(entry.content), computation: entry.computation } : {}),
 				...(entry.type === "directory"
 					? { entries: entry.entries && [...entry.entries] }
 					: entry.type === "alias"
@@ -1504,6 +1506,8 @@ export class ResourceReadView {
 						dependency,
 						metadata,
 						...(content ? { content } : {}),
+						...(content && entry.computation && speculativeConfig().subcomputation.persistTimelineIntervals
+							? { computation: TimelineInterval.serialize(entry.computation) } : {}),
 						...(type === "directory"
 							? { entries: entry.entries }
 							: type === "alias"
@@ -2214,6 +2218,7 @@ export class ResourceVersionManager {
 						if (reference) references.set(reference.digest, reference.size);
 					view.capture(target, {
 						...entry,
+						computation: entry.computation && TimelineInterval.restore(entry.computation),
 						...(content ? { content } : {}),
 					} as CapturedResource);
 					view.assertComplete();
@@ -2809,7 +2814,7 @@ export class ResourceInputSession {
 		token: ResourceVersionToken,
 		signal?: AbortSignal,
 		inputs: readonly ResourceVersionToken[] = [],
-	): Promise<void> {
+	): Promise<boolean> {
 		if (
 			signal?.aborted ||
 			this.lifecycle.sealed ||
@@ -2819,12 +2824,13 @@ export class ResourceInputSession {
 			token.view.contents !== this.contents ||
 			!(token.view.resources.length || token.view.hasPreparedInputs)
 		)
-			return;
+			return false;
 		try {
 			await token.manager.persist(token, inputs);
 			this.published.add(token);
+			return true;
 		} catch {
-			/* A failed cache write leaves the completed tool result available. */
+			return false;
 		}
 	}
 	dispose(): Promise<void> {

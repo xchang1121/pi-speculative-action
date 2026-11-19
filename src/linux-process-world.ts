@@ -386,6 +386,7 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 					const sourceRoot = path.resolve(context.cwd);
 					const selected = (operation && qualifiedDrivers.get(sourceRoot)) || (await qualify(sourceRoot));
 					const parent = workspaceSandbox.checkpoint(context.parentCheckpoint, sourceRoot);
+					await using inputs = !parent ? backend.fileInputs(sourceRoot, context.signal, context.inputs) : undefined;
 					let session: LinuxProcessSession | undefined;
 					let launches = 0;
 					let exitCode: number | null | undefined;
@@ -394,6 +395,7 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 							workspaceSandbox.capture(
 								{
 									...workspaceOptions,
+									inputs,
 									cwd: sourceRoot,
 									driver: selected.driver,
 									executionMetrics: () => ({ reuse: session?.metrics() }),
@@ -402,6 +404,7 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 									execute: async (workspace) => {
 										session = await backend.open({
 											sourceRoot,
+											inputs,
 											workspace,
 											invocation,
 											scope: context.executionScope,

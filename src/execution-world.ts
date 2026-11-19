@@ -642,6 +642,8 @@ const WORLD_REUSE_COUNTERS = [
 	"bypasses",
 	"published",
 	"tainted",
+	"fileInputHits",
+	"fileInputsPublished",
 	"validationCandidates",
 	"validationPathsets",
 	"validationFilesRead",
