@@ -6,7 +6,7 @@
 
 `node --import tsx bench/pattern-workflows.mjs` 运行可复现的合成工作流、混噪训练与位置偏好切换实验。
 
-`node --import tsx bench/pattern-trace-replay.mjs /path/to/tasks/*/record.session.jsonl` 读取每条原始会话及同名的 `record.json`。每折留出一个完整仓库，按原始 Actor 批次先预测再学习。报告按宿主的工具契约区分原始参数相同、规范键精确匹配和范围投影，统计首位命中、误报及覆盖的调用数。每个被覆盖的调用只累计一次原录制耗时。测量 Actor 实际等待需在运行中的 Host 重放相同调用。
+`node --import tsx bench/pattern-trace-replay.mjs /path/to/tasks/*/record.session.jsonl` 读取每条原始会话及同名的 `record.json`。每折留出一个完整仓库，按原始 Actor 批次先预测再学习。报告按宿主的工具契约区分原始参数相同和规范键精确匹配，统计首位命中、误报及覆盖的调用数。每个被覆盖的调用只累计一次原录制耗时。测量 Actor 实际等待需在运行中的 Host 重放相同调用。
 
 ## 后端资格
 

@@ -1,5 +1,4 @@
 import path from "node:path";
-import type { ActionProjectionRule } from "./action-semantics.ts";
 import { type ActionSemanticsRegistry } from "./action-semantics.ts";
 import {
 	agentBatchKey,
@@ -27,6 +26,7 @@ import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import type { PlanAction } from "./settlement.ts";
 type PatternPlanFeedback = Pick<PatternAwareCandidate, "continuation" | "supportingPatternIDs"> & {
 	readonly store: PatternAwareStore;
+	readonly drafterRoot: boolean;
 };
 type CarriedPrediction = {
 	readonly signature: string;
@@ -38,23 +38,28 @@ type PatternTurn = {
 	revision: number;
 	observationRevision: number;
 };
+export function coversDrafterRoot(
+	hint: Pick<PatternAwareCandidate, "horizon" | "confidence" | "background" | "immediateConfidence">,
+) {
+	return !hint.background && hint.horizon === 0 && (hint.immediateConfidence ?? hint.confidence) >= 0.8;
+}
 export interface PatternPlanSourceController {
 	readonly source: AgentPlanSource;
 	readonly connect: (runtime: AgentRuntime) => () => void;
 	/** The calls PatternAware expects next, without proposing them. */
 	readonly hints: (input: {
 		readonly sessionID: string;
+		readonly startInput?: AgentStartInput;
 		readonly schemaHashes: Readonly<Record<string, string>>;
 		readonly patternIdentities?: Readonly<Record<string, string>>;
 		readonly settings: SpeculativeActionSettings;
-	}) => Promise<readonly Pick<PatternAwareCandidate, "tool" | "input" | "horizon">[]>;
+	}) => Promise<readonly Pick<PatternAwareCandidate, "tool" | "input" | "horizon" | "confidence">[]>;
 	readonly dispose: () => Promise<void>;
 }
 export function createPatternPlanSource({
 	sessionID,
 	cwd,
 	actionSemantics,
-	projectionRules,
 	stateDirectory,
 	reservedRoot,
 	workspaceIdentity,
@@ -63,14 +68,13 @@ export function createPatternPlanSource({
 	readonly sessionID: string;
 	readonly cwd: string;
 	readonly actionSemantics: ActionSemanticsRegistry;
-	readonly projectionRules: readonly ActionProjectionRule<ToolSettlement>[];
 	readonly stateDirectory?: string;
 	readonly reservedRoot?: boolean;
 	readonly workspaceIdentity?: string;
 	readonly store?: PatternAwareStore | Promise<PatternAwareStore>;
 }): PatternPlanSourceController {
 	cwd = path.resolve(cwd);
-	const patternActionSemantics = patternAwareActionSemantics(actionSemantics, cwd, projectionRules);
+	const patternActionSemantics = patternAwareActionSemantics(actionSemantics, cwd);
 	let openedStore:
 		| {
 				readonly key: string;
@@ -148,6 +152,28 @@ export function createPatternPlanSource({
 		if (signal?.aborted) return;
 		const store = await resolveStore(settings);
 		return signal?.aborted ? undefined : store;
+	};
+	const roots = new WeakMap<
+		AgentStartInput,
+		Promise<{ store: PatternAwareStore; candidates: PatternAwareCandidate[] }>
+	>();
+	const rootPrediction = (
+		sessionID: string,
+		startInput: AgentStartInput | undefined,
+		settings: PatternAwareSettings,
+		schemas: Readonly<Record<string, string>>,
+		identities?: Readonly<Record<string, string>>,
+	) => {
+		const predict = async () => {
+			await analysisTail;
+			const store = await resolveStore(settings);
+			return { store, candidates: await store.predict(sessionID, schemas, settings, identities) };
+		};
+		const existing = startInput && roots.get(startInput);
+		if (existing) return existing;
+		const pending = predict();
+		if (startInput) roots.set(startInput, pending);
+		return pending;
 	};
 	const flushStores = async (finish = false): Promise<void> => {
 		await analysisTail;
@@ -238,17 +264,19 @@ export function createPatternPlanSource({
 						pattern.maxPredictionDepth)
 			);
 		},
+		continuationBatch: ({ feedback, actionID }) =>
+			feedbacks.get(feedback as object)?.context?.drafterRoot ? [actionID] : undefined,
 		requestLifetime: "actor_decision",
 		propose: ({ startInput, data, settings, signal }) =>
 			admit(settings, async (patternSettings) => {
 				if (!patternSettings.enabled) return undefined;
 				const turn = turnState(startInput.sessionID, startInput.turnID);
-				const store = await predictionStore(patternSettings, signal);
-				if (!store) return undefined;
-				const candidates = await store.predict(
+				if (signal.aborted) return undefined;
+				const { store, candidates } = await rootPrediction(
 					startInput.sessionID,
-					data.schemaHashes,
+					startInput,
 					patternSettings,
+					data.schemaHashes,
 					data.patternIdentities,
 				);
 				const carried = carriedPredictions.get(startInput.sessionID);
@@ -498,13 +526,31 @@ export function createPatternPlanSource({
 						await flushStores(true);
 					}),
 			}),
-		hints: ({ sessionID, schemaHashes, settings, patternIdentities }) =>
+		hints: ({ sessionID, startInput, schemaHashes, settings, patternIdentities }) =>
 			admit(settings, async (patternSettings) => {
 				if (!settings.enabled || !patternSettings.enabled) return [];
-				const store = await predictionStore(patternSettings);
-				return (await store!.predict(sessionID, schemaHashes, patternSettings, patternIdentities))
-					.slice(0, speculativeConfig().prediction.maxHints)
-					.map(({ tool, input, horizon }) => ({ tool, input, horizon }));
+				const { candidates } = await rootPrediction(
+					sessionID,
+					startInput,
+					patternSettings,
+					schemaHashes,
+					patternIdentities,
+				);
+				return candidates
+					.filter(
+						({ background, tool }) =>
+							!background &&
+							(!startInput || Object.hasOwn(schemaHashes, tool)) &&
+							(!settings.tools || settings.tools.includes(tool)),
+					)
+					.map(({ tool, input, horizon, confidence, immediateConfidence }) => ({
+						tool,
+						input,
+						horizon,
+						confidence: horizon === 0 ? immediateConfidence ?? confidence : confidence,
+					}))
+					.sort((a, b) => a.horizon - b.horizon || b.confidence - a.confidence)
+					.slice(0, speculativeConfig().prediction.maxHints);
 			}),
 		dispose: () =>
 			lifecycle.close(async () => {
@@ -543,7 +589,9 @@ function patternPlanAction(
 		latestHorizon,
 		empiricalProbability,
 		conditionalProbability,
+		adoptionProbability,
 		confidence,
+		expectedDurationMs,
 		background,
 		depth,
 		presetID,
@@ -558,13 +606,16 @@ function patternPlanAction(
 		latestHorizon,
 		empiricalProbability,
 		conditionalProbability,
+		adoptionProbability,
 		confidence,
+		expectedDurationMs,
 		depth,
 		...(presetID ? { mode: presetID } : {}),
 		...(background ? { background: true } : {}),
 		...(dependsOn?.length ? { dependsOn } : {}),
 		feedback: {
 			store,
+			drafterRoot: !dependsOn && coversDrafterRoot(candidate),
 			continuation: candidate.continuation,
 			supportingPatternIDs,
 		},

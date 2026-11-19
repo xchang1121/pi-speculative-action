@@ -99,7 +99,6 @@ export const DEFAULT_SPECULATIVE_CONFIG = deepFreeze({
 		minOccurrences: 2,
 		maxPatterns: 4096,
 	},
-	explicitOnly: true,
 	subcomputation: {
 		exposeToControlledProcesses: false,
 		maxStepResultBytes: 16 * 1024 * 1024,

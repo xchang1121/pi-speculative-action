@@ -30,12 +30,20 @@ interface EvidenceState {
 	trials: number;
 	successes: number;
 }
-/** Beta-prior evidence over opaque structural contexts. */
+/** Beta posterior over the latest observation batches, including their exact trial counts. */
 export class EvidenceLedger {
 	private readonly states = new Map<string, EvidenceState>();
+	private readonly recent: { key: string; trials: number; successes: number }[] = [];
+	private readonly window: number;
 	private readonly priorTrials: number;
 	private readonly priorSuccesses: number;
-	constructor(priorTrials: number, priorSuccesses: number) {
+	constructor(
+		priorTrials: number,
+		priorSuccesses: number,
+		window = speculativeConfig().prediction.calibrationWindow,
+	) {
+		if (!isSafeCount(window)) throw new RangeError("Invalid evidence window");
+		this.window = window;
 		this.priorTrials = priorTrials;
 		this.priorSuccesses = priorSuccesses;
 	}
@@ -52,6 +60,14 @@ export class EvidenceLedger {
 		state.trials += trials;
 		state.successes += successes;
 		this.states.set(key, state);
+		this.recent.push({ key, trials, successes });
+		if (this.recent.length > this.window) {
+			const oldest = this.recent.shift()!;
+			const expired = this.states.get(oldest.key)!;
+			expired.trials -= oldest.trials;
+			expired.successes -= oldest.successes;
+			if (--expired.observations === 0) this.states.delete(oldest.key);
+		}
 	}
 	probability(contexts: readonly object[]): number {
 		if (!contexts.length) return this.priorSuccesses / this.priorTrials;
@@ -369,8 +385,6 @@ interface ReportedCandidate {
 interface CandidateRecord {
 	readonly id: string;
 	readonly key: string;
-	readonly executionKey: string;
-	readonly executionID: string;
 	readonly tool: string;
 	readonly input: Readonly<Record<string, unknown>>;
 	readonly sources: Set<string>;
@@ -560,7 +574,6 @@ export class SelfSpeculationCoordinator {
 		candidate: MaterializedSpeculativeCandidate<string>,
 	): CandidateRecord {
 		const predictedAction = candidate.predictedAction;
-		const executionAction = candidate.executionAction;
 		const existing = candidates.get(predictedAction.key);
 		const source = candidate.source || "unknown";
 		if (existing) {
@@ -589,8 +602,6 @@ export class SelfSpeculationCoordinator {
 			const record: CandidateRecord = {
 				id: actionIdentity(predictedAction.key),
 				key: predictedAction.key,
-				executionKey: executionAction.key,
-				executionID: actionIdentity(executionAction.key),
 				tool: candidate.tool,
 				input: structuredClone(candidate.input),
 				sources: new Set([source]),
@@ -1084,11 +1095,6 @@ function candidatePayload(
 ): Readonly<Record<string, unknown>> {
 	return {
 		id: candidate.id,
-		action_identity: {
-			predicted_action_id: candidate.id,
-			execution_action_id: candidate.executionID,
-			projected: candidate.key !== candidate.executionKey,
-		},
 		sources: [...candidate.sources].sort(),
 		provenance: candidate.provenance,
 		tool_call: { name: candidate.tool, arguments: candidate.input },

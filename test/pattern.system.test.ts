@@ -1,3 +1,5 @@
+import { fauxAssistantMessage, type Context } from "@earendil-works/pi-ai";
+import { SpeculationScheduler } from "../src/system-resources.ts";
 import { afterEach, expect, test, vi } from "vitest";
 import path from "node:path";
 import { existsSync, globSync } from "node:fs";
@@ -13,6 +15,7 @@ import {
 	type PatternAwareEvent,
 	type PatternAwareEventInput,
 } from "../src/pattern-aware.ts";
+import { coversDrafterRoot } from "../src/pattern-plan-source.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import type { PredictionSettlement } from "../src/settlement.ts";
 import {
@@ -737,7 +740,7 @@ test("checks workspace confinement for read arguments learned from a custom text
 
 test("learns absolute Actor paths from relative output and preserves non-round-tripping tool arguments", async () => {
 	const cwd = await directories.create();
-	const semantics = patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd, PI_ACTION_SEMANTICS.projectors());
+	const semantics = patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd);
 	const store = new PatternAwareStore(immediate, undefined, semantics);
 	for (let i = 0; i < 6; i++) {
 		const id = "paths-" + i;
@@ -922,6 +925,27 @@ test("merges per-gap probability into the covered window while crediting a singl
 	expect(open(1)).toMatchObject({ horizon: 0, latestHorizon: 0, supportingPatternIDs: [early.id] });
 });
 
+test("keeps the Drafter root when a confident prediction spreads its probability across two gaps", () => {
+	const settings = { ...immediate, maxFutureGap: 1, decayHalfLifeEvents: 0 };
+	const store = new PatternAwareStore(settings);
+	const report = (id: string) => event(id, "locate", {}, { outputPaths: [id + ".ts"] });
+	for (let i = 0; i < 12; i++) {
+		const id = String(i);
+		store.observe(report(id));
+		if (i % 2) store.observe(event(id, "wait", {}, { learnTarget: false }));
+		store.observe(event(id, "open", { path: id + ".ts" }));
+		if (!(i % 2)) store.observe(event(id, "wait", {}, { learnTarget: false }));
+		store.finishSession(id);
+	}
+	for (const pattern of store.snapshot().filter((p) => p.targetTool === "open"))
+		for (let i = 0; i < 12; i++) store.settled(pattern.id, accepted);
+	const candidate = store.predictAfterBatch("held", [report("held")]).find((p) => p.tool === "open")!;
+	expect(candidate).toMatchObject({ horizon: 0, latestHorizon: 1 });
+	expect(candidate.confidence).toBeGreaterThan(0.8);
+	expect(candidate.immediateConfidence).toBeLessThan(0.5);
+	expect(coversDrafterRoot(candidate)).toBe(false);
+});
+
 function learnPortablePattern(store: PatternAwareStore, tool: string, count: number) {
 	for (let i = 0; i < count; i++) {
 		const id = tool + i;
@@ -991,3 +1015,124 @@ test("checks portable confusion on the source clock and rebases aged feedback on
 	expect(candidate?.patternID).toBe(id);
 	expect(candidate?.background).toBeFalsy();
 });
+
+test("ranks actionable savings using decayed pattern durations after reopening the store", async () => {
+	const file = path.join(await directories.create(), "durations.json");
+	const settings = { ...immediate, decayHalfLifeEvents: 6 };
+	const store = new PatternAwareStore(settings, file);
+	await store.load();
+	const report = (id: string) => event(id, "locate", {}, { outputPaths: [id + ".ts"] });
+	const samples: PatternAwareEvent[] = [];
+	for (let i = 0; i < 6; i++) {
+		const id = String(i);
+		store.observe(report(id));
+		store.observeBatch(
+			["fast", "slow"].map((tool) => ({
+				...event(id, tool, { path: id + ".ts" }, { durationMs: tool === "fast" ? 0.25 : i < 3 ? 10 : 90 }),
+				turnID: "actions",
+			})),
+		);
+		samples.push(store.recent(id).find((e) => e.tool === "slow")!);
+		store.finishSession(id);
+	}
+	const fast = store.snapshot().find((pattern) => pattern.targetTool === "fast")!;
+	store.settled(fast.id, accepted);
+	const weights = samples.map(
+		(e) => 2 ** ((e.sequence - samples.at(-1)!.sequence) / settings.decayHalfLifeEvents),
+	);
+	const expected =
+		samples.reduce((sum, e, i) => sum + weights[i]! * e.durationMs, 0) / weights.reduce((a, b) => a + b);
+	await store.flush();
+	const reopened = new PatternAwareStore(settings, file);
+	await reopened.load();
+	for (const model of [store, reopened]) {
+		const candidates = model.predictAfterBatch("held", [report("held")]);
+		expect(candidates.map((p) => p.tool)).toEqual(["slow", "fast"]);
+		expect(candidates[0]!.confidence).toBeLessThan(candidates[1]!.confidence);
+		expect(candidates[0]!.expectedDurationMs).toBeCloseTo(expected);
+		expect(candidates[1]!.expectedDurationMs).toBe(0.25);
+	}
+});
+
+test.each(["strong", "uncalibrated", "background"] as const)(
+	"coordinates the %s PatternAware forecast with concurrent Drafter roots",
+	async (quality) => {
+		const cwd = await directories.create();
+		await writeFile(path.join(cwd, "live.txt"), "live");
+		const store = new PatternAwareStore(immediate);
+		const report = (id: string) => event(id, "catalog", {}, { outputPaths: [id + ".txt"] });
+		for (let i = 0; i < 8; i++) {
+			const id = String(i);
+			store.observe(report(id));
+			store.observe(event(id, "read", { path: id + ".txt" }, { durationMs: 42 }));
+			store.finishSession(id);
+		}
+		const pattern = store.snapshot().find((p) => p.targetTool === "read")!;
+		for (let i = 0; i < 12 && quality !== "uncalibrated"; i++) {
+			store.settled(pattern.id, quality === "strong" ? accepted : { ...accepted, match: { matched: false } });
+		}
+		store.observe(report("live"));
+		const [candidate] = store.predict("live");
+		expect(!!candidate?.background).toBe(quality === "background");
+		expect(candidate!.confidence >= 0.8).toBe(quality === "strong");
+		const contexts: Context[] = [];
+		const f = systemHost(
+			cwd,
+			[createReadTool(cwd)],
+			{
+				patternStore: store,
+				complete: async (_model, context) => {
+					contexts.push(context);
+					return fauxAssistantMessage("done");
+				},
+			},
+			{
+				patternAware: immediate,
+				drafterEnabled: true,
+				drafterPatternHints: quality !== "strong",
+				drafterMaxDepth: quality === "strong" ? 1 : 0,
+				candidateLimit: 2,
+			},
+			"live",
+		);
+		const predictions = vi.spyOn(store, "predict");
+		const evaluate = vi.spyOn(SpeculationScheduler.prototype, "evaluate");
+		try {
+			await f.start();
+			const roots = () =>
+				f.events.flatMap((e) =>
+					e.type === "source_request" &&
+					e.request.request.source === "drafter" &&
+					e.request.request.kind === "proposal"
+						? [e.request]
+						: [],
+				);
+			await expect.poll(() => roots().length).toBe(2);
+			expect(predictions).toHaveBeenCalledTimes(1);
+			if (quality === "strong") {
+				expect(
+					roots().every(
+						(r) => r.settlement.status === "empty" && r.settlement.cause?.code === "pattern_covers_root",
+					),
+				).toBe(true);
+				await expect.poll(() => contexts.length).toBe(1);
+				expect(contexts[0]!.messages.some((m) => m.role === "toolResult")).toBe(true);
+				expect(f.drafter.budget.requests).toBe(1);
+				expect(f.materialized).toContainEqual(
+					expect.objectContaining({ source: "pattern_aware", expectedDurationMs: 42 }),
+				);
+				expect(evaluate.mock.calls.flatMap(([forecasts]) => forecasts)).toContainEqual(
+					expect.objectContaining({ tool: "read", expectedDurationMs: 42 }),
+				);
+			} else {
+				expect(f.drafter.budget.requests).toBe(2);
+				for (const context of contexts)
+					expect(JSON.stringify(context.messages).includes("live.txt")).toBe(quality === "uncalibrated");
+			}
+		} finally {
+			await f.dispose();
+			predictions.mockRestore();
+			evaluate.mockRestore();
+		}
+	},
+);

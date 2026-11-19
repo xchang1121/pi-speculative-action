@@ -1,10 +1,5 @@
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
-import type {
-	ActionKey,
-	ActionKeyMatch,
-	ActionProjectionRule,
-	ActionSemanticsRegistry,
-} from "./action-semantics.ts";
+import type { ActionKey, ActionKeyMatch, ActionSemanticsRegistry } from "./action-semantics.ts";
 import type { DrafterToolDefinition } from "./config-schema.ts";
 import { nonNegativeNumber } from "./config-schema.ts";
 import type {
@@ -37,7 +32,7 @@ export type ResolutionStage =
 	| "authorization"
 	| "freshness"
 	| "compatibility"
-	| "projection"
+	| "reconstruction"
 	| "commit"
 	| "retention"
 	| "control";
@@ -299,12 +294,10 @@ export interface MaterializedSpeculativeCandidate<SessionID>
 	readonly source: string;
 	readonly proposalID: string;
 	readonly actionID: string;
-	/** Producer-facing arguments, before K(a) canonicalization or execution projection. */
+	/** Producer-facing arguments, before K(a) canonicalization. */
 	readonly input: Readonly<Record<string, unknown>>;
 	/** Exact Actor-visible K(a) represented by the prediction and target-decoder draft. */
 	readonly predictedAction: ActionKey;
-	/** K(a) actually scheduled; it may cover the prediction through a lossless projection. */
-	readonly executionAction: ActionKey;
 }
 /** The exact K(a) Runtime assigned to an authoritative Actor tool call. */
 export interface MaterializedActorAction<SessionID>
@@ -549,7 +542,6 @@ export interface SpeculativeActionRuntimeAdapter<
 				readonly parentWorld?: WorldBranch<Output>;
 			},
 	) => MaybePromise<WorldBranch<Output>>;
-	readonly projectionRules?: readonly ActionProjectionRule<Output>[];
 	readonly rejectCandidateOutput?: (input: {
 		readonly output: Output;
 		readonly candidate: SpeculativeCandidate;
@@ -1144,9 +1136,8 @@ export interface ActorCandidateSelection<
 	readonly match: ActionKeyMatch;
 	readonly output: Output;
 	readonly toolExecution: TimelineInterval;
-	readonly projection?: TimelineInterval;
-	/** This projection already existed before the current Actor call; a fresh reconstruction has no receipt. */
-	readonly projectionReused?: true;
+	/** This result view already existed before the current Actor call; a fresh reconstruction has no receipt. */
+	readonly viewReused?: true;
 }
 type ActorActionState<
 	Candidate extends {

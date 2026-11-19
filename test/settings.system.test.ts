@@ -36,8 +36,6 @@ it("rejects unusable SQLite retry budgets through the public configuration API",
 	const config = resolveSpeculativeConfig({
 		storage: { sqliteRetryInitialMs: 2, sqliteRetryMaxMs: 8, sqliteRetryMultiplier: 2 },
 	});
-	expect(config.explicitOnly).toBe(true);
-	expect(resolveSpeculativeConfig({ explicitOnly: false }).explicitOnly).toBe(false);
 	expect(Object.isFrozen(config.storage)).toBe(true);
 });
 

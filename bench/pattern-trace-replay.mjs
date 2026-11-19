@@ -55,8 +55,7 @@ async function replay(tape, stateDirectory) {
 	const schemas = definitionSchemaHashes(
 		definitions.map((tool) => ({ name: tool.name, inputSchema: tool.parameters })),
 	);
-	const rules = PI_ACTION_SEMANTICS.projectors();
-	const semantics = patternAwareActionSemantics(PI_ACTION_SEMANTICS, tape.cwd, rules);
+	const semantics = patternAwareActionSemantics(PI_ACTION_SEMANTICS, tape.cwd);
 	const key = (tool, input) => semantics.actionKey(tool, input, schemas[tool]);
 	const lease = await acquirePatternAwareStore(workspace, PATTERN_AWARE_DEFAULTS, stateDirectory, semantics);
 	const { store } = lease;
@@ -69,7 +68,6 @@ async function replay(tape, stateDirectory) {
 		falseProposals: 0,
 		rawExact: 0,
 		exact: 0,
-		projected: 0,
 		coveredCalls: 0,
 		matchedRecordedWallMs: 0,
 	};
@@ -90,18 +88,12 @@ async function replay(tape, stateDirectory) {
 					.map(({ call, key: actor }) => ({
 						call,
 						raw: isDeepStrictEqual(call.arguments, p.input),
-						relation: predicted && actor && actionKeyMatch(predicted, actor, rules, true),
+						relation: predicted && actor && actionKeyMatch(predicted, actor),
 					}));
 				score.rawExact += Number(matches.some(({ raw }) => raw));
-				const compatible = matches.filter(({ relation }) => relation)
-					.sort(
-						(a, b) =>
-							Number(b.raw) - Number(a.raw) ||
-							Number(b.relation.kind === "exact") - Number(a.relation.kind === "exact") ||
-							a.relation.distance - b.relation.distance,
-					);
+				const compatible = matches.filter(({ relation }) => relation);
 				if (compatible.length) {
-					score[compatible[0].relation.kind]++;
+					score.exact++;
 					score.top1 += Number(rank === 0);
 					for (const { call } of compatible) covered.add(call.id);
 				} else score.falseProposals++;

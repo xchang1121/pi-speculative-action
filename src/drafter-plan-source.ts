@@ -23,10 +23,10 @@ import {
 import type { ToolSettlement } from "./execution-world.ts";
 import { canonicalToolObservation, toolObservationContract, toolObservationKey } from "./execution-world.ts";
 import { BoundedRecencyMap, immutableSnapshot, stableValueHash } from "./primitives.ts";
-import type { SpeculativeActionSettings } from "./runtime-engine.ts";
+import { coversDrafterRoot, type PatternPlanSourceController } from "./pattern-plan-source.ts";
 import { SharedAbortScope, waitForCompletion } from "./runtime-lifecycle.ts";
 import type { PlanAction, PlanProposal } from "./settlement.ts";
-import { predictionLearning } from "./settlement.ts";
+import { predictionLearning, SourceRequestSuppressed } from "./settlement.ts";
 export interface DrafterBudgetSnapshot {
 	readonly requests: number;
 	readonly reportedTokens: number;
@@ -146,25 +146,14 @@ export interface DrafterPlanSnapshot {
 export function createDrafterPlanSource(
 	input: DrafterModelOptions & {
 		readonly sessionID: string;
-		readonly patternHints?: (input: {
-			readonly sessionID: string;
-			readonly schemaHashes: Readonly<Record<string, string>>;
-			readonly patternIdentities?: Readonly<Record<string, string>>;
-			readonly settings: SpeculativeActionSettings;
-		}) => Promise<
-			readonly {
-				readonly tool: string;
-				readonly input: Readonly<Record<string, unknown>>;
-				readonly horizon: number;
-			}[]
-		>;
+		readonly patternHints?: PatternPlanSourceController["hints"];
 	},
 ) {
 	const batches = new Map<
 		string,
 		{
 			lifetime: SharedAbortScope;
-			ready: Promise<DrafterBatch | undefined>;
+			ready: Promise<(DrafterBatch & { skipRoot: boolean }) | undefined>;
 		}
 	>();
 	const budget = input.drafterBudget ?? new DrafterTaskBudget();
@@ -178,6 +167,7 @@ export function createDrafterPlanSource(
 			adoptions: number[];
 		}
 	>(speculativeConfig().prediction.calibrationBuckets);
+	const durations = new BoundedRecencyMap<string, number[]>(speculativeConfig().prediction.calibrationBuckets);
 	const calibrationKey = (batch: DrafterBatch, tool: string) => JSON.stringify([batch.key, tool]);
 	const probability = (samples: readonly number[] = []) =>
 		(samples.reduce((sum, value) => sum + value, 0) +
@@ -185,8 +175,8 @@ export function createDrafterPlanSource(
 		(samples.length +
 			speculativeConfig().prediction.calibrationSuccessPrior +
 			speculativeConfig().prediction.calibrationFailurePrior);
-	const observe = (samples: number[], outcome: boolean) => {
-		samples.push(Number(outcome));
+	const observe = (samples: number[], value: number) => {
+		samples.push(value);
 		if (samples.length > speculativeConfig().prediction.calibrationWindow) samples.shift();
 	};
 	const finishBatch = (key: string) => {
@@ -287,6 +277,7 @@ export function createDrafterPlanSource(
 		return {
 			actions: [...feedback.calls].map(([id, { call }]): PlanAction => {
 				const samples = calibration.get(calibrationKey(batch, call.name));
+				const times = durations.get(call.name);
 				return {
 					id,
 					type: "tool_call",
@@ -295,6 +286,7 @@ export function createDrafterPlanSource(
 					depth,
 					feedback,
 					dependsOn,
+					expectedDurationMs: times?.length ? times.reduce((sum, ms) => sum + ms, 0) / times.length : undefined,
 					empiricalProbability: probability(samples?.matches),
 					adoptionProbability: probability(samples?.adoptions),
 				};
@@ -368,10 +360,12 @@ export function createDrafterPlanSource(
 						// Optional pattern hints follow the Actor history to preserve its prefix.
 						const hints = await input.patternHints?.({
 							sessionID: startInput.sessionID,
+							startInput,
 							schemaHashes: data.schemaHashes,
 							patternIdentities: data.patternIdentities,
 							settings,
-						});
+						}).catch(() => []);
+						if (signal.aborted) return undefined;
 						const selected: Context = settings.tools
 							? {
 									...startInput.context,
@@ -419,6 +413,7 @@ export function createDrafterPlanSource(
 							},
 							key,
 							budgetPolicy: drafter,
+							skipRoot: hints?.some(coversDrafterRoot) ?? false,
 						};
 					}),
 				};
@@ -430,6 +425,8 @@ export function createDrafterPlanSource(
 			try {
 				const prepared = await batch.ready;
 				if (!prepared || signal.aborted) return undefined;
+				if (prepared.skipRoot)
+					throw new SourceRequestSuppressed({ stage: "source", code: "pattern_covers_root" });
 				draft = await completeDraft(
 					{
 						...prepared,
@@ -616,6 +613,10 @@ export function createDrafterPlanSource(
 		source,
 		connect: (runtime: AgentRuntime) =>
 			runtime.subscribe({
+				actor_observed: ({ tool, durationMs }) => {
+					if (Number.isFinite(durationMs) && durationMs > 0)
+						observe(durations.getOrCreate(tool, () => []), durationMs);
+				},
 				prediction_feedback: ({ actionID, feedback, settlement, served }) => {
 					const batch = feedbacks.get(feedback as object);
 					const tool = batch?.calls.get(actionID)?.call.name;
@@ -626,8 +627,8 @@ export function createDrafterPlanSource(
 						matches: [],
 						adoptions: [],
 					}));
-					if (matched !== undefined) observe(samples.matches, matched);
-					if (adopted !== undefined) observe(samples.adoptions, adopted);
+					if (matched !== undefined) observe(samples.matches, Number(matched));
+					if (adopted !== undefined) observe(samples.adoptions, Number(adopted));
 				},
 				turn_finished: ({ startInput }) => {
 					finishBatch(agentBatchKey(startInput.sessionID, startInput.turnID));

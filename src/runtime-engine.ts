@@ -1,22 +1,8 @@
 import { serialize } from "node:v8";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import type {
-	ActionKey,
-	ActionKeyMatch,
-	ActionKeyProjector,
-	ActionProjectionCoverage,
-	ActionProjectionRule,
-	ActionSemanticsRegistry,
-} from "./action-semantics.ts";
-import {
-	actionKeyCovers,
-	actionKeyMatch,
-	actionKeyProjectionPartitions,
-	ownActionKeyProjector,
-	PI_ACTION_SEMANTICS,
-	resolveActionProjectionRules,
-} from "./action-semantics.ts";
+import type { ActionKey, ActionKeyMatch, ActionSemanticsRegistry } from "./action-semantics.ts";
+import { actionKeyMatch, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import type { AgentPlanSource, AgentRuntime } from "./agent-integration.ts";
 import type { DrafterToolDefinition } from "./config-schema.ts";
 import {
@@ -131,31 +117,22 @@ interface IndexedEntry<Entry> {
 }
 interface IndexedScope<Entry> {
 	readonly entries: Map<string, IndexedEntry<Entry>>;
-	/** Pending work, tagged exact/input/view keys and JSON projections occupy disjoint namespaces. */
+	/** Disjoint indexes for pending work, exact keys, sealed inputs and rebuilt views. */
 	readonly partitions: Map<string, Set<IndexedEntry<Entry>>>;
 }
 /** One registration survives execution, settlement and cache retention. Keys identify reuse, IDs own work. */
 export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 	private readonly scopes = new Map<Scope, IndexedScope<Entry>>();
 	private readonly waiters = new Map<Scope, Set<(changed: boolean) => void>>();
-	private readonly projectors: readonly ActionKeyProjector[];
 	private readonly score: (entry: Entry, evidence: ResultCacheEvidence, now: number) => number;
 	private readonly now: () => number;
 	private sequence = 0;
 	constructor(
-		projectors: readonly ActionKeyProjector[] = [],
 		score: (entry: Entry, evidence: ResultCacheEvidence, now: number) => number = () => 0,
 		now: () => number = Date.now,
 	) {
-		this.projectors = projectors.map(ownActionKeyProjector);
 		this.score = score;
 		this.now = now;
-	}
-	insert(scope: Scope, entry: Entry): Entry | undefined {
-		return (
-			this.get(scope, entry.id) ??
-			this.add(scope, entry, entry.key ? actionKeyProjectionPartitions(entry.key, this.projectors) : [])
-		);
 	}
 	/** Observe before yielding: a later producer or sealed view may satisfy an existing consumer. */
 	observe(scope: Scope): {
@@ -189,24 +166,21 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		scope: Scope,
 		key: ActionKey,
 		create: () => Entry,
-		canReuse: (existing: Entry, match: ActionKeyMatch) => boolean = (_entry, match) => match.kind === "exact",
+		canReuse: (existing: Entry) => boolean = () => true,
 	): CandidateLookup<Entry> & {
 		readonly inserted: boolean;
 	} {
-		const partitions = actionKeyProjectionPartitions(key, this.projectors);
-		for (const { entry: existing, match, indexed } of this.lookupRecords(scope, key, partitions).sort(
-			(left, right) => Number(right.match.kind === "exact") - Number(left.match.kind === "exact"),
-		)) {
+		for (const { entry: existing, match, indexed } of this.lookupRecords(scope, key, false)) {
 			if (
 				this.record(scope, existing) !== indexed ||
-				!canReuse(existing, match) ||
+				!canReuse(existing) ||
 				this.record(scope, existing) !== indexed
 			)
 				continue;
 			return { entry: existing, match, inserted: false };
 		}
 		const entry = create();
-		const existing = this.add(scope, entry, partitions);
+		const existing = this.insert(scope, entry);
 		return {
 			entry: existing ?? entry,
 			match: { kind: "exact", distance: 0 },
@@ -219,19 +193,8 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 	has(scope: Scope, entry: Entry): boolean {
 		return this.get(scope, entry.id) === entry;
 	}
-	lookup(
-		scope: Scope,
-		action: ActionKey,
-		requireCoverage?: (entry: Entry) => boolean,
-		includeInputs = true,
-	): readonly CandidateLookup<Entry>[] {
-		return this.lookupRecords(
-			scope,
-			action,
-			actionKeyProjectionPartitions(action, this.projectors),
-			requireCoverage,
-			includeInputs,
-		).map(({ entry, match }) => ({ entry, match }));
+	lookup(scope: Scope, action: ActionKey, includeInputs = true): readonly CandidateLookup<Entry>[] {
+		return this.lookupRecords(scope, action, includeInputs).map(({ entry, match }) => ({ entry, match }));
 	}
 	/** Path lookup and dynamic query discovery share the same bounded input owners. */
 	lookupInputs(scope: Scope, resources?: readonly string[]): readonly Entry[] {
@@ -402,13 +365,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 			}
 		return inputs;
 	}
-	private lookupRecords(
-		scope: Scope,
-		action: ActionKey,
-		partitions: readonly string[],
-		requireCoverage?: (entry: Entry) => boolean,
-		includeInputs = false,
-	) {
+	private lookupRecords(scope: Scope, action: ActionKey, includeInputs: boolean) {
 		const state = this.scopes.get(scope);
 		if (!state) return [];
 		const inputs = includeInputs
@@ -427,17 +384,13 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 			...inputs.keys(),
 			...(views ?? []),
 		]);
-		for (const key of partitions)
-			for (const indexed of state.partitions.get(key) ?? []) candidates.add(indexed);
 		const ranked: (CandidateLookup<Entry> & {
 			readonly indexed: IndexedEntry<Entry>;
 		})[] = [];
 		for (const indexed of candidates) {
-			if (this.record(scope, indexed.entry) !== indexed) continue;
-			const coverage = requireCoverage?.(indexed.entry) ?? false;
 			const match =
-				(indexed.entry.key && actionKeyMatch(indexed.entry.key, action, this.projectors, coverage)) ??
-				(!coverage && (inputs.has(indexed) || views?.has(indexed))
+				(indexed.entry.key && actionKeyMatch(indexed.entry.key, action)) ??
+				(inputs.has(indexed) || views?.has(indexed)
 					? {
 							kind: "inputs" as const,
 							distance:
@@ -448,15 +401,12 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 					: undefined);
 			if (match) ranked.push({ entry: indexed.entry, match, indexed });
 		}
-		// Provider callbacks may retire or replace a registration, even with the same object and ID.
-		return ranked
-			.filter(({ entry, indexed }) => this.record(scope, entry) === indexed)
-			.sort(
-				(left, right) =>
-					left.match.distance - right.match.distance || right.indexed.recency - left.indexed.recency,
-			);
+		return ranked.sort(
+			(left, right) =>
+				left.match.distance - right.match.distance || right.indexed.recency - left.indexed.recency,
+		);
 	}
-	private add(scope: Scope, entry: Entry, partitions: readonly string[]): Entry | undefined {
+	insert(scope: Scope, entry: Entry): Entry | undefined {
 		const state: IndexedScope<Entry> = this.scopes.get(scope) ?? {
 			entries: new Map(),
 			partitions: new Map(),
@@ -469,7 +419,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 			recency: this.sequence++,
 		};
 		state.entries.set(entry.id, indexed);
-		this.index(state, indexed, ["pending", ...(entry.key ? [`exact:${entry.key.key}`] : []), ...partitions]);
+		this.index(state, indexed, ["pending", ...(entry.key ? [`exact:${entry.key.key}`] : [])]);
 		this.scopes.set(scope, state);
 		this.notify(scope);
 		return undefined;
@@ -1809,31 +1759,16 @@ function candidateBranch<Output>(candidate: CandidateRecord<Output>): WorldBranc
 	const execution = candidate.work.execution;
 	return execution.status === "succeeded" ? execution.output : undefined;
 }
-function captureCoverage<Output>(
-	action: ActionKey,
-	output: Output,
-	rules: readonly ActionProjectionRule<Output>[],
-): readonly ActionProjectionCoverage[] {
-	return rules.flatMap((rule) => {
-		try {
-			const value = rule.captureCoverage?.(action, output);
-			return value === undefined ? [] : [{ rule: rule.id, value: cloneSharedData(value) }];
-		} catch {
-			return [];
-		}
-	});
-}
-async function projectOutput<Output>(
+async function resolveResultView<Output>(
 	candidate: CandidateRecord<Output>,
 	actor: ActionKey,
 	match: ActionKeyMatch,
-	rules: readonly ActionProjectionRule<Output>[],
 	request: Parameters<NonNullable<WorldBranch<Output>["reconstruct"]>>[0],
 	mode: "cached" | "output" | "inputs" = "cached",
-): Promise<ProjectionResult<Output>> {
+): Promise<ResultView<Output>> {
 	const branch = candidateBranch(candidate)!;
 	if (branch.inputsOnly && match.kind !== "inputs")
-		return { ok: false, cause: cause("projection", "input_only_branch") };
+		return { ok: false, cause: cause("reconstruction", "input_only_branch") };
 	const retained = mode === "cached" && candidate.resultViews?.get(actor.key);
 	// A view kept without its proof is served only by a branch that can still commit and validate as a whole.
 	if (retained && (retained.validate || !branch.inputsOnly)) {
@@ -1843,42 +1778,23 @@ async function projectOutput<Output>(
 	}
 	if (!branch.inputsOnly && match.kind === "exact" && mode !== "inputs")
 		return { ok: true, output: branch.output };
-	const reconstruct = branch.reconstruct;
-	const rule =
-		match.kind === "projected" && mode !== "inputs"
-			? rules.find((item) => item.id === match.projector)
-			: undefined;
-	const coverage = candidate.projectionCoverage.find((item) => item.rule === rule?.id);
-	let rebuilt: Awaited<ReturnType<NonNullable<typeof reconstruct>>>;
+	let rebuilt: Awaited<ReturnType<NonNullable<typeof branch.reconstruct>>>;
 	try {
-		const { output: projected, computation: execution } = await TimelineInterval.measure(async () => {
-			const projected: Output | undefined =
-				!branch.inputsOnly && candidate.key && match.kind === "projected" && coverage && rule?.projectOutput
-					? cloneSharedData(
-							await rule.projectOutput({
-								speculative: candidate.key,
-								actor,
-								output: branch.output,
-								coverage: cloneSharedData(coverage.value),
-								keyMatch: match,
-							}),
-						)
-					: undefined;
-			return projected !== undefined ? projected : (rebuilt = await reconstruct?.(request))?.output;
+		const { computation: execution } = await TimelineInterval.measure(async () => {
+			rebuilt = await branch.reconstruct?.(request);
 		});
 		if ((rebuilt?.requiresQueryValidation || mode === "inputs") && !rebuilt?.validate)
-			return { ok: false, cause: cause("projection", "query_proof_missing") };
-		if (projected === undefined) return { ok: false, cause: cause("projection", "view_not_covered") };
-		const resource = rebuilt?.dispose ? { dispose: rebuilt.dispose.bind(rebuilt), references: 1 } : undefined;
-		const result: ProjectionResult<Output> = {
+			return { ok: false, cause: cause("reconstruction", "query_proof_missing") };
+		if (rebuilt?.output === undefined) return { ok: false, cause: cause("reconstruction", "view_not_covered") };
+		const resource = rebuilt.dispose ? { dispose: rebuilt.dispose.bind(rebuilt), references: 1 } : undefined;
+		const result: ResultView<Output> = {
 			ok: true,
-			output: projected,
+			output: rebuilt.output,
 			execution,
-			inputs: !!rebuilt,
-			compatibility: rebuilt?.compatibility,
-			validate: rebuilt?.validate,
-			capturedBytes: rebuilt?.capturedBytes,
-			requiresQueryValidation: rebuilt?.requiresQueryValidation,
+			compatibility: rebuilt.compatibility,
+			validate: rebuilt.validate,
+			capturedBytes: rebuilt.capturedBytes,
+			requiresQueryValidation: rebuilt.requiresQueryValidation,
 			resource,
 		};
 		rebuilt = undefined;
@@ -1886,7 +1802,7 @@ async function projectOutput<Output>(
 	} catch (error) {
 		return {
 			ok: false,
-			cause: cause("projection", "reconstruction_failed", errorDetail(error)),
+			cause: cause("reconstruction", "reconstruction_failed", errorDetail(error)),
 		};
 	} finally {
 		if (rebuilt?.dispose)
@@ -2012,7 +1928,6 @@ interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	};
 	expectedDurationMs?: number;
 	estimatedBytes: number;
-	projectionCoverage: readonly ActionProjectionCoverage[];
 	inputSource?: object;
 	resultViews?: Map<string, RetainedResultView<Output>>;
 	previews?: Set<ActorPreviewRecord>;
@@ -2083,22 +1998,21 @@ interface TurnState<SessionID, Output, StartInput, StateData> extends RuntimeTur
 	actorArrivedAt?: number;
 	lifecycle: "active" | "closing" | "finished";
 }
-interface ProjectionResource {
+interface ViewResource {
 	readonly dispose: () => void | Promise<void>;
 	references: number;
 }
-type ProjectionResult<Output> =
+type ResultView<Output> =
 	| {
 			readonly ok: true;
 			readonly output: Output;
 			readonly execution?: TimelineInterval;
 			readonly reused?: true;
-			readonly inputs?: boolean;
 			readonly compatibility?: WorldBranch<Output>["compatibility"];
 			readonly validate?: WorldBranch<Output>["validate"];
 			readonly capturedBytes?: number;
 			readonly requiresQueryValidation?: true;
-			readonly resource?: ProjectionResource;
+			readonly resource?: ViewResource;
 	  }
 	| {
 			readonly ok: false;
@@ -2106,7 +2020,7 @@ type ProjectionResult<Output> =
 	  };
 type RetainedResultView<Output> = Omit<
 	Extract<
-		ProjectionResult<Output>,
+		ResultView<Output>,
 		{
 			ok: true;
 		}
@@ -2159,8 +2073,7 @@ export function makeSpeculativeActionRuntime<
 		if (sourcesByID.has(source.id)) throw new Error(`duplicate speculative plan source ${source.id}`);
 		sourcesByID.set(source.id, source);
 	}
-	const projectionRules = resolveActionProjectionRules(adapter.projectionRules ?? [], semantics);
-	const candidateStore = new CandidateStore<SessionID, Candidate>(projectionRules, (_candidate, evidence) =>
+	const candidateStore = new CandidateStore<SessionID, Candidate>((_candidate, evidence) =>
 		resultCacheRecency(evidence),
 	);
 	const sourceEnabled = (source: Source | undefined, settings: SpeculativeActionSettings): boolean => {
@@ -2170,7 +2083,7 @@ export function makeSpeculativeActionRuntime<
 			return false;
 		}
 	};
-	const releaseProjectionResource = (sessionID: SessionID, resource?: ProjectionResource) => {
+	const releaseViewResource = (sessionID: SessionID, resource?: ViewResource) => {
 		if (resource && --resource.references === 0) sessionStates.get(sessionID)?.lifecycle.release(resource);
 	};
 	/** One mutation owns a view's storage, budget, lookup membership, and proof reference. */
@@ -2187,31 +2100,31 @@ export function makeSpeculativeActionRuntime<
 		else candidate.resultViews?.delete(key);
 		candidate.estimatedBytes += (view?.bytes ?? 0) - (previous?.bytes ?? 0);
 		candidateStore.indexView(sessionID, candidate, key, view !== undefined);
-		releaseProjectionResource(sessionID, previous?.resource);
+		releaseViewResource(sessionID, previous?.resource);
 	}
 	/** Memoized queries share their sealed candidate's proof, retention budget, and lifetime. */
 	function retainResultView(
 		sessionID: SessionID,
 		candidate: Candidate,
 		action: ActionKey,
-		projection: Extract<
-			ProjectionResult<Output>,
+		view: Extract<
+			ResultView<Output>,
 			{
 				ok: true;
 			}
 		>,
 		settings: SpeculativeActionSettings,
 	): boolean {
-		if (settings.reuseEnabled === false || !projection.execution || projection.reused) return false;
+		if (settings.reuseEnabled === false || !view.execution || view.reused) return false;
 		try {
-			const owned = cloneSharedData(projection.output);
+			const owned = cloneSharedData(view.output);
 			const outputBytes = estimateValueBytes(owned) + Buffer.byteLength(action.key);
 			setResultView(sessionID, candidate, action.key);
-			let bytes = outputBytes + finiteValue(projection.capturedBytes);
-			let validate = projection.validate;
-			let resource = projection.resource;
+			let bytes = outputBytes + finiteValue(view.capturedBytes);
+			let validate = view.validate;
+			let resource = view.resource;
 			if (
-				!projection.requiresQueryValidation &&
+				!view.requiresQueryValidation &&
 				candidate.estimatedBytes + bytes > cacheByteLimit(settings)
 			) {
 				bytes = outputBytes;
@@ -2228,13 +2141,12 @@ export function makeSpeculativeActionRuntime<
 				setResultView(sessionID, candidate, action.key, {
 					output: owned,
 					bytes,
-					execution: projection.execution,
-					inputs: projection.inputs,
-					compatibility: projection.compatibility,
+					execution: view.execution,
+					compatibility: view.compatibility,
 					validate,
 					resource,
 					capturedBytes: bytes - outputBytes,
-					requiresQueryValidation: projection.requiresQueryValidation,
+					requiresQueryValidation: view.requiresQueryValidation,
 				});
 				return true;
 			}
@@ -2384,7 +2296,7 @@ export function makeSpeculativeActionRuntime<
 		context: RuntimeTurnContext<StartInput, StateData>,
 		draft: SpeculativeDraftCandidate,
 		input: Pick<Candidate, "origin" | "key" | "route" | "expectedDurationMs"> &
-			Partial<Pick<Candidate, "forkParent" | "estimatedBytes" | "projectionCoverage">>,
+			Partial<Pick<Candidate, "forkParent" | "estimatedBytes">>,
 	): Candidate => {
 		const sequence = ++session.candidateSequence;
 		let resultBytes = input.estimatedBytes ?? 0;
@@ -2397,7 +2309,6 @@ export function makeSpeculativeActionRuntime<
 			),
 			actorAdopted: input.origin === "actor_result",
 			owner: { ...turnContext(context), draft, index: sequence - 1 },
-			projectionCoverage: [],
 			...input,
 			get estimatedBytes() {
 				return resultBytes + (candidateBranch(candidate)?.capturedBytes ?? 0);
@@ -2430,7 +2341,7 @@ export function makeSpeculativeActionRuntime<
 				session.id,
 				input.key,
 				create,
-				(existing, match) => {
+				(existing) => {
 					const execution = existing.work.execution;
 					return (
 						!!existing.key &&
@@ -2444,10 +2355,7 @@ export function makeSpeculativeActionRuntime<
 								input.route.reuse === "shared_result" &&
 								execution.status === "succeeded" &&
 								scheduler.assessCompatibility(execution.output.compatibility, input.key.executionFingerprint)
-									.compatible)) &&
-						(match.kind === "exact" ||
-							((existing.route.reuse === "shared_result" || execution.status !== "succeeded") &&
-								actionKeyCovers(existing.key, input.key, projectionRules)))
+									.compatible))
 					);
 				},
 			);
@@ -2900,7 +2808,6 @@ export function makeSpeculativeActionRuntime<
 					tool: node.action.tool,
 					input: structuredClone(concrete),
 					predictedAction,
-					executionAction: predictedAction,
 					...definedFields(node.action, [
 						"depth",
 						"horizon",
@@ -3271,21 +3178,11 @@ export function makeSpeculativeActionRuntime<
 					if (node.action.type !== "operation" || !node.actionKey) return [];
 					const exact =
 						operation?.backend === adoption.backend && operation.identity === adoption.operationIdentity;
-					return exact || node.actionKey.key === action.key
-						? maybe(
-								session.plan.claimMatch(
-									node,
-									actorAction,
-									exact
-										? { kind: "exact", distance: 0 }
-										: {
-												kind: "projected",
-												distance: 1,
-												projector: "owned-operation",
-											},
-								),
-							)
-						: [];
+					const owner = "candidateID" in node.execution && node.execution.candidateID === candidate.id;
+					if (!exact && !owner) return [];
+					return maybe(
+						session.plan.claimMatch(node, actorAction, { kind: exact ? "exact" : "inputs", distance: 0 }),
+					);
 				});
 				confirmPredictions(session, matches, actorAction, {
 					status: "adopted",
@@ -3331,9 +3228,6 @@ export function makeSpeculativeActionRuntime<
 					candidate: publicCandidate(candidate),
 				});
 			if (rejected) throw new CandidateFailure(cause("execution", "output_rejected", rejected));
-			candidate.projectionCoverage = branch.inputsOnly
-				? []
-				: captureCoverage(action, branch.output, projectionRules);
 			candidate.estimatedBytes = estimateValueBytes(branch.output) + inputIndexBytes(branch);
 			const completedAt = performance.now();
 			const computation = evaluation.computation;
@@ -3518,7 +3412,7 @@ export function makeSpeculativeActionRuntime<
 				`preview:${callKey(state.turnID, actualCall.id!)}`,
 			);
 			if (!lease) continue;
-			let projected: ProjectionResult<Output> | undefined;
+			let view: ResultView<Output> | undefined;
 			let prepared = false;
 			attachActorPreview(record, candidate, "existing");
 			try {
@@ -3531,7 +3425,7 @@ export function makeSpeculativeActionRuntime<
 					!active()
 				)
 					continue;
-				projected = await prepareCandidateOutput(
+				view = await prepareCandidateOutput(
 					state,
 					candidate,
 					action,
@@ -3539,9 +3433,9 @@ export function makeSpeculativeActionRuntime<
 					{ ...actualCall, input: action.input },
 					record.controller.signal,
 				);
-				if (projected.ok && active() && candidateStore.get(state.sessionID, candidate.id) === candidate) {
+				if (view.ok && active() && candidateStore.get(state.sessionID, candidate.id) === candidate) {
 					prepared = true;
-					if (retainResultView(state.sessionID, candidate, action, projected, state.settings))
+					if (retainResultView(state.sessionID, candidate, action, view, state.settings))
 						trimResults(state.session, state.settings);
 					return;
 				}
@@ -3550,7 +3444,7 @@ export function makeSpeculativeActionRuntime<
 					candidate.previews?.delete(record);
 					record.state = { status: "pending" };
 				}
-				if (projected?.ok) releaseProjectionResource(state.sessionID, projected.resource);
+				if (view?.ok) releaseViewResource(state.sessionID, view.resource);
 				lease.release();
 			}
 		}
@@ -3654,7 +3548,7 @@ export function makeSpeculativeActionRuntime<
 		match: ActionKeyMatch,
 		call: ActualToolCall,
 		signal: AbortSignal,
-	): Promise<ProjectionResult<Output>> => {
+	): Promise<ResultView<Output>> => {
 		const branch = candidateBranch(candidate)!;
 		const sourceCompatibility =
 			branch.reconstructionScope === "current_action" && match.kind !== "exact"
@@ -3679,11 +3573,10 @@ export function makeSpeculativeActionRuntime<
 						candidate,
 						`inputs:query:${callKey(state.turnID, call.id ?? action.hash)}`,
 					);
-				const projection = await projectOutput(
+				const view = await resolveResultView(
 					candidate,
 					action,
 					mode === "inputs" ? { kind: "inputs", distance: match.distance } : match,
-					projectionRules,
 					{
 						action,
 						args: call.input,
@@ -3693,26 +3586,26 @@ export function makeSpeculativeActionRuntime<
 					},
 					mode,
 				);
-				if (!projection.ok) return projection;
+				if (!view.ok) return view;
 				const compatibility =
 					sourceCompatibility ??
 					scheduler.assessCompatibility(
-						projection.compatibility ?? branch.compatibility,
+						view.compatibility ?? branch.compatibility,
 						action.executionFingerprint,
 					);
 				const validation = compatibility.compatible
 					? await validateWorldBranch(
-							projection.validate ? { validate: projection.validate } : branch,
+							view.validate ? { validate: view.validate } : branch,
 							candidate.route.reuse,
 						)
 					: {
 							status: "incompatible" as const,
 							cause: cause("compatibility", compatibility.code, compatibility.detail),
 						};
-				if (validation.status === "valid") return projection;
-				releaseProjectionResource(state.sessionID, projection.resource);
+				if (validation.status === "valid") return view;
+				releaseViewResource(state.sessionID, view.resource);
 				if (validation.status === "stale") {
-					if (projection.reused) {
+					if (view.reused) {
 						mode = "output";
 						continue;
 					}
@@ -3786,7 +3679,7 @@ export function makeSpeculativeActionRuntime<
 					continue;
 				}
 				(candidate.actorConsumers ??= new Set()).add(actorAction);
-				let projection: ProjectionResult<Output> | undefined;
+				let view: ResultView<Output> | undefined;
 				try {
 					if (candidate.work.execution.status === "queued") {
 						preemptForActor(
@@ -3824,7 +3717,7 @@ export function makeSpeculativeActionRuntime<
 					)
 						await waitForCompletion(preview.task, signal);
 					if (stopCandidate(candidate)) break;
-					projection = await prepareCandidateOutput(
+					view = await prepareCandidateOutput(
 						state,
 						candidate,
 						actualKey,
@@ -3833,13 +3726,13 @@ export function makeSpeculativeActionRuntime<
 						signal,
 					);
 					if (stopCandidate(candidate)) break;
-					if (!projection.ok) {
-						actorAction.rejectCandidate(candidate.id, choice.match, projection.cause);
+					if (!view.ok) {
+						actorAction.rejectCandidate(candidate.id, choice.match, view.cause);
 						continue;
 					}
-					let output = projection.output;
+					let output = view.output;
 					try {
-						if (!projection.validate) {
+						if (!view.validate) {
 							const committed = await branch.commit();
 							if (choice.match.kind === "exact") output = committed;
 						}
@@ -3885,25 +3778,24 @@ export function makeSpeculativeActionRuntime<
 							state.sessionID,
 							candidate,
 							actualKey,
-							projection,
+							view,
 							state.settings,
 						);
 						candidateStore.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
 						if (retained) trimResults(state.session, state.settings);
 					}
 					// Re-evaluating inputs adopts this query's computation, not the source tool's unused output work.
-					const toolExecution = projection.inputs ? projection.execution! : execution.toolExecution;
+					const toolExecution = view.execution ?? execution.toolExecution;
 					actorAction.select({
 						candidate,
-						match: projection.inputs ? { kind: "inputs", distance: choice.match.distance } : choice.match,
+						match: view.execution ? { kind: "inputs", distance: choice.match.distance } : choice.match,
 						output,
 						toolExecution,
-						...(projection.execution ? { projection: projection.execution } : {}),
-						...(projection.reused ? { projectionReused: true } : {}),
+						...(view.reused ? { viewReused: true } : {}),
 					});
 					break;
 				} finally {
-					if (projection?.ok) releaseProjectionResource(state.sessionID, projection.resource);
+					if (view?.ok) releaseViewResource(state.sessionID, view.resource);
 					candidate.actorConsumers?.delete(actorAction);
 					reservation.release();
 					retireUndemandedCandidate(state.session, candidate, cause("retention", "actor_released"));
@@ -4021,7 +3913,7 @@ export function makeSpeculativeActionRuntime<
 				actorAction.setFallback(cause("control", "reuse_disabled"));
 				return Object.freeze(prepared);
 			}
-			if (preview?.actionKey && actionKeyCovers(preview.actionKey, actualKey, projectionRules)) {
+			if (preview?.actionKey?.key === actualKey.key) {
 				preview.actorDemand = true;
 				const preparation = preparations.get(preview);
 				if (preparation) startQueuedCandidates(state.session, preparation);
@@ -4158,8 +4050,6 @@ export function makeSpeculativeActionRuntime<
 					key: action,
 					route,
 					estimatedBytes: estimateValueBytes(branch.output) + inputIndexBytes(branch),
-					projectionCoverage:
-						action && !branch.inputsOnly ? captureCoverage(action, branch.output, projectionRules) : [],
 				},
 			);
 			TimelineInterval.producedBy(toolExecution, candidateProducer(session, candidate));
@@ -4256,16 +4146,8 @@ export function makeSpeculativeActionRuntime<
 		const consumed = [
 			{
 				computation: settlement.provider.toolExecution,
-				reused: !!selection && (selection.match.kind !== "inputs" || !!selection.projectionReused),
+				reused: !!selection && (selection.match.kind !== "inputs" || !!selection.viewReused),
 			},
-			...(selection?.projection
-				? [
-						{
-							computation: selection.projection,
-							reused: selection.projectionReused,
-						},
-					]
-				: []),
 		];
 		const reused = TimelineInterval.reusedProducers(consumed);
 		actorAction.finishConsumption(reused);
@@ -4322,7 +4204,7 @@ export function makeSpeculativeActionRuntime<
 					concrete: asConcreteInput(actualCall.input) ?? {},
 					...(output !== undefined ? { output } : {}),
 				});
-				const execution = candidate?.work.execution;
+				const { toolExecution } = settlement.provider;
 				const observed = {
 					...turnContext(state),
 					...feedback,
@@ -4333,9 +4215,7 @@ export function makeSpeculativeActionRuntime<
 					durationMs:
 						settlement.provider.kind === "actor"
 							? settlement.provider.durationMs
-							: execution && "executionMs" in execution
-								? execution.executionMs
-								: 0,
+							: toolExecution.completedAt - toolExecution.startedAt,
 					order: settlement.actorAction.sequence,
 					signal: state.generation.signal,
 				};
@@ -4822,17 +4702,13 @@ export function makeSpeculativeActionRuntime<
 	const rankCandidates = (session: Session, action: ActionKey, preferred?: string) => {
 		const now = performance.now();
 		const choices = candidateStore
-			.lookup(
-				session.id,
-				action,
-				(candidate) => candidate.work.execution.status !== "succeeded",
-				semantics.effect(action) === "observation",
-			)
+			.lookup(session.id, action, semantics.effect(action) === "observation")
 			.flatMap(({ entry: candidate, match }) => {
 				const execution = candidate.work.execution;
 				const reservation = candidate.work.reservation;
 				if (
 					candidate.owner.draft.type !== "tool_call" ||
+					(match.kind === "inputs" && execution.status !== "succeeded") ||
 					!activeExecution(candidate) ||
 					(reservation.kind === "exclusive" && reservation.status === "consumed")
 				)
@@ -4920,7 +4796,7 @@ export function makeSpeculativeActionRuntime<
 		readonly relation: ActionKeyMatch;
 	}[] =>
 		nearestPredictions(session, decisionSequence, (node) => {
-			const relation = actionKeyMatch(node.actionKey!, action, projectionRules, true);
+			const relation = actionKeyMatch(node.actionKey!, action);
 			return relation ? { node, relation } : undefined;
 		});
 	const promoteForActor = async (

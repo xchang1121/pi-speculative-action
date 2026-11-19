@@ -234,7 +234,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${onOff(self.enabled)}; early tool execution ${self.enabled && self.forkTransport !== "provider" && self.forkEnabled && self.forkActionEnabled ? (self.forkTransport === "drafter" ? "On (Drafter)" : `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})`) : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; Actor Profile=${self.actorProfile}; ${self.draftFormat} (${self.draftBoundary === "auto" ? "automatic" : self.draftBoundary} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : FORK_TRANSPORT_LABELS[self.forkTransport]}`,
 		`Execution routing: admitted providers ${onOff(settings.executionRouting.primary)}; local routes ${onOff(settings.executionRouting.nativeFallback)}; Actor always available`,
 		`Search execution: ${searchExecutionLabel(settings.searchExecution)}`,
-		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial, ${metrics.inputReuseHits} inputs`,
+		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.inputReuseHits} inputs`,
 		...formatSubcomputations(metrics),
 		...(hasProcessReuse(metrics.actorProcessReuse)
 			? [`Bash Actor reuse: ${formatActorProcessReuse(metrics.actorProcessReuse)}`]
@@ -1234,13 +1234,7 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 			parts.push(tool, sources.join("+") || (provider.kind === "speculative" ? "cache" : "no prediction"));
 			if (provider.kind === "speculative") {
 				const { match } = provider;
-				parts.push(
-					match.kind === "projected"
-						? `partial-result reuse (${match.projector})`
-						: match.kind === "inputs"
-							? "sealed-input reuse"
-							: "exact-action reuse",
-				);
+				parts.push(match.kind === "inputs" ? "sealed-input reuse" : "exact-action reuse");
 			} else parts.push(`${formatDuration(provider.durationMs)} Actor ${provider.origin} execution`);
 			parts.push(compactEventText(event.actualAction));
 			break;

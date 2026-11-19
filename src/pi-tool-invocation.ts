@@ -25,14 +25,7 @@ import path from "node:path";
 import process from "node:process";
 import type { Worker } from "node:worker_threads";
 
-import {
-	BASH_TIMEOUT_ACTION_KEY_PROJECTOR,
-	GREP_LITERAL_ACTION_KEY_PROJECTOR,
-	grepLiteralMatches,
-	PI_ACTION_SEMANTICS,
-	resolvePiToolPath,
-	type ActionProjectionRule,
-} from "./action-semantics.ts";
+import { PI_ACTION_SEMANTICS, resolvePiToolPath } from "./action-semantics.ts";
 import { bindResourceOperation } from "./agent-execution-world.ts";
 import { speculativeConfig } from "./config-schema.ts";
 import {
@@ -199,45 +192,6 @@ export function resolvePiToolInvocation(
 	};
 }
 
-/** Only a finished command projects: Pi reports a timeout or non-zero exit as an error, which no other timeout reproduces. */
-export const PI_BASH_TIMEOUT_PROJECTION_RULE: ActionProjectionRule<ToolSettlement> = {
-	...BASH_TIMEOUT_ACTION_KEY_PROJECTOR,
-	captureCoverage: (action, output) => (action.tool === "bash" && !output.isError ? true : undefined),
-	projectOutput: ({ output }) => (output.isError ? undefined : output),
-};
-/** Pi prints each match of a complete literal search once, as `path:line: text`; the matches of a longer literal are a subset of those lines. */
-export const PI_GREP_LITERAL_PROJECTION_RULE: ActionProjectionRule<ToolSettlement> = {
-	...GREP_LITERAL_ACTION_KEY_PROJECTOR,
-	// Pi reports a match limit, byte limit or cut line in details: only a result without any covers a refinement.
-	captureCoverage: (action, output) =>
-		action.tool === "grep" && !output.isError && output.result.details === undefined ? true : undefined,
-	projectOutput: ({ speculative, actor, output }) => {
-		const [content, ...rest] = output.result.content;
-		const found = String(speculative.input.pattern);
-		const sought = String(actor.input.pattern);
-		if (output.isError || output.result.details !== undefined || rest.length || content?.type !== "text")
-			return undefined;
-		if (content.text === "No matches found") return output;
-		const kept: string[] = [];
-		const holds = (text: string, literal: string) =>
-			grepLiteralMatches(text, literal, actor.input.ignoreCase === true);
-		for (const line of content.text.split("\n")) {
-			// A path may itself contain `:N: `: every split whose text holds the found literal must agree.
-			const verdicts = new Set(
-				[...line.matchAll(/:\d+: /g)]
-					.map((split) => line.slice(split.index + split[0].length))
-					.filter((text) => holds(text, found))
-					.map((text) => holds(text, sought)),
-			);
-			if (verdicts.size !== 1) return undefined;
-			if (verdicts.has(true)) kept.push(line);
-		}
-		// At its limit the Actor's own search stops early and says so.
-		if (kept.length >= Number(actor.input.limit)) return undefined;
-		const text = kept.length ? kept.join("\n") : "No matches found";
-		return { ...output, result: { ...output.result, content: [{ type: "text", text }] } };
-	},
-};
 /** Pi's bash throws once a completed command exits non-zero, appending this status last (aborts and timeouts append others). */
 export function piToolErrorSettlement(tool: string, error: unknown): ToolSettlement {
 	const code =

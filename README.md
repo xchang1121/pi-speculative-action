@@ -54,7 +54,6 @@ export default function extension(pi) {
   "enabled": false,
   "reuseEnabled": true,
   "config": {
-    "explicitOnly": true,
     "subcomputation": { "maxStepResultBytes": 16777216, "persistTimelineIntervals": true },
     "filesystem": {
       "sandboxDriver": "in_memory", "excludes": [".git", "node_modules", "target"],
@@ -68,9 +67,9 @@ export default function extension(pi) {
 }
 ```
 
-`explicitOnly` 默认开启。内置预测预设和自由文本路径推测已移除；显式计划、结构化观测及声明的步骤仍可使用。
+规范动作键相同的调用按 `exact` 复用结果。读取范围等参数变化时，运行时可以用已封存的资源输入重建并校验本次结果，计为 `inputs`。
 
-预测器使用序列 PPM 和结构化字段绑定。旧版 `transform/template/splice/rebase/near/join/coalesce` 绑定已停止执行，旧学习状态按分析器版本隔离。工具应把后续调用所需的参数输出为结构化字段。
+PatternAware 用序列 PPM 和结构化字段绑定预测调用，同时用近期观测耗时估算候选可节省的时间。当前台模式对本轮动作的校准置信度达到 0.80 时，Drafter 跳过本轮根请求，仍可根据该动作的结果预测下一步。
 
 环境契约支持 `exact`、`allowlist`、`denylist`、`isolated`。投影列表由 `environmentKeys` 提供，隔离环境由 `isolatedEnvironment` 提供。默认比较完整业务环境；`PI_SUBCOMPUTE_SOCKET`、`PI_SUBCOMPUTE_CONTEXT` 两个协议句柄排除在环境摘要之外，受控通道读取的输入纳入进程证书。`replayAcceptedTaints` 默认空列表；用户可显式允许负载所需的 `clock`、`random`、`pid_observation`、`descriptor_observation` 等标记。
 

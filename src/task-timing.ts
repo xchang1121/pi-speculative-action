@@ -1127,8 +1127,6 @@ export function emptySpeculativeTraceSummary(
 		speculativeHits: 0,
 		exactReuseHits: 0, // Adopted identical K(a) results.
 		inputReuseHits: 0, // Current tool semantics evaluated over another execution's sealed inputs.
-		partialResultReuseHits: 0, // Adopted lossless views from a different K(a); its execution ran in full.
-		partialResultReuseByProjector: {} as Readonly<Record<string, number>>,
 		actorPreviews: 0,
 		actorFallbacks: 0,
 		hitRate: 0,
@@ -1271,12 +1269,7 @@ export function reduceSpeculativeTrace<SessionID>(
 			if (event.settlement.provider.kind === "speculative") {
 				next.speculativeHits++;
 				const match = event.settlement.provider.match;
-				if (match.kind === "projected") {
-					next.partialResultReuseHits++;
-					next.partialResultReuseByProjector = increment(current.partialResultReuseByProjector, [
-						match.projector,
-					]);
-				} else if (match.kind === "inputs") next.inputReuseHits++;
+				if (match.kind === "inputs") next.inputReuseHits++;
 				else next.exactReuseHits++;
 			} else next[event.settlement.provider.origin === "preview" ? "actorPreviews" : "actorFallbacks"]++;
 			break;

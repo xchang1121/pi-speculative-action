@@ -13,8 +13,8 @@ import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { ActionKey, ActionProjectionRule, ActionSemanticsRegistry } from "./action-semantics.ts";
-import { buildActionKey, PI_ACTION_SEMANTICS, resolveActionProjectionRules } from "./action-semantics.ts";
+import type { ActionKey, ActionSemanticsRegistry } from "./action-semantics.ts";
+import { buildActionKey, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import type { AgentExecutionWorld, SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import { createResourceSnapshotExecutionWorld } from "./agent-execution-world.ts";
 import type { DrafterRequestSettings } from "./config-schema.ts";
@@ -45,8 +45,6 @@ import type { PatternAwareSettings, PatternAwareStore } from "./pattern-aware.ts
 import { patternAwareSettings } from "./pattern-aware.ts";
 import { createPatternPlanSource } from "./pattern-plan-source.ts";
 import {
-	PI_BASH_TIMEOUT_PROJECTION_RULE,
-	PI_GREP_LITERAL_PROJECTION_RULE,
 	piToolErrorSettlement,
 } from "./pi-tool-invocation.ts";
 import { asRecord, immutableSnapshot, isImmutableSnapshot, stableValueHash } from "./primitives.ts";
@@ -342,7 +340,7 @@ export interface CreateSpeculativeActionHostOptions extends DrafterModelOptions 
 	readonly configuration?: SpeculativeConfiguration;
 	/** Override host observations for embedding or deterministic tests. */
 	readonly resources?: ExecutionResourceMonitor;
-	/** Canonical K(a), projection, and resource-version semantics for this host. */
+	/** Canonical K(a) and resource-version semantics for this host. */
 	readonly actionSemantics?: ActionSemanticsRegistry;
 	/** Workspace root used for action canonicalization and resource validation. */
 	readonly cwd: string;
@@ -361,8 +359,6 @@ export interface CreateSpeculativeActionHostOptions extends DrafterModelOptions 
 	readonly preflight?: (
 		context: SpeculativeAgentPreflightContext,
 	) => boolean | CandidatePreflight | Promise<boolean | CandidatePreflight>;
-	/** Lossless Π rules; each rule owns key relation, realized coverage, and output reconstruction. */
-	readonly projectionRules?: readonly ActionProjectionRule<ToolSettlement>[];
 	/** Actor probe source shared with the decoder-feedback coordinator. */
 	readonly actorForkPlanSource?: ActorForkPlanSource;
 	/** Ordered execution capabilities. A runtime-wide sandbox takes precedence over local fallbacks. */
@@ -491,15 +487,6 @@ function assembleAgentExecutionHost(
 	) => string | undefined,
 ): SpeculativeActionHost {
 	const actionSemantics = options.actionSemantics ?? PI_ACTION_SEMANTICS;
-	const projectionRules = resolveActionProjectionRules(
-		[
-			...(options.projectionRules ?? []),
-			...(!speculativeConfig().explicitOnly
-				? [PI_BASH_TIMEOUT_PROJECTION_RULE, PI_GREP_LITERAL_PROJECTION_RULE]
-				: []),
-		],
-		actionSemantics,
-	);
 	let inputMaxBytes = speculativeConfig().runtime.resourceCacheMaxBytes;
 	const executionWorlds = [...new Set(options.executionWorlds ?? [])];
 	if (
@@ -581,23 +568,22 @@ function assembleAgentExecutionHost(
 			},
 		};
 	};
+	const patternPlans = createPatternPlanSource({
+		sessionID,
+		cwd: options.cwd,
+		actionSemantics,
+		stateDirectory: options.patternStateDirectory,
+		reservedRoot: options.patternStoreReservedRoot,
+		workspaceIdentity: options.patternWorkspaceIdentity,
+		store: options.patternStore,
+	});
 	const drafterPlans = createDrafterPlanSource({
 		sessionID,
 		draftModel: options.draftModel,
 		getDraftOptions: options.getDraftOptions,
 		complete: options.complete,
 		drafterBudget: options.drafterBudget,
-		patternHints: (hint) => patternPlans.hints(hint),
-	});
-	const patternPlans = createPatternPlanSource({
-		sessionID,
-		cwd: options.cwd,
-		actionSemantics,
-		projectionRules,
-		stateDirectory: options.patternStateDirectory,
-		reservedRoot: options.patternStoreReservedRoot,
-		workspaceIdentity: options.patternWorkspaceIdentity,
-		store: options.patternStore,
+		patternHints: patternPlans.hints,
 	});
 	const executionPreparation = createExecutionPreparation(options.cwd, actionSemantics);
 	const resolveBinding = async (
@@ -755,7 +741,6 @@ function assembleAgentExecutionHost(
 					resourceScope: undefined,
 					...operation.semantics,
 					epoch,
-					projectors: [],
 				},
 				executionContext: Object.freeze({
 					...invocation,
@@ -881,7 +866,6 @@ function assembleAgentExecutionHost(
 		observationKey: toolObservationKey,
 		rejectCandidateOutput: ({ output }) =>
 			output.isError && output.exitCode === undefined ? "tool_error_result" : undefined,
-		projectionRules,
 		onResourceWrites: (paths) => service.invalidate(paths),
 		onEvent: options.onEvent && ((event) => {
 			const subcomputations = service.drainMetrics();

@@ -6,6 +6,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { bindResourceOperation, createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { DrafterTaskBudget } from "../src/drafter-plan-source.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
+import { SpeculationScheduler } from "../src/system-resources.ts";
 import { TimelineInterval } from "../src/task-timing.ts";
 import { ResourceInputSession, ResourceReadView, ResourceVersionManager } from "../src/resource-version.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
@@ -49,6 +50,75 @@ test("accounts for every model request without adding output or task quotas", as
 		requests: 40,
 		unreportedRequests: 0,
 	});
+});
+
+test("settles canonical read defaults exactly and rebuilds another range from sealed inputs", async () => {
+	const cwd = await directories.create();
+	await writeText(cwd, "lines.txt", "one\ntwo\nthree\n");
+	const f = systemHost(
+		cwd,
+		[createReadTool(cwd)],
+		{
+			complete: async () => toolUse("read", { path: "lines.txt" }),
+		},
+		{ drafterEnabled: true, drafterMaxDepth: 0 },
+	);
+	await using _close = onExit(() => f.dispose());
+	await f.start();
+	await f.ready();
+	const full = { path: "./lines.txt", offset: 1 };
+	expect(await f.execute("read", full)).toEqual(await f.oracle("read", full));
+	expect(f.actors.at(-1)?.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } });
+	const range = { path: "lines.txt", offset: 2, limit: 1 };
+	for (let i = 0; i < 2; i++) {
+		expect(await f.execute("read", range)).toEqual(await f.oracle("read", range));
+		expect(f.actors.at(-1)?.settlement).toMatchObject({
+			provider: { kind: "speculative", match: { kind: "inputs" } },
+			matchedPredictions: [],
+		});
+	}
+	expect(f.fallbacks).toEqual([]);
+});
+
+test("schedules a Drafter call with the measured duration of recent Actor calls to its tool", async () => {
+	const cwd = await directories.create();
+	for (const file of ["one", "two", "next"]) await writeText(cwd, file, file);
+	let trained = false;
+	const f = systemHost(
+		cwd,
+		[createReadTool(cwd)],
+		{
+			complete: async () => (trained ? toolUse("read", { path: "next" }) : fauxAssistantMessage("done")),
+		},
+		{ drafterEnabled: true, drafterMaxDepth: 0 },
+	);
+	await using _close = onExit(() => f.dispose());
+	const observed: number[] = [];
+	f.host.runtime.subscribe({
+		actor_observed: ({ durationMs }) => {
+			observed.push(durationMs);
+		},
+	});
+	await f.start();
+	for (const file of ["one", "two"]) await f.execute("read", { path: file });
+	await f.finish();
+	expect(observed).toHaveLength(2);
+	expect(observed.every((ms) => ms > 0)).toBe(true);
+	const expected = (observed[0]! + observed[1]!) / 2;
+	const evaluate = vi.spyOn(SpeculationScheduler.prototype, "evaluate");
+	try {
+		trained = true;
+		await f.start("next");
+		await f.ready(1, "drafter");
+		expect(f.materialized).toContainEqual(
+			expect.objectContaining({ source: "drafter", expectedDurationMs: expected }),
+		);
+		expect(evaluate.mock.calls.flatMap(([forecasts]) => forecasts)).toContainEqual(
+			expect.objectContaining({ tool: "read", expectedDurationMs: expected }),
+		);
+	} finally {
+		evaluate.mockRestore();
+	}
 });
 
 test.skipIf(process.platform !== "linux")(
@@ -289,7 +359,6 @@ function readDefinition(tool: string): ActionSemanticsDefinition {
 		...PI_ACTION_SEMANTICS.definition("read")!,
 		tool,
 		epoch: tool,
-		projectors: [],
 	};
 }
 
@@ -434,7 +503,6 @@ test.for([
 		...(mutates(index) ? PI_ACTION_SEMANTICS.definition("write") : {}),
 		tool,
 		epoch: `custom:${tool}`,
-		projectors: [],
 		resourceScope: mutates(index) ? undefined : ("captured_inputs" as const),
 		canonicalize: (input: unknown, cwd: string) => {
 			const key = (index || !unkeyed) && read.canonicalize(input, cwd);

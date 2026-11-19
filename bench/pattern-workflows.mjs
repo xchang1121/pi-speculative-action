@@ -24,7 +24,6 @@ const controller = createPatternPlanSource({
 	sessionID: "benchmark",
 	cwd: workspace,
 	actionSemantics: PI_ACTION_SEMANTICS,
-	projectionRules: [],
 	store,
 });
 let events;

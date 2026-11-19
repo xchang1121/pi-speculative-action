@@ -1,11 +1,28 @@
 import { createServer } from "node:http";
 import { afterEach, expect, test, vi } from "vitest";
-import { createActorForkPlanSource } from "../src/self-speculation.ts";
+import { createActorForkPlanSource, EvidenceLedger } from "../src/self-speculation.ts";
 import { SelfSpeculationCoordinator, normalizeSelfSpeculationSettings } from "../src/self-speculation.ts";
 import { nextTurn } from "./async.ts";
 import { testModel } from "./model.ts";
 
 afterEach(() => vi.unstubAllEnvs());
+
+test("expires calibration contexts and reverses old successes as recent trials drift", () => {
+	const ledger = new EvidenceLedger(2, 1, 3);
+	const cold = { tool: "cold" },
+		active = { tool: "active" };
+	ledger.observe(cold, 20, 20);
+	ledger.observe(active, 2, 2);
+	ledger.observe(active, 2, 2);
+	expect(ledger.probability([active])).toBeCloseTo(5 / 6);
+	for (let i = 0; i < 3; i++) ledger.observe(active, 2, 0);
+	expect(ledger.probability([cold])).toBe(0.5);
+	expect(ledger.probability([active])).toBeCloseTo(1 / 8);
+	expect(ledger.snapshot()).toEqual({ contexts: 1, observations: 3, trials: 6, successes: 0 });
+	for (let i = 0; i < 20; i++) ledger.observe({ i }, 1, 1);
+	expect(ledger.snapshot()).toEqual({ contexts: 3, observations: 3, trials: 3, successes: 3 });
+	expect(ledger.probability([active])).toBe(0.5);
+});
 
 test.each(["valid", "low confidence", "HTTP failure"])(
 	"runs a sidecar fork over HTTP and drains the request (%s)",

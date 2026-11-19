@@ -23,12 +23,6 @@ import {
 } from "./primitives.ts";
 export type ActionEffect = "observation" | "workspace_mutation" | "unbounded";
 export type ResourceDependencyScope = "content" | "entries" | "tree_entries" | "tree_content";
-export interface ReadActionRange {
-	readonly path: string;
-	readonly offset: number;
-	readonly limit: number;
-	readonly end: number;
-}
 export interface ActionKey extends CanonicalAction {
 	readonly key: string;
 	readonly hash: string;
@@ -46,36 +40,16 @@ export interface ActionKey extends CanonicalAction {
 	/** An explicitly selected executor contract; absent for the host registry's default tools. */
 	readonly semantics?: ActionSemanticsDefinition;
 }
-export interface ProjectedActionKey {
-	readonly action: ActionKey;
-	/** Information discarded by the projection; lower is a more specific match. */
-	readonly distance: number;
-}
-/** A partial projection π that can map one canonical K(a) into another. */
-export interface ActionKeyProjector {
-	readonly id: string;
-	/** Coarse cache partition; every pair accepted by project must return the same value. */
-	readonly partition: (action: ActionKey) => string | undefined;
-	readonly project: (speculative: ActionKey, actor: ActionKey) => ProjectedActionKey | undefined;
-	/** Whether the speculative request itself covers the actor request before output coverage is known. */
-	readonly canShareInFlight?: (speculative: ActionKey, actor: ActionKey) => boolean;
-}
 export interface ExactActionKeyMatch {
 	readonly kind: "exact";
 	readonly distance: 0;
-}
-export interface ProjectedActionKeyMatch {
-	/** A lossless result projection may satisfy the Actor action if execution and adoption later succeed. */
-	readonly kind: "projected";
-	readonly distance: number;
-	readonly projector: string;
 }
 /** Resource retrieval is not action equivalence or a correct prediction. */
 export interface ResourceInputMatch {
 	readonly kind: "inputs";
 	readonly distance: number;
 }
-export type ActionKeyMatch = ExactActionKeyMatch | ProjectedActionKeyMatch | ResourceInputMatch;
+export type ActionKeyMatch = ExactActionKeyMatch | ResourceInputMatch;
 export interface CanonicalAction {
 	readonly input: Readonly<Record<string, unknown>>;
 	readonly resources: readonly string[];
@@ -92,27 +66,17 @@ export interface ActionSemanticsDefinition {
 	/** Eager filesystem scope, or supplied inputs only (never proof of an ambient Actor window). */
 	readonly resourceScope?: ResourceDependencyScope | "captured_inputs";
 	readonly canonicalize: (input: unknown, cwd: string) => CanonicalAction | undefined;
-	readonly projectors?: readonly ActionKeyProjector[];
 }
 // Only issued definitions may skip normalization; mutable provider records are never memoized.
 const normalizedDefinitions = new WeakSet<ActionSemanticsDefinition>();
-const projectorSources = new WeakMap<ActionKeyProjector, ActionKeyProjector>();
-/** Immutable source of truth for K(a), projection, resource evidence, and safe local fallback capability. */
 export class ActionSemanticsRegistry {
 	private readonly definitionsByTool = new Map<string, ActionSemanticsDefinition>();
-	private readonly projectorsByID = new Map<string, ActionKeyProjector>();
 	constructor(definitions: readonly ActionSemanticsDefinition[]) {
 		for (const source of definitions) {
 			const definition = normalizeDefinition(source);
 			const { tool } = definition;
 			if (this.definitionsByTool.has(tool)) throw new Error(`duplicate action semantics for ${tool}`);
 			this.definitionsByTool.set(tool, definition);
-			for (const projector of definition.projectors ?? []) {
-				const existing = this.projectorsByID.get(projector.id);
-				if (existing && projectorSources.get(existing) !== projectorSources.get(projector))
-					throw new Error(`conflicting action projector ${projector.id}`);
-				this.projectorsByID.set(projector.id, projector);
-			}
 		}
 	}
 	definition(action: string | ActionKey): ActionSemanticsDefinition | undefined {
@@ -129,12 +93,6 @@ export class ActionSemanticsRegistry {
 	}
 	requirements(action: string | ActionKey): EffectRequirements | undefined {
 		return this.definition(action)?.requirements;
-	}
-	projectors(): readonly ActionKeyProjector[] {
-		return [...this.projectorsByID.values()];
-	}
-	supportsProjector(id: string): boolean {
-		return this.projectorsByID.has(id);
 	}
 	buildKey(
 		tool: string,
@@ -170,65 +128,12 @@ export class ActionSemanticsRegistry {
 		}
 	}
 }
-/** π_read narrows a cached read action to the actor's requested interval. */
-export const READ_RANGE_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKeyProjector({
-	id: "read.range",
-	partition: readProjectionPartition,
-	project: (speculative, actor) => {
-		const speculativeRange = readActionRange(speculative);
-		const actorRange = readActionRange(actor);
-		if (!speculativeRange || !actorRange) return undefined;
-		if (
-			readProjectionPartition(speculative) !== readProjectionPartition(actor) ||
-			speculativeRange.limit === 0 ||
-			speculativeRange.offset > actorRange.offset ||
-			actorRange.offset > speculativeRange.end + 1
-		)
-			return undefined;
-		return {
-			action: actor,
-			distance: actorRange.offset - speculativeRange.offset + Math.abs(speculativeRange.end - actorRange.end),
-		};
-	},
-	canShareInFlight: readRangesShareInFlight,
-});
 // Stock query tools launch ambient executables/configuration (rg can even invoke --pre).
 // A static workspace tree is not their dependency closure or their isolation authority.
 const HOST_PROCESS_EFFECTS = effectRequirements(
 	"invocation.host_function",
 	...UNRESTRICTED_PROCESS_EFFECTS.capabilities,
 );
-/** A command that finished within its timeout finishes, with the same output, under any longer or no timeout. */
-export const BASH_TIMEOUT_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKeyProjector({
-	id: "bash.timeout",
-	partition: bashTimeoutPartition,
-	project: (speculative, actor) =>
-		bashTimeoutCovers(speculative, actor) ? { action: actor, distance: 1 } : undefined,
-	canShareInFlight: bashTimeoutCovers,
-});
-/** A complete literal search, filtered by line, answers a search for any literal containing its own. */
-export const GREP_LITERAL_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKeyProjector({
-	id: "grep.literal",
-	partition: grepLiteralPartition,
-	project: (speculative, actor) => {
-		const found = speculative.input.pattern;
-		const sought = actor.input.pattern;
-		const partition = grepLiteralPartition(speculative);
-		return partition !== undefined &&
-			partition === grepLiteralPartition(actor) &&
-			typeof found === "string" &&
-			typeof sought === "string" &&
-			grepLiteralMatches(sought, found, actor.input.ignoreCase === true)
-			? { action: actor, distance: sought.length - found.length }
-			: undefined;
-	},
-});
-/** rg's case-insensitive literal folds each code point simply, as `/iu` does; the printable-ASCII patterns it projects share every fold. */
-export function grepLiteralMatches(text: string, literal: string, ignoreCase: boolean): boolean {
-	return ignoreCase
-		? new RegExp(literal.replace(/[\\^$.*+?()[\]{}|/]/g, "\\$&"), "iu").test(text)
-		: text.includes(literal);
-}
 export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry(
 	(
 		[
@@ -237,13 +142,11 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry(
 				effect: "observation",
 				requirements: RESOURCE_OBSERVATION_EFFECTS,
 				resourceScope: "content",
-				projectors: [READ_RANGE_ACTION_KEY_PROJECTOR],
 			},
 			{
 				tool: "grep",
 				effect: "unbounded",
 				requirements: HOST_PROCESS_EFFECTS,
-				projectors: [GREP_LITERAL_ACTION_KEY_PROJECTOR],
 			},
 			{ tool: "find", effect: "unbounded", requirements: HOST_PROCESS_EFFECTS },
 			{
@@ -256,7 +159,6 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry(
 				tool: "bash",
 				effect: "unbounded",
 				requirements: UNRESTRICTED_PROCESS_EFFECTS,
-				projectors: [BASH_TIMEOUT_ACTION_KEY_PROJECTOR],
 			},
 			{
 				tool: "write",
@@ -307,86 +209,8 @@ export function buildActionKey(
 		...(semantics ? { semantics } : {}),
 	});
 }
-/** K(a_s) covers K(a) without relying on completed-output coverage. */
-export function actionKeyCovers(
-	speculative: ActionKey,
-	actor: ActionKey,
-	projectors: readonly ActionKeyProjector[] = [],
-): boolean {
-	return actionKeyMatch(speculative, actor, projectors, true) !== undefined;
-}
-/** Lookup relation only; adoption still requires realized output/input coverage and branch evidence.
- * Prediction matching sets requireCoverage: it needs request containment, not merely overlapping reusable inputs. */
-export function actionKeyMatch(
-	speculative: ActionKey,
-	actor: ActionKey,
-	projectors: readonly ActionKeyProjector[] = [],
-	requireCoverage = false,
-): ActionKeyMatch | undefined {
-	if (speculative.key === actor.key) return { kind: "exact", distance: 0 };
-	if (
-		speculative.tool !== actor.tool ||
-		speculative.semanticsEpoch !== actor.semanticsEpoch ||
-		speculative.schemaHash !== actor.schemaHash ||
-		speculative.executionFingerprint !== actor.executionFingerprint
-	)
-		return undefined;
-	let best: ActionKeyMatch | undefined;
-	for (const projector of projectors) {
-		let projected: ProjectedActionKey | undefined;
-		try {
-			if (requireCoverage && projector.canShareInFlight?.(speculative, actor) !== true) continue;
-			projected = projector.project(speculative, actor);
-		} catch {
-			continue;
-		}
-		if (!projected || projected.action.key !== actor.key) continue;
-		if (!Number.isFinite(projected.distance) || projected.distance < 0) continue;
-		if (best && best.distance <= projected.distance) continue;
-		best = {
-			kind: "projected",
-			projector: projector.id,
-			distance: projected.distance,
-		};
-	}
-	return best;
-}
-/** Projection partitions used only as an indexed lookup optimization. */
-export function actionKeyProjectionPartitions(
-	action: ActionKey,
-	projectors: readonly ActionKeyProjector[],
-): readonly string[] {
-	const partitions = new Set<string>();
-	for (const projector of projectors) {
-		let partition: string | undefined;
-		try {
-			partition = projector.partition(action);
-		} catch {
-			continue;
-		}
-		if (partition !== undefined) partitions.add(JSON.stringify([projector.id, partition]));
-	}
-	return [...partitions];
-}
-export function readActionRange(action: ActionKey): ReadActionRange | undefined {
-	if (action.tool !== "read") return undefined;
-	const input = asRecord(action.input);
-	if (!input || typeof input.path !== "string") return undefined;
-	const offset = normalizeReadOffset(input.offset);
-	const limit = normalizeReadLimit(input.limit);
-	return { path: input.path, offset, limit, end: offset + limit - 1 };
-}
-export function readRangesShareInFlight(speculative: ActionKey, actor: ActionKey): boolean {
-	const speculativeRange = readActionRange(speculative);
-	const actorRange = readActionRange(actor);
-	return (
-		!!speculativeRange &&
-		!!actorRange &&
-		!(actor.input.limit === undefined && speculative.input.limit !== undefined) &&
-		readProjectionPartition(speculative) === readProjectionPartition(actor) &&
-		speculativeRange.offset <= actorRange.offset &&
-		speculativeRange.end >= actorRange.end
-	);
+export function actionKeyMatch(speculative: ActionKey, actor: ActionKey): ExactActionKeyMatch | undefined {
+	return speculative.key === actor.key ? { kind: "exact", distance: 0 } : undefined;
 }
 export function normalizeRelativeRoot(value: unknown, cwd: string): string | undefined {
 	return value !== undefined && typeof value !== "string"
@@ -472,65 +296,6 @@ function canonicalPiAction(tool: string, input: unknown, cwd: string): Canonical
 	fields.path = resource;
 	return { resources: [resource], input: fields };
 }
-/** Everything but the timeout: internal process operations share a Bash key shape without a command, and never project. */
-function bashTimeoutPartition(action: ActionKey): string | undefined {
-	return action.tool === "bash" && typeof action.input.command === "string"
-		? stableStringify([
-				action.semanticsEpoch,
-				action.schemaHash,
-				action.executionFingerprint,
-				action.resources,
-				Object.entries(action.input).filter(([name]) => name !== "timeout"),
-			])
-		: undefined;
-}
-/** Everything but the pattern and limit. rg matches within one line's bytes: context, a line break, U+FFFD or a non-ASCII case fold never projects.
- * A regex of only word characters, spaces and hyphens matches as its literal does. */
-function grepLiteralPartition(action: ActionKey): string | undefined {
-	const { pattern, literal, ignoreCase, context } = action.input;
-	return action.tool === "grep" &&
-		(literal === true || (typeof pattern === "string" && /^[\w -]+$/.test(pattern))) &&
-		context === 0 &&
-		typeof pattern === "string" &&
-		(ignoreCase ? /^[\x20-\x7e]+$/ : /^[^\r\n�]+$/u).test(pattern)
-		? stableStringify([
-				action.semanticsEpoch,
-				action.schemaHash,
-				action.executionFingerprint,
-				action.resources,
-				Object.entries(action.input).filter(([name]) => name !== "pattern" && name !== "limit"),
-			])
-		: undefined;
-}
-function bashTimeoutCovers(speculative: ActionKey, actor: ActionKey): boolean {
-	const limit = (action: ActionKey) =>
-		typeof action.input.timeout === "number" ? action.input.timeout : Number.POSITIVE_INFINITY;
-	return (
-		bashTimeoutPartition(speculative) !== undefined &&
-		bashTimeoutPartition(speculative) === bashTimeoutPartition(actor) &&
-		limit(actor) >= limit(speculative)
-	);
-}
-function readProjectionPartition(action: ActionKey): string | undefined {
-	const range = readActionRange(action);
-	return (
-		range &&
-		JSON.stringify([
-			action.semanticsEpoch,
-			action.schemaHash,
-			action.executionFingerprint,
-			action.resources,
-			range.path,
-		])
-	);
-}
-/** Capture rule slots once; retain source identity only for conflicting-registration checks. */
-export function ownActionKeyProjector<Projector extends ActionKeyProjector>(source: Projector): Projector {
-	if (projectorSources.has(source)) return source;
-	const owned = Object.freeze({ ...source });
-	projectorSources.set(owned, source);
-	return owned;
-}
 function normalizeDefinition(source: ActionSemanticsDefinition): ActionSemanticsDefinition {
 	if (normalizedDefinitions.has(source)) return source;
 	const tool = source.tool.trim();
@@ -544,7 +309,6 @@ function normalizeDefinition(source: ActionSemanticsDefinition): ActionSemantics
 		tool,
 		epoch,
 		requirements: normalizeEffectRequirements(source.requirements),
-		projectors: Object.freeze([...new Set(source.projectors ?? [])].map(ownActionKeyProjector)),
 	});
 	assertDefinitionCoherence(definition);
 	normalizedDefinitions.add(definition);
@@ -602,34 +366,4 @@ function fastHash(value: string): string {
 		hash = Math.imul(hash, 0x01000193);
 	}
 	return (hash >>> 0).toString(16).padStart(8, "0");
-}
-export interface ActionProjectionCoverage {
-	readonly rule: string;
-	/** Runtime-owned plain data; each projection callback receives a separate copy. */
-	readonly value: unknown;
-}
-/** A key relation uses either branch-owned inputs or optional lossless output coverage. */
-export interface ActionProjectionRule<Output> extends ActionKeyProjector {
-	/** Opaque or otherwise unshareable proof declines output projection, not sealed-input reconstruction. */
-	readonly captureCoverage?: (action: ActionKey, output: Output) => unknown | undefined;
-	/** The returned data view is owned before revalidation/commit, separately for every Actor. */
-	readonly projectOutput?: (input: {
-		readonly speculative: ActionKey;
-		readonly actor: ActionKey;
-		readonly output: Output;
-		readonly coverage: unknown;
-		readonly keyMatch: ProjectedActionKeyMatch;
-	}) => Output | undefined | Promise<Output | undefined>;
-}
-/** Registered key relations are shared by learning, lookup and feedback; explicit output rules take precedence. */
-export function resolveActionProjectionRules<Output>(
-	rules: readonly ActionProjectionRule<Output>[],
-	semantics: ActionSemanticsRegistry,
-): readonly ActionProjectionRule<Output>[] {
-	const unique = new Map<string, ActionProjectionRule<Output>>();
-	for (const rule of [...rules, ...semantics.projectors()]) {
-		if (semantics.supportsProjector(rule.id) && !unique.has(rule.id))
-			unique.set(rule.id, ownActionKeyProjector(rule));
-	}
-	return [...unique.values()];
 }
