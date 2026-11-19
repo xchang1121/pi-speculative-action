@@ -1,12 +1,42 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, expect, test } from "vitest";
+import { resolveSpeculativeConfig, withSpeculativeConfig } from "../src/config-schema.ts";
 import { createClosedSearchProfile } from "../src/pi-tool-invocation.ts";
 import { captureResourceVersion } from "../src/resource-version.ts";
 import { temporaryDirectories } from "./filesystem.ts";
 
 const directories = temporaryDirectories("pi-captured-find-");
 afterEach(directories.dispose);
+
+test("large live searches skip evidence collection and preserve the native Actor result", async () => {
+	const cwd = await directories.create();
+	await mkdir(path.join(cwd, ".git"));
+	await mkdir(path.join(cwd, "ignored"));
+	await writeFile(path.join(cwd, ".gitignore"), "ignored/\n");
+	for (const name of ["a", "b", ...Array.from({ length: 8 }, (_, i) => `ignored/${i}`)])
+		await writeFile(path.join(cwd, name), "match\n");
+	await withSpeculativeConfig(resolveSpeculativeConfig({ search: { maxDirectoryEntries: 4 } }), async () => {
+		const profile = await createClosedSearchProfile(cwd);
+		try {
+			const grep = profile.invocations.get("grep")!;
+			const request = { callID: "large", args: { pattern: "match" }, signal: AbortSignal.timeout(10000) };
+			await grep.checkCaptureBudget!(request);
+			await writeFile(path.join(cwd, "c"), "match\n");
+			await expect(grep.checkCaptureBudget!(request)).rejects.toMatchObject({ code: "ERR_RESOURCE_BUDGET" });
+			const capture = grep.captureInputs!(undefined, 1024 * 1024, request.callID);
+			try {
+				const output = await grep.authoritative!(request);
+				expect(output.result.content).toEqual([{ type: "text", text: "a:1: match\nb:1: match\nc:1: match" }]);
+				await expect(capture.seal(output)).rejects.toThrow("resource_inputs_empty");
+			} finally {
+				await capture.dispose();
+			}
+		} finally {
+			await profile.dispose();
+		}
+	});
+});
 
 test("captured find preserves relative glob spellings and terminates outside the working directory", async () => {
 	const root = await directories.create();

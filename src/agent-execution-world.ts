@@ -155,6 +155,7 @@ export function createResourceSnapshotExecutionWorld(
 				const execute = invocation?.filesystem;
 				if (!execute || context.parentCheckpoint)
 					throw new Error("Resource execution context is not supported");
+				await invocation.checkCaptureBudget?.(context);
 				const session = persistence && new ResourceInputSession(persistence, operations.maxBytes());
 				try {
 					const evaluate = () =>
@@ -539,6 +540,7 @@ export function resourceSnapshotBranch<Outcome extends WorldOutput<ToolSettlemen
 							invocation?.filesystemRoot ??
 							(request.action.executionFingerprint === executionFingerprint ? version.root : undefined);
 						if (!owned || !execute || !root) return undefined;
+						await invocation.checkCaptureBudget?.(request);
 						const maxBytes = Math.max(0, version.view!.remainingBytes - inputBytes(versions.slice(1)));
 						const session =
 							persistence && maxBytes > 0 ? new ResourceInputSession(persistence, maxBytes) : undefined;
@@ -662,7 +664,8 @@ export function bindResourceOperation(
 	root: string,
 	native?: NonNullable<ToolInvocation["authoritative"]>,
 	completeObservation: boolean | "single_query" = false,
-): Pick<ToolInvocation, "authoritative" | "captureInputs" | "filesystem" | "filesystemRoot"> {
+	checkCaptureBudget?: ToolInvocation["checkCaptureBudget"],
+): Pick<ToolInvocation, "authoritative" | "captureInputs" | "filesystem" | "filesystemRoot" | "checkCaptureBudget"> {
 	type Capture = {
 		maxBytes: number;
 		inputs: Map<string, ResourceInput>;
@@ -679,6 +682,7 @@ export function bindResourceOperation(
 	return {
 		filesystem: execute,
 		filesystemRoot: root,
+		checkCaptureBudget,
 		captureInputs: (action, maxBytes, callID, session) => {
 			if (active.has(callID) || !Number.isFinite(maxBytes) || maxBytes <= 0)
 				throw new Error("resource_snapshot_budget_invalid");
@@ -800,6 +804,7 @@ export function bindResourceOperation(
 				native: () => Promise<Value>,
 			) => {
 				try {
+					await checkCaptureBudget?.(request);
 					const result = await query(execute, request.signal, "output");
 					if (result) return result.output;
 				} catch {

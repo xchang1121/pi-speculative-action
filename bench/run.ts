@@ -333,7 +333,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions, implementati
 	>();
 	session.subscribe((event) => {
 		if (event.type === "tool_execution_start") {
-			journal({ topic: "tool_start", id: event.toolCallId, tool: event.toolName });
+			journal({ topic: "tool_start", id: event.toolCallId, tool: event.toolName, args: event.args });
 			actorActionsByTool = incrementCounts(actorActionsByTool, [event.toolName]);
 			const startedAt = performance.now();
 			toolWaits.set(event.toolCallId, { startedAt, finish: toolTimeline.startToolWait(startedAt) });
@@ -363,8 +363,8 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions, implementati
 			"prompt",
 			() =>
 				session.prompt(
-					`${task.row.problem_statement}\n\nWork in the checked-out repository and finish the implementation. Do not use network access to look up the answer.` +
-					(toolchain.length ? "\n\nThe active compiler reports these system include directories:\n" + toolchain.join("\n") : ""),
+					`${task.row.problem_statement}\n\nImplement and test the fix in this checkout. Use this repository as the source of project code. Scope source searches to the checkout and dependency searches to the toolchain's declared paths. Other checkouts, installed copies of this project, and online solutions are outside the task.\nWorkspace: ${task.workspace}` +
+					(toolchain.length ? "\nSystem include directories reported by the active compiler:\n" + toolchain.join("\n") : ""),
 				),
 		],
 		["shutdown", () => session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" })],

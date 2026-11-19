@@ -5,7 +5,8 @@ import type { SpeculativeActionEvent } from "../src/settlement.ts";
 type Event = SpeculativeActionEvent<string>;
 type Entry =
 	| { topic: "run_start"; instance: string; implementationCommit: string }
-	| { topic: "tool_start" | "tool_end"; id: string; tool: string }
+	| { topic: "tool_start"; id: string; tool: string; args: unknown }
+	| { topic: "tool_end"; id: string; tool: string }
 	| { topic: "host"; event: Event }
 	| { topic: "heartbeat" | "timeout" | "run_end" };
 
@@ -20,7 +21,7 @@ export function openRunJournal(path: string, instance: string, implementationCom
 
 /** Process complete newline-delimited records. A killed writer may leave a partial final line. */
 export async function recoverRun(path: string) {
-	const starts = new Map<string, { tool: string; at: number; end?: number }>();
+	const starts = new Map<string, { tool: string; args: unknown; at: number; end?: number }>();
 	const actions = new Map<string, Extract<Event, { type: "actor_action" }>>();
 	let started: Extract<Entry, { topic: "run_start" }> | undefined;
 	let ended = false, timedOut = false, lastAt = 0, buffer = "";
@@ -34,7 +35,7 @@ export async function recoverRun(path: string) {
 			if (row.topic === "run_start") started = row;
 			if (row.topic === "run_end") ended = true;
 			if (row.topic === "timeout") timedOut = true;
-			if (row.topic === "tool_start") starts.set(row.id, { tool: row.tool, at: row.at });
+			if (row.topic === "tool_start") starts.set(row.id, { tool: row.tool, args: row.args, at: row.at });
 			if (row.topic === "tool_end") {
 				const call = starts.get(row.id);
 				if (call) call.end = row.at;
@@ -47,7 +48,7 @@ export async function recoverRun(path: string) {
 	const calls = [...starts].map(([id, start]) => {
 		const action = actions.get(id);
 		const timing = action?.computation;
-		return { id, tool: start.tool, completed: start.end !== undefined,
+		return { id, tool: start.tool, args: start.args, completed: start.end !== undefined,
 			waitMs: (start.end ?? lastAt) - start.at, toolComputeMs: timing?.toolComputeMs ?? null,
 			hiddenComputeMs: timing?.hiddenComputeIncomplete ? null : timing?.hiddenComputeMs ?? null,
 			provider: action?.settlement.provider, source: action?.candidate?.source };

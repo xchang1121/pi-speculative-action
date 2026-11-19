@@ -271,6 +271,7 @@ export async function createClosedSearchProfile(cwd: string) {
 				root,
 				tool === "grep" ? (request) => engine!.search(cwd, request.args as GrepInput, request.signal) : undefined,
 				"single_query",
+				tool === "grep" ? (request) => engine!.checkCaptureBudget(cwd, request.args as GrepInput, request.signal) : undefined,
 			),
 		});
 	}
@@ -543,15 +544,46 @@ async function prepareGrepEngine() {
 			{ engine: identity, namespace: "pi.captured-grep" },
 			acceptsGrepMatches,
 		);
+		const paths = (query: GrepInput, directory: boolean) => [
+			"--ignore", "--no-ignore-global",
+			...(query.glob ? ["--glob", query.glob] : []),
+			...(directory ? ["--glob", "!.git/"] : []),
+		];
+		const checkCaptureBudget = async (cwd: string, query: GrepInput, signal: AbortSignal) => {
+			signal.throwIfAborted();
+			const target = resolvePiToolPath(query.path || ".", cwd);
+			if (!await fs.stat(target).then((stat) => stat.isDirectory(), () => false)) return;
+			const { maxDirectoryEntries, maxEntries } = speculativeConfig().search;
+			const limit = Math.min(maxDirectoryEntries, maxEntries);
+			if (!limit) throw resourceBudgetError("search entry budget");
+			// Every selected name needs an entry proof, including the root. Stop at the first excess name.
+			let entries = 1;
+			const child = spawn(executable, ["--no-config", "--hidden", ...paths(query, true), "--files", "--null", "--", target], {
+				cwd, env: environment, signal, windowsHide: true, stdio: ["ignore", "pipe", "ignore"],
+			});
+			await new Promise<void>((resolve, reject) => {
+				child.once("error", reject);
+				child.once("close", () => resolve());
+				child.stdout.on("data", (chunk: Buffer) => {
+					if (entries > limit) return;
+					for (let i = chunk.indexOf(0); i >= 0; i = chunk.indexOf(0, i + 1)) {
+						if (++entries > limit) {
+							child.kill();
+							break;
+						}
+					}
+				});
+			});
+			signal.throwIfAborted();
+			if (entries > limit) throw resourceBudgetError("search entry budget");
+		};
 		const search = async (cwd: string, query: GrepInput, signal: AbortSignal) => {
 			const target = resolvePiToolPath(query.path || ".", cwd);
 			const directory = await fs.stat(target).then((s) => s.isDirectory(), () => {
 				throw new Error(`Path not found: ${target}`);
 			});
 			const limit = Math.max(1, query.limit ?? limits.grepLimit);
-			const args = [...flags, "--ignore", "--no-ignore-global"];
-			if (query.glob) args.push("--glob", query.glob);
-			if (directory) args.push("--glob", "!.git/");
+			const args = [...flags, ...paths(query, directory)];
 			if (query.literal) args.push("--fixed-strings");
 			if (query.ignoreCase) args.push("--ignore-case");
 			const child = spawn(executable, [...args, "--", query.pattern, target], {
@@ -587,7 +619,7 @@ async function prepareGrepEngine() {
 				await closed.catch(() => {});
 			}
 		};
-		return { root, identity, matchesBinding, execute, search, release, jj };
+		return { root, identity, matchesBinding, execute, search, checkCaptureBudget, release, jj };
 	} catch (error) {
 		await release();
 		throw error;

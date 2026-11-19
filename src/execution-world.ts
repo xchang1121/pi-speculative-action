@@ -550,6 +550,8 @@ export interface ToolInvocation {
 	readonly process?: ToolProcessInvocation;
 	/** Explicit read-only input boundary; omitted operations remain confined to the host workspace. */
 	readonly filesystemRoot?: string;
+	/** Decline a live-workspace capture before collecting evidence when its declared budget is exhausted. */
+	readonly checkCaptureBudget?: (request: { readonly args: unknown; readonly signal: AbortSignal }) => Promise<void>;
 	/** Explicit selected Actor semantics; the host invokes this inside its original execution callback. */
 	readonly authoritative?: (
 		request: Parameters<NonNullable<ToolInvocation["filesystem"]>>[1],

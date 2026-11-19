@@ -213,7 +213,7 @@ export const DEFAULT_SPECULATIVE_CONFIG = deepFreeze({
 		maxInputBytes: 8 * 1024 * 1024,
 		maxEntries: 65536,
 		maxResultBytes: 1024 * 1024,
-		maxDirectoryEntries: 4096,
+		maxDirectoryEntries: 256,
 		imageSniffBytes: 4100,
 		displayBytes: 50 * 1024,
 		lineCharacters: 500,

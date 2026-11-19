@@ -6,7 +6,9 @@
 
 `node --import tsx bench/pattern-workflows.mjs` 运行可复现的合成工作流、混噪训练与位置偏好切换实验。
 
-真实任务按同一条轨迹中已结算调用的 `ΣhiddenComputeMs / ΣtoolComputeMs` 计量。每次运行都会在输出旁写入 `.events.jsonl`。用 `node --import tsx bench/run-journal.ts <日志路径>` 可恢复已完整写入的事件、未结算调用和等待下界。报告列出具有完整计时的调用数。
+真实任务按同一条轨迹中已结算调用的 `ΣhiddenComputeMs / ΣtoolComputeMs` 计量。每次运行都会在输出旁写入 `.events.jsonl`。用 `node --import tsx bench/run-journal.ts <日志路径>` 可恢复已完整写入的事件、未结算调用的原始参数和等待下界。报告列出具有完整计时的调用数。
+
+目录搜索的证明预算由 `search.maxDirectoryEntries` 控制，默认 256 项。合格的本地 grep 按相同的忽略规则和 glob 预查文件名，超过预算时 Actor 直接使用原生搜索。同一调用的输出格式和排序保持一致。
 
 自建模型端点可通过 `--models-file <Pi 模型配置>`、`--actor provider/id`、`--drafter provider/id` 指定。同一供应方的密钥可用 `--api-key-stdin` 从标准输入读取。`--thinking-level` 设置 Actor 推理档位。C 和 C++ 任务会把本机编译器报告的系统头文件目录附在任务环境中。
 
