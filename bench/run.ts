@@ -1,14 +1,15 @@
 import { safeName } from "./suite-report.ts";
+import { openRunJournal } from "./run-journal.ts";
 import { parsePatternPresets } from "./pattern-options.ts";
 import { benchmarkTraceReport, slowCallReport } from "./trace-report.ts";
 import { execHostFile } from "../src/primitives.ts";
 import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { parseArgs } from "node:util";
 import { type Api, type AssistantMessage, type CredentialStore, type Model } from "@earendil-works/pi-ai";
-import { getModels, getProviders } from "@earendil-works/pi-ai/compat";
 import {
 	createAgentSession,
 	DefaultResourceLoader,
@@ -81,6 +82,9 @@ const { values } = parseArgs({
 		drafter: { type: "string", default: "deepseek/deepseek-v4-flash" },
 		// Every model request goes through this endpoint instead (a pi-llm-tape recorder or replayer).
 		"model-base-url": { type: "string" },
+		"models-file": { type: "string" },
+		"api-key-stdin": { type: "boolean", default: false },
+		"thinking-level": { type: "string", default: "high" },
 		"max-turns": { type: "string", default: "128" },
 		"timeout-ms": { type: "string", default: "900000" },
 		"repo-cache": { type: "string" },
@@ -103,6 +107,20 @@ const { values } = parseArgs({
 });
 
 const instance = required(values.instance, "--instance");
+const provider = (values.actor ?? "").split("/")[0]!;
+const key = values["api-key-stdin"] ? readFileSync(0, "utf8").trim() : process.env.DEEPSEEK_API_KEY;
+const keyProvider = values["api-key-stdin"] ? provider : "deepseek";
+const credentials: CredentialStore = {
+	read: async (id) => (id === keyProvider && key ? { type: "api_key", key } : undefined),
+	list: async () => key ? [{ providerId: keyProvider, type: "api_key" }] : [],
+	modify: (id) => credentials.read(id),
+	delete: async () => {},
+};
+const modelRuntime = await ModelRuntime.create({ credentials, allowModelNetwork: false,
+	modelsPath: values["models-file"] ? path.resolve(values["models-file"]) : null });
+const thinking = values["thinking-level"];
+if (thinking !== "off" && thinking !== "minimal" && thinking !== "low" && thinking !== "medium" && thinking !== "high" && thinking !== "xhigh")
+	throw new Error("Invalid --thinking-level");
 const repoCache = path.resolve(
 	values["repo-cache"] ?? path.join(os.tmpdir(), "pi-speculative-ablation-cache"),
 );
@@ -117,6 +135,7 @@ const options = {
 	drafter: model(values.drafter ?? "deepseek/deepseek-v4-flash"),
 	maxTurns: numberOption("max-turns"),
 	timeoutMs: numberOption("timeout-ms"),
+	thinkingLevel: thinking,
 	repoCache,
 	runRoot,
 	...(values.output ? { output: path.resolve(values.output) } : {}),
@@ -141,17 +160,20 @@ if (options.prepareOnly) {
 	);
 } else {
 	if (
-		!process.env.DEEPSEEK_API_KEY &&
+		!key &&
 		(options.actor.provider === "deepseek" || options.drafter.provider === "deepseek")
 	) {
 		throw new Error("DEEPSEEK_API_KEY is required for DeepSeek benchmark models");
 	}
 	if (values["prepared-run"])
 		await writeFile(path.join(prepared.runDirectory, "benchmark-started"), options.instance, { flag: "wx" });
-	const result = await runTask(prepared, options);
 	const output = options.output ?? path.join(prepared.runDirectory, "result.json");
 	await mkdir(path.dirname(output), { recursive: true });
+	const implementationCommit = (await command("git", ["rev-parse", "HEAD"], process.cwd())).stdout.trim();
+	const journal = openRunJournal(output + ".events.jsonl", options.instance, implementationCommit);
+	const result = await runTask(prepared, options, implementationCommit, journal.write).finally(() => journal.close());
 	await writeFile(output, `${JSON.stringify(result, null, 2)}\n`, "utf8");
+	journal.write({ topic: "run_end" });
 	process.stdout.write(`${JSON.stringify({ output, ...result.summary }, null, 2)}\n`);
 	if (Object.keys(result.summary.benchmarkErrors).length) {
 		throw new Error(`Benchmark failed: ${JSON.stringify(result.summary.benchmarkErrors)}`);
@@ -206,8 +228,8 @@ async function prepareTask(input: BenchmarkOptions) {
 	return { row, runDirectory, workspace };
 }
 
-async function runTask(task: PreparedTask, input: BenchmarkOptions) {
-	const implementationCommit = (await command("git", ["rev-parse", "HEAD"], process.cwd())).stdout.trim();
+async function runTask(task: PreparedTask, input: BenchmarkOptions, implementationCommit: string,
+	journal: ReturnType<typeof openRunJournal>["write"]) {
 	const taskStartedAt = performance.now();
 	const events: SpeculativeActionEvent<string>[] = [];
 	const drafterPredictionTrace: Array<
@@ -241,13 +263,6 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	);
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	// The Actor's shell inherits this environment: credentials move into Pi's in-memory store first.
-	const key = process.env.DEEPSEEK_API_KEY;
-	const credentials: CredentialStore = {
-		read: async (provider) => (provider === "deepseek" && key ? { type: "api_key", key } : undefined),
-		list: async () => (key ? [{ providerId: "deepseek", type: "api_key" }] : []),
-		modify: (provider) => credentials.read(provider),
-		delete: async () => {},
-	};
 	for (const name of Object.keys(process.env)) if (SECRET_VARIABLE.test(name)) delete process.env[name];
 	let drafterBudget: DrafterTaskBudget | undefined;
 	let finalMetrics: Parameters<NonNullable<SpeculativeActionExtensionDependencies["onMetrics"]>> | undefined;
@@ -273,6 +288,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 				...options,
 				onEvent: (event) => {
 					events.push(event);
+					journal({ topic: "host", event });
 					options.onEvent?.(event);
 				},
 			});
@@ -288,7 +304,6 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		extensionFactories: [extension],
 	});
 	await resourceLoader.reload();
-	const modelRuntime = await ModelRuntime.create({ credentials, modelsPath: null, allowModelNetwork: false });
 	if (
 		input.speculationEnabled &&
 		(input.drafterEnabled || input.selfSpeculation) &&
@@ -302,7 +317,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		agentDir,
 		model: input.actor,
 		modelRuntime,
-		thinkingLevel: "high",
+		thinkingLevel: input.thinkingLevel,
 		resourceLoader,
 		settingsManager,
 		tools: ["read", "grep", "find", "ls", "bash", "edit", "write"],
@@ -318,11 +333,13 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	>();
 	session.subscribe((event) => {
 		if (event.type === "tool_execution_start") {
+			journal({ topic: "tool_start", id: event.toolCallId, tool: event.toolName });
 			actorActionsByTool = incrementCounts(actorActionsByTool, [event.toolName]);
 			const startedAt = performance.now();
 			toolWaits.set(event.toolCallId, { startedAt, finish: toolTimeline.startToolWait(startedAt) });
 		}
 		if (event.type === "tool_execution_end") {
+			journal({ topic: "tool_end", id: event.toolCallId, tool: event.toolName });
 			const wait = toolWaits.get(event.toolCallId);
 			if (wait && wait.completedAt === undefined) {
 				wait.finish((wait.completedAt = performance.now()));
@@ -331,12 +348,14 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		if (event.type === "turn_end" && ++turns >= input.maxTurns) void session.abort();
 	});
 
+	const toolchain = await compilerSearchPaths(task.row.language);
 	const agentStartedAt = performance.now();
 	let agentCompletedAt = agentStartedAt;
 	const benchmarkErrors: Record<string, string> = {};
 	let timedOut = false;
 	const timeout = setTimeout(() => {
 		timedOut = true;
+		journal({ topic: "timeout" });
 		void session.abort();
 	}, input.timeoutMs);
 	for (const [phase, operation] of [
@@ -344,7 +363,8 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			"prompt",
 			() =>
 				session.prompt(
-					`${task.row.problem_statement}\n\nWork in the checked-out repository and finish the implementation. Do not use network access to look up the answer.`,
+					`${task.row.problem_statement}\n\nWork in the checked-out repository and finish the implementation. Do not use network access to look up the answer.` +
+					(toolchain.length ? "\n\nThe active compiler reports these system include directories:\n" + toolchain.join("\n") : ""),
 				),
 		],
 		["shutdown", () => session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" })],
@@ -419,6 +439,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 				? { ...finalMetrics[1], primaryIDs: [...finalMetrics[1].primaryIDs] }
 				: null,
 			workspace: task.workspace,
+			toolchainIncludePaths: toolchain,
 		},
 		summary: {
 			...summary,
@@ -569,12 +590,23 @@ function model(value: string): Model<Api> {
 	if (separator <= 0 || separator === value.length - 1)
 		throw new Error(`Invalid model ${value}; expected provider/id`);
 	const providerName = value.slice(0, separator);
-	const provider = getProviders().find((candidate) => candidate === providerName);
-	if (!provider) throw new Error(`Unknown model provider ${providerName}`);
 	const modelID = value.slice(separator + 1);
-	const resolved = getModels(provider).find((candidate) => candidate.id === modelID);
+	const resolved = modelRuntime.getModel(providerName, modelID);
 	if (!resolved) throw new Error(`Unknown model ${value}`);
 	return values["model-base-url"] ? { ...resolved, baseUrl: values["model-base-url"] } : resolved;
+}
+
+async function compilerSearchPaths(language: string): Promise<string[]> {
+	const languages = language.split("/").filter((name) => name === "C++" || name === "C");
+	const paths = await Promise.all(languages.map(async (name) => {
+		const compiler = name === "C++" ? process.env.CXX ?? "c++" : process.env.CC ?? "cc";
+		const { stderr } = await execHostFile(compiler, ["-E", "-v", "-x", name.toLowerCase(), os.devNull], {
+			cwd: os.tmpdir(), encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, timeout: 5000,
+		}).catch(() => ({ stderr: "" }));
+		return (stderr.split("#include <...> search starts here:")[1]?.split("End of search list.")[0] ?? "")
+			.split(/\r?\n/).map((s) => s.trim()).filter((s) => path.isAbsolute(s));
+	}));
+	return [...new Set(paths.flat())];
 }
 
 function patchFiles(patch: string): string[] {

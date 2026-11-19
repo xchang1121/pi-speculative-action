@@ -41,6 +41,7 @@ import {
 	hasErrorCode,
 	ignoreMissing,
 	digestObject,
+	filesystemPathKey,
 	isSafeCount,
 	isSha256Digest,
 	isMissing as missing,
@@ -649,6 +650,37 @@ export class ProvenanceCertificateStore {
 			decodeInputVersion,
 			signal,
 		);
+	}
+	/** One read snapshot supplies path hints for a whole resource query, including existing stores. */
+	async inputPathIndex(root: string, limit: number, signal: AbortSignal) {
+		if (!isSafeCount(limit, 1, this.configuration.current.filesystem.maxHistoryEntries))
+			throw new Error("invalid input discovery limit");
+		const rows = await this.query(
+			`WITH recent AS MATERIALIZED (
+				SELECT rowid AS age, id, value FROM input_versions WHERE root = ? ORDER BY rowid DESC LIMIT ?
+			)
+			SELECT recent.id AS id, e.value ->> '$[0]' AS name, e.value ->> '$[1].type' AS kind
+			FROM recent, json_each(CASE WHEN json_valid(recent.value) THEN recent.value END, '$.payload.entries') AS e
+			WHERE e.type = 'array' ORDER BY age DESC`,
+			[root, limit], signal,
+		);
+		const paths = new Map<string, Sha256Digest[]>();
+		for (const { id, name, kind } of rows) {
+			if (!isSha256Digest(id) || typeof name !== "string") continue;
+			const key = kind === "alias" ? `tree:${name}` : name;
+			const ids = paths.get(key);
+			if (ids) ids.push(id);
+			else paths.set(key, [id]);
+		}
+		return (target: string) => {
+			const ids = new Set(paths.get(target));
+			for (let current = target; ; ) {
+				for (const id of paths.get(`tree:${current}`) ?? []) ids.add(id);
+				const parent = filesystemPathKey(path.dirname(current));
+				if (current === parent) return ids;
+				current = parent;
+			}
+		};
 	}
 	async findByWeakKey(
 		weakKey: Sha256Digest,

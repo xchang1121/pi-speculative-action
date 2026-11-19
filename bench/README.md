@@ -6,6 +6,12 @@
 
 `node --import tsx bench/pattern-workflows.mjs` 运行可复现的合成工作流、混噪训练与位置偏好切换实验。
 
+真实任务按同一条轨迹中已结算调用的 `ΣhiddenComputeMs / ΣtoolComputeMs` 计量。每次运行都会在输出旁写入 `.events.jsonl`。用 `node --import tsx bench/run-journal.ts <日志路径>` 可恢复已完整写入的事件、未结算调用和等待下界。报告列出具有完整计时的调用数。
+
+自建模型端点可通过 `--models-file <Pi 模型配置>`、`--actor provider/id`、`--drafter provider/id` 指定。同一供应方的密钥可用 `--api-key-stdin` 从标准输入读取。`--thinking-level` 设置 Actor 推理档位。C 和 C++ 任务会把本机编译器报告的系统头文件目录附在任务环境中。
+
+若有时间在先的真实会话，先运行 `node --import tsx bench/pattern-trace-replay.mjs --seed-for <被测仓库> --state-dir <独立新目录> <历史会话.session.jsonl...>`，再把该目录传给实测的 `--pattern-state`。训练跳过被测仓库，跨仓库共享沿用 PatternAware 的真实采纳门槛。报告中的 `pattern_pool_empty` 和 `no_foreground_match` 分别记录空池和已有模式未给出前台预测的轮次。
+
 `node --import tsx bench/pattern-trace-replay.mjs /path/to/tasks/*/record.session.jsonl` 读取每条原始会话及同名的 `record.json`。每折留出一个完整仓库，按原始 Actor 批次先预测再学习。报告按宿主的工具契约区分原始参数相同和规范键精确匹配，统计首位命中、误报及覆盖的调用数。每个被覆盖的调用只累计一次原录制耗时。测量 Actor 实际等待需在运行中的 Host 重放相同调用。
 
 ## 后端资格

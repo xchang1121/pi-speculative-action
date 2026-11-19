@@ -17,12 +17,14 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import os from "node:os";
 import { serialize } from "node:v8";
 import path from "node:path";
 import process from "node:process";
+import { createInterface } from "node:readline";
 import type { Worker } from "node:worker_threads";
 
 import { PI_ACTION_SEMANTICS, resolvePiToolPath } from "./action-semantics.ts";
@@ -41,11 +43,11 @@ import {
 	isRecord,
 	isSafeCount,
 	relativeFilesystemPath,
+	resourceBudgetError,
 	resolveHostExecutable,
 	slash,
 } from "./primitives.ts";
 import {
-	captureResourceVersion,
 	createSerializablePreparationBinding,
 	type ToolFilesystemOperations,
 } from "./resource-version.ts";
@@ -243,21 +245,6 @@ export async function createClosedSearchProfile(cwd: string) {
 	for (const tool of PI_CLOSED_SEARCH_TOOLS) {
 		if (tool === "grep" && !engine) continue;
 		const semantics = PI_ACTION_SEMANTICS.definition(tool)!;
-		const execute = async (
-			request: Parameters<NonNullable<ToolInvocation["authoritative"]>>[0],
-			provided?: ToolFilesystemOperations,
-		): Promise<ToolSettlement> => {
-			const capture = provided
-				? undefined
-				: await captureResourceVersion(undefined, root, PI_ACTION_SEMANTICS, profile.limits.maxInputBytes);
-			const view = provided ?? capture!.view!;
-			try {
-				if (tool === "find") return await runCapturedFind(view, cwd, request.args, request.signal);
-				return await runCapturedGrep(view, cwd, request.args as GrepInput, request.signal, engine!);
-			} finally {
-				await capture?.release();
-			}
-		};
 		invocations.set(tool, {
 			executor: profile.id,
 			identity: {
@@ -278,10 +265,12 @@ export async function createClosedSearchProfile(cwd: string) {
 				},
 			},
 			...bindResourceOperation(
-				(view, request) => execute(request, view),
+				(view, request) => tool === "find"
+					? runCapturedFind(view, cwd, request.args, request.signal)
+					: runCapturedGrep(view, cwd, request.args as GrepInput, request.signal, engine!),
 				root,
-				(request) => execute(request),
-				true,
+				tool === "grep" ? (request) => engine!.search(cwd, request.args as GrepInput, request.signal) : undefined,
+				"single_query",
 			),
 		});
 	}
@@ -297,6 +286,7 @@ async function walkSearchInputs(
 	signal: AbortSignal,
 	engine?: Awaited<ReturnType<typeof prepareGrepEngine>>,
 	expression?: string,
+	readInput?: (view: ToolFilesystemOperations, file: string) => Promise<Buffer>,
 ): Promise<string[]> {
 	const limits = speculativeConfig().search;
 	const grep = !!engine;
@@ -336,8 +326,8 @@ async function walkSearchInputs(
 	const repositories = new Set<string>();
 	const text = async (file: string) => {
 		if (!(await view.exists!(file))) return undefined;
-		const content = await view.readFile(file);
-		assert.ok((bytes += content.length) <= limits.maxInputBytes, "search input byte budget");
+		const content = readInput ? await readInput(view, file) : await view.readFile(file);
+		if ((bytes += content.length) > limits.maxInputBytes) throw resourceBudgetError("search input byte budget");
 		return content.toString("utf8");
 	};
 	const rules = async (directory: string): Promise<Rule[]> => {
@@ -381,8 +371,8 @@ async function walkSearchInputs(
 	};
 	const walk = async (file: string): Promise<void> => {
 		signal.throwIfAborted();
-		assert.ok(entries++ < limits.maxEntries, "search entry budget");
-		if (grep) assert.ok(entries <= limits.maxDirectoryEntries, "metadata entry budget");
+		if (++entries > limits.maxEntries || (grep && entries > limits.maxDirectoryEntries))
+			throw resourceBudgetError("search entry budget");
 		const stat = await view.stat!(file, "entry", false);
 		const root = file === target;
 		if (!root && (stat.type === "symlink" || stat.type === "special")) {
@@ -553,7 +543,51 @@ async function prepareGrepEngine() {
 			{ engine: identity, namespace: "pi.captured-grep" },
 			acceptsGrepMatches,
 		);
-		return { root, identity, matchesBinding, execute, release, jj };
+		const search = async (cwd: string, query: GrepInput, signal: AbortSignal) => {
+			const target = resolvePiToolPath(query.path || ".", cwd);
+			const directory = await fs.stat(target).then((s) => s.isDirectory(), () => {
+				throw new Error(`Path not found: ${target}`);
+			});
+			const limit = Math.max(1, query.limit ?? limits.grepLimit);
+			const args = [...flags, "--ignore", "--no-ignore-global"];
+			if (query.glob) args.push("--glob", query.glob);
+			if (directory) args.push("--glob", "!.git/");
+			if (query.literal) args.push("--fixed-strings");
+			if (query.ignoreCase) args.push("--ignore-case");
+			const child = spawn(executable, [...args, "--", query.pattern, target], {
+				cwd, env: environment, signal, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
+			});
+			let diagnostic = "", count = 0;
+			child.stderr.setEncoding("utf8").on("data", (text: string) => {
+				if (diagnostic.length < limits.displayBytes) diagnostic += text;
+			});
+			const closed = new Promise<number | null>((resolve, reject) => {
+				child.once("error", reject);
+				child.once("close", resolve);
+			});
+			const rows = new Map<string, GrepMatch[]>();
+			const collect = async () => {
+				for await (const line of createInterface({ input: child.stdout, crlfDelay: Infinity })) {
+					const { type, data } = JSON.parse(line);
+					if (type !== "match") continue;
+					const file: string = data.path.text ?? Buffer.from(data.path.bytes, "base64").toString();
+					let hits = rows.get(file);
+					if (!hits) rows.set(file, (hits = []));
+					hits.push(data);
+					if (++count >= limit) { child.kill(); break; }
+				}
+			};
+			try {
+				const [, code] = await Promise.all([collect(), closed]);
+				signal.throwIfAborted();
+				if (count < limit && code !== 0 && code !== 1) throw new Error(diagnostic.trim() || `rg exited ${code}`);
+				return formatGrep(query, target, directory, [...rows.keys()], [...rows.values()], (file) => fs.readFile(file));
+			} finally {
+				child.kill();
+				await closed.catch(() => {});
+			}
+		};
+		return { root, identity, matchesBinding, execute, search, release, jj };
 	} catch (error) {
 		await release();
 		throw error;
@@ -584,7 +618,24 @@ async function runCapturedGrep(
 ): Promise<ToolSettlement> {
 	const limits = speculativeConfig().search;
 	const target = resolvePiToolPath(query.path || ".", cwd);
-	const files = await walkSearchInputs(view, cwd, target, query.glob, signal, engine, query.pattern);
+	const cancelled = new AbortController();
+	const active = AbortSignal.any([signal, cancelled.signal]);
+	let remaining = limits.maxInputBytes;
+	const admitted = new Map<string, number>();
+	const readInput = async (inputs: ToolFilesystemOperations, file: string) => {
+		const { size } = await inputs.stat!(file, "type");
+		if (size === undefined) throw new Error("search input size unavailable");
+		if (admitted.has(file)) assert.equal(size, admitted.get(file), "search input size changed");
+		else {
+			if (size > remaining) throw resourceBudgetError("search input byte budget");
+			remaining -= size;
+			admitted.set(file, size);
+		}
+		const content = await inputs.readFile(file, size + 1);
+		assert.equal(content.length, size, "search input size changed");
+		return content;
+	};
+	const files = await walkSearchInputs(view, cwd, target, query.glob, active, engine, query.pattern, readInput);
 	let pending: { source: string; inputs: ToolFilesystemOperations; signal: AbortSignal }[] = [];
 	let batch: Promise<GrepMatch[][]> | undefined;
 	const enqueue = (source: string, inputs: ToolFilesystemOperations, signal: AbortSignal) => {
@@ -596,12 +647,10 @@ async function runCapturedGrep(
 			const root = await fs.mkdtemp(path.join(engine.root, "matches-"));
 			const scope = new SharedAbortScope();
 			const release = inputs.map((item) => scope.acquire(item.signal));
-			let bytes = 0;
 			try {
 				for (const [index, item] of inputs.entries()) {
 					scope.signal.throwIfAborted();
-					const content = item.source ? await item.inputs.readFile(item.source) : Buffer.alloc(0);
-					assert.ok((bytes += content.length) <= limits.maxInputBytes, "search input byte budget");
+					const content = item.source ? await readInput(item.inputs, item.source) : Buffer.alloc(0);
 					await fs.writeFile(path.join(root, String(index)), content);
 				}
 				const args = ["--", query.pattern, root];
@@ -619,20 +668,43 @@ async function runCapturedGrep(
 			return results[index]!;
 		});
 	};
-	const jobs = (files.length ? files : [""]).map((source) => {
+	const matchesFor = (source: string) => {
 		const build = async (inputs: ToolFilesystemOperations, signal: AbortSignal) => {
 			const value = await enqueue(source, inputs, signal);
 			return { value, bytes: serialize(value).byteLength, dispose: () => {} };
 		};
 		const key = JSON.stringify([source, query.pattern, !!query.ignoreCase, !!query.literal]);
 		return source && view.prepare
-			? view.prepare(engine.matchesBinding, key, build, async (value) => value, source, signal)
-			: build(view, signal).then((result) => result.value);
-	});
-	const matches = await Promise.all(jobs).finally(() => Promise.allSettled(jobs));
+			? view.prepare(engine.matchesBinding, key, build, async (value) => value, source, active)
+			: build(view, active).then((result) => result.value);
+	};
+	const limit = Math.max(1, query.limit ?? limits.grepLimit);
+	const matches: GrepMatch[][] = [];
+	let found = 0;
+	const names = files.length ? files : [""]; // Still run rg to validate the expression on an empty search.
+	while (matches.length < names.length && found < limit) {
+		active.throwIfAborted();
+		const size = matches.length ? 32 : Math.min(32, limit);
+		const jobs = names.slice(matches.length, matches.length + size).map(matchesFor);
+		try {
+			for (const rows of await Promise.all(jobs)) {
+				matches.push(rows);
+				found += rows.length;
+			}
+		} catch (error) {
+			cancelled.abort(error);
+			await Promise.allSettled(jobs);
+			throw error;
+		}
+	}
+	const directory = (await view.stat!(target, "type", false)).isDirectory();
+	return formatGrep(query, target, directory, files, matches, (file) => readInput(view, file));
+}
+async function formatGrep(query: GrepInput, target: string, directory: boolean, files: string[],
+	matches: GrepMatch[][], read: (file: string) => Buffer | Promise<Buffer>): Promise<ToolSettlement> {
+	const limits = speculativeConfig().search;
 	const limit = Math.max(1, query.limit ?? limits.grepLimit);
 	const context = Math.max(0, query.context ?? 0);
-	const directory = (await view.stat!(target, "type", false)).isDirectory();
 	const output: string[] = [];
 	let linesTruncated = false;
 	let count = 0;
@@ -650,7 +722,7 @@ async function runCapturedGrep(
 				? undefined
 				: match.lines.text?.replace(/\r\n/g, "\n").replace(/\r/g, "").replace(/\n$/, "");
 			if (inline === undefined)
-				lines ??= (await view.readFile(file)).toString("utf8").replace(/\r\n?/g, "\n").split("\n");
+				lines ??= (await read(file)).toString("utf8").replace(/\r\n?/g, "\n").split("\n");
 			for (let i = Math.max(1, row - context); i <= Math.min(lines?.length ?? row, row + context); i++) {
 				const line = truncateLine(
 					inline ?? lines![i - 1] ?? "",

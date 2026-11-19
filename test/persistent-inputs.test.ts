@@ -190,6 +190,31 @@ linux("stops persistent recovery after a consumed input and releases its lease",
 	expect(session.contents.openChunks).toBe(0);
 });
 
+linux("reads one path catalog and restores a shared closure once for concurrent queries", async () => {
+	const f = await fixture();
+	const session = new ResourceInputSession({ store: f.store }, memoryBudget);
+	try {
+		const paths = ["a", "b"].map((name) => path.join(f.root, name));
+		for (const file of paths) await writeFile(file, file);
+		const token = await f.manager.capture(paths.map((path) => ({ path, scope: "content" })), memoryBudget);
+		f.tokens.push(token);
+		await f.manager.persist(token);
+		const catalog = vi.spyOn(f.store, "inputPathIndex");
+		const fetch = vi.spyOn(f.store, "getInputVersion");
+		const restore = vi.spyOn(ResourceVersionManager.prototype, "restore");
+		const read = session.reader(f.root, new AbortController().signal);
+		const buffers = await Promise.all([...paths, path.join(f.root, "absent")].map(async (file) => {
+			for await (const token of read(file)) return (await token.view!.readFile(file)).toString();
+		}));
+		expect(buffers).toEqual([...paths, undefined]);
+		for (const operation of [catalog, fetch, restore]) expect(operation).toHaveBeenCalledOnce();
+	} finally {
+		await session.dispose();
+		await f.close();
+	}
+	expect(session.contents.openChunks).toBe(0);
+});
+
 linux("rejects incomplete, corrupt, over-budget and stale persistent preparation closures", async () => {
 	const f = await fixture();
 	const file = path.join(f.root, "input");

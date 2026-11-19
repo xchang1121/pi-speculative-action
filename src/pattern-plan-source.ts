@@ -15,7 +15,7 @@ import {
 	type PatternAwareStoreLease,
 } from "./pattern-aware.ts";
 import { stableValueHash } from "./primitives.ts";
-import type { SpeculativeActionSettings } from "./settlement.ts";
+import { SourceRequestSuppressed, type SpeculativeActionSettings } from "./settlement.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import type { CallGenerator, CompletedCall, GeneratorTurn } from "./call-generators.ts";
 import { speculativeConfig } from "./config-schema.ts";
@@ -282,6 +282,9 @@ export function createPatternPlanSource({
 					turn.data.schemaHashes,
 					turn.data.patternIdentities,
 				);
+				if (!candidates.some((candidate) => !candidate.background))
+					throw new SourceRequestSuppressed({ stage: "source",
+						code: store.patternCount ? "no_foreground_match" : "pattern_pool_empty" });
 				await emit(turn, store, candidates, "pattern:" + turn.startInput.turnID);
 				return candidates.filter((c) => !c.background).length;
 			});

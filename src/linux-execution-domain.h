@@ -44,6 +44,7 @@ struct pi_version_clock {
   unsigned long long lost;
   unsigned long long uncertain;
   unsigned long long active;
+  unsigned long long memfd_device;
 };
 struct pi_domain_admission {
   unsigned long long descriptor;

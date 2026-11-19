@@ -44,6 +44,9 @@ export function searchJourney({ cwd, name, tools, args, invocation, world, resou
 				candidate.resolve(event.state);
 			if (event.type === "prediction" && event.settlement.observation === "unobserved")
 				candidate.resolve(event.settlement);
+			if (event.type === "source_request" && event.request.request.source === "drafter" &&
+				event.request.request.kind === "proposal" && event.request.settlement.status === "empty")
+				candidate.resolve(event.request.settlement);
 			if (event.type === "actor_action") feedback?.resolve(event.settlement);
 		},
 	});

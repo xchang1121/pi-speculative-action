@@ -278,6 +278,7 @@ export async function evaluateResourceQuery<Output>(
 	acceptObservation?: (observation: ResourceObservation) => boolean,
 ) {
 	signal.throwIfAborted();
+	const recover = session?.reader(root, signal);
 	const capture = () =>
 		session
 			? session.capture(undefined, root, semantics, maxBytes)
@@ -346,7 +347,7 @@ export async function evaluateResourceQuery<Output>(
 													? [observe(token, dependencies, commit)]
 													: observeOwner(tokens, undefined, commit),
 										};
-							for await (const token of session?.recover(root, signal, target, preparation) ?? [])
+							for await (const token of recover?.(target, preparation) ?? [])
 								if (token.view)
 									yield {
 										view: token.view.readOnly(),
@@ -743,8 +744,10 @@ export function bindResourceOperation(
 			const scope = resourceOperationContext.getStore();
 			if (!owned && !scope && native) return native(request);
 			if (owned) owned.phase = "observing";
+			let observe = !!(owned || scope);
 			const unproven = () => {
 				if (owned) owned.phase = "incomplete";
+				if (completeObservation === "single_query") observe = false;
 			};
 			const session =
 				owned?.session ??
@@ -754,7 +757,7 @@ export function bindResourceOperation(
 				signal = request.signal,
 				validation: "prepared" | "output" = "prepared",
 			) => {
-				if (!owned && !scope) return;
+				if (!observe) return;
 				let source: object | undefined;
 				const evaluate = () =>
 					TimelineInterval.outside(() =>
@@ -925,11 +928,11 @@ export function bindResourceOperation(
 				},
 			};
 			try {
-				// The stock reader checks access, sniffs the type and reads the body from one validated input.
+				// An observation shares one input budget and publishes one proof for the whole call.
 				if (completeObservation === "single_query" && (owned || scope))
 					return await read(
 						(view) => execute(view, request),
-						() => execute(host, request),
+						() => native ? native(request) : execute(host, request),
 					);
 				return await (native && completeObservation
 					? collectResourceComputation(() => execute(host, request))
@@ -937,7 +940,7 @@ export function bindResourceOperation(
 			} catch (error) {
 				// Only an explicitly supplied observation fallback may repeat an effect-free attempt.
 				unproven();
-				if (!native || !completeObservation || effectsStarted || isPoisonedEffectCommit(error)) throw error;
+				if (!native || completeObservation !== true || effectsStarted || isPoisonedEffectCommit(error)) throw error;
 				request.signal.throwIfAborted();
 				return await native(request);
 			} finally {

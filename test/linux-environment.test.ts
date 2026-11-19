@@ -15,7 +15,32 @@ import {
 	resolveLinuxExecHelper,
 } from "../src/linux-held-exec.ts";
 import { nativeProcessLibrary } from "../src/process-startup.mjs";
-import { sha256Digest } from "../src/primitives.ts";
+import { execHostFile, sha256Digest } from "../src/primitives.ts";
+import { speculativeConfig } from "../src/config-schema.ts";
+
+test.skipIf(!process.env.PI_SPEC_DOMAIN_SOCKET || process.platform !== "linux")(
+	"continues sealing and detects new writes after the kernel object history fills", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-domain-capacity-"));
+		const collector = await executionDomainCollector(await resolveLinuxExecHelper(process.env.PI_SPEC_HELD_EXEC));
+		let proof: ReturnType<typeof executionDomainProof> | undefined;
+		try {
+			await execHostFile("python3", ["-c", [
+				"import os, sys", "for _ in range(int(sys.argv[1])):",
+				" fd = os.memfd_create('pi-history-test')", " os.write(fd, b'x')", " os.close(fd)",
+			].join("\n"), String(speculativeConfig().nativeBuild.domainRecords + 1)]);
+			const file = path.join(root, "late");
+			await writeFile(file, "original");
+			proof = executionDomainProof(collector, root);
+			const valid = proof.seal([{ kind: "file", path: file, role: "input", contentDigest: sha256Digest("original") }], (p) => p);
+			expect(valid(), proof.reason).toBe(true);
+			await writeFile(file, "modified");
+			expect(valid()).toBe(false);
+		} finally {
+			proof?.close();
+			await rm(root, { recursive: true, force: true });
+		}
+	}, 30_000,
+);
 
 test.skipIf(process.platform !== "linux").each([
 	["with space 中", ""],

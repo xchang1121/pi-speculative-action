@@ -138,6 +138,9 @@ export function createDrafterPlanSource(
 	const batches = new WeakMap<GeneratorTurn, Promise<(DrafterBatch & { skipRoot: boolean }) | undefined>>();
 	const budget = input.drafterBudget ?? new DrafterTaskBudget();
 	const observations = { forecasted: 0, compared: 0, matched: 0 };
+	const latencies = new BoundedRecencyMap<string, number>(speculativeConfig().prediction.calibrationBuckets);
+	const latencyKey = (batch: DrafterBatch, tool?: string) =>
+		JSON.stringify([batch.model.provider, batch.model.baseUrl, batch.model.id, tool ?? null]);
 	// Separate Beta(1, 1) estimates over the latest 32 eligible outcomes per model and tool contract.
 	const calibration = new BoundedRecencyMap<
 		string,
@@ -177,6 +180,7 @@ export function createDrafterPlanSource(
 						onPayload: forceToolChoice(options.onPayload, force === true ? undefined : force),
 					}
 				: {};
+		const started = performance.now();
 		const response = await waitForCompletion(
 			budget
 				.run({
@@ -194,7 +198,9 @@ export function createDrafterPlanSource(
 				}),
 			signal,
 		);
-		return response.status === "completed" ? response.value : undefined;
+		if (response.status !== "completed") return;
+		if (response.value) latencies.set(latencyKey(batch), performance.now() - started);
+		return response.value;
 	};
 	const prepare = (turn: GeneratorTurn) => {
 		const existing = batches.get(turn);
@@ -285,16 +291,7 @@ export function createDrafterPlanSource(
 			if (!message) return 0;
 			const calls = message.content.filter((item): item is AgentToolCall => item.type === "toolCall");
 			if (!calls.length || new Set(calls.map((call) => call.id)).size !== calls.length) return 0;
-			let scopes = [calls.map((call) => call.id)];
-			if (calls.length > 1 && depth < batch.budgetPolicy.drafterMaxDepth) {
-				const context = scopeContext(batch, message, calls);
-				const reply = await completeRequest(batch, context, signal, report, CONTINUATION_TOOL).catch(
-					() => undefined,
-				);
-				const args = privateToolArguments(reply, context);
-				if (args) scopes = args.scopes as string[][];
-			}
-			const members: (DrafterCall & { issued?: GeneratedCall })[] = [];
+			const members: (DrafterCall & { issued?: GeneratedCall; started: number })[] = [];
 			let previousWrite: string | undefined;
 			for (const [index, call] of calls.entries()) {
 				const bucket = calibrationKey(batch, call.name);
@@ -318,7 +315,7 @@ export function createDrafterPlanSource(
 					},
 					{ after, previousWrite, signal },
 				);
-				members.push({ call, action: issued?.key, issued });
+				members.push({ call, action: issued?.key, issued, started: performance.now() });
 				if (issued) {
 					// The Drafter owns every run whose arguments depend on this private forecast.
 					const withdraw = () => {
@@ -335,6 +332,7 @@ export function createDrafterPlanSource(
 				if (!member.issued) return;
 				const result = await member.issued.run.completion;
 				if (result.status !== "completed") return;
+				latencies.set(latencyKey(batch, member.call.name), performance.now() - member.started);
 				member.result = privateObservation(member.call, result.output, member.action);
 				return { ...member.issued, output: result.output };
 			});
@@ -342,12 +340,28 @@ export function createDrafterPlanSource(
 				if (!signal.aborted && peers.every((p): p is CompletedCall => !!p)) turn.peers("drafter", peers);
 			});
 			if (depth < batch.budgetPolicy.drafterMaxDepth) {
+				let scopes = [calls.map((call) => call.id)];
+				if (calls.length > 1 && members.some((m) => m.issued)) {
+					const context = scopeContext(batch, message, calls);
+					const reply = await completeRequest(batch, context, signal, report, CONTINUATION_TOOL).catch(() => undefined);
+					const args = privateToolArguments(reply, context);
+					if (args) scopes = args.scopes as string[][];
+				}
+				if (signal.aborted) return members.filter((m) => m.issued).length;
 				for (const ids of new Map(scopes.map((ids) => [JSON.stringify([...ids].sort()), ids])).values()) {
 					const visible = members.filter((m) => ids.includes(m.call.id));
 					if (!visible.length || visible.some((m) => !m.issued)) continue;
 					const reconcile = async () => {
 						const actual = Promise.all(visible.map((m) => results[members.indexOf(m)]!));
 						const forecasts = new Map<string, DrafterObservation>();
+						// When every pending tool previously beat this model, give the actual results
+						// their measured head start. A slower invocation can still open a forecast.
+						const missing = visible.filter((m) => !m.result);
+						const modelMs = latencies.get(latencyKey(batch)) ?? 0;
+						const durations = missing.map((m) => latencies.get(latencyKey(batch, m.call.name)));
+						if (durations.length && durations.every((ms): ms is number => ms !== undefined && ms < modelMs))
+							await waitForCompletion(actual, signal, Math.max(...durations));
+						if (signal.aborted) return;
 						const pending = visible.filter((m) => !m.result);
 						const guessed = new AbortController();
 						const suffixSignal = AbortSignal.any([signal, guessed.signal]);
@@ -399,7 +413,7 @@ export function createDrafterPlanSource(
 						};
 						if (pending.length) {
 							const stopForecast = new AbortController();
-							void actual.then(() => stopForecast.abort());
+							void actual.then(() => stopForecast.abort(new SourceRequestSuppressed({ stage: "source", code: "actual_result_ready" })));
 							await turn.request(
 								"drafter",
 								"observation",

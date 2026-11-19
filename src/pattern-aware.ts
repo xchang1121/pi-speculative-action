@@ -934,6 +934,9 @@ export class PatternAwareStore {
 		const id = typeof support === "string" ? support : support.visitedPatternIDs.at(-1);
 		return id ? this.patterns.get(id)?.feedback : undefined;
 	}
+	get patternCount(): number {
+		return this.patterns.size;
+	}
 	snapshot(): ReadonlyArray<PatternAwarePattern> {
 		return [...this.patterns.values()].map((pattern) =>
 			readonlyPattern(this.measured(pattern), this.clock, this.settings.decayHalfLifeEvents),

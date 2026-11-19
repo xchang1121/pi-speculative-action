@@ -58,6 +58,7 @@ import {
 	isSafeCount,
 	isSha256Digest,
 	relativeFilesystemPath,
+	resourceBudgetError,
 	digestObject,
 	type Sha256Digest,
 	releaseOnce,
@@ -252,7 +253,7 @@ class ResourceInputMemory {
 		return this.limit - this.retained;
 	}
 	change(bytes: number): void {
-		if (bytes > this.remainingBytes) throw new Error("resource_snapshot_budget_exceeded");
+		if (bytes > this.remainingBytes) throw resourceBudgetError("resource_snapshot_budget_exceeded");
 		if (this.retained + bytes < 0) throw new Error("resource_snapshot_budget_underflow");
 		this.retained += bytes;
 	}
@@ -868,7 +869,7 @@ export class ResourceReadView {
 		}
 		if (!isSafeCount(bytes)) throw new Error("resource_snapshot_budget_invalid");
 		if (bytes > this.remainingBytes) {
-			this.failure = new Error("resource_snapshot_budget_exceeded");
+			this.failure = resourceBudgetError("resource_snapshot_budget_exceeded");
 			for (const entry of this.entries.values()) this.releaseObject(entry);
 			this.entries.clear();
 			this.objectCount = 0;
@@ -2179,7 +2180,7 @@ export class ResourceVersionManager {
 				(sum, entry) => sum + observationBytes(dependencyKey(entry), entry),
 				0,
 			);
-			if (proofBytes > retainBytes) throw new Error("resource_snapshot_budget_exceeded");
+			if (proofBytes > retainBytes) throw resourceBudgetError("resource_snapshot_budget_exceeded");
 			const contents = this.persistentInputs!.contents ?? new ContentChunkPool(store, limits);
 			const observations = new ResourceObservations(
 				this.persistentInputs!.memory,
@@ -2336,7 +2337,7 @@ export class ResourceVersionManager {
 		}
 	}
 	/** Resolve existing ancestors before creating the cache: persistent capture must not write into its source. */
-	private async assertPersistentStore(): Promise<void> {
+	async assertPersistentStore(): Promise<void> {
 		if (!this.persistentInputs || this.persistentInputs.internalCache) return;
 		await withFilesystemReadView(undefined, async (filesystem) => {
 			const root = await filesystem.realpath(this.root);
@@ -2761,20 +2762,48 @@ export class ResourceInputSession {
 			this.persistence,
 		);
 	}
-	async *recover(
-		root: string,
-		signal: AbortSignal,
-		target?: string,
-		preparation?: PreparationLookup,
-	): AsyncGenerator<ResourceVersionToken> {
-		for await (const { token } of this.root(root).recover(() => this.remainingBytes, {
-			signal,
-			target,
-			preparation,
-		})) {
-			this.lifecycle.own({ dispose: token.release });
-			yield token;
-		}
+	/** Concurrent reads in one evaluation share discovery and a single validated lease per closure. */
+	reader(root: string, signal: AbortSignal) {
+		const manager = this.root(root);
+		const store = this.configuration.store;
+		let catalog: ReturnType<typeof store.inputPathIndex> | undefined;
+		const restored = new Map<Sha256Digest, Promise<ResourceVersionToken | undefined>>();
+		const session = this;
+		const restore = async (id: Sha256Digest) => {
+			const record = await store.getInputVersion(id, signal);
+			if (!record) return;
+			try {
+				const token = await manager.restore(record, session.remainingBytes, signal);
+				if (token) session.lifecycle.own({ dispose: token.release });
+				return token;
+			} catch {
+				signal.throwIfAborted();
+				store.signal.throwIfAborted();
+				// An invalid historical input leaves the current filesystem authoritative.
+			}
+		};
+		return async function* (target?: string, preparation?: PreparationLookup) {
+			if (target === undefined || preparation || session.persistence.inputs) {
+				for await (const { token } of manager.recover(() => session.remainingBytes, { signal, target, preparation })) {
+					session.lifecycle.own({ dispose: token.release });
+					yield token;
+				}
+				return;
+			}
+			const limit = Math.min(store.limits.maxCertificates, speculativeConfig().filesystem.maxHistoryEntries);
+			const lookup = await (catalog ??= manager.assertPersistentStore().then(() =>
+				store.inputPathIndex(manager.root, limit, signal)));
+			for (const id of lookup(filesystemPathKey(path.resolve(manager.root, target)))) {
+				signal.throwIfAborted();
+				let pending = restored.get(id);
+				if (!pending) restored.set(id, (pending = restore(id)));
+				const token = await pending;
+				if (token) yield token;
+			}
+		};
+	}
+	recover(root: string, signal: AbortSignal, target?: string, preparation?: PreparationLookup) {
+		return this.reader(root, signal)(target, preparation);
 	}
 	async publish(
 		token: ResourceVersionToken,
@@ -3299,7 +3328,7 @@ async function fingerprintDependencies(
 						: Number(info.size);
 				const retain = !view?.verifyingInputs && (view?.reserve(reserved) ?? false);
 				if (!retain && (chunked || (provided && (!hot || (view && !view.verifyingInputs)))))
-					throw new Error("resource_snapshot_budget_exceeded");
+					throw resourceBudgetError("resource_snapshot_budget_exceeded");
 				const bytes = provided && (provided instanceof ChunkedContent ? provided : Buffer.from(provided));
 				// Supplied bytes own data, never a host observation window; adoption validates them exactly.
 				// A file unchanged since an earlier read of it, by the racy-git rule, needs no read unless its bytes are retained.

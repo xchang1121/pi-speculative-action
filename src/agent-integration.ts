@@ -1109,21 +1109,21 @@ function assembleAgentExecutionHost(
 							void pending.track(Promise.resolve(generator.peers(turn, source, calls))).catch(() => {});
 			},
 			request(source, kind, signal, produce) {
-				let tokens = 0;
+				let tokens: number | undefined;
 				const report = runSourceRequest({
 					request: { source, kind, turnID, index: requestIndex++, targetDecisionSequence: sequenceAtStart },
 					signal,
 					timeoutMs: settings.predictionTimeoutMs,
 					produce: (s) =>
 						produce(s, (n) => {
-							tokens += n;
+							tokens = (tokens ?? 0) + n;
 						}),
 					count: (n) => n,
 				});
 				return pending.track(
 					report.then(({ value: _, ...record }) => {
-						const request = { ...record, draftTokens: tokens };
-						tokenTotal += tokens;
+						const request = { ...record, ...(tokens !== undefined && { draftTokens: tokens }) };
+						tokenTotal += tokens ?? 0;
 						event(turnID, { type: "source_request", request, totalDraftTokens: tokenTotal });
 						return subscriptions.publish("source_request", { sessionID, turnID, request });
 					}),

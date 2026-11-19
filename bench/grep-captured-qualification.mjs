@@ -100,7 +100,7 @@ async function qualifyCaptured(
 		const completion = await probe.candidate;
 		assert.equal(
 			completion.observation === "unobserved" ? completion.cause.code : completion.status,
-			rejected === "unkeyable" ? "action_not_keyable" : rejected ? "failed" : "succeeded",
+			rejected === "unkeyable" ? "empty" : rejected ? "failed" : "succeeded",
 			JSON.stringify(completion),
 		);
 		const materialized = reads.size;

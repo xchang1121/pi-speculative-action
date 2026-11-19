@@ -186,9 +186,12 @@ export async function executionDomainCollector(binary: string) {
 				version: () => {
 					if (phase !== "watching") return;
 					const answer = request(6, id);
-					const incomplete = answer.readBigUInt64LE(24) | answer.readBigUInt64LE(32);
-					failure = incomplete ? `observer_history_incomplete:0x${incomplete.toString(16)}` : undefined;
-					return incomplete ? undefined : answer.readBigUInt64LE(16);
+					const global = answer.readBigUInt64LE(24);
+					const domain = answer.readBigUInt64LE(32);
+					failure = global || domain
+						? `observer_history_incomplete:global=0x${global.toString(16)},domain=0x${domain.toString(16)}`
+						: undefined;
+					return failure ? undefined : answer.readBigUInt64LE(16);
 				},
 				changes: (
 					since: bigint,

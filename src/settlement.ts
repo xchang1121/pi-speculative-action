@@ -471,7 +471,8 @@ export async function runSourceRequest<Value>(input: {
 	const aborted = () =>
 		finish({
 			status: "aborted",
-			cause: cause("source", "generation_expired"),
+			cause: input.signal.reason instanceof SourceRequestSuppressed
+				? input.signal.reason.cause : cause("source", "generation_expired"),
 		});
 	const failed = (code: string, error: unknown) =>
 		finish({

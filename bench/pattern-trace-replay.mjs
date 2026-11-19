@@ -2,7 +2,7 @@
 import { readFile, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { isDeepStrictEqual } from "node:util";
+import { isDeepStrictEqual, parseArgs } from "node:util";
 import { createCodingTools, createReadOnlyTools } from "@earendil-works/pi-coding-agent";
 import { definitionSchemaHashes } from "../src/agent-integration.ts";
 import { actionKeyMatch, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
@@ -38,7 +38,7 @@ async function transcript(file) {
 		if (!cursor) throw new Error("Incomplete or cyclic session ancestry");
 	}
 	const batches = [];
-	const historical = new Map(traces.actorActions.map((action) => [action.id, action]));
+	const historical = new Map(traces.actorActions.map((action) => [action.settlement.actorAction.id, action]));
 	const results = new Map();
 	for (const { message } of branch.reverse()) {
 		if (message?.role === "toolResult") results.set(message.toolCallId, message);
@@ -100,12 +100,12 @@ async function replay(tape, stateDirectory) {
 				const adopted = compatible.find(({ call }) => {
 					const old = tape.historical.get(call.id);
 					if (
-						old?.provider !== "speculative" ||
-						old.candidateSource !== "pattern_aware" ||
-						!old.predictedAction
+						old?.settlement.provider.kind !== "speculative" ||
+						old.candidate?.source !== "pattern_aware" ||
+						!old.candidate.predictedAction
 					)
 						return false;
-					const issued = JSON.parse(old.predictedAction);
+					const issued = JSON.parse(old.candidate.predictedAction);
 					return issued.tool === p.tool && key(issued.tool, issued.input)?.key === predicted.key;
 				});
 				for (const id of p.supportingPatternIDs) {
@@ -166,22 +166,32 @@ async function replay(tape, stateDirectory) {
 	}
 }
 
-const tapes = await Promise.all(process.argv.slice(2).map(transcript));
-const repositories = [...new Set(tapes.map((tape) => tape.repo))].sort();
-if (repositories.length < 2 || new Set(tapes.map((t) => t.session)).size !== tapes.length)
-	throw new Error("Provide distinct recorded sessions from at least two repositories");
-const folds = {};
-for (const held of repositories) {
-	const state = await mkdtemp(path.join(os.tmpdir(), "pattern-fold-"));
-	try {
-		for (const tape of tapes.filter((t) => t.repo !== held)) await replay(tape, state);
-		for (const tape of tapes.filter((t) => t.repo === held)) {
-			const { score, startingPatterns } = await replay(tape, state);
-			const total = (folds[held] ??= { startingPatterns });
-			for (const [key, value] of Object.entries(score)) total[key] = (total[key] ?? 0) + value;
+const { values, positionals } = parseArgs({ allowPositionals: true, options: {
+	"seed-for": { type: "string" }, "state-dir": { type: "string" },
+} });
+const tapes = await Promise.all(positionals.map(transcript));
+if (values["seed-for"] || values["state-dir"]) {
+	if (!values["seed-for"] || !values["state-dir"]) throw new Error("Seeding requires --seed-for REPO and --state-dir DIR");
+	const training = tapes.filter((t) => t.repo !== values["seed-for"]);
+	for (const tape of training) await replay(tape, path.resolve(values["state-dir"]));
+	console.log(JSON.stringify({ heldOut: values["seed-for"], trainingSessions: training.length }));
+} else {
+	const repositories = [...new Set(tapes.map((tape) => tape.repo))].sort();
+	if (repositories.length < 2 || new Set(tapes.map((t) => t.session)).size !== tapes.length)
+		throw new Error("Provide distinct recorded sessions from at least two repositories");
+	const folds = {};
+	for (const held of repositories) {
+		const state = await mkdtemp(path.join(os.tmpdir(), "pattern-fold-"));
+		try {
+			for (const tape of tapes.filter((t) => t.repo !== held)) await replay(tape, state);
+			for (const tape of tapes.filter((t) => t.repo === held)) {
+				const { score, startingPatterns } = await replay(tape, state);
+				const total = (folds[held] ??= { startingPatterns });
+				for (const [key, value] of Object.entries(score)) total[key] = (total[key] ?? 0) + value;
+			}
+		} finally {
+			await rm(state, { recursive: true, force: true });
 		}
-	} finally {
-		await rm(state, { recursive: true, force: true });
 	}
+	console.log(JSON.stringify({ folds }, null, 2));
 }
-console.log(JSON.stringify({ folds }, null, 2));

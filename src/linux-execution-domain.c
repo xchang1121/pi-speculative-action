@@ -6,6 +6,18 @@
 
 struct unknown_key { unsigned long long owner, number, tid, started, image; };
 
+/* A collision can invalidate another observation. It must never erase a write
+ * or share the namespace-wide mount clock with ordinary inode traffic. */
+#define MOUNT_BUCKETS 256
+static inline unsigned version_bucket(struct pi_domain_record key, unsigned long long memfd_device) {
+  unsigned long long h = key.first * 0x9e3779b97f4a7c15ULL + key.second + (key.type >> 32);
+  h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  h ^= h >> 32;
+  if (key.type == 1)
+    return (key.first == memfd_device ? PI_DOMAIN_RECORDS : 0) + h % PI_DOMAIN_RECORDS;
+  return 2 * PI_DOMAIN_RECORDS + ((key.type & 3) - 2) * MOUNT_BUCKETS + h % MOUNT_BUCKETS;
+}
+
 #ifdef PI_BPF_OBJECT
 #include <linux/bpf.h>
 
@@ -137,9 +149,10 @@ struct {
  * unused value at startup. Any allocation failure still marks proof loss. */
 struct pending_write {
   struct pi_domain_record objects[PI_DOMAIN_PENDING_OBJECTS];
+  unsigned char async_only[PI_DOMAIN_PENDING_OBJECTS];
   unsigned asynchronous;
   unsigned mount_paths;
-  __u64 mount_namespace;
+  struct pi_domain_record mount_key;
 };
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
@@ -155,6 +168,12 @@ struct {
   __type(key, struct pi_domain_record);
   __type(value, struct pi_object_version);
 } versions SEC(".maps");
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 2 * PI_DOMAIN_RECORDS + 2 * MOUNT_BUCKETS);
+  __type(key, __u32);
+  __type(value, struct pi_object_version);
+} overflow_versions SEC(".maps");
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, 1);
@@ -1479,21 +1498,31 @@ static struct pending_write *pending_write(__u64 task) {
   return pending;
 }
 
-/* Every physical object has one version, independent of the number of execution
- * domains reading it. In-flight and mapped writes keep that object dirty. */
+static __always_inline struct pi_object_version *stored_version(struct pi_domain_record key) {
+  if (key.type) return bpf_map_lookup_elem(&versions, &key);
+  __u32 bucket = key.first;
+  return bpf_map_lookup_elem(&overflow_versions, &bucket);
+}
+static __always_inline struct pi_object_version *write_version(struct pi_domain_record *key, __u64 memfd_device) {
+  struct pi_object_version empty = {};
+  if (key->type != 1 || key->first != memfd_device) {
+    struct pi_object_version *object = bpf_map_lookup_elem(&versions, key);
+    if (!object) {
+      bpf_map_update_elem(&versions, key, &empty, BPF_NOEXIST);
+      object = bpf_map_lookup_elem(&versions, key);
+    }
+    if (object) return object;
+  }
+  __u32 bucket = version_bucket(*key, memfd_device);
+  *key = (struct pi_domain_record){0, bucket, 1};
+  return bpf_map_lookup_elem(&overflow_versions, &bucket);
+}
 static __always_inline int changed(struct pi_domain_record key, unsigned uncertain,
                                    unsigned long filesystem) {
-  if (!key.second)
-    return 0;
+  if (!key.second) return 0;
   struct pi_version_clock *clock = version_clock();
-  if (!clock)
-    return 0;
-  struct pi_object_version empty = {};
-  struct pi_object_version *object = bpf_map_lookup_elem(&versions, &key);
-  if (!object) {
-    bpf_map_update_elem(&versions, &key, &empty, BPF_NOEXIST);
-    object = bpf_map_lookup_elem(&versions, &key);
-  }
+  if (!clock) return 0;
+  struct pi_object_version *object = write_version(&key, clock->memfd_device);
   if (!object) {
     __sync_fetch_and_or(&clock->lost, 8);
     return 0;
@@ -1502,10 +1531,12 @@ static __always_inline int changed(struct pi_domain_record key, unsigned uncerta
     /* A released inode number can identify a new object. No old mapping can
      * survive that lifetime boundary, but outstanding syscall counters drain.
      */
-    if (__sync_lock_test_and_set(&object->uncertain, 0))
-      __sync_fetch_and_sub(&clock->uncertain, 1);
-    object->born = bpf_ktime_get_boot_ns();
-    object->filesystem = filesystem;
+    if (key.type) {
+      if (__sync_lock_test_and_set(&object->uncertain, 0))
+        __sync_fetch_and_sub(&clock->uncertain, 1);
+      object->born = bpf_ktime_get_boot_ns();
+      object->filesystem = filesystem;
+    }
     uncertain &= ~64U;
   }
   if (object->born)
@@ -1523,11 +1554,13 @@ static __always_inline int changed(struct pi_domain_record key, unsigned uncerta
   for (unsigned index = 0; index < PI_DOMAIN_PENDING_OBJECTS; index++) {
     if (pending->objects[index].type == key.type && pending->objects[index].first == key.first &&
         pending->objects[index].second == key.second) {
+      if (!pending->asynchronous) pending->async_only[index] = 0;
       retained = 1;
       break;
     }
     if (!pending->objects[index].second) {
       pending->objects[index] = key;
+      pending->async_only[index] = !!pending->asynchronous;
       __sync_fetch_and_add(&object->active, 1);
       __sync_fetch_and_add(&clock->active, 1);
       retained = 1;
@@ -1806,19 +1839,14 @@ int namespace_change(struct bpf_raw_tracepoint_args *context) {
   struct pi_version_clock *clock = version_clock();
   if (!pending || !clock)
     return 0;
-  pending->mount_namespace =
-      BPF_CORE_READ((struct task_struct *)bpf_get_current_task_btf(), nsproxy, mnt_ns, ns.inum);
-  struct pi_domain_record key = {2, 0, pending->mount_namespace};
-  struct pi_object_version empty = {};
-  struct pi_object_version *object = bpf_map_lookup_elem(&versions, &key);
-  if (!object) {
-    bpf_map_update_elem(&versions, &key, &empty, BPF_NOEXIST);
-    object = bpf_map_lookup_elem(&versions, &key);
-  }
+  struct pi_domain_record key = {2, 0,
+      BPF_CORE_READ((struct task_struct *)bpf_get_current_task_btf(), nsproxy, mnt_ns, ns.inum)};
+  struct pi_object_version *object = write_version(&key, clock->memfd_device);
   if (!object) {
     __sync_fetch_and_or(&clock->lost, 128);
     return 0;
   }
+  pending->mount_key = key;
   __sync_fetch_and_add(&object->active, 1);
   __sync_fetch_and_add(&clock->active, 1);
   __sync_fetch_and_add(&clock->version, 1);
@@ -1827,7 +1855,7 @@ int namespace_change(struct bpf_raw_tracepoint_args *context) {
 SEC("fexit/user_path_at") int resolved_mount_path(unsigned long long *args) {
   __u64 task = bpf_get_current_pid_tgid();
   struct pending_write *pending = bpf_map_lookup_elem(&writing, &task);
-  if (pending && pending->mount_namespace && !args[4]) {
+  if (pending && pending->mount_key.second && !args[4]) {
     pending->mount_paths++;
     return mount_watch(BPF_CORE_READ((struct path *)args[3], dentry));
   }
@@ -1839,9 +1867,8 @@ static void completed(int asynchronous, long result) {
   struct pending_write *pending = bpf_map_lookup_elem(&writing, &task);
   struct pi_version_clock *clock = version_clock();
   if (pending && clock) {
-    if (pending->mount_namespace) {
-      struct pi_domain_record key = {2, 0, pending->mount_namespace};
-      struct pi_object_version *object = bpf_map_lookup_elem(&versions, &key);
+    if (pending->mount_key.second) {
+      struct pi_object_version *object = stored_version(pending->mount_key);
       __u64 next = __sync_fetch_and_add(&clock->version, 1) + 1;
       if (object) {
         if (result >= 0 && !pending->mount_paths)
@@ -1850,13 +1877,14 @@ static void completed(int asynchronous, long result) {
         __sync_fetch_and_sub(&clock->active, 1);
       } else
         __sync_fetch_and_or(&clock->lost, 128);
-      pending->mount_namespace = 0;
+      pending->mount_key = (struct pi_domain_record){};
     }
     unsigned remaining = 0;
     for (unsigned index = 0; index < PI_DOMAIN_PENDING_OBJECTS; index++) {
-      struct pi_object_version *object = bpf_map_lookup_elem(&versions, &pending->objects[index]);
-      if (object && pending->objects[index].second) {
-        if (asynchronous && !(object->uncertain & 16)) {
+      if (!pending->objects[index].second) continue;
+      struct pi_object_version *object = stored_version(pending->objects[index]);
+      if (object) {
+        if (asynchronous && !pending->async_only[index]) {
           remaining++;
           continue;
         }
@@ -1864,7 +1892,7 @@ static void completed(int asynchronous, long result) {
         __sync_fetch_and_sub(&object->active, 1);
         __sync_fetch_and_sub(&clock->active, 1);
         pending->objects[index] = (struct pi_domain_record){};
-      }
+      } else __sync_fetch_and_or(&clock->lost, 8);
     }
     if (!remaining)
       bpf_map_delete_elem(&writing, &task);
@@ -1954,6 +1982,20 @@ static struct metadata_binary metadata_binaries[PI_DOMAIN_LIMIT];
 static int domain_map = -1;
 static int membership_map = -1;
 static int version_map = -1;
+static int overflow_map = -1;
+static uint64_t memfd_device;
+static int read_version(struct pi_domain_record key, struct pi_object_version *object) {
+  unsigned bucket = version_bucket(key, memfd_device);
+  struct pi_object_version spill;
+  *object = (struct pi_object_version){};
+  if (bpf_map_lookup_elem(version_map, &key, object) && errno != ENOENT) return -1;
+  if (bpf_map_lookup_elem(overflow_map, &bucket, &spill)) return -1;
+  if (spill.version > object->version) object->version = spill.version;
+  if (spill.binding > object->binding) object->binding = spill.binding;
+  object->uncertain |= spill.uncertain;
+  object->active |= spill.active;
+  return 0;
+}
 static int clock_map = -1;
 static int role_map = -1;
 static int metadata_call_map = -1;
@@ -2303,7 +2345,7 @@ static int inspected_input(void *record, void *context) {
       return -EAGAIN;
     struct pi_domain_record key = {1, current->device, current->inode};
     struct pi_object_version object = {0};
-    if (bpf_map_lookup_elem(version_map, &key, &object) && errno != ENOENT)
+    if (read_version(key, &object))
       return -errno;
     /* These flags describe possible writers, not permanent taint. The current
      * census closes them without erasing the event that invalidates older
@@ -2531,7 +2573,7 @@ static int respond(struct pi_domain_packet *message, const struct ucred *peer, p
       struct pi_domain_record key = {1, ((uint64_t)major(device) << 20) | minor(device),
                                      message->values[index + 2]};
       struct pi_object_version object = {0};
-      if (bpf_map_lookup_elem(version_map, &key, &object) && errno != ENOENT)
+      if (read_version(key, &object))
         return errno;
       observed[index / 3] = object.version;
     }
@@ -2546,7 +2588,7 @@ static int respond(struct pi_domain_packet *message, const struct ucred *peer, p
       struct pi_domain_record key = {1, ((uint64_t)major(device) << 20) | minor(device),
                                      message->values[index + 2]};
       struct pi_object_version object = {0};
-      if (bpf_map_lookup_elem(version_map, &key, &object) && errno != ENOENT)
+      if (read_version(key, &object))
         return errno;
       if (object.version != observed[index / 3] || object.active ||
           (object.uncertain & ~(4U | 16U | 32U)))
@@ -2565,11 +2607,8 @@ static int respond(struct pi_domain_packet *message, const struct ucred *peer, p
       struct pi_domain_inode ancestor = state.ancestors[index];
       struct pi_object_version observed;
       struct pi_domain_record key = {1, ancestor.device, ancestor.inode};
-      if (!bpf_map_lookup_elem(version_map, &key, &observed)) {
-        if (observed.binding > group->watched)
-          state.uncertain |= 8;
-      } else if (errno != ENOENT)
-        return errno;
+      if (read_version(key, &observed)) return errno;
+      if (observed.binding > group->watched) state.uncertain |= 8;
     }
   }
   if (message->operation == PI_DOMAIN_VERSION) {
@@ -2577,8 +2616,8 @@ static int respond(struct pi_domain_packet *message, const struct ucred *peer, p
       return EINVAL;
     message->count = 3;
     message->values[0] = clock.version;
-    message->values[1] = 0;
-    message->values[2] = state.uncertain | clock.lost;
+    message->values[1] = clock.lost;
+    message->values[2] = state.uncertain;
     return 0;
   }
   if (message->operation == PI_DOMAIN_CHANGES) {
@@ -2604,7 +2643,7 @@ static int respond(struct pi_domain_packet *message, const struct ucred *peer, p
         struct pi_object_version object = {0};
         if (mount)
           key.type = (state.mount_namespace << 32) | 3;
-        if (bpf_map_lookup_elem(version_map, &key, &object) && errno != ENOENT)
+        if (read_version(key, &object))
           return errno;
         if ((flags & 1 &&
              (object.version > since || object.active || (object.uncertain & ~(4U | 16U | 32U)))) ||
@@ -2614,7 +2653,7 @@ static int respond(struct pi_domain_packet *message, const struct ucred *peer, p
     }
     struct pi_domain_record key = {2, 0, state.mount_namespace};
     struct pi_object_version mount = {0};
-    if (bpf_map_lookup_elem(version_map, &key, &mount) && errno != ENOENT)
+    if (read_version(key, &mount))
       return errno;
     if (mount.version > since || mount.active || mount.uncertain)
       return EAGAIN;
@@ -2685,7 +2724,19 @@ int main(int argc, char **argv) {
   domain_map = bpf_object__find_map_fd_by_name(object, "domains");
   membership_map = bpf_object__find_map_fd_by_name(object, "membership");
   version_map = bpf_object__find_map_fd_by_name(object, "versions");
+  overflow_map = bpf_object__find_map_fd_by_name(object, "overflow_versions");
   clock_map = bpf_object__find_map_fd_by_name(object, "clock");
+  /* Anonymous CAS images can outnumber all named inputs in one search. Identify
+   * their superblock once and track their writes in a disjoint bounded history. */
+  int probe = memfd_create("pi-domain-device", MFD_CLOEXEC);
+  struct stat probe_stat;
+  if (probe < 0) goto done;
+  int inspected = fstat(probe, &probe_stat);
+  close(probe);
+  if (inspected) goto done;
+  memfd_device = ((uint64_t)major(probe_stat.st_dev) << 20) | minor(probe_stat.st_dev);
+  struct pi_version_clock initial_clock = {.memfd_device = memfd_device};
+  if (bpf_map_update_elem(clock_map, &(unsigned){0}, &initial_clock, BPF_EXIST)) goto done;
   task_query_program = bpf_object__find_program_by_name(object, "task_query");
   input_query = bpf_object__find_program_by_name(object, "admission_query");
   role_map = bpf_object__find_map_fd_by_name(object, "metadata_roles");

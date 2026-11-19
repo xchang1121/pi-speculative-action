@@ -68,3 +68,29 @@ test("grep reads each captured file once for all its context lines", async () =>
 		await profile.dispose();
 	}
 });
+
+test("a limited grep consumes only the matching prefix and agrees with native ordered search", async () => {
+	const cwd = await directories.create();
+	await mkdir(path.join(cwd, ".git"));
+	await writeFile(path.join(cwd, ".gitignore"), "ignored.txt\n");
+	for (const file of ["aa.txt", "zz.txt", "ignored.txt", ".git/internal.txt"]) await writeFile(path.join(cwd, file), "hit\n");
+	const profile = await createClosedSearchProfile(cwd);
+	const input = await captureResourceVersion(undefined, path.parse(cwd).root, undefined, 8 * 1024 * 1024);
+	try {
+		const contents: string[] = [];
+		const view = input.view!;
+		const invocation = profile.invocations.get("grep")!;
+		const request = { callID: "limited", args: { pattern: "hit", glob: "*.txt", limit: 1 }, signal: AbortSignal.timeout(5000) };
+		const result = await invocation.filesystem!({ ...view, prepare: undefined, readFile: async (file, limit) => {
+			contents.push(path.basename(file));
+			return view.readFile(file, limit);
+		} }, request);
+		expect(contents).toContain("aa.txt");
+		expect(contents).not.toContain("zz.txt");
+		expect(result.result.content[0]).toMatchObject({ text: expect.stringContaining("aa.txt:1: hit") });
+		expect(await invocation.authoritative!(request)).toEqual(result);
+	} finally {
+		await input.release();
+		await profile.dispose();
+	}
+});

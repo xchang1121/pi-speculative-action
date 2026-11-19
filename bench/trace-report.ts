@@ -45,6 +45,20 @@ export function benchmarkTraceReport<SessionID>(events: readonly SpeculativeActi
 	}
 	return {
 		predictionsBySource: Object.fromEntries(predictionsBySource),
+		requestOutcomes: countBy(requests, ({ request: { request, settlement } }) =>
+			[request.source, request.kind, settlement.status, "cause" in settlement && settlement.cause?.code].filter(Boolean).join("/")),
+		requestsWithUsageBySource: countBy(requests.filter(({ request }) => request.draftTokens !== undefined),
+			({ request }) => request.request.source),
+		hiddenMsByFinalProvider: actors.reduce<Record<string, number>>((sum, event) => {
+			const timing = event.computation;
+			if (timing?.hiddenComputeMs !== undefined && !timing.hiddenComputeIncomplete) {
+				const provider = event.settlement.provider;
+				const source = provider.kind === "actor" ? (provider.origin === "preview" ? "actor_preview" : "actor")
+					: event.candidate?.source ?? "cache";
+				sum[source] = (sum[source] ?? 0) + timing.hiddenComputeMs;
+			}
+			return sum;
+		}, {}),
 		sourceRequestKinds: countBy(requests, (event) => event.request.request.kind),
 		sourceRequestsBySource: countBy(requests, (event) => event.request.request.source),
 		candidateStartsBySource: countBy(candidates, (event) => event.candidate.source),

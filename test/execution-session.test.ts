@@ -1,5 +1,5 @@
 import { expect, test, vi } from "vitest";
-import { fauxText, fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { fauxText, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { createReadTool } from "@earendil-works/pi-coding-agent";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { LocalExecutionSession } from "../src/runtime-engine.ts";
@@ -11,6 +11,8 @@ import { PATTERN_AWARE_DEFAULTS, PatternAwareStore } from "../src/pattern-aware.
 import { cause, zeroValidationMetrics } from "../src/settlement.ts";
 import { TimelineInterval } from "../src/task-timing.ts";
 import { testModel, toolUse } from "./model.ts";
+import path from "node:path";
+import { resourceBudgetError } from "../src/primitives.ts";
 
 const read = (name: string): ExecutionCall => ({ tool: "read", input: { path: name } });
 const shared: SpeculativeExecutionRoute = {
@@ -25,6 +27,36 @@ const exclusive: SpeculativeExecutionRoute = {
 	isolation: "workspace_branch",
 	reuse: "exclusive_branch",
 };
+
+test("skips unrelated file snapshots and attempts a budget-limited current query once", async () => {
+	const attempts: string[] = [];
+	const session = new LocalExecutionSession<string>({
+		settings: () => ({ enabled: true, maxConcurrentActions: 3, resourceCacheMaxEntries: 20 }),
+		key: async (call) => PI_ACTION_SEMANTICS.buildKey(call.tool, call.input, "/workspace", "memory", { fingerprint: "test" }),
+		route: async () => shared, authorize: async () => ({ ok: true }), capture: async () => undefined,
+		native: async () => "native",
+		fork: async (call) => {
+			const file = String(call.input.path);
+			return { backend: "memory", output: file, resources: [], executionMetrics: {}, capturedBytes: 1,
+				inputResources: [{ path: path.resolve("/workspace", file === "disjoint" ? file : "target") }],
+				compatibility: { status: "compatible", executionFingerprint: "test", backend: "memory" },
+				reconstructionScope: "current_action", reconstruct: async () => {
+					attempts.push(file); throw resourceBudgetError("test byte limit");
+				},
+				validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }),
+				commit: async () => file, dispose() {} };
+		},
+	});
+	try {
+		for (const file of ["first", "second", "disjoint"]) await session.speculate(read(file)).completion;
+		expect(await session.execute(read("target"))).toMatchObject({ output: "native", served: false });
+		expect(attempts).toHaveLength(1);
+		expect(attempts).not.toContain("disjoint");
+		expect(await session.execute(read("first"))).toMatchObject({ served: true, reuseKind: "exact" });
+	} finally {
+		await session.close();
+	}
+});
 
 test("joins independent handles at capacity, admits an Actor, and validates retained work across detours in both directions", async () => {
 	const gate = Promise.withResolvers<void>();
@@ -414,6 +446,54 @@ test("session close drains source-request delivery from detached continuations",
 		expect(order).toEqual(["continuation", "closed"]);
 	} finally {
 		finish.resolve();
+		await host.dispose();
+	}
+});
+
+test("issues both Drafter calls before a slow scope reply and continues from their ready results", async () => {
+	const tools = [createReadTool("/virtual")];
+	const classify = Promise.withResolvers<void>();
+	const entered = Promise.withResolvers<void>();
+	const calls: unknown[] = [];
+	let forecasts = 0, continuations = 0;
+	const host = createSpeculativeActionHost("scope", {
+		cwd: "/virtual",
+		executionSession: {
+			speculate(call) {
+				calls.push(call.input.path);
+				return { runID: String(call.input.path), completion: Promise.resolve({
+					status: "completed", served: false, output: { result: { content: [fauxText("done")], details: {} }, isError: false },
+					toolExecution: new TimelineInterval(performance.now(), performance.now()),
+				}) };
+			},
+			execute: async () => { throw new Error("unexpected Actor call"); },
+			release() {}, async flush() {}, async close() {},
+		},
+		getSettings: () => ({ enabled: true, drafterEnabled: true, candidateLimit: 1, drafterMaxDepth: 1 }),
+		complete: async (_model, context) => {
+			const privateTool = context.tools?.[0]?.name;
+			if (privateTool === "speculative_continuations") {
+				entered.resolve();
+				await classify.promise;
+				return toolUse(privateTool, { scopes: [["a"], ["b"]] });
+			}
+			if (privateTool === "speculative_observations") forecasts++;
+			if (context.messages.some((m) => m.role === "toolResult")) {
+				continuations++;
+				return fauxAssistantMessage("complete");
+			}
+			return fauxAssistantMessage(["a", "b"].map((id) => fauxToolCall("read", { path: id }, { id })));
+		},
+	});
+	try {
+		await host.startTurn({ turnID: "turn", tools, actorModel: testModel(), actorOptions: {}, context: { messages: [], tools } });
+		await entered.promise;
+		expect(calls).toEqual(["a", "b"]);
+		classify.resolve();
+		await expect.poll(() => continuations).toBe(2);
+		expect(forecasts).toBe(0);
+	} finally {
+		classify.resolve();
 		await host.dispose();
 	}
 });

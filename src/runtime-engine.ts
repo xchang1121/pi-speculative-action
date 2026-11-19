@@ -24,6 +24,7 @@ import type {
 import {
 	cloneSharedData,
 	errorDetail,
+	hasErrorCode,
 	filesystemPathKey,
 	nonNegativeFinite as finiteValue,
 	positiveCount,
@@ -110,6 +111,7 @@ class CandidateStore<Entry extends CandidateStoreEntry> {
 		row.segment ??= "cold";
 		if (shared && (branch.inputSource || branch.reconstruct)) {
 			row.inputs = true;
+			if (!branch.inputResources) this.index(row, "inputs:unindexed");
 			for (const input of branch.inputResources ?? [])
 				this.index(row, inputPartition(input.path, input.descendants));
 		}
@@ -131,7 +133,11 @@ class CandidateStore<Entry extends CandidateStoreEntry> {
 	private inputRecords(resources?: readonly string[]) {
 		const distances = new Map<IndexedEntry<Entry>, number>();
 		const range = speculativeConfig().runtime.inputDistanceRange;
-		for (const row of this.entries.values()) if (row.inputs) distances.set(row, range);
+		if (!resources?.length) {
+			for (const row of this.entries.values()) if (row.inputs) distances.set(row, range);
+			return distances;
+		}
+		for (const row of this.partitions.get("inputs:unindexed") ?? []) distances.set(row, range);
 		for (const resource of resources ?? []) {
 			let current = path.resolve(resource);
 			for (let depth = 0; ; depth++) {
@@ -339,7 +345,9 @@ async function resolveResultView<Output>(
 	} catch (error) {
 		return {
 			ok: false,
-			cause: cause("reconstruction", "reconstruction_failed", errorDetail(error)),
+			cause: cause("reconstruction", hasErrorCode(error, "ERR_RESOURCE_BUDGET") ||
+				hasErrorCode(error, "ERR_ARTIFACT_LEASE_BUDGET") ? "input_budget_exhausted" : "reconstruction_failed",
+				errorDetail(error)),
 		};
 	} finally {
 		if (rebuilt?.dispose)
@@ -717,6 +725,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 		actor: boolean,
 		parent?: Entry<Output>,
 		handle?: Handle<Output>,
+		exhausted?: Set<string>,
 	) {
 		if (!this.limits().maxEntries) return;
 		for (const { entry, match } of this.pool.lookup(key, actor)) {
@@ -725,6 +734,9 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 			if (!parent) while (base?.adopted) base = base.parent;
 			if (entry.adopted && entry.route.reuse === "exclusive_branch") continue;
 			if (base !== parent || (parent && match.kind === "inputs")) continue;
+			const rebuild = match.kind === "inputs" && candidateBranch(entry)?.reconstructionScope === "current_action" &&
+				!entry.resultViews?.has(key.key);
+			if (rebuild && exhausted?.has(entry.route.fingerprint)) continue;
 			entry.pins++;
 			let lease: ReturnType<typeof entry.work.acquire>;
 			let resultView: Extract<ResultView<Output>, { ok: true }> | undefined;
@@ -749,6 +761,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 				const execution = waiting.value;
 				const view = await this.view(entry, call, key, match, signal);
 				if (!view.ok) {
+					if (rebuild && view.cause.code === "input_budget_exhausted") exhausted?.add(entry.route.fingerprint);
 					this.hooks.rejection?.(call, { candidateID: entry.id, match, cause: view.cause });
 					continue;
 				}
@@ -965,10 +978,11 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 				: this.controller.signal;
 			signal.throwIfAborted();
 			const key = await this.hooks.key(call, true);
+			const exhausted = new Set<string>();
 			while (key && this.limits().maxEntries) {
 				signal.throwIfAborted();
 				const seen = new Set(this.pool.lookup(key, false).map(({ entry }) => entry));
-				const selected = await this.select(call, key, signal, true);
+				const selected = await this.select(call, key, signal, true, undefined, undefined, exhausted);
 				if (selected) return selected;
 				const opening = this.capturing.get(key.key);
 				const admissions = [...(this.admitting.get(key.key) ?? [])];
