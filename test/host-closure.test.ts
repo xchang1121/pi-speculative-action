@@ -1,6 +1,6 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
-import { createReadTool } from "@earendil-works/pi-coding-agent";
+import { createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, test } from "vitest";
 import type { AgentExecutionWorld, SpeculativeToolExecutionContext } from "../src/agent-execution-world.ts";
 import { resourceWorld, systemHost, expectHiddenCompute } from "./agent-system-fixture.ts";
@@ -15,12 +15,76 @@ import {
 import {
 	ExecutionWorldRouter,
 	registerExecutionWorld,
+	WORKSPACE_PATH_MUTATION_EFFECTS,
 	type ExecutionWorldEntry,
 } from "../src/execution-world.ts";
+import { zeroValidationMetrics } from "../src/settlement.ts";
 import { ProcessExecutionCoordinator } from "../src/linux-process-world.ts";
 
 const directories = temporaryDirectories("pi-host-closure-");
 afterEach(directories.dispose);
+
+test("background operation preparation releases its private branch as soon as its inputs are sealed", async () => {
+	const cwd = await directories.create();
+	const sealing = Promise.withResolvers<void>();
+	const sealed = Promise.withResolvers<void>();
+	let disposed = 0;
+	const backend = "observed-operation";
+	const output = { isError: false, result: { content: [], details: {} } };
+	const world = registerExecutionWorld<AgentExecutionWorld>({
+		id: backend,
+		scope: "runtime",
+		isolation: "runtime_sandbox",
+		observeOperations: async ({ action }, execute, observe) => {
+			const result = await execute();
+			if (action) observe([{
+				backend,
+				identity: "child",
+				permissionHash: action.hash,
+				stale: async () => true,
+				semantics: { effect: "workspace_mutation", requirements: WORKSPACE_PATH_MUTATION_EFFECTS },
+			}]);
+			return result;
+		},
+		speculation: {
+			capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
+			execute: async ({ action }) => ({
+				backend,
+				output,
+				resources: [],
+				capturedBytes: 0,
+				executionMetrics: {},
+				compatibility: { status: "compatible", backend, executionFingerprint: action.executionFingerprint },
+				validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }),
+				commit: async () => output,
+				takeReadInputs: async () => {
+					sealing.resolve();
+					await sealed.promise;
+					return undefined;
+				},
+				dispose: () => {
+					disposed++;
+				},
+			}),
+		},
+	}, {
+		operations: ["observeOperations", "speculation"],
+		verify: async () => ({ fingerprint: backend, externalEffects: "excluded" }),
+	});
+	const f = systemHost(
+		cwd, [createWriteTool(cwd)], { executionWorlds: [world] }, { prepareObservedOperations: true },
+	);
+	await using _cleanup = onExit(f.dispose);
+	try {
+		await f.start();
+		await f.execute("write", { path: "trigger", content: "new" });
+		await sealing.promise;
+		expect(disposed).toBe(0);
+	} finally {
+		sealed.resolve();
+	}
+	await expect.poll(() => disposed).toBe(1);
+});
 
 test.for(["native", "external", "copied-completed", "copied-restorable"] as const)(
 	"rejects every unsupported execution entry before provider work (%s)",

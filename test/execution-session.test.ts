@@ -99,6 +99,7 @@ test("joins independent handles at capacity, admits an Actor, and validates reta
 		expect(await second.completion).toMatchObject({ status: "completed", output: "original" });
 		const produced = await actor;
 		expect(produced).toMatchObject({ served: true, reuseKind: "exact", output: "original" });
+		session.release(second.runID);
 		for (let i = 0; i < 12; i++) await session.execute(read(String(i)));
 		expect(await session.execute(read("A"))).toMatchObject({
 			served: true,
@@ -140,9 +141,82 @@ test("joins independent handles at capacity, admits an Actor, and validates reta
 	}
 });
 
+test("trimming an unreleased handle retains its shared result after the remaining alias releases", async () => {
+	const branch: WorldBranch<string> = {
+		backend: "memory",
+		output: "file",
+		resources: [],
+		capturedBytes: 4,
+		executionMetrics: {},
+		compatibility: { status: "compatible", executionFingerprint: "memory", backend: "memory" },
+		validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }),
+		commit: async () => "file",
+		dispose: vi.fn(),
+	};
+	const session = new LocalExecutionSession<string>({
+		settings: () => ({ resourceCacheMaxEntries: 1 }),
+		key: async (call) =>
+			PI_ACTION_SEMANTICS.buildKey(call.tool, call.input, "/root", "memory", { fingerprint: "memory" }),
+		route: async () => shared,
+		authorize: async () => ({ ok: true }),
+		fork: async () => branch,
+		capture: async () => undefined,
+		native: async () => "native",
+	});
+	try {
+		const owner = session.speculate(read("one"));
+		await owner.completion;
+		const alias = session.speculate(read("one"));
+		expect(await alias.completion).toMatchObject({ served: true, producerRunID: owner.runID });
+		session.release(alias.runID);
+		expect(await session.execute(read("one"))).toMatchObject({ served: true, producerRunID: owner.runID });
+	} finally {
+		await session.close();
+	}
+	expect(branch.dispose).toHaveBeenCalledOnce();
+});
+
+test("sealing an authoritative mutation keeps its committed inputs and retires its effect branch", async () => {
+	const takeInputs = vi.fn(async () => undefined);
+	const dispose = vi.fn();
+	const commit = vi.fn();
+	const session = new LocalExecutionSession<number>({
+		settings: () => ({ resourceCacheMaxEntries: 4 }),
+		key: async (call) => PI_ACTION_SEMANTICS.buildKey(call.tool, call.input, "/root", "memory", { fingerprint: "memory" }),
+		route: async () => exclusive,
+		authorize: async () => ({ ok: true }),
+		fork: vi.fn(),
+		native: async () => 1,
+		capture: async () => ({
+			route: exclusive,
+			dispose() {},
+			seal: () => ({
+				backend: "memory", output: 1, resources: [], capturedBytes: 0, executionMetrics: {},
+				compatibility: { status: "compatible", executionFingerprint: "memory", backend: "memory" },
+				validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }),
+				commit,
+				dispose,
+				takeCommittedInputs: takeInputs,
+			}),
+		}),
+	});
+	try {
+		const write = { tool: "write", input: { path: "A", content: "data" } };
+		expect(await session.execute(write)).toMatchObject({ served: false });
+		expect(session.snapshot().branchEntries).toBe(0);
+		expect(await session.execute(write)).toMatchObject({ served: false });
+		expect(commit).not.toHaveBeenCalled();
+		expect(takeInputs).toHaveBeenCalledTimes(2);
+		expect(dispose).toHaveBeenCalledTimes(2);
+	} finally {
+		await session.close();
+	}
+});
+
 test("after reads private writes; only a proved Actor adoption exposes their effects", async () => {
 	let disk = "before";
 	const images = new WeakMap<WorldBranch<string>, string>();
+	const disposed = vi.fn<(id: string) => void>();
 	const write: ExecutionCall = { tool: "write", input: { path: "A", content: "after" } };
 	const session = new LocalExecutionSession<string>({
 		settings: () => ({ enabled: true, maxConcurrentActions: 2, resourceCacheMaxEntries: 16 }),
@@ -169,7 +243,10 @@ test("after reads private writes; only a proved Actor adoption exposes their eff
 					if (call.tool === "write") disk = value;
 					return value;
 				},
-				dispose() {},
+				dispose() {
+					disposed(id);
+					images.delete(branch);
+				},
 			};
 			images.set(branch, value);
 			return branch;
@@ -184,9 +261,160 @@ test("after reads private writes; only a proved Actor adoption exposes their eff
 		expect(await session.execute(read("A"))).toMatchObject({ served: false, output: "before" });
 		expect(disk).toBe("before");
 		expect(await session.execute(write)).toMatchObject({ served: true, output: "after" });
+		expect(disposed).toHaveBeenCalledWith(parent.runID);
 		expect(await session.execute(read("A"))).toMatchObject({ served: true, output: "after" });
+		expect(session.snapshot()).toMatchObject({ branchEntries: 0, exclusiveCandidates: 0 });
+		disk = "later";
+		const late = session.speculate(read("late"), { after: parent.runID });
+		expect(await late.completion).toMatchObject({ status: "completed", output: "later" });
+		expect(disposed.mock.calls).toEqual([[parent.runID], [child.runID]]);
 	} finally {
 		await session.close();
+	}
+});
+
+test.each([true, false])("credits two exact predictions by the returned producer (merged: %s)", async (merged) => {
+	const tools = [createReadTool("/virtual")];
+	const finished = Promise.withResolvers<void>();
+	const actorWaiting = Promise.withResolvers<void>();
+	const bothIssued = Promise.withResolvers<void>();
+	const aliasReceipt = Promise.withResolvers<void>();
+	const credited = Promise.withResolvers<void>();
+	const feedback: Array<[string, string, boolean]> = [];
+	const value = {
+		output: { isError: false, result: { content: [fauxText("file")], details: {} } },
+		toolExecution: new TimelineInterval(performance.now(), performance.now()),
+		producerRunID: "run-1",
+		reuseKind: "exact" as const,
+	};
+	let handles = 0;
+	const session: ExecutionSession<ToolSettlement> = {
+		speculate() {
+			const second = ++handles === 2;
+			if (second) bothIssued.resolve();
+			return {
+				runID: "run-" + handles,
+				completion: finished.promise.then(async () => {
+					if (second) await aliasReceipt.promise;
+					const producerRunID = second && !merged ? "run-2" : value.producerRunID;
+					return { ...value, status: "completed", served: second && merged, producerRunID };
+				}),
+			};
+		},
+		async execute() {
+			actorWaiting.resolve();
+			await finished.promise;
+			return { ...value, served: true };
+		},
+		release() {},
+		async flush() {},
+		async close() {},
+	};
+	const fork = createActorForkPlanSource();
+	const host = createSpeculativeActionHost("coalesced", {
+		cwd: "/virtual",
+		executionSession: session,
+		actorForkPlanSource: fork,
+		getSettings: () => ({
+			enabled: true,
+			drafterEnabled: true,
+			candidateLimit: 1,
+			drafterMaxDepth: 0,
+			selfSpeculation: { enabled: true, forkEnabled: true, forkActionEnabled: true, forkTransport: "sidecar" },
+		}),
+		complete: async () => toolUse("read", { path: "same" }),
+	});
+	host.runtime.subscribe({
+		prediction_feedback: ({ settlement, served }) => {
+			if (settlement.observation === "observed" && settlement.match.matched) {
+				feedback.push([settlement.prediction.source, settlement.match.adoption.status, served]);
+				if (feedback.length === 2) credited.resolve();
+			}
+		},
+	});
+	try {
+		fork.startTurn("turn");
+		await host.startTurn({
+			turnID: "turn",
+			tools,
+			actorModel: testModel(),
+			actorOptions: {},
+			context: { messages: [], tools },
+		});
+		fork.publish("turn", [
+			{ id: "peer", calls: [{ id: "forked", index: 0, tool: "read", input: { path: "same" } }] },
+		]);
+		await bothIssued.promise;
+		const actor = host.execute({ tool: "read", turnID: "turn", tools, args: { path: "same" } });
+		await actorWaiting.promise;
+		finished.resolve();
+		await actor;
+		await host.finishTurn("turn");
+		aliasReceipt.resolve();
+		await credited.promise;
+		expect(feedback.map(([source]) => source).sort()).toEqual(["drafter", "self-speculation"]);
+		expect(feedback.map(([, status, served]) => [status, served]).sort()).toEqual([
+			["adopted", true],
+			merged ? ["adopted", true] : ["rejected", false],
+		]);
+	} finally {
+		finished.resolve();
+		aliasReceipt.resolve();
+		await host.dispose();
+	}
+});
+
+test("session close drains source-request delivery from detached continuations", async () => {
+	const entered = Promise.withResolvers<void>();
+	const finish = Promise.withResolvers<void>();
+	const sessionClosed = Promise.withResolvers<void>();
+	const order: string[] = [];
+	const fork = createActorForkPlanSource();
+	vi.spyOn(fork.source, "start").mockImplementation((turn) => {
+		void turn.request("drafter", "continuation", turn.signal, async () => 1);
+	});
+	const host = createSpeculativeActionHost("drain", {
+		cwd: "/virtual",
+		actorForkPlanSource: fork,
+		complete: vi.fn(),
+		executionSession: {
+			speculate: vi.fn(),
+			execute: vi.fn(),
+			release() {},
+			async flush() {},
+			async close() {
+				sessionClosed.resolve();
+			},
+		},
+		getSettings: () => ({ enabled: true, drafterEnabled: false }),
+	});
+	host.runtime.subscribe({
+		source_request: async ({ request }) => {
+			if (request.request.kind !== "continuation") return;
+			entered.resolve();
+			await finish.promise;
+			order.push("continuation");
+		},
+		session_closed: () => { order.push("closed"); },
+	});
+	try {
+		await host.startTurn({
+			turnID: "turn",
+			tools: [],
+			actorModel: testModel(),
+			actorOptions: {},
+			context: { messages: [] },
+		});
+		await entered.promise;
+		const closed = host.dispose();
+		await sessionClosed.promise;
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		finish.resolve();
+		await closed;
+		expect(order).toEqual(["continuation", "closed"]);
+	} finally {
+		finish.resolve();
+		await host.dispose();
 	}
 });
 

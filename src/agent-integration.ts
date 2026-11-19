@@ -695,6 +695,8 @@ function assembleAgentExecutionHost(
 			key: ActionKey;
 			turnID: string;
 			lastDecision: number;
+			run: SpeculativeRun<ToolSettlement>;
+			after?: string;
 			producer?: string;
 		}
 	>();
@@ -1040,8 +1042,9 @@ function assembleAgentExecutionHost(
 				bound.set(call, { tool, turnID, binding, rejections: [] });
 				attribution.set(call, prediction);
 				const effect = actionSemantics.effect(key) ?? "unbounded";
+				const after = effect !== "observation" ? (opts.previousWrite ?? opts.after) : opts.after;
 				const run = session.speculate(call, {
-					after: effect !== "observation" ? (opts.previousWrite ?? opts.after) : opts.after,
+					after,
 					signal: preview && opts.signal ? opts.signal : external,
 				});
 				if (!preview) {
@@ -1056,6 +1059,8 @@ function assembleAgentExecutionHost(
 						prediction,
 						key,
 						turnID,
+						run,
+						after,
 						lastDecision: sequenceAtStart + (prediction.latestHorizon ?? prediction.horizon ?? 0),
 						producer: undefined as string | undefined,
 					};
@@ -1103,9 +1108,9 @@ function assembleAgentExecutionHost(
 						if (generator.peers)
 							void pending.track(Promise.resolve(generator.peers(turn, source, calls))).catch(() => {});
 			},
-			async request(source, kind, signal, produce) {
+			request(source, kind, signal, produce) {
 				let tokens = 0;
-				const report = await runSourceRequest({
+				const report = runSourceRequest({
 					request: { source, kind, turnID, index: requestIndex++, targetDecisionSequence: sequenceAtStart },
 					signal,
 					timeoutMs: settings.predictionTimeoutMs,
@@ -1115,11 +1120,14 @@ function assembleAgentExecutionHost(
 						}),
 					count: (n) => n,
 				});
-				const { value: _, ...record } = report;
-				const request = { ...record, draftTokens: tokens };
-				tokenTotal += tokens;
-				event(turnID, { type: "source_request", request, totalDraftTokens: tokenTotal });
-				await subscriptions.publish("source_request", { sessionID, turnID, request });
+				return pending.track(
+					report.then(({ value: _, ...record }) => {
+						const request = { ...record, draftTokens: tokens };
+						tokenTotal += tokens;
+						event(turnID, { type: "source_request", request, totalDraftTokens: tokenTotal });
+						return subscriptions.publish("source_request", { sessionID, turnID, request });
+					}),
+				);
 			},
 		};
 		turns.set(turnID, turn);
@@ -1194,7 +1202,8 @@ function assembleAgentExecutionHost(
 								});
 								const call: ExecutionCall = { tool: tool.name, input: key.input };
 								bound.set(call, { tool, turnID, binding: { action: op }, rejections: [] });
-								local.speculate(call);
+								const run = local.speculate(call);
+								void run.completion.then(() => local.release(run.runID));
 							})(),
 						)
 						.catch(() => {});
@@ -1315,29 +1324,40 @@ function assembleAgentExecutionHost(
 					kind: result.reuseKind ?? "exact",
 					distance: result.reuseKind === "inputs" ? 1 : 0,
 				} as const;
+				if (result.served) await Promise.resolve(); // Deliver already settled run receipts before attribution.
 				for (const [id, p] of predictions) {
 					const relation = action && actionKeyMatch(p.key, action);
-					const producer = p.producer ?? id;
-					const served = (result.served && producer === result.producerRunID) || adopted.has(producer);
-					if (!relation && !served) continue;
 					if (relation) matched.push(p.identity);
-					const fact = { prediction: p.identity, observation: "observed" as const, actorAction: identity };
-					const settlement: PredictionSettlement = relation
-						? {
-								...fact,
-								match: {
-									matched: true,
-									relation,
-									adoption: served
-										? { status: "adopted", candidateID: result.producerRunID ?? id }
-										: {
-												status: "rejected",
-												cause: state.rejections[0]?.cause ?? cause("matching", "actor_fallback"),
-											},
-								},
-							}
-						: { ...fact, match: { matched: false } };
-					settlePrediction(id, p, settlement, served);
+					const credit = () => {
+						const producer = p.producer ?? id;
+						const served = (result.served && producer === result.producerRunID) || adopted.has(producer);
+						if (!relation && !served) return;
+						const fact = { prediction: p.identity, observation: "observed" as const, actorAction: identity };
+						const settlement: PredictionSettlement = relation
+							? {
+									...fact,
+									match: {
+										matched: true,
+										relation,
+										adoption: served
+											? { status: "adopted", candidateID: result.producerRunID ?? id }
+											: {
+													status: "rejected",
+													cause: state.rejections[0]?.cause ?? cause("matching", "actor_fallback"),
+												},
+									},
+								}
+							: { ...fact, match: { matched: false } };
+						settlePrediction(id, p, settlement, served);
+					};
+					if (
+						result.served && result.producerRunID && match.kind === "exact" && relation &&
+						!p.after && !p.producer && id !== result.producerRunID
+					) {
+						// Reserve this observation while the equivalent root handle confirms its physical producer.
+						predictions.delete(id);
+						void pending.track(p.run.completion.then(credit));
+					} else credit();
 				}
 				lastActor.set(turnID, identity);
 

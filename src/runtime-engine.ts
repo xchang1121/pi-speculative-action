@@ -283,6 +283,7 @@ interface Entry<Output> extends CandidateStoreEntry {
 	handles: Set<string>;
 	pins: number;
 	adopted: boolean;
+	retained: boolean;
 	inputSource?: object;
 	estimatedBytes: number;
 	resultViews?: Map<string, RetainedResultView<Output>>;
@@ -472,6 +473,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 		if (this.handles.size <= capacity) return;
 		for (const handle of this.handles.values()) {
 			if (!handle.settled || handle.parentUsers) continue;
+			if (handle.entry && !handle.released) handle.entry.retained = true;
 			this.handles.delete(handle.id);
 			handle.entry?.handles.delete(handle.id);
 			if (this.handles.size <= capacity) break;
@@ -607,6 +609,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 			pins: 0,
 			estimatedBytes: 0,
 			adopted: false,
+			retained: false,
 		};
 	}
 	private retain(entry: Entry<Output>, branch: WorldBranch<Output>, execution: TimelineInterval) {
@@ -633,6 +636,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 			reuse: "shared_result",
 		});
 		owner.work.start(timing.startedAt);
+		owner.retained = true;
 		this.retain(owner, inputs, timing);
 	}
 	private recheckWrites(key: ActionKey, branch?: WorldBranch<Output>) {
@@ -680,9 +684,11 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 				await this.keepInputs(entry, branch, evaluation.computation, false);
 				throw new Error("output_rejected");
 			}
-			this.retain(entry, branch, evaluation.computation);
-			if (route.reuse === "exclusive_branch")
+			if (route.reuse === "exclusive_branch") {
 				await this.keepInputs(entry, branch, evaluation.computation, false);
+				work.controller.signal.throwIfAborted();
+			}
+			this.retain(entry, branch, evaluation.computation);
 			this.hooks.event?.(call, id, route, "succeeded", performance.now() - started, branch);
 		} catch (error) {
 			const failure = cause("execution", "candidate_failed", errorDetail(error));
@@ -763,8 +769,10 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 					entry.adopted = true;
 					this.recheckWrites(key, execution.output);
 					await this.keepInputs(entry, execution.output, execution.toolExecution, true);
-					this.pool.recordHit(entry, this.limits());
+					for (const key of entry.resultViews?.keys() ?? []) this.setView(entry, key);
+					this.pool.delete(entry);
 				} else {
+					if (actor) entry.retained = true;
 					if (handle) this.attach(handle, entry);
 					try {
 						this.retainView(entry, key, view);
@@ -852,7 +860,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 						if (ready.status !== "completed" || ready.value.status !== "completed" || !parent.entry)
 							return { status: "rejected", reason: "parent_unavailable" };
 						base = parent.entry;
-						if (base?.route.reuse === "shared_result") base = base.parent;
+						while (base && (base.route.reuse === "shared_result" || base.adopted)) base = base.parent;
 						if (base) {
 							pinned = base;
 							pinned.pins++;
@@ -983,7 +991,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 					capture = await this.hooks.capture(call, key, signal).catch(() => undefined);
 				if (key && capture && !capture.inputsOnly && capture.route.reuse === "shared_result") {
 					pending = this.makeEntry(call, key, capture.route, id);
-					pending.adopted = true;
+					pending.retained = true;
 					pending.work.start(started);
 					this.pool.insert(pending);
 				}
@@ -1009,9 +1017,18 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 					try {
 						const branch = await capture.seal(this.hooks.reject?.(output) ? undefined : output);
 						const entry = pending ?? this.makeEntry(call, key, capture.route, id);
-						entry.adopted = true;
-						entry.work.start(computation.startedAt);
-						this.retain(entry, branch, computation);
+						if (entry.route.reuse === "exclusive_branch") {
+							// The native call has already applied these effects.
+							try {
+								await this.keepInputs(entry, branch, computation, true);
+							} finally {
+								await this.lifetime.release(branch);
+							}
+						} else {
+							entry.retained = true;
+							entry.work.start(computation.startedAt);
+							this.retain(entry, branch, computation);
+						}
 						pending = undefined;
 					} catch {
 						/* Optional capture cannot change the authoritative result. */
@@ -1043,7 +1060,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 		entry.handles.delete(id);
 		if (!entry.handles.size && !entry.pins) {
 			if (this.running.has(entry)) entry.work.controller.abort();
-			else if (!entry.adopted) this.remove(entry);
+			else if (!entry.retained && !entry.adopted) this.remove(entry);
 		}
 	}
 	snapshot(): SpeculativeCacheSnapshot {
