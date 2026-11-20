@@ -364,33 +364,44 @@ function query(file: string, args: readonly string[]): Promise<string> {
 		maxBuffer: speculativeConfig().filesystem.diagnosticBytes,
 	});
 }
+function sanitizeDiagnosticText(text: string): string {
+	return stripVTControlCharacters(text).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+}
 function clean(text: string): string {
-	return stripVTControlCharacters(text)
-		.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "")
-		.slice(0, speculativeConfig().processReuse.diagnosticCharacters);
+	return sanitizeDiagnosticText(text).slice(0, speculativeConfig().processReuse.diagnosticCharacters);
+}
+function requireIdleLinuxContext(ctx: ExtensionContext, action: string, linuxMessage: string): boolean {
+	if (process.platform !== "linux") {
+		ctx.ui.notify(linuxMessage, "warning");
+		return false;
+	}
+	if (!ctx.isIdle()) {
+		ctx.ui.notify(`Wait for the current task to finish before ${action}.`, "warning");
+		return false;
+	}
+	return true;
+}
+function ensureStillIdle(ctx: ExtensionContext, message: string): boolean {
+	if (ctx.isIdle()) return true;
+	ctx.ui.notify(`The task is now running. ${message} after it finishes.`, "warning");
+	return false;
 }
 /** Show host prerequisites separately from the controller's authoritative runtime diagnostics. */
 export async function checkLinuxEnvironment(
 	ctx: ExtensionContext,
 	refresh: () => Promise<void>,
 ): Promise<void> {
-	if (process.platform !== "linux") {
-		ctx.ui.notify(
+	if (
+		!requireIdleLinuxContext(
+			ctx,
+			"checking the Linux environment",
 			"Linux environment checks require Pi running inside Linux or WSL 2. Open this menu there.",
-			"warning",
-		);
+		)
+	)
 		return;
-	}
-	if (!ctx.isIdle()) {
-		ctx.ui.notify("Wait for the current task to finish before checking the Linux environment.", "warning");
-		return;
-	}
 	const report = await inspectLinuxEnvironment(ctx.cwd);
 	ctx.ui.notify(report.text, report.warnings ? "warning" : "info");
-	if (!ctx.isIdle()) {
-		ctx.ui.notify("The task is now running. Refresh execution diagnostics after it finishes.", "warning");
-		return;
-	}
+	if (!ensureStillIdle(ctx, "Refresh execution diagnostics")) return;
 	await refresh();
 }
 /** The installer and its native sources ship in src for both TypeScript and dist entry points. */
@@ -398,22 +409,16 @@ export async function installLinuxDependencies(
 	ctx: ExtensionContext,
 	refresh: () => Promise<void>,
 ): Promise<void> {
-	if (process.platform !== "linux") {
-		ctx.ui.notify(
+	if (
+		!requireIdleLinuxContext(
+			ctx,
+			"installing Linux dependencies",
 			"Linux dependencies must be installed from Pi running inside Linux or WSL 2. Open this menu there.",
-			"warning",
-		);
+		)
+	)
 		return;
-	}
-	if (!ctx.isIdle()) {
-		ctx.ui.notify("Wait for the current task to finish before installing Linux dependencies.", "warning");
-		return;
-	}
 	const report = await inspectLinuxEnvironment(ctx.cwd);
-	if (!ctx.isIdle()) {
-		ctx.ui.notify("The task is now running. Retry installation after it finishes.", "warning");
-		return;
-	}
+	if (!ensureStillIdle(ctx, "Retry installation")) return;
 	if (
 		!(await ctx.ui.confirm(
 			"Install / update Linux dependencies?",
@@ -423,10 +428,7 @@ export async function installLinuxDependencies(
 		))
 	)
 		return;
-	if (!ctx.isIdle()) {
-		ctx.ui.notify("The task is now running. Retry installation after it finishes.", "warning");
-		return;
-	}
+	if (!ensureStillIdle(ctx, "Retry installation")) return;
 	const script = fileURLToPath(new URL("../src/setup-linux-process-backend.mjs", import.meta.url));
 	const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
 	const result = await ctx.ui.custom<{
@@ -440,12 +442,7 @@ export async function installLinuxDependencies(
 		const signal = AbortSignal.any([loader.signal, lifetime.signal]);
 		let output = "";
 		const append = (text: string) => {
-			output = (
-				output +
-				stripVTControlCharacters(text)
-					.replace(/\r/g, "\n")
-					.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "")
-			).slice(-16384);
+			output = (output + sanitizeDiagnosticText(text.replace(/\r/g, "\n"))).slice(-16384);
 			tui.requestRender();
 		};
 		loader.addChild({
@@ -608,6 +605,9 @@ interface DispatcherResponse {
 	/** Present only after a sealed result was registered; independent of optional disk publication. */
 	readonly reusable?: boolean;
 }
+type WriterTraceState =
+	| { readonly kind: "traced"; readonly tail: TraceTail }
+	| { readonly kind: "settled"; readonly writes: readonly TracedWrite[]; readonly unsafe?: boolean };
 /** A brokered run writing into a session's workspace: its launcher's pid and, once known, what it and the runs brokered from its tree wrote. */
 interface SessionWriter {
 	readonly channel?: ReturnType<typeof controlledSubcomputeChannel>;
@@ -615,9 +615,7 @@ interface SessionWriter {
 	readonly owner: string;
 	readonly startedAt: number;
 	endedAt?: number;
-	writes?: readonly TracedWrite[];
-	tail?: TraceTail;
-	unsafe?: boolean;
+	trace: WriterTraceState;
 	readonly pid?: number;
 	pids?: readonly number[];
 	closedPids?: readonly number[];
@@ -628,6 +626,18 @@ interface SessionWriter {
 	evidence?: DynamicDependencyCertificate;
 	observation?: ExecutionObservation;
 }
+async function readWriterTrace(
+	writer: SessionWriter,
+): Promise<{ readonly writes: readonly TracedWrite[]; readonly unsafe?: boolean }> {
+	const state = writer.trace;
+	if (state.kind === "settled") return state;
+	try {
+		return await state.tail.read();
+	} catch (error) {
+		if (writer.trace.kind === "settled") return writer.trace;
+		throw error;
+	}
+}
 interface DomainExecution {
 	readonly channel?: ReturnType<typeof controlledSubcomputeChannel>;
 	readonly pid: number;
@@ -637,6 +647,15 @@ interface DomainExecution {
 	readonly exit: Promise<number>;
 }
 const workspaceWriters = new WeakMap<SandboxWorkspaceContext["transactions"], Set<SessionWriter>>();
+type SessionAdmissionState =
+	| { readonly kind: "unverified" }
+	| {
+			readonly kind: "verified";
+			readonly proof: ReturnType<typeof executionDomainProof>;
+			readonly valid: () => boolean;
+			readonly result: ResourceValidation;
+	  }
+	| { readonly kind: "disposed" };
 type ActiveSession = Awaited<ReturnType<LinuxProcessReuseBackend["allocateSession"]>>["session"];
 type PrivatePrestate = Awaited<ReturnType<typeof privateBranch>> & {
 	readonly startedAt: number;
@@ -667,6 +686,8 @@ type ActorImageRecorder = (
 	installed: { dev: bigint; ino: bigint },
 	clock: HeldExecClock,
 ) => Promise<void>;
+const orderedBindings = (bindings: ReadonlyMap<number, ProcessExecutionBinding>) =>
+	Object.freeze([...bindings].sort(([left], [right]) => left - right).map(([, binding]) => binding));
 interface NativeObservation {
 	readonly scope?: ExecutionScope;
 	ordering: Int32Array;
@@ -719,7 +740,7 @@ export class LinuxProcessReuseBackend {
 			observation.closed = true;
 			try {
 				observe(
-					[...observation.bindings].sort(([left], [right]) => left - right).map(([, binding]) => binding),
+					orderedBindings(observation.bindings),
 					Object.freeze([...observation.computations, ...observation.heldClock.dependencies()]),
 				);
 			} catch {
@@ -760,16 +781,11 @@ export class LinuxProcessReuseBackend {
 			this.store,
 			Math.min(speculativeConfig().processReuse.maxCaptureBytes, this.store.limits.maxBytes),
 		);
-		this.handoffs.configure(
-			Math.min(speculativeConfig().runtime.completedProcesses, this.store.limits.maxCertificates),
-		);
+		this.configureHandoffs();
 		this.storage = this.configuration.bind({
 			configure: ({ maxEntries, maxBytes }) => {
 				this.store.configure({ maxCertificates: maxEntries, maxBytes });
-				this.handoffs.configure(
-					Math.min(speculativeConfig().runtime.completedProcesses, this.store.limits.maxCertificates),
-					Math.min(speculativeConfig().processReuse.maxCaptureBytes, this.store.limits.maxBytes),
-				);
+				this.configureHandoffs();
 			},
 			maintain: async (operation) => {
 				this.handoffs.clearCompleted();
@@ -781,6 +797,49 @@ export class LinuxProcessReuseBackend {
 				};
 			},
 		});
+	}
+	private configureHandoffs() {
+		this.handoffs.configure(
+			Math.min(speculativeConfig().runtime.completedProcesses, this.store.limits.maxCertificates),
+			Math.min(speculativeConfig().processReuse.maxCaptureBytes, this.store.limits.maxBytes),
+		);
+	}
+	private async topLevelPrototype(
+		invocation: ToolProcessInvocation,
+		request: ProcessExecutionRequest,
+		projection: ExecutionPathProjection,
+		environment = definedProcessEnvironment(request.environment),
+	) {
+		return topLevelProcessPrototype(
+			invocation,
+			request,
+			environment,
+			projection,
+			await this.resolvePlatformFingerprint(),
+		);
+	}
+	private async appendOutputJournal(journal: OrderedEffectEvent[], events: readonly BufferedOutput[]) {
+		for (const event of events)
+			journal.push({
+				sequence: journal.length,
+				kind: "output",
+				fd: event.fd,
+				data: await this.store.artifacts.put(event.data),
+			});
+	}
+	private publishCompletedCertificate(
+		input: import("./provenance-certificate.ts").ProcessCertificateInput,
+		allowByteStream = true,
+	) {
+		const bytesOnly =
+			allowByteStream &&
+			input.result.streamMetadataObserved === false &&
+			input.result.journal.every((event) => event.kind === "output") &&
+			byteStreamPrototype(input.prototype);
+		return this.planner.publishCompleted(
+			sealProcessCertificate(bytesOnly ? { ...input, prototype: bytesOnly } : input),
+			acceptedReplayTaints(),
+		);
 	}
 	async check(refresh = false, sourceRoot?: string): Promise<LinuxProcessBackendStatus> {
 		if (process.platform !== "linux") return { state: "unavailable", detail: "Linux host required" };
@@ -1024,45 +1083,23 @@ export class LinuxProcessReuseBackend {
 							sourceRoot,
 							workspaceRoot: sourceRoot,
 						});
-						const platformFingerprint = await this.resolvePlatformFingerprint();
 						const prototype = (
-							await TimelineInterval.collect(() =>
-								topLevelProcessPrototype(
-									invocation,
-									request,
-									definedProcessEnvironment(request.environment),
-									projection,
-									platformFingerprint,
-								),
-							)
+							await TimelineInterval.collect(() => this.topLevelPrototype(invocation, request, projection))
 						).output;
 						plan = await this.planPrototype(prototype, projection, acceptProducer, {
 							signal: request.signal,
 						});
 						if (this.disposal || !plan?.certificate.result.exit) return;
 						request.signal?.throwIfAborted();
-						if (!plan.validate()) return;
-						await replayFilesystemEffects(
-							this.replayWorkspace,
-							this.store,
-							plan.artifacts,
-							plan.certificate.result.journal,
-							projection,
-						);
+						const replay = this.prepareReplay(plan, projection);
+						if (!replay.validate()) return;
+						await replay.commitEffects();
 						committed = true;
-						for (const event of loadOutputEvents(plan.artifacts, plan.certificate.result.journal))
-							request.onData(event.data);
-						TimelineInterval.use(reusedComputation(plan.certificate).computation);
-						this.add(
-							undefined,
-							"wholeCommandReusedProcessMs",
-							plan.certificate.result.observedProcessMs ?? 0,
-						);
+						for (const event of replay.output) request.onData(event.data);
+						TimelineInterval.use(replay.computation.computation);
+						this.add(undefined, "wholeCommandReusedProcessMs", replay.observedMs);
 						this.add(undefined, "wholeCommandHits");
-						return {
-							exitCode:
-								plan.certificate.result.exit.kind === "code" ? plan.certificate.result.exit.code : null,
-						};
+						return { exitCode: replay.exit.kind === "code" ? replay.exit.code : null };
 					} catch (error) {
 						this.setError(undefined, `actor_replay:${errorMessage(error)}`);
 						if (committed || isPoisonedEffectCommit(error)) throw error;
@@ -1103,13 +1140,7 @@ export class LinuxProcessReuseBackend {
 				sourceRoot: options.sourceRoot,
 				workspaceRoot: options.sourceRoot,
 			});
-			const prototype = await topLevelProcessPrototype(
-				invocation,
-				request,
-				definedProcessEnvironment(request.environment),
-				projection,
-				await this.resolvePlatformFingerprint(),
-			);
+			const prototype = await this.topLevelPrototype(invocation, request, projection);
 			// Watch from before execution; post-exit hashes alone cannot establish what the process read.
 			proof = executionDomainProof(ready.collector, options.sourceRoot);
 			if (proof.reason) throw new Error(proof.reason);
@@ -1264,34 +1295,29 @@ export class LinuxProcessReuseBackend {
 		if (!validate()) return;
 		await this.store.withPublication(async () => {
 			const journal: OrderedEffectEvent[] = [];
-			for (const event of observation.output ?? [])
-				journal.push({
-					sequence: journal.length,
-					kind: "output",
-					fd: event.fd,
-					data: await this.store.artifacts.put(event.data),
-				});
+			await this.appendOutputJournal(journal, observation.output ?? []);
 			await channel?.validate();
 			if (!validate()) return;
-			const bytesOnly = !whole && observation.streamMetadataObserved === false && byteStreamPrototype(prototype);
-			const certificate = sealProcessCertificate({
-				prototype: bytesOnly || prototype,
-				producer: {
-					observer: { provider: "execution_domain", fingerprint: OBSERVER_FINGERPRINT },
-					execution: { authority: "actor" },
+			const published = await this.publishCompletedCertificate(
+				{
+					prototype,
+					producer: {
+						observer: { provider: "execution_domain", fingerprint: OBSERVER_FINGERPRINT },
+						execution: { authority: "actor" },
+					},
+					dependencyCertificate: { complete: true, dependencies, taints },
+					result: {
+						replayProfile: "buffered_noninteractive",
+						journal,
+						exit,
+						streamMetadataObserved: observation.streamMetadataObserved,
+						observedProcessMs: computation.completedAt - computation.startedAt,
+						computation: TimelineInterval.serialize(computation),
+					},
 				},
-				dependencyCertificate: { complete: true, dependencies, taints },
-				result: {
-					replayProfile: "buffered_noninteractive",
-					journal,
-					exit,
-					streamMetadataObserved: observation.streamMetadataObserved,
-					observedProcessMs: computation.completedAt - computation.startedAt,
-					computation: TimelineInterval.serialize(computation),
-				},
-			});
-			if (await this.planner.publishCompleted(certificate, acceptedReplayTaints()))
-				this.add(undefined, whole ? "wholeCommandPublished" : "published");
+				!whole,
+			);
+			if (published) this.add(undefined, whole ? "wholeCommandPublished" : "published");
 		});
 	}
 	private async captureActorFiles(
@@ -1358,21 +1384,21 @@ export class LinuxProcessReuseBackend {
 	): Promise<LinuxProcessSession> {
 		return this.withProducer(async (): Promise<LinuxProcessSession> => {
 			const { session, ready, readyAt, controller } = await this.allocateSession(input);
-			let executionKind: "tool" | "operation" | undefined;
+			let executionState: "idle" | "tool" | "operation" = "idle";
 			this.producers++;
 			let dispatch: Promise<void> | undefined;
 			const execute = <Value>(
-				kind: NonNullable<typeof executionKind>,
+				kind: "tool" | "operation",
 				operation: () => Promise<Value>,
 			): Promise<Value> => {
 				if (
 					session.lifecycle.sealed ||
-					session.sealPromise ||
-					executionKind === "operation" ||
-					(executionKind && executionKind !== kind)
+					session.sealing.promise ||
+					executionState === "operation" ||
+					(executionState !== "idle" && executionState !== kind)
 				)
 					return Promise.reject(new Error("process session execution boundary is already consumed"));
-				executionKind = kind;
+				executionState = kind;
 				return session.lifecycle.admit(() =>
 					measureProcess(session, async () => {
 						session.signal?.throwIfAborted();
@@ -1386,82 +1412,61 @@ export class LinuxProcessReuseBackend {
 								const computation = new TimelineInterval(
 									creation.startedAt,
 									dispatch.completedAt,
-									[
-										{ computation: creation, owned: true, shared: [creation] },
-										{ computation: dispatch, owned: true, shared: [dispatch] },
-									],
+									[ownedDependency(creation), ownedDependency(dispatch)],
 									[],
 								);
 								TimelineInterval.group(computation, session);
 								// Only recorded preparation cuts its caller's clock; work between creation and dispatch belongs to that caller.
-								session.preparation = {
-									computation,
-									shared: [creation, dispatch],
-								};
-								session.computations.push({
-									...session.preparation,
-									owned: true,
-								});
+								session.preparation = { computation, shared: [creation, dispatch] };
+								session.computations.push({ ...session.preparation, owned: true });
 							},
 						));
-						session.privateSince ??= Date.now();
-						await (session.transaction ??= session.workspace.transactions.begin());
+						session.sealing.privateSince ??= Date.now();
+						await (session.sealing.transaction ??= session.workspace.transactions.begin());
 						return operation();
 					}),
 				);
 			};
 			const creation = new TimelineInterval(readyAt, performance.now());
-			let admission:
-				| {
-						proof: ReturnType<typeof executionDomainProof>;
-						valid: () => boolean;
-						result: ResourceValidation;
-				  }
-				| undefined;
 			let validating: Promise<ResourceValidation> | undefined;
-			let discarded = false;
+			const currentAdmission = () => session.sealing.admission;
+			const admissionFailure = (
+				status: "stale" | "indeterminate",
+				code: string,
+				detail?: string,
+				metrics = zeroValidationMetrics(),
+			): ResourceValidation => ({
+				status,
+				cause: detail === undefined ? cause("freshness", code) : { stage: "freshness", code, detail },
+				metrics,
+			});
 			const inspectAdmission = async (): Promise<ResourceValidation> => {
-				if (discarded)
-					return {
-						status: "indeterminate",
-						cause: cause("freshness", "process_session_disposed"),
-						metrics: zeroValidationMetrics(),
-					};
+				const initial = currentAdmission();
+				if (initial.kind === "disposed") return admissionFailure("indeterminate", "process_session_disposed");
 				try {
 					ready.collector.check();
 				} catch (error) {
-					return {
-						status: "indeterminate",
-						cause: {
-							stage: "freshness",
-							code: "execution_domain_unavailable",
-							detail: errorMessage(error),
-						},
-						metrics: zeroValidationMetrics(),
-					};
+					return admissionFailure("indeterminate", "execution_domain_unavailable", errorMessage(error));
 				}
-				if (admission?.valid())
-					return {
-						...admission.result,
-						metrics: zeroValidationMetrics(),
-					};
-				admission?.proof.close();
-				admission = undefined;
+				if (initial.kind === "verified") {
+					if (initial.valid()) return { ...initial.result, metrics: zeroValidationMetrics() };
+					initial.proof.close();
+					session.sealing.admission = { kind: "unverified" };
+				}
+				const evidence = session.sealing.topLevelEvidence;
 				const paths =
-					session.topLevelEvidence?.dependencies.flatMap((dependency) => {
-						if ("path" in dependency) {
-							return [
-								dependency.path,
-								...(dependency.kind === "file"
-									? (dependency.aliases ?? [])
-									: dependency.kind === "symlink"
-										? [path.resolve(path.dirname(dependency.path), dependency.target)]
-										: []),
-							];
-						} else {
-							return [];
-						}
-					}) ?? [];
+					evidence?.dependencies.flatMap((dependency) =>
+						"path" in dependency
+							? [
+									dependency.path,
+									...(dependency.kind === "file"
+										? (dependency.aliases ?? [])
+										: dependency.kind === "symlink"
+											? [path.resolve(path.dirname(dependency.path), dependency.target)]
+											: []),
+								]
+							: [],
+					) ?? [];
 				const policy = (mounts: string) =>
 					JSON.stringify([
 						filesystemMountTopology(mounts, [session.sourceRoot], true),
@@ -1470,34 +1475,25 @@ export class LinuxProcessReuseBackend {
 				const proof = executionDomainProof(ready.collector, session.sourceRoot);
 				try {
 					if (policy(await readFile("/proc/self/mountinfo", "utf8")) !== policy(session.sourceMounts))
-						return {
-							status: "stale",
-							cause: cause("freshness", "source_mount_policy_changed"),
-							metrics: zeroValidationMetrics(),
-						};
+						return admissionFailure("stale", "source_mount_policy_changed");
 					const result = await validateTransferredProcessEvidence(
-						session.topLevelEvidence,
+						evidence,
 						session.incompleteReasons,
 						await session.hostReads,
 					);
 					if (result.status !== "valid") return result;
-					const valid = proof.seal(session.topLevelEvidence!.dependencies, (target) => target);
+					if (currentAdmission().kind === "disposed")
+						return admissionFailure("indeterminate", "process_session_disposed");
+					const valid = proof.seal(evidence!.dependencies, (target) => target);
 					if (!valid())
-						return {
-							status: "stale",
-							cause: {
-								stage: "freshness",
-								code: "process_inputs_changed_during_admission",
-								detail: proof.reason,
-							},
-							metrics: result.metrics,
-						};
+						return admissionFailure("stale", "process_inputs_changed_during_admission", proof.reason, result.metrics);
 					// The session owns both this proof and the prepared result; its final commit
 					// rechecks continuity instead of repeating the same dependency reads.
-					admission = { proof, valid, result };
+					session.sealing.admission = { kind: "verified", proof, valid, result };
 					return result;
 				} finally {
-					if (admission?.proof !== proof) proof.close();
+					const settled = currentAdmission();
+					if (settled.kind !== "verified" || settled.proof !== proof) proof.close();
 				}
 			};
 			const validate = () =>
@@ -1505,10 +1501,14 @@ export class LinuxProcessReuseBackend {
 					validating = undefined;
 				}));
 			const seal = () =>
-				(session.sealPromise ??= this.withProducer(async () => {
+				(session.sealing.promise ??= this.withProducer(async () => {
 					await session.lifecycle.drain();
 					try {
-						const external = await privateCommits(session, session.privateSince ?? 0, sessionWriters(session));
+						const external = await privateCommits(
+							session,
+							session.sealing.privateSince ?? 0,
+							sessionWriters(session),
+						);
 						if (!external.complete)
 							throw new Error(
 								`unrepresentable writes outside the workspace: external_write:${[...external.before].find(([, value]) => !value)?.[0]}`,
@@ -1523,12 +1523,7 @@ export class LinuxProcessReuseBackend {
 			const result: LinuxProcessSession = {
 				ownership: session.ownership,
 				computationDependencies: () => Object.freeze([...session.computations]),
-				executionBindings: () =>
-					Object.freeze(
-						[...session.executionBindings]
-							.sort(([left], [right]) => left - right)
-							.map(([, binding]) => binding),
-					),
+				executionBindings: () => orderedBindings(session.executionBindings),
 				executor: {
 					execute: (request) =>
 						execute("tool", async () => {
@@ -1545,14 +1540,8 @@ export class LinuxProcessReuseBackend {
 								throw new Error("process cwd is unmapped");
 							const environment = definedProcessEnvironment(request.environment);
 							const { output: prototype, computation: preparation } = await TimelineInterval.outside(() =>
-								TimelineInterval.measure(async () =>
-									topLevelProcessPrototype(
-										invocation,
-										request,
-										environment,
-										session.projection,
-										await this.resolvePlatformFingerprint(),
-									),
+								TimelineInterval.measure(() =>
+									this.topLevelPrototype(invocation, request, session.projection, environment),
 								),
 							);
 							this.add(session, "wholeCommandRequests");
@@ -1637,13 +1626,12 @@ export class LinuxProcessReuseBackend {
 						}
 					}),
 				dispose: async () => {
-					discarded = true;
+					if (session.sealing.admission.kind === "verified") session.sealing.admission.proof.close();
+					session.sealing.admission = { kind: "disposed" };
 					try {
 						await result.close();
 					} finally {
 						await validating?.catch(() => undefined);
-						admission?.proof.close();
-						admission = undefined;
 						await session.hostReads?.then(
 							(view) => view.close(),
 							() => undefined,
@@ -1734,7 +1722,7 @@ export class LinuxProcessReuseBackend {
 			inputs: input.inputs,
 			invocation,
 			scope: snapshotExecutionScope(input.scope),
-			interposition: "",
+			interposition: undefined as string | undefined,
 			signal: AbortSignal.any([controller.signal, ...(input.signal ? [input.signal] : [])]),
 			lifecycle: new RuntimeLifecycleLane(),
 			ownership: new ProcessHandoffOwnership(input.onOperationAdopted, input.acceptOperationScope),
@@ -1749,15 +1737,19 @@ export class LinuxProcessReuseBackend {
 			writers: workspaceWriterRecords(input.workspace),
 			fileEvidence: new WeakMap<object, SessionWriter>(),
 			metrics: emptyWorldReuseMetrics() as MutableLinuxProcessReuseMetrics,
-			transaction: undefined as Promise<WorkspaceTransactionCapture> | undefined,
-			capture: undefined as Promise<WorkspaceTransactionDelta> | undefined,
-			topLevelEvidence: undefined as DynamicDependencyCertificate | undefined,
-			topLevelOutputEndpoints: undefined as readonly [string, string] | undefined,
 			// Children write into their parent's captured output sockets.
-			nestedOutputEndpoints: new Set<readonly [string, string]>(),
-			sealPromise: undefined as Promise<readonly SandboxWorkspaceChange[]> | undefined,
-			// When the top level began writing into the private branch.
-			privateSince: undefined as number | undefined,
+			outputs: {
+				topLevel: undefined as readonly [string, string] | undefined,
+				nested: new Set<readonly [string, string]>(),
+			},
+			sealing: {
+				admission: { kind: "unverified" } as SessionAdmissionState,
+				transaction: undefined as Promise<WorkspaceTransactionCapture> | undefined,
+				capture: undefined as Promise<WorkspaceTransactionDelta> | undefined,
+				promise: undefined as Promise<readonly SandboxWorkspaceChange[]> | undefined,
+				topLevelEvidence: undefined as DynamicDependencyCertificate | undefined,
+				privateSince: undefined as number | undefined,
+			},
 			hostReads: undefined as Promise<FilesystemReadView> | undefined,
 			inputProofs: sharedWalk((key: string) =>
 				captureInputProof(path.join(processRoot, "private", "writes", "inputs", key)),
@@ -1933,8 +1925,8 @@ export class LinuxProcessReuseBackend {
 		held: HeldExecProcess,
 	): Promise<HeldExecDecision> {
 		const native = { kind: "continue" } as const;
-		const source = owner.tail;
-		if (!source || session.lifecycle.sealed) return native;
+		if (owner.trace.kind !== "traced" || !session.interposition || session.lifecycle.sealed) return native;
+		const source = owner.trace.tail;
 		const receipt = await readFile(session.interposition + ".route." + held.pid, "utf8").catch(ignoreMissing);
 		if (!receipt) return native;
 		const route = receipt.split("\0");
@@ -2068,9 +2060,13 @@ export class LinuxProcessReuseBackend {
 					const plan = acquired.plan;
 					const binding = acquired.producer?.binding;
 					return TimelineInterval.outside(async (): Promise<DispatcherResponse> => {
-						const { artifacts, certificate } = plan;
-						const output = loadOutputEvents(artifacts, certificate.result.journal);
-						const computation = reusedComputation(certificate, acquired);
+						const { certificate } = plan;
+						const replay = this.prepareReplay(plan, session.projection, {
+							workspace: this.replayWorkspace,
+							privateStorage: path.join(session.processRoot, "private"),
+							acquired,
+						});
+						const { output, computation } = replay;
 						const paths = certificate.result.journal.flatMap((event) =>
 							event.kind === "workspace" ? [event.path] : [],
 						);
@@ -2085,13 +2081,16 @@ export class LinuxProcessReuseBackend {
 							written: paths
 								.filter((target) => pathContains(session.sourceRoot, target))
 								.map((target) => slash(path.relative(session.sourceRoot, target))),
-							writes: [
-								{
-									at: startedAt,
-									opened: true,
-									paths: paths.flatMap((target) => [target, session.projection.toPhysical(target)!]),
-								},
-							],
+							trace: {
+								kind: "settled",
+								writes: [
+									{
+										at: startedAt,
+										opened: true,
+										paths: paths.flatMap((target) => [target, session.projection.toPhysical(target)!]),
+									},
+								],
+							},
 							observed: new Map(
 								certificate.dependencyCertificate.dependencies.flatMap((dependency) =>
 									"path" in dependency && pathContains(session.sourceRoot, dependency.path)
@@ -2102,14 +2101,8 @@ export class LinuxProcessReuseBackend {
 						};
 						const commit = async () => {
 							session.writers.add(writer);
-							await replayFilesystemEffects(
-								this.replayWorkspace,
-								this.store,
-								artifacts,
-								certificate.result.journal,
-								session.projection,
-								path.join(session.processRoot, "private"),
-							)
+							await replay
+								.commitEffects()
 								.then(
 									() => acquired.settle?.(true, true),
 									(error) => {
@@ -2120,34 +2113,33 @@ export class LinuxProcessReuseBackend {
 										throw error;
 									},
 								)
-								.finally(async () => {
+								.finally(() => {
 									writer.endedAt = Date.now();
 								});
 							if (outlet) this.add(session, "wholeCommandHits");
 							else this.recordHit(acquired.producer?.scope, acquired.joined, session);
 							recordProcessDependency(session, computation, domain?.pid);
-							const observed = certificate.result.observedProcessMs;
-							if (observed !== undefined)
-								this.add(session, outlet ? "wholeCommandReusedProcessMs" : "reusedProcessMs", observed);
+							if (certificate.result.observedProcessMs !== undefined)
+								this.add(session, outlet ? "wholeCommandReusedProcessMs" : "reusedProcessMs", replay.observedMs);
 							if (!outlet && binding && this.handoffs.resolveBinding(binding, session.scope))
 								session.executionBindings.set(requestID, binding);
 						};
-						if (domain && certificate.result.exit.kind === "code")
+						if (domain && replay.exit.kind === "code")
 							return {
 								kind: "hit",
 								held: {
 									kind: "replay",
-									validate: plan.validate,
+									validate: replay.validate,
 									output,
-									exitCode: certificate.result.exit.code,
+									exitCode: replay.exit.code,
 									commit,
 									settle: (consumed) => acquired.settle?.(consumed),
 								},
 							};
 						try {
-							if (domain || !plan.validate()) return { kind: "bypass" };
+							if (domain || !replay.validate()) return { kind: "bypass" };
 							await commit();
-							return { kind: "hit", output, exit: certificate.result.exit };
+							return { kind: "hit", output, exit: replay.exit };
 						} finally {
 							acquired.settle?.(false);
 						}
@@ -2160,11 +2152,7 @@ export class LinuxProcessReuseBackend {
 				this.add(session, outlet ? "wholeCommandMisses" : "misses");
 				try {
 					TimelineInterval.group(preparation, session);
-					recordProcessDependency(
-						session,
-						{ computation: preparation, owned: true, shared: [preparation] },
-						domain?.pid,
-					);
+					recordProcessDependency(session, ownedDependency(preparation), domain?.pid);
 					const work = acquired.work;
 					const ready = await this.resolveReady();
 					const started = performance.now();
@@ -2198,7 +2186,7 @@ export class LinuxProcessReuseBackend {
 						};
 						privateBefore.versions = await session.privateStructure.captureVersions();
 						const image = session.projection.toLogical(executable);
-						const dispatcher = session.interposition;
+						const dispatcher = session.interposition!;
 						const launchPath = request.imageSource ?? image;
 						const logicalCwd = session.projection.toLogical(request.cwd);
 						let rootPid: number | undefined;
@@ -2320,7 +2308,7 @@ export class LinuxProcessReuseBackend {
 								id: `${session.token}:${requestID}`,
 								owner: session.token,
 								startedAt: Date.now(),
-								tail,
+								trace: { kind: "traced", tail },
 								...(domain ? { pid: domain.pid } : {}),
 							}),
 						);
@@ -2331,7 +2319,7 @@ export class LinuxProcessReuseBackend {
 						const observe = () =>
 							completedObservation
 								? Promise.resolve(completedObservation)
-								: observeExecution(writer!.tail!, image, logicalCwd, {
+								: observeExecution(tail, image, logicalCwd, {
 										platformFingerprint: observedPrototype.platformFingerprint,
 										controlledSocket: channel?.socket,
 										launchPath,
@@ -2388,8 +2376,8 @@ export class LinuxProcessReuseBackend {
 												rootPid = child.pid;
 											},
 											onOutputEndpoints: (endpoints) => {
-												session.nestedOutputEndpoints.add((outputEndpoints = endpoints));
-												session.topLevelOutputEndpoints = endpoints;
+												session.outputs.nested.add((outputEndpoints = endpoints));
+												session.outputs.topLevel = endpoints;
 											},
 											cwd: request.cwd,
 											environment: request.environment,
@@ -2410,7 +2398,7 @@ export class LinuxProcessReuseBackend {
 								});
 						}
 						if (!domain && outputEndpoints) {
-							session.nestedOutputEndpoints.delete(outputEndpoints);
+							session.outputs.nested.delete(outputEndpoints);
 							completedObservation = verifyProcessOutput(await observe(), outcome.output);
 							if (completedObservation.complete && completedObservation.output)
 								outcome = { ...outcome, output: completedObservation.output };
@@ -2447,7 +2435,7 @@ export class LinuxProcessReuseBackend {
 											: undefined;
 									// When it last looked at each workspace name; one the trace cannot place counts as seen at its end.
 									const looked = new Map<string, number>();
-									for (const [target, at] of (await own.tail!.read()).seen) {
+									for (const [target, at] of (await tail.read()).seen) {
 										const name = named(target);
 										if (name !== undefined) looked.set(name, Math.max(looked.get(name) ?? 0, at));
 									}
@@ -2562,24 +2550,9 @@ export class LinuxProcessReuseBackend {
 										...(change.kind !== "directory" ? projectFileMutation(change) : {}),
 									});
 								}
-								for (const event of outcome!.output) {
-									journal.push({
-										sequence: journal.length,
-										kind: "output",
-										fd: event.fd,
-										data: await this.store.artifacts.put(event.data),
-									});
-								}
+								await this.appendOutputJournal(journal, outcome!.output);
 								const computation = TimelineInterval.current(work.startedAt, performance.now(), [
-									...(preparation
-										? [
-												{
-													computation: preparation,
-													owned: true,
-													shared: [preparation],
-												},
-											]
-										: []),
+									...(preparation ? [ownedDependency(preparation)] : []),
 									...(session.preparation ? [session.preparation] : []),
 									...session.computations.filter((input) => {
 										const pid = processDependencyPIDs.get(input);
@@ -2587,11 +2560,7 @@ export class LinuxProcessReuseBackend {
 									}),
 								]);
 								TimelineInterval.group(computation, session);
-								recordProcessDependency(
-									session,
-									{ computation, owned: true, shared: [computation] },
-									domain?.pid,
-								);
+								recordProcessDependency(session, ownedDependency(computation), domain?.pid);
 								const result: ProcessResultRecord = {
 									replayProfile: "buffered_noninteractive",
 									streamMetadataObserved: observation.streamMetadataObserved,
@@ -2614,7 +2583,7 @@ export class LinuxProcessReuseBackend {
 									own.observation = observation;
 								else {
 									own.evidence = dependencyCertificate;
-									for (const file of own.tail!.records)
+									for (const file of tail.records)
 										for (const line of file.lines)
 											if (!session.fileEvidence.has(line)) session.fileEvidence.set(line, own);
 								}
@@ -2645,16 +2614,8 @@ export class LinuxProcessReuseBackend {
 								}
 								stage = "certificate_publication";
 								await channel?.validate();
-								if (speculativeConfig().processReuse.persistCompletedCertificates) {
-									const bytesOnly =
-										observation.streamMetadataObserved === false &&
-										journal.every((event) => event.kind === "output") &&
-										byteStreamPrototype(observedPrototype);
-									await this.planner.publishCompleted(
-										sealProcessCertificate(bytesOnly ? { ...input, prototype: bytesOnly } : input),
-										acceptedReplayTaints(),
-									);
-								}
+								if (speculativeConfig().processReuse.persistCompletedCertificates)
+									await this.publishCompletedCertificate(input);
 								stage = "handoff_registration";
 								if (await this.handoffs.publish(weakKey, work, input, computation))
 									this.add(session, outlet ? "wholeCommandPublished" : "published");
@@ -2708,15 +2669,21 @@ export class LinuxProcessReuseBackend {
 							await transaction.abort(stage === "capture" ? true : undefined).catch(() => undefined);
 						if (writer) {
 							writer.endedAt ??= Date.now();
-							writer.writes ??= await writer.tail!.read().then(
-								(tail) => {
-									writer!.unsafe = tail.unsafe;
-									return tail.writes;
-								},
-								() => [{ at: writer!.startedAt, opened: true }],
-							);
-							await writer.tail?.[Symbol.asyncDispose]();
-							writer.tail = undefined;
+							if (writer.trace.kind === "traced") {
+								const activeTail = writer.trace.tail;
+								writer.trace = await activeTail.read().then(
+									(snapshot): WriterTraceState => ({
+										kind: "settled",
+										writes: snapshot.writes,
+										unsafe: snapshot.unsafe,
+									}),
+									(): WriterTraceState => ({
+										kind: "settled",
+										writes: [{ at: writer!.startedAt, opened: true }],
+									}),
+								);
+								await activeTail[Symbol.asyncDispose]();
+							}
 						}
 					}
 				} finally {
@@ -2725,6 +2692,36 @@ export class LinuxProcessReuseBackend {
 			},
 			domain?.pid,
 		);
+	}
+	private prepareReplay(
+		plan: ReadyProcessPlan,
+		projection: ExecutionPathProjection,
+		options: {
+			workspace?: Pick<WorkspaceSandboxService, "commitDelta">;
+			privateStorage?: string;
+			acquired?: {
+				readonly producer?: ProcessHandoff;
+				readonly waiting?: readonly TimelineInterval[];
+			};
+		} = {},
+	) {
+		const { artifacts, certificate, validate } = plan;
+		return {
+			validate,
+			exit: certificate.result.exit,
+			observedMs: certificate.result.observedProcessMs ?? 0,
+			output: loadOutputEvents(artifacts, certificate.result.journal),
+			computation: reusedComputation(certificate, options.acquired),
+			commitEffects: () =>
+				replayFilesystemEffects(
+					options.workspace ?? this.replayWorkspace,
+					this.store,
+					artifacts,
+					certificate.result.journal,
+					projection,
+					options.privateStorage,
+				),
+		};
 	}
 	private async planPrototype(
 		prototype: ExecPrototype,
@@ -3006,29 +3003,21 @@ export class LinuxProcessReuseBackend {
 				this.add(undefined, "misses");
 				return continued();
 			}
-			const output = loadOutputEvents(plan.artifacts, plan.certificate.result.journal);
-			const computation = reusedComputation(plan.certificate, acquired);
+			const replay = this.prepareReplay(plan, projection, {
+				workspace: observation?.effects ?? this.replayWorkspace,
+				acquired,
+			});
+			const { output, computation } = replay;
 			const decision = measured({
 				kind: "replay",
-				exitCode: (
-					plan.certificate.result.exit as {
-						kind: "code";
-						code: number;
-					}
-				).code,
-				validate: plan.validate,
+				exitCode: (replay.exit as { kind: "code"; code: number }).code,
+				validate: replay.validate,
 				settle,
 				output,
 				commit: async () => {
 					try {
 						process.signal?.throwIfAborted();
-						await replayFilesystemEffects(
-							observation?.effects ?? this.replayWorkspace,
-							this.store,
-							plan.artifacts,
-							plan.certificate.result.journal,
-							projection,
-						);
+						await replay.commitEffects();
 					} catch (error) {
 						this.setError(undefined, `actor_child_commit:${errorMessage(error)}`);
 						throw error;
@@ -3047,7 +3036,7 @@ export class LinuxProcessReuseBackend {
 						observation.computations.push(computation);
 					}
 					this.recordHit(acquired.producer?.scope, acquired.joined, undefined, scope);
-					this.add(undefined, "reusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
+					this.add(undefined, "reusedProcessMs", replay.observedMs);
 					if (scope)
 						acquired.producer?.ownership.adopted({
 							scope,
@@ -3055,7 +3044,7 @@ export class LinuxProcessReuseBackend {
 							sequence: order,
 							backend: "linux_process_reuse",
 							operationIdentity: weakKey,
-							executionMs: plan.certificate.result.observedProcessMs ?? 0,
+							executionMs: replay.observedMs,
 							computation,
 						});
 				},
@@ -3189,6 +3178,11 @@ function bufferedProcessPrototype(
 		platformFingerprint,
 	});
 }
+const ownedDependency = (computation: TimelineInterval): TimelineDependency => ({
+	computation,
+	owned: true,
+	shared: [computation],
+});
 function recordProcessDependency(session: ActiveSession, dependency: TimelineDependency, pid?: number) {
 	if (pid !== undefined) processDependencyPIDs.set(dependency, pid);
 	session.computations.push(dependency);
@@ -3198,15 +3192,7 @@ async function measureProcess<T>(session: ActiveSession, execute: () => Promise<
 	const result = await TimelineInterval.measure(execute, () =>
 		session.computations.slice(first).filter((input) => processDependencyPIDs.get(input) === pid),
 	);
-	recordProcessDependency(
-		session,
-		{
-			computation: result.computation,
-			owned: true,
-			shared: [result.computation],
-		},
-		pid,
-	);
+	recordProcessDependency(session, ownedDependency(result.computation), pid);
 	return result.output;
 }
 /** Optimistic execution boundaries: control wins over sibling overlap; original producers keep their own clocks. */
@@ -3272,7 +3258,7 @@ async function sealSessionEvidence(
 	external: Awaited<ReturnType<typeof privateCommits>>,
 ) {
 	const capture = await captureSessionInterval(session);
-	session.topLevelEvidence = {
+	session.sealing.topLevelEvidence = {
 		complete: false,
 		dependencies: [],
 		taints: ["trace_incomplete"],
@@ -3298,7 +3284,7 @@ async function sealSessionEvidence(
 			writers.flatMap((writer) => writer.evidence ?? []),
 		);
 		for (const reason of evidence.incompleteReasons) session.incompleteReasons.add(`top_evidence:${reason}`);
-		session.topLevelEvidence = {
+		session.sealing.topLevelEvidence = {
 			...evidence,
 			complete: evidence.complete && session.incompleteReasons.size === 0,
 		};
@@ -3424,32 +3410,9 @@ async function captureDependencies(
 			return;
 		}
 		const identity = dynamicDependencyIdentity(dependency);
-		const existing = dependencies.get(identity);
-		if (
-			existing?.kind === "file" &&
-			dependency.kind === "file" &&
-			stableEqual({ ...existing, role: dependency.role }, dependency)
-		) {
-			if (existing.role !== "executable" && dependency.role === "executable")
-				dependencies.set(identity, dependency);
-			return;
-		}
-		// A listing adds evidence to reaching the same directory; neither observation may replace conflicting evidence.
-		if (
-			existing?.kind === dependency.kind &&
-			(dependency.kind === "directory" || dependency.kind === "absence") &&
-			Object.entries(dependency).every(
-				([key, value]) => !(key in existing) || stableEqual(Reflect.get(existing, key), value),
-			)
-		) {
-			dependencies.set(identity, { ...existing, ...dependency });
-			return;
-		}
-		if (existing && !stableEqual(existing, dependency)) {
-			incompleteReasons.add(`dependency_changed_during_execution:${identity}`);
-			return;
-		}
-		dependencies.set(identity, dependency);
+		const merged = mergeDynamicDependency(dependencies.get(identity), dependency);
+		if (merged === "conflict") incompleteReasons.add(`dependency_changed_during_execution:${identity}`);
+		else dependencies.set(identity, merged);
 	};
 	// Rebase owned inputs; metadata survives unless its private object vanished within this transaction.
 	const changed = new Set(effects.effects.map((effect) => effect.logicalPath));
@@ -3460,12 +3423,8 @@ async function captureDependencies(
 	const privateObjectUnmoved = async (target: string) => {
 		// A rename/link of this name or an ancestor can retain its object elsewhere.
 		// Unrelated multi-path writes do not extend the lifetime of this private object.
-		const writes = await (privateWrites ??= Promise.all(
-			sessionWriters(session).map((writer) => writer.tail?.read() ?? writer),
-		).then((traces) =>
-			traces.some((trace) => trace.unsafe || !trace.writes)
-				? undefined
-				: traces.flatMap((trace) => trace.writes!),
+		const writes = await (privateWrites ??= Promise.all(sessionWriters(session).map(readWriterTrace)).then((traces) =>
+			traces.some((trace) => trace.unsafe) ? undefined : traces.flatMap((trace) => trace.writes),
 		));
 		return (
 			writes !== undefined &&
@@ -3713,45 +3672,16 @@ async function captureDependencies(
 			!(session.gitDirectory && pathContains(session.gitDirectory, observedPath))
 				? (session.projection.toPhysical(observedPath) ?? observedPath)
 				: observedPath;
-		if (
-			item.role !== "metadata" &&
-			speculativeConfig().processReuse.contentAddressedPaths.some((root) => pathContains(root, physical))
-		) {
-			const info = await lstat(physical, { bigint: true }).catch(() => undefined);
-			const dependency = contentAddressedIdentity(physical, info);
-			if (dependency) {
-				add(dependency);
-				continue;
-			}
+		const contentAddressed = await captureContentAddressedDependency(physical, item.role, hostReads);
+		if (contentAddressed) {
+			add(contentAddressed);
+			continue;
 		}
-		if (
-			speculativeConfig().processReuse.kernelConfigurationPaths.some((root) =>
-				pathContains(root, observedPath),
-			)
-		)
-			continue; // Changes only with the kernel's own configuration, like the clock.
 		// What it wrote outside the workspace, and the directories holding those names, rest on its effects' baselines.
 		if (own.has(physical) && (item.role !== "metadata" || !external.before.has(physical))) continue;
-		// A process reading its own state, or the host's CPU and cgroup limits, observes this one run like the clock or its pid.
-		if (/^\/proc\/(?:self|thread-self|\d+)(?:\/|$)/.test(observedPath)) {
-			taints.add(observedPath.endsWith("/limits") ? "confinement_observation" : "pid_observation");
-			continue;
-		}
-		// Reopening an inherited descriptor reaches what that descriptor carries, like a jobserver pipe, not a host file.
-		if (/^\/dev\/fd\/\d+$/.test(observedPath)) {
-			taints.add("descriptor_observation");
-			continue;
-		}
-		if (/^\/dev\/u?random$/.test(observedPath)) {
-			taints.add("random");
-			continue;
-		} // Entropy, as getrandom(2) reads it.
-		if (
-			/^\/sys\/(?:devices\/system\/cpu|fs\/cgroup)(?:\/|$)|^\/proc\/(?:meminfo|version|version_signature|cpuinfo|stat|loadavg|uptime)$/.test(
-				observedPath,
-			)
-		) {
-			taints.add("clock");
+		const special = classifyObservedSpecialPath(observedPath, undefined, item.role !== "metadata");
+		if (special) {
+			if (special !== "ignored") taints.add(special);
 			continue;
 		}
 		if (item.role === "metadata") {
@@ -3771,7 +3701,6 @@ async function captureDependencies(
 			} else add(input);
 			continue;
 		}
-		if (speculativeConfig().processReuse.stableDevices.includes(observedPath)) continue;
 		// The kernel itself opens a script's interpreter and an ELF's loader, which no traced syscall names.
 		const interpreter =
 			item.role === "executable" &&
@@ -3821,27 +3750,18 @@ async function captureDependencies(
 								.get(physical)
 								?.map((dependency) => (dependency.kind === "file" ? { ...dependency, role } : dependency)),
 						};
-					const captured = safe && !absent && (await hostInput(physical));
-					const dependency = absent
-						? await captureAbsenceDependency(physical, slash(physical), false, [], undefined, hostReads)
-						: captured && captured.info.isFile()
-							? (
-									await captureFileDependency(physical, slash(physical), role, {
-										includeMetadata: true,
-										view: hostReads,
-									})
-								).dependency
-							: captured && captured.info.isDirectory()
-								? await captureDirectoryDependency(
-										physical,
-										slash(physical),
-										!listed,
-										[],
-										listed,
-										undefined,
-										hostReads,
-									)
-								: undefined;
+					const captured = safe && !absent ? await hostInput(physical) : undefined;
+					const dependency =
+						absent || captured
+							? await captureHostObjectDependency(
+									physical,
+									slash(physical),
+									role,
+									listed,
+									captured?.info,
+									hostReads,
+								)
+							: undefined;
 					return { physical, value: dependency && [dependency] };
 				} catch (error) {
 					return { physical, error };
@@ -4188,7 +4108,7 @@ export async function observeWorkspaceWrites(
 			other.startedAt <= input.until &&
 			(other.endedAt ?? Infinity) >= input.from
 		) {
-			const tail = other.writes ?? (await other.tail!.read()).writes;
+			const { writes: tail } = await readWriterTrace(other);
 			// Shared parent traces retain the child's original opens after its complete tree has exited.
 			if (
 				(other.endedAt ?? Infinity) >= input.from &&
@@ -4240,7 +4160,7 @@ function writerOwnership(
 	};
 }
 function captureSessionInterval(session: ActiveSession): Promise<WorkspaceTransactionDelta> {
-	return (session.capture ??= Promise.resolve(session.transaction)
+	return (session.sealing.capture ??= Promise.resolve(session.sealing.transaction)
 		.then((capture) =>
 			capture
 				? capture.finish(async () => writerOwnership(session, sessionWriters(session)))
@@ -4541,10 +4461,9 @@ async function privateInterference(
 		}
 	for (const writer of sessionWriters(session))
 		if (!owned.includes(writer) && (writer.endedAt ?? Infinity) >= since) {
-			const tail = writer.tail ? await writer.tail.read() : writer;
+			const tail = await readWriterTrace(writer);
 			if (
 				tail.unsafe ||
-				!tail.writes ||
 				writesWithin(
 					tail.writes.filter(
 						(write) => !processes.has(write.pid!) && (!write.paths || write.at >= since || write.mapped),
@@ -4742,15 +4661,15 @@ function eligibleRequest(
 		speculativeConfig().processReuse.maxArgumentBytes
 	)
 		return "argument_bytes_limit";
-	if (!session.topLevelOutputEndpoints) return "output_endpoint_capture_missing";
+	if (!session.outputs.topLevel) return "output_endpoint_capture_missing";
 	if (context.outputEndpoints.some((endpoint) => !endpoint)) return "request_output_endpoint_missing";
 	// The launch key below still checks a discarded descriptor's type and flags. Both outlets belong to one captured process.
 	const endpoints =
-		[session.topLevelOutputEndpoints, ...session.nestedOutputEndpoints].find((pair) =>
+		[session.outputs.topLevel, ...session.outputs.nested].find((pair) =>
 			context.outputEndpoints.every(
 				(endpoint) => pair.includes(endpoint) || endpoint === "/dev/null",
 			),
-		) ?? session.topLevelOutputEndpoints;
+		) ?? session.outputs.topLevel;
 	const launch = processLaunchOptions(context, endpoints);
 	if (!launch) return "output_endpoint_mismatch";
 	const routed = routedProcessIdentity(expectedContext, launch);
@@ -4814,10 +4733,78 @@ async function topLevelProcessPrototype(
 		platformFingerprint,
 	});
 }
-function contentAddressedIdentity(target: string, info?: BigIntStats): DynamicDependency | undefined {
+async function captureHostObjectDependency(
+	physical: string,
+	logical: string,
+	role: DependencyRole,
+	listed: boolean,
+	info: BigIntStats | undefined,
+	view: FilesystemReadView,
+	options?: { signal?: AbortSignal; maxFileBytes?: number },
+): Promise<DynamicDependency | undefined> {
+	if (!info) return captureAbsenceDependency(physical, logical, false, [], undefined, view);
+	if (info.isDirectory())
+		return captureDirectoryDependency(physical, logical, options !== undefined || !listed, [], listed, undefined, view);
+	if (!info.isFile()) return undefined;
+	return (await captureFileDependency(physical, logical, role, { ...options, view, includeMetadata: true })).dependency;
+}
+async function captureContentAddressedDependency(
+	target: string,
+	role: DependencyRole | "metadata",
+	view: FilesystemReadView,
+	settings = speculativeConfig().processReuse,
+): Promise<DynamicDependency | undefined> {
+	if (role === "metadata" || !settings.contentAddressedPaths.some((root) => pathContains(root, target))) return;
+	const info = await view.stat(target, false).catch(ignoreMissing);
 	if (!info?.isFile() || !settledFilesystemStat(info, Date.now(), target)) return;
 	const fields = ["dev", "ino", "mode", "size", "mtimeNs", "ctimeNs"] as const;
 	return { kind: "metadata", path: slash(target), followSymlinks: false, fields, digest: filesystemObservationDigest(info, fields) };
+}
+function mergeDynamicDependency(
+	existing: DynamicDependency | undefined,
+	incoming: DynamicDependency,
+): DynamicDependency | "conflict" {
+	if (!existing) return incoming;
+	if (
+		existing.kind === "file" &&
+		incoming.kind === "file" &&
+		stableEqual({ ...existing, role: incoming.role }, incoming)
+	)
+		return existing.role !== "executable" && incoming.role === "executable" ? incoming : existing;
+	// A listing adds evidence to reaching the same directory; neither observation may replace conflicting evidence.
+	if (
+		existing.kind === incoming.kind &&
+		(incoming.kind === "directory" || incoming.kind === "absence") &&
+		Object.entries(incoming).every(
+			([key, value]) => !(key in existing) || stableEqual(Reflect.get(existing, key), value),
+		)
+	)
+		return { ...existing, ...incoming };
+	return stableEqual(existing, incoming) ? existing : "conflict";
+}
+function classifyObservedSpecialPath(
+	observedPath: string,
+	settings = speculativeConfig().processReuse,
+	includeStableDevices = true,
+): "ignored" | ProvenanceTaint | undefined {
+	if (
+		(includeStableDevices && settings.stableDevices.includes(observedPath)) ||
+		settings.kernelConfigurationPaths.some((root) => pathContains(root, observedPath))
+	)
+		return "ignored";
+	// A process reading its own state, or the host's CPU, sysctl, and cgroup limits, observes this one run like the clock or its pid.
+	if (/^\/proc\/(?:self|thread-self|\d+)(?:\/|$)/.test(observedPath))
+		return observedPath.endsWith("/limits") ? "confinement_observation" : "pid_observation";
+	// Reopening an inherited descriptor reaches what that descriptor carries, like a jobserver pipe, not a host file.
+	if (/^\/dev\/fd\/\d+$/.test(observedPath)) return "descriptor_observation";
+	if (/^\/dev\/u?random$/.test(observedPath)) return "random";
+	if (
+		/^\/proc\/sys(?:\/|$)|^\/sys\/(?:devices\/system\/cpu|fs\/cgroup)(?:\/|$)|^\/proc\/(?:meminfo|version|version_signature|cpuinfo|stat|loadavg|uptime)$/.test(
+			observedPath,
+		)
+	)
+		return "clock";
+	return undefined;
 }
 async function captureActorDependencies(
 	observation: ExecutionObservation,
@@ -4831,27 +4818,9 @@ async function captureActorDependencies(
 	await using view = await FilesystemReadView.open();
 	const add = (dependency: DynamicDependency) => {
 		const key = dynamicDependencyIdentity(dependency);
-		const previous = dependencies.get(key);
-		if (
-			previous?.kind === "file" &&
-			dependency.kind === "file" &&
-			stableEqual({ ...previous, role: dependency.role }, dependency)
-		) {
-			if (previous.role !== "executable" && dependency.role === "executable") dependencies.set(key, dependency);
-			return;
-		}
-		if (
-			previous?.kind === dependency.kind &&
-			(dependency.kind === "directory" || dependency.kind === "absence") &&
-			Object.entries(dependency).every(
-				([field, value]) => !(field in previous) || stableEqual(Reflect.get(previous, field), value),
-			)
-		) {
-			dependencies.set(key, { ...previous, ...dependency });
-			return;
-		}
-		if (previous && !stableEqual(previous, dependency)) throw new Error(`actor_dependency_conflict:${key}`);
-		dependencies.set(key, dependency);
+		const merged = mergeDynamicDependency(dependencies.get(key), dependency);
+		if (merged === "conflict") throw new Error(`actor_dependency_conflict:${key}`);
+		dependencies.set(key, merged);
 	};
 	const prefixes = new Map<string, Promise<DynamicDependency | undefined>>();
 	const symlinkAt = (prefix: string) => {
@@ -4876,29 +4845,9 @@ async function captureActorDependencies(
 		if (/^\/proc\/(?:self|thread-self|\d+)\/(?:task\/\d+\/)?(?:cwd|root|fd|map_files)\//.test(input.path) ||
 			/^\/dev\/fd\/\d+\//.test(input.path))
 			throw new Error(`actor_unresolved_process_path:${input.path}`);
-		if (
-			settings.stableDevices.includes(observedPath) ||
-			settings.kernelConfigurationPaths.some((root) => pathContains(root, observedPath))
-		)
-			continue;
-		if (/^\/proc\/(?:self|thread-self|\d+)(?:\/|$)/.test(observedPath)) {
-			taints.add(observedPath.endsWith("/limits") ? "confinement_observation" : "pid_observation");
-			continue;
-		}
-		if (/^\/dev\/fd\/\d+$/.test(observedPath)) {
-			taints.add("descriptor_observation");
-			continue;
-		}
-		if (/^\/dev\/u?random$/.test(observedPath)) {
-			taints.add("random");
-			continue;
-		}
-		if (
-			/^\/sys\/(?:devices\/system\/cpu|fs\/cgroup)(?:\/|$)|^\/proc\/(?:meminfo|version|version_signature|cpuinfo|stat|loadavg|uptime)$/.test(
-				observedPath,
-			)
-		) {
-			taints.add("clock");
+		const special = classifyObservedSpecialPath(observedPath, settings);
+		if (special) {
+			if (special !== "ignored") taints.add(special);
 			continue;
 		}
 		relevant.push(input);
@@ -4922,22 +4871,16 @@ async function captureActorDependencies(
 					items.push(link);
 				}
 			}
-			if (
-				input.role !== "metadata" &&
-				settings.contentAddressedPaths.some((root) => pathContains(root, observedPath))
-			) {
-				const info = await view.stat(observedPath, false).catch(ignoreMissing);
-				const dependency = contentAddressedIdentity(observedPath, info);
-				if (dependency) {
-					items.push(dependency);
-					return { items, sharedComputation };
-				}
+			const contentAddressed = await captureContentAddressedDependency(observedPath, input.role, view, settings);
+			if (contentAddressed) {
+				items.push(contentAddressed);
+				return { items, sharedComputation };
 			}
 			const info = await view
 				.stat(input.path, input.role === "metadata" ? input.followSymlinks : true)
 				.catch(ignoreMissing);
 			if (!info) {
-				const absence = await captureAbsenceDependency(input.path, input.path, false, [], undefined, view);
+				const absence = await captureHostObjectDependency(input.path, input.path, "input", false, undefined, view);
 				if (!absence) throw new Error(`actor_absence_changed:${input.path}`);
 				items.push(absence);
 			} else if (input.role === "metadata") {
@@ -4952,7 +4895,7 @@ async function captureActorDependencies(
 				items.push(item);
 			} else if (info.isDirectory())
 				items.push(
-					await captureDirectoryDependency(input.path, input.path, true, [], !!input.listed, undefined, view),
+					(await captureHostObjectDependency(input.path, input.path, input.role, !!input.listed, info, view, {}))!,
 				);
 			else if (info.isFile()) {
 				const target = await view.realpath(input.path);
@@ -4970,14 +4913,10 @@ async function captureActorDependencies(
 					if (file.shared) sharedComputation = file.computation;
 				} else {
 					items.push(
-						(
-							await captureFileDependency(target, target, input.role, {
-								signal,
-								view,
-								includeMetadata: true,
-								maxFileBytes: settings.maxCaptureBytes,
-							})
-						).dependency,
+						(await captureHostObjectDependency(target, target, input.role, false, info, view, {
+							signal,
+							maxFileBytes: settings.maxCaptureBytes,
+						}))!,
 					);
 				}
 			} else throw new Error(`actor_special_input:${input.path}`);

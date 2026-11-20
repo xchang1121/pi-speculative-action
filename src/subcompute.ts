@@ -90,23 +90,26 @@ const fields = {
 	consumed: ["op", "token"],
 };
 const endpoint = new AsyncLocalStorage<SubcomputeService>();
+type SubcomputeScopeState =
+	| { kind: "proven" | "tainted"; busy: number }
+	| { kind: "closed" };
 type SubcomputeScope = {
-	run: ReturnType<typeof AsyncLocalStorage.snapshot>;
-	timer?: NodeJS.Timeout;
-	runtimes?: readonly TrustedStepRuntime[];
-	clients: Set<Socket>;
-	socket: string;
-	identity: string;
-	currentIdentity: () => string;
-	proofs: ResourceVersionToken[];
-	busy: number;
-	failed: boolean;
-	general: boolean;
+	readonly owner: SubcomputeService;
+	readonly run: ReturnType<typeof AsyncLocalStorage.snapshot>;
+	readonly timer?: NodeJS.Timeout;
+	readonly runtimes: readonly TrustedStepRuntime[];
+	readonly clients: Set<Socket>;
+	readonly socket: string;
+	readonly identity: string;
+	readonly currentIdentity: () => string;
+	readonly proofs: ResourceVersionToken[];
+	readonly general: boolean;
+	state: SubcomputeScopeState;
 };
 const channels = new Map<string, SubcomputeScope>();
 function adapterEnvironment(scope: SubcomputeScope, base: Readonly<Record<string, string | undefined>>) {
 	const variables: Record<string, string> = {};
-	for (const runtime of scope.runtimes ?? []) Object.assign(variables, runtime.environment({ ...base, ...variables }));
+	for (const runtime of scope.runtimes) Object.assign(variables, runtime.environment({ ...base, ...variables }));
 	return variables;
 }
 export function controlledSubcomputeChannel(environment: Readonly<Record<string, string | undefined>>) {
@@ -116,13 +119,14 @@ export function controlledSubcomputeChannel(environment: Readonly<Record<string,
 	return {
 		socket: scope.socket,
 		identity: scope.identity,
-		readOnlyDirectories: [...new Set(scope.runtimes?.flatMap((runtime) => runtime.readOnlyDirectories))],
+		readOnlyDirectories: [...new Set(scope.runtimes.flatMap((runtime) => runtime.readOnlyDirectories))],
 		environment: (base: Readonly<Record<string, string | undefined>>) => adapterEnvironment(scope, base),
 		async validate() {
 			if (
-				channels.get(token!) !== scope || scope.currentIdentity() !== scope.identity ||
-				scope.failed ||
-				scope.busy ||
+				channels.get(token!) !== scope ||
+				scope.currentIdentity() !== scope.identity ||
+				scope.state.kind !== "proven" ||
+				scope.state.busy > 0 ||
 				(scope.proofs.length && (await validateResourceVersion(scope.proofs)).expired)
 			)
 				throw new Error("subcompute_process_inputs_unproven");
@@ -163,7 +167,7 @@ export class SubcomputeService {
 	private directory?: string;
 	private readonly lifetime = new RuntimeLifecycleLane();
 	private readonly clients = new Map<Socket, AbortController>();
-	private readonly scopes = new Map<string, SubcomputeScope>();
+	private readonly tokens = new Set<string>();
 	private readonly owners = new AsyncLocalStorage<{ readonly tokens: Set<string>; closed: boolean }>();
 	private readonly inputManager: ResourceVersionManager;
 	private readonly inputStorage: { store: ProvenanceCertificateStore; contents: ContentChunkPool; internalCache: true };
@@ -195,21 +199,23 @@ export class SubcomputeService {
 		this.maxBytes = maxBytes;
 		this.configuration.bind(this);
 	}
+	private scope(token: string | undefined): SubcomputeScope | undefined {
+		const active = token ? channels.get(token) : undefined;
+		return active?.owner === this ? active : undefined;
+	}
 	async controlledEnvironment(base: Readonly<Record<string, string | undefined>>): Promise<Readonly<Record<string, string>>> {
 		const general = this.configuration.current.subcomputation.exposeToControlledProcesses;
-		const steps = [...this.trusted.values()].filter((step) => this.trustedEnabled(step));
-		if (!general && !steps.length) return {};
-		const existing = base.PI_SUBCOMPUTE_CONTEXT && this.scopes.get(base.PI_SUBCOMPUTE_CONTEXT);
-		const transport = existing && existing.socket === base.PI_SUBCOMPUTE_SOCKET && existing.currentIdentity() === existing.identity ? {
-			PI_SUBCOMPUTE_SOCKET: existing.socket, PI_SUBCOMPUTE_CONTEXT: base.PI_SUBCOMPUTE_CONTEXT!,
-		} : await this.environment(general).catch((error: unknown) => {
-			if (general) throw error;
-			return undefined;
-		});
+		if (!general && ![...this.trusted.values()].some((step) => this.trustedEnabled(step))) return {};
+		const existing = this.scope(base.PI_SUBCOMPUTE_CONTEXT);
+		const transport =
+			existing && existing.state.kind === "proven" && existing.socket === base.PI_SUBCOMPUTE_SOCKET && existing.currentIdentity() === existing.identity
+				? { PI_SUBCOMPUTE_SOCKET: existing.socket, PI_SUBCOMPUTE_CONTEXT: base.PI_SUBCOMPUTE_CONTEXT! }
+				: await this.environment(general).catch((error: unknown) => {
+						if (general) throw error;
+						return undefined;
+					});
 		if (!transport) return {};
-		const scope = this.scopes.get(transport.PI_SUBCOMPUTE_CONTEXT)!;
-		scope.runtimes ??= (await Promise.all(steps.map((step) => step.runtime?.()))).filter((runtime) => runtime !== undefined);
-		return { ...adapterEnvironment(scope, base), ...transport };
+		return { ...adapterEnvironment(this.scope(transport.PI_SUBCOMPUTE_CONTEXT)!, base), ...transport };
 	}
 	private trustedEnabled(step: TrustedSubcomputeStep): boolean {
 		const runtime = this.runtime();
@@ -282,7 +288,7 @@ export class SubcomputeService {
 		}
 		this.files.delete(key);
 		this.files.set(key, entry);
-		while (this.files.size > 2048) this.evict(this.files.keys().next().value!);
+		this.trimFiles();
 		try {
 			const token = await entry.token;
 			if (this.files.get(key) !== entry) return;
@@ -291,8 +297,7 @@ export class SubcomputeService {
 				this.cacheBytes += entry.bytes;
 				this.trimPrepared();
 			}
-			while (this.cacheBytes + this.inputStorage.contents.storedBytes > budget && this.files.size)
-				this.evict(this.files.keys().next().value!);
+			this.trimFiles(budget);
 			if (!this.files.size) this.renewChunkPool();
 			else if (this.files.get(key) === entry) return token;
 		} catch (error) {
@@ -327,8 +332,10 @@ export class SubcomputeService {
 	}
 	async environment(general = true): Promise<Readonly<Record<string, string>>> {
 		const socket = await this.socket();
+		const steps = [...this.trusted.values()].filter((step) => this.trustedEnabled(step));
+		const runtimes = (await Promise.all(steps.map((step) => step.runtime?.()))).filter((runtime) => runtime !== undefined);
 		if (this.lifetime.sealed) throw new Error("subcompute_service_closed");
-		if (this.scopes.size >= this.configuration.current.subcomputation.maxPendingRequests)
+		if (this.tokens.size >= this.configuration.current.subcomputation.maxPendingRequests)
 			throw new Error("subcompute_scope_budget_exceeded");
 		const token = randomUUID();
 		const owner = this.owners.getStore();
@@ -343,31 +350,32 @@ export class SubcomputeService {
 				[step.namespace, this.trustedEnabled(step) ? step.implementation : null])),
 		});
 		const scope: SubcomputeScope = {
+			owner: this,
 			identity: currentIdentity(),
 			currentIdentity,
 			run: subcomputeTiming.run(subcomputeTiming.getStore() ?? this.record, () => AsyncLocalStorage.snapshot()),
 			timer,
+			runtimes,
 			clients: new Set(),
 			socket,
 			proofs: [],
-			busy: 0,
-			failed: false,
 			general,
+			state: { kind: "proven", busy: 0 },
 		};
-		this.scopes.set(token, scope);
+		this.tokens.add(token);
 		channels.set(token, scope);
 		activeOwner?.tokens.add(token);
 		return { PI_SUBCOMPUTE_SOCKET: socket, PI_SUBCOMPUTE_CONTEXT: token };
 	}
 	private releaseScope(token: string): void {
-		const scope = this.scopes.get(token);
-		if (scope) {
-			clearTimeout(scope.timer);
-			for (const socket of scope.clients) socket.destroy(new Error("subcompute_context_closed"));
-			this.lifetime.track(Promise.allSettled(scope.proofs.splice(0).map((proof) => proof.release())));
-		}
-		this.scopes.delete(token);
+		const scope = this.scope(token);
+		this.tokens.delete(token);
+		if (!scope) return;
 		channels.delete(token);
+		scope.state = { kind: "closed" };
+		clearTimeout(scope.timer);
+		for (const socket of scope.clients) socket.destroy(new Error("subcompute_context_closed"));
+		this.lifetime.track(Promise.allSettled(scope.proofs.splice(0).map((proof) => proof.release())));
 	}
 	socket(): Promise<string> {
 		if (this.lifetime.sealed) return Promise.reject(new Error("subcompute_service_closed"));
@@ -515,9 +523,9 @@ export class SubcomputeService {
 				const request = await read();
 				if (request === undefined) break;
 				if (request.op !== "compute") throw new Error("invalid_subcompute_request");
-				const active = this.scopes.get(request.context);
+				const active = this.scope(request.context);
 				if (scope && scope !== active) throw new Error("subcompute_context_changed");
-				if (!active) throw new Error("subcompute_context_unavailable");
+				if (!active || active.state.kind === "closed") throw new Error("subcompute_context_unavailable");
 				scope = active;
 				scope.clients.add(socket);
 				const step = this.trusted.get(request.namespace);
@@ -546,11 +554,11 @@ export class SubcomputeService {
 					continue;
 				}
 				let busy = true;
-				active.busy++;
+				active.state.busy++;
 				const releaseBusy = () => {
 					if (!busy) return;
 					busy = false;
-					active.busy--;
+					if (active.state.kind !== "closed") active.state.busy--;
 				};
 				try {
 					if (step) {
@@ -579,7 +587,7 @@ export class SubcomputeService {
 									if (value === undefined) throw unavailable;
 									return value;
 								}, maxResultBytes), signal);
-								if (this.scopes.get(request.context) !== active) throw new Error("subcompute_context_closed");
+								if (active.state.kind === "closed") throw new Error("subcompute_context_closed");
 								const value = deserialize(result.data);
 								if (wireBytes(value) > maxResultBytes) {
 									releaseBusy();
@@ -619,7 +627,7 @@ export class SubcomputeService {
 							));
 							if (!query) throw new Error("subcompute_retention_budget_exceeded");
 							try {
-								if (this.scopes.get(request.context) !== active) throw new Error("subcompute_context_closed");
+								if (active.state.kind === "closed") throw new Error("subcompute_context_closed");
 								for (const proof of query.versions) active.proofs.push(session.retain({ ...proof, view: undefined }));
 								releaseBusy();
 								await send({ state: produced ? "published" : "hit", value: encodeValue(query.output) });
@@ -633,7 +641,8 @@ export class SubcomputeService {
 				}
 			}
 		} catch (error) {
-			if (scope && !signal.aborted) scope.failed = true;
+			if (scope?.state.kind === "proven" && !signal.aborted)
+				scope.state = { kind: "tainted", busy: scope.state.busy };
 			throw error;
 		} finally {
 			scope?.clients.delete(socket);
@@ -704,11 +713,18 @@ export class SubcomputeService {
 		this.trimPrepared();
 		return result;
 	}
+	private totalCachedBytes(): number {
+		return this.cacheBytes + this.inputStorage.contents.storedBytes + this.preparedBytes;
+	}
+	private trimFiles(budget?: number): void {
+		while (this.files.size && (this.files.size > 2048 ||
+			(budget !== undefined && this.cacheBytes + this.inputStorage.contents.storedBytes > budget)))
+			this.evict(this.files.keys().next().value!);
+	}
 	private trimPrepared(): void {
 		const runtime = this.runtime();
 		const budget = Math.min(this.maxBytes(), runtime.resourceCacheMaxBytes ?? Infinity);
-		while (this.prepared.size && (this.prepared.size > runtime.resourceCacheMaxEntries ||
-			this.cacheBytes + this.inputStorage.contents.storedBytes + this.preparedBytes > budget)) {
+		while (this.prepared.size && (this.prepared.size > runtime.resourceCacheMaxEntries || this.totalCachedBytes() > budget)) {
 			const [key, value] = this.prepared.entries().next().value!;
 			this.prepared.delete(key);
 			if (value.referenced) {
@@ -734,7 +750,7 @@ export class SubcomputeService {
 	}
 	dispose(): Promise<void> {
 		return this.lifetime.close(async () => {
-			for (const token of this.scopes.keys()) this.releaseScope(token);
+			for (const token of [...this.tokens]) this.releaseScope(token);
 			for (const [socket, controller] of this.clients) {
 				controller.abort(new Error("subcompute_service_closed"));
 				socket.destroy();

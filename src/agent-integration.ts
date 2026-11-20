@@ -672,20 +672,23 @@ function assembleAgentExecutionHost(
 		return recheck && !result.ok ? { ...result, reason } : result;
 	};
 	type Binding = Awaited<ReturnType<typeof resolveBinding>>;
-	type Bound = {
+	type CallRecord = {
 		binding: Binding;
 		tool?: AgentTool;
 		turnID: string;
 		tools?: readonly AgentTool[];
 		executor?: Parameters<SpeculativeActionHost["execute"]>[2];
+		prediction?: Prediction;
 		error?: { value: unknown };
 		rejections: CandidateRejection[];
 		steps?: Map<string, SubcomputeCounts>;
 	};
-	const bound = new WeakMap<ExecutionCall, Bound>();
+	type PredictionState =
+		| { readonly kind: "running"; readonly settled: Promise<void> }
+		| { readonly kind: "completed"; readonly producerRunID: string };
+	const calls = new WeakMap<ExecutionCall, CallRecord>();
 	const measured = <T>(call: ExecutionCall, execute: () => T) =>
-		service ? service.withMetrics(bound.get(call)!.steps ??= new Map(), execute) : execute();
-	const attribution = new WeakMap<ExecutionCall, Prediction>();
+		service ? service.withMetrics(calls.get(call)!.steps ??= new Map(), execute) : execute();
 	const subscriptions = new RuntimeSubscriptions<AgentRuntimeEvents>();
 	const pending = new PendingTasks();
 	const turns = new Map<string, GeneratorTurn>();
@@ -716,7 +719,8 @@ function assembleAgentExecutionHost(
 			lastDecision: number;
 			run: SpeculativeRun<ToolSettlement>;
 			after?: string;
-			producer?: string;
+			descriptor?: CandidateEventDescriptor;
+			state: PredictionState;
 		}
 	>();
 	const lastActor = new Map<string, AgentRuntimeEvents["actor_materialized"]["identity"]>();
@@ -804,19 +808,19 @@ function assembleAgentExecutionHost(
 					resourceCacheMaxBytes: currentSettings.resourceCacheMaxBytes,
 				}),
 				effect: (key) => actionSemantics.effect(key),
-				key: async (call) => bound.get(call)?.binding.action,
+				key: async (call) => calls.get(call)?.binding.action,
 				route: async (_call, key, signal, parent) =>
 					resolveExecutionRoute(key.tool, signal, key, parent?.checkpoint),
 				authorize: async (call, key, route, signal, recheck) => {
 					const action = (key.executionContext as ToolInvocation | undefined)?.operation?.permission ?? key;
 					return checkPermission(
-						bound.get(call)?.tool,
+						calls.get(call)?.tool,
 						{ toolName: call.tool, args: action.input, action, route, signal },
 						recheck,
 					);
 				},
 				fork: async (call, action, route, callID, signal, resources, parent) => {
-					const { tool, turnID } = bound.get(call)!;
+					const { tool, turnID } = calls.get(call)!;
 					if (!tool) throw new Error("tool_unavailable");
 					const scope = { sessionID, turnID, callID };
 					const runFork = () =>
@@ -840,7 +844,7 @@ function assembleAgentExecutionHost(
 					return service ? service.run(() => measured(call, runFork)) : runFork();
 				},
 				capture: async (call, action, signal) => {
-					const { tool, turnID, binding } = bound.get(call)!;
+					const { tool, turnID, binding } = calls.get(call)!;
 					if (!tool) return;
 					const definition = binding.invocation?.semantics ?? actionSemantics.definition(action ?? call.tool);
 					const captured = await executionGateway.captureAuthoritativeResult(
@@ -874,7 +878,7 @@ function assembleAgentExecutionHost(
 					);
 				},
 				native: async (call, action, signal, resources, dependencies) => {
-					const state = bound.get(call)!;
+					const state = calls.get(call)!;
 					const { tool, turnID, binding, executor } = state;
 					const scope = { sessionID, turnID, callID: call.id };
 					const operation: AgentToolOperation = {
@@ -934,7 +938,7 @@ function assembleAgentExecutionHost(
 				reject: (output) => output.isError && output.exitCode === undefined,
 				writes: (paths) => service?.invalidate(paths),
 				observed: async (call, key, branch) => {
-					const state = bound.get(call)!;
+					const state = calls.get(call)!;
 					remember(key, state.tool, branch?.operations);
 					if (state.tools)
 						await prepareOperations(
@@ -943,10 +947,10 @@ function assembleAgentExecutionHost(
 							actionSemantics.effect(key) === "workspace_mutation",
 						);
 				},
-				rejection: (call, rejection) => bound.get(call)?.rejections.push(rejection),
+				rejection: (call, rejection) => calls.get(call)?.rejections.push(rejection),
 				event: (call, id, route, status, ms, branch, failure) => {
-					const state = bound.get(call)!;
-					const pred = attribution.get(call);
+					const state = calls.get(call)!;
+					const pred = state.prediction;
 					const operation = (state.binding.action?.executionContext as ToolInvocation | undefined)?.operation;
 					const source = operation ? "backend" : (pred?.source ?? "actor_result");
 					const descriptor: CandidateEventDescriptor = {
@@ -969,7 +973,10 @@ function assembleAgentExecutionHost(
 							? { world: { backend: branch.backend, executionMetrics: branch.executionMetrics } }
 							: {}),
 					};
+					owners.delete(id);
 					owners.set(id, descriptor);
+					const activePrediction = predictions.get(id);
+					if (activePrediction) activePrediction.descriptor = descriptor;
 					if (
 						owners.size >
 						currentSettings.resourceCacheMaxEntries + (currentSettings.maxConcurrentActions ?? 1)
@@ -1060,8 +1067,7 @@ function assembleAgentExecutionHost(
 				const key = binding.action;
 				if (!key || signal.aborted || opts.signal?.aborted) return;
 				const call: ExecutionCall = { tool: tool.name, input: asRecord(args) ?? {}, id: prediction.id };
-				bound.set(call, { tool, turnID, binding, rejections: [] });
-				attribution.set(call, prediction);
+				calls.set(call, { tool, turnID, binding, prediction, rejections: [] });
 				const effect = actionSemantics.effect(key) ?? "unbounded";
 				const after = effect !== "observation" ? (opts.previousWrite ?? opts.after) : opts.after;
 				const run = measured(call, () => session.speculate(call, {
@@ -1075,7 +1081,7 @@ function assembleAgentExecutionHost(
 						proposalID: prediction.group,
 						actionID: prediction.id,
 					};
-					const p = {
+					const p: NonNullable<ReturnType<typeof predictions.get>> = {
 						identity,
 						prediction,
 						key,
@@ -1083,7 +1089,21 @@ function assembleAgentExecutionHost(
 						run,
 						after,
 						lastDecision: sequenceAtStart + (prediction.latestHorizon ?? prediction.horizon ?? 0),
-						producer: undefined as string | undefined,
+						descriptor: owners.get(run.runID),
+						state: {
+							kind: "running",
+							settled: run.completion.then((completion) => {
+								if (completion.status === "completed")
+									p.state = { kind: "completed", producerRunID: completion.producerRunID ?? run.runID };
+								else if (predictions.has(run.runID))
+									settlePrediction(
+										run.runID,
+										p,
+										{ prediction: identity, observation: "unobserved", cause: cause("admission", completion.reason) },
+										false,
+									);
+							}),
+						},
 					};
 					predictions.set(run.runID, p);
 					prediction.onIssued?.();
@@ -1109,16 +1129,6 @@ function assembleAgentExecutionHost(
 						adoptionProbability: prediction.adoptionProbability,
 						empiricalProbability: prediction.empiricalProbability,
 						conditionalProbability: prediction.conditionalProbability,
-					});
-					void run.completion.then((result) => {
-						if (result.status === "completed") p.producer = result.producerRunID ?? run.runID;
-						else if (predictions.has(run.runID))
-							settlePrediction(
-								run.runID,
-								p,
-								{ prediction: identity, observation: "unobserved", cause: cause("admission", result.reason) },
-								false,
-							);
 					});
 				}
 				return { key, run, effect };
@@ -1222,7 +1232,7 @@ function assembleAgentExecutionHost(
 									},
 								});
 								const call: ExecutionCall = { tool: tool.name, input: key.input };
-								bound.set(call, { tool, turnID, binding: { action: op }, rejections: [] });
+								calls.set(call, { tool, turnID, binding: { action: op }, rejections: [] });
 								const run = measured(call, () => local.speculate(call));
 								void run.completion.then(() => local.release(run.runID));
 							})(),
@@ -1322,8 +1332,8 @@ function assembleAgentExecutionHost(
 					tool && stableValueHash(tool.parameters ?? null),
 					tool,
 				);
-				const state: Bound = { binding, tool, turnID, tools: input.tools, executor, rejections: [] };
-				bound.set(call, state);
+				const state: CallRecord = { binding, tool, turnID, tools: input.tools, executor, rejections: [] };
+				calls.set(call, state);
 				const action = binding.action;
 				if (action)
 					void subscriptions.publish("actor_materialized", {
@@ -1338,19 +1348,28 @@ function assembleAgentExecutionHost(
 				const durationMs = result.toolExecution.completedAt - result.toolExecution.startedAt;
 				const roots = [{ computation: result.toolExecution, reused: result.reusedInterval ?? result.served }];
 				const computation = timeline.recordCall(roots, issued, performance.now());
-				const candidate = (result.producerRunID && owners.get(result.producerRunID)) || undefined;
+				const candidate = result.producerRunID
+					? (owners.get(result.producerRunID) ?? predictions.get(result.producerRunID)?.descriptor)
+					: undefined;
 				const adopted = TimelineInterval.reusedProducers(roots);
 				const matched: PredictionIdentity[] = [];
 				const match = {
 					kind: result.reuseKind ?? "exact",
 					distance: result.reuseKind === "inputs" ? 1 : 0,
 				} as const;
-				if (result.served) await Promise.resolve(); // Deliver already settled run receipts before attribution.
+				if (result.served)
+					await Promise.all(
+						[...predictions.values()].map((p) =>
+							p.state.kind === "running"
+								? Promise.race([p.state.settled, Promise.resolve().then(() => undefined)])
+								: undefined,
+						),
+					);
 				for (const [id, p] of predictions) {
 					const relation = action && actionKeyMatch(p.key, action);
 					if (relation) matched.push(p.identity);
 					const credit = () => {
-						const producer = p.producer ?? id;
+						const producer = p.state.kind === "completed" ? p.state.producerRunID : id;
 						const served = (result.served && producer === result.producerRunID) || adopted.has(producer);
 						if (!relation && !served) return;
 						const fact = { prediction: p.identity, observation: "observed" as const, actorAction: identity };
@@ -1373,11 +1392,11 @@ function assembleAgentExecutionHost(
 					};
 					if (
 						result.served && result.producerRunID && match.kind === "exact" && relation &&
-						!p.after && !p.producer && id !== result.producerRunID
+						!p.after && p.state.kind === "running" && id !== result.producerRunID
 					) {
 						// Reserve this observation while the equivalent root handle confirms its physical producer.
 						predictions.delete(id);
-						void pending.track(p.run.completion.then(credit));
+						void pending.track(p.state.settled.then(credit));
 					} else credit();
 				}
 				lastActor.set(turnID, identity);

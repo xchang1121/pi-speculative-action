@@ -628,6 +628,9 @@ type ResourceInputLookup = (
 	target?: string,
 	preparation?: PreparationLookup,
 ) => Iterable<ResourceInputSource> | AsyncIterable<ResourceInputSource>;
+type PreparedSharingState =
+	| { readonly kind: "building"; requiresProofs: boolean; readonly waiters: Set<() => void> }
+	| { readonly kind: "settled"; readonly shareable: boolean };
 type PreparedResource = {
 	readonly cancellation: SharedAbortScope;
 	readonly waiting: Set<PreparedResource>;
@@ -637,20 +640,56 @@ type PreparedResource = {
 	readonly dispose: () => void | Promise<void>;
 	readonly resource?: string;
 	dependencies?: ReadonlySet<string>;
-	readonly boundary?: {
-		readonly root: string;
-		readonly physicalRoot: string;
-	};
+	readonly boundary?: { readonly root: string; readonly physicalRoot: string };
 	readonly origin: ResourceReadView;
 	destination: ResourceReadView;
 	ready?: Promise<void>;
-	readonly declined: Promise<void>;
-	readonly composed?: Promise<void>;
+	sharing: PreparedSharingState;
 	borrowers: number;
 	phase: "building" | "retained" | "revoked";
-	shareable?: boolean;
 	proofs?: ResourceVersionToken[];
 };
+function updatePreparedSharing(
+	resource: PreparedResource,
+	next: "proof_acceptors" | { readonly kind: "settled"; readonly shareable: boolean },
+): void {
+	if (resource.sharing.kind !== "building") return;
+	const { waiters } = resource.sharing;
+	if (next === "proof_acceptors") resource.sharing.requiresProofs = true;
+	else resource.sharing = next;
+	for (const wake of [...waiters]) wake();
+	if (next !== "proof_acceptors") waiters.clear();
+}
+async function waitForPreparedSharing(
+	resource: PreparedResource,
+	building: boolean,
+	owner: ResourceReadView,
+	acceptsProofs: boolean,
+): Promise<boolean> {
+	if (building) return resource.ready!.then(() => true);
+	if (resource.phase === "retained" && resource.destination === owner) return true;
+	const current = () => resource.sharing;
+	const initial = current();
+	if (initial.kind === "building") {
+		const { waiters } = initial;
+		await new Promise<void>((resolve) => {
+			const wake = () => {
+				const state = current();
+				if (state.kind === "settled" || (!acceptsProofs && state.requiresProofs)) {
+					waiters.delete(wake);
+					resolve();
+				}
+			};
+			waiters.add(wake);
+			wake();
+		});
+		const after = current();
+		if (after.kind === "building" || !after.shareable) return false;
+		await resource.ready;
+	}
+	const settled = current();
+	return settled.kind === "settled" && settled.shareable && (!resource.proofs?.length || acceptsProofs);
+}
 function preparationWaitsFor(resource: PreparedResource, target: PreparedResource): boolean {
 	const pending = new Set([resource]);
 	for (const current of pending) {
@@ -659,6 +698,32 @@ function preparationWaitsFor(resource: PreparedResource, target: PreparedResourc
 	}
 	return false;
 }
+type ResourceViewMode = "capturing" | "sealed" | "read_only" | "read_through";
+type ResourceEvaluationContext = {
+	dependencies?: Set<string>;
+	lookup?: ResourceInputLookup;
+	missing?: () => Promise<ResourceInputSource>;
+	observed?: ResourceInputSource["observed"];
+	validateInputs?: (proofs: readonly ResourceVersionToken[]) => Promise<void>;
+	acceptProofs?: (proofs: readonly ResourceVersionToken[]) => readonly ResourceVersionToken[];
+	onForeignInputs?: (transferable: boolean) => void;
+	collectProofs?: Map<ResourceVersionToken["observations"], ResourceVersionToken>;
+	preparing?: PreparedResource;
+	foreignInputs: boolean;
+};
+type ResourceViewOptions = Partial<
+	Pick<ResourceReadView, "contents" | "verifyingInputs"> & {
+		readonly mode: ResourceViewMode;
+		readonly owner: ResourceReadView;
+		readonly entries: ResourceReadView["entries"];
+		readonly prepared: ResourceReadView["prepared"];
+		readonly boundary: ResourceReadView["boundary"];
+		readonly load: ResourceReadView["load"];
+		readonly observeObject: ResourceReadView["observeObject"];
+		readonly memory: ResourceInputMemory;
+		readonly evaluation: ResourceEvaluationContext;
+	}
+>;
 /** Token-owned input data, not a filesystem cache or authority to execute host functions. */
 export class ResourceReadView {
 	computeStep = <Value>(
@@ -666,13 +731,13 @@ export class ResourceReadView {
 		calculate: (view: ToolFilesystemOperations, signal: AbortSignal) => Value | Promise<Value>,
 		signal?: AbortSignal,
 	): Promise<Value> => computeStepInView(this, request, calculate, signal);
-	private entries = new Map<
+	private readonly entries: Map<
 		string,
 		CapturedResource & {
 			readonly bytes: number;
 		}
-	>();
-	private owner?: ResourceReadView;
+	>;
+	private readonly owner?: ResourceReadView;
 	private failure?: Error;
 	private allocatedBytes = 0;
 	private readonly memory?: ResourceInputMemory;
@@ -685,21 +750,12 @@ export class ResourceReadView {
 	}
 	private objectCount = 0;
 	private inputEpoch = 0;
-	private mode: "capturing" | "sealed" | "read_only" | "read_through" = "capturing";
+	private mode: ResourceViewMode;
 	private get sealed() {
 		return this.mode !== "capturing";
 	}
 	private pending?: Promise<void>;
-	private dependencies?: Set<string>;
-	private lookup?: ResourceInputLookup;
-	private missing?: () => Promise<ResourceInputSource>;
-	private foreignInputs = false;
-	private onForeignInputs?: (transferable: boolean) => void;
-	private collectProofs?: Map<ResourceVersionToken["observations"], ResourceVersionToken>;
-	private observed?: ResourceInputSource["observed"];
-	private validateInputs?: (proofs: readonly ResourceVersionToken[]) => Promise<void>;
-	private acceptProofs?: (proofs: readonly ResourceVersionToken[]) => readonly ResourceVersionToken[];
-	private preparing?: PreparedResource;
+	private readonly evaluation?: ResourceEvaluationContext;
 	private prepared?: {
 		readonly lifetime: RuntimeLifecycleLane;
 		readonly bindings: Map<object | Sha256Digest, Map<string, PreparedResource>>;
@@ -715,22 +771,20 @@ export class ResourceReadView {
 	readonly contents?: ContentChunkPool;
 	private readonly contentOwners = new Set<ContentChunkPool>();
 	readonly verifyingInputs: boolean;
-	constructor(
-		maxBytes: number,
-		load?: (dependency: ResourceDependency) => Promise<void>,
-		boundary?: ResourceReadView["boundary"],
-		observeObject?: ResourceReadView["observeObject"],
-		storage?: ContentChunkPool | "verify",
-		memory?: ResourceInputMemory,
-	) {
+	constructor(maxBytes: number, options: ResourceViewOptions = {}) {
 		if (!Number.isFinite(maxBytes) || maxBytes < 0) throw new Error("resource_snapshot_budget_invalid");
 		this.maxBytes = maxBytes;
-		this.memory = memory;
-		this.load = load;
-		this.boundary = boundary;
-		this.observeObject = observeObject;
-		this.contents = storage instanceof ContentChunkPool ? storage : undefined;
-		this.verifyingInputs = storage === "verify";
+		this.mode = options.mode ?? "capturing";
+		this.owner = options.owner;
+		this.entries = options.entries ?? new Map();
+		this.prepared = options.prepared;
+		this.memory = options.memory;
+		this.load = options.load;
+		this.boundary = options.boundary;
+		this.observeObject = options.observeObject;
+		this.contents = options.contents;
+		this.verifyingInputs = options.verifyingInputs ?? false;
+		this.evaluation = options.evaluation;
 		if (this.contents) this.retainContentPool(this.contents);
 	}
 	get bytes(): number {
@@ -771,14 +825,16 @@ export class ResourceReadView {
 		return resources;
 	}
 	/** Read completed entries without allowing a borrower to load or seal its active owner. */
-	readOnly(load = false, memory = this.memory): ResourceReadView {
+	readOnly(load = false, memory = this.memory, evaluation?: ResourceEvaluationContext): ResourceReadView {
 		this.assertComplete();
-		return Object.assign(new ResourceReadView(0, undefined, undefined, undefined, undefined, memory), {
-			entries: this.entries,
-			owner: this,
+		return new ResourceReadView(0, {
 			mode: load ? "read_through" : "read_only",
+			owner: this,
+			entries: this.entries,
 			boundary: this.boundary,
 			prepared: this.prepared,
+			memory,
+			evaluation,
 		});
 	}
 	/** Keep proven path metadata; payloads and preparations remain with their original owner. */
@@ -792,7 +848,7 @@ export class ResourceReadView {
 		// The root proof still anchors queries whose retained metadata belongs to another token.
 		let retained =
 			this.boundary?.dependency && observations.has(this.boundary.dependency)
-				? new ResourceReadView(maxBytes, undefined, this.boundary, undefined, undefined, memory)
+				? new ResourceReadView(maxBytes, { boundary: this.boundary, memory })
 				: undefined;
 		for (const observation of observations.values())
 			for (let target: string | undefined = filesystemPathKey(observation.path); target;) {
@@ -803,7 +859,7 @@ export class ResourceReadView {
 						? entry.metadata.dependency
 						: entry.dependency;
 				if (!dependency || !observations.has(dependency)) break;
-				retained ??= new ResourceReadView(maxBytes, undefined, undefined, undefined, undefined, memory);
+				retained ??= new ResourceReadView(maxBytes, { memory });
 				retained.capture(target, resourceMetadata(entry, dependency));
 				if (!retained.retained) {
 					void retained.dispose();
@@ -1013,7 +1069,11 @@ export class ResourceReadView {
 		return { content: entry.content, computation: entry.computation };
 	}
 	async validateObserved(): Promise<void> {
-		const proofs = [...(this.observed?.(this.dependencies, false) ?? []), ...(this.collectProofs?.values() ?? [])];
+		const evaluation = this.evaluation;
+		const proofs = [
+			...(evaluation?.observed?.(evaluation.dependencies, false) ?? []),
+			...(evaluation?.collectProofs?.values() ?? []),
+		];
 		if ((await validateResourceVersion(proofs, true)).expired) throw new Error("subcompute_inputs_changed");
 	}
 	/** A process borrows the same captured kernel object without inheriting the tool's OFD offset. */
@@ -1100,32 +1160,23 @@ export class ResourceReadView {
 					cached.boundary?.root === this.boundary?.root &&
 					cached.boundary?.physicalRoot === this.boundary?.physicalRoot;
 				const use = async (cached: PreparedResource, building = false, source?: ResourceInputSource) => {
-					if (this.preparing && preparationWaitsFor(cached, this.preparing)) return undefined;
-					this.preparing?.waiting.add(cached);
+					const context = this.evaluation;
+					if (context?.preparing && preparationWaitsFor(cached, context.preparing)) return undefined;
+					context?.preparing?.waiting.add(cached);
 					cached.borrowers++;
 					const withdraw = cached.cancellation.acquire(signal);
 					let accepted = building;
 					try {
 						// A composed waiter must take its own proof references before the producer can retire.
-						const ready = building
-							? cached.ready!.then(() => true)
-							: cached.phase === "retained" && cached.destination === owner
-								? Promise.resolve(true)
-								: Promise.race([
-										cached.ready!.then(() => cached.shareable),
-										cached.declined.then(() => cached.shareable),
-										...(!this.acceptProofs && cached.composed
-											? [cached.composed.then(() => cached.shareable && !cached.proofs?.length)]
-											: []),
-									]).then((shareable) => shareable && (!cached.proofs?.length || !!this.acceptProofs));
+						const ready = waitForPreparedSharing(cached, building, owner, Boolean(context?.acceptProofs));
 						const readiness = await waitForCompletion(ready, signal);
 						signal?.throwIfAborted();
 						if (readiness.status !== "completed" || !readiness.value) return undefined;
 						if (registration && !registration.accepts(cached.value))
 							throw new Error("resource_preparation_data_invalid");
 						const dependencies =
-							cached.origin === owner && cached.dependencies && this.dependencies
-								? new Set([...this.dependencies, ...cached.dependencies])
+							cached.origin === owner && cached.dependencies && context?.dependencies
+								? new Set([...context.dependencies, ...cached.dependencies])
 								: undefined;
 						const sourceDependencies =
 							source && cached.origin.entries === source.view.entries ? cached.dependencies : undefined;
@@ -1144,19 +1195,19 @@ export class ResourceReadView {
 						return await cached.destination.prepared!.lifetime.admit(async () => {
 							this.assertComplete();
 							cached.destination.assertComplete();
-							await this.validateInputs?.([...(this.observed?.(dependencies, false) ?? []), ...proofs]);
+							await context?.validateInputs?.([...(context.observed?.(dependencies, false) ?? []), ...proofs]);
 							signal?.throwIfAborted();
 							accepted = true;
-							this.dependencies = dependencies;
+							if (context) context.dependencies = dependencies;
 							// Retain the validated proof before effects; its source may already have retired.
 							const transferred =
-								this.acceptProofs &&
+								context?.acceptProofs &&
 								proofs.length &&
 								(source || cached.phase !== "retained" || cached.destination !== owner);
 							if (transferred) {
-								for (const proof of this.acceptProofs!(proofs))
-									this.collectProofs?.set(proof.observations, proof);
-								this.onForeignInputs?.(true);
+								for (const proof of context.acceptProofs!(proofs))
+									context.collectProofs?.set(proof.observations, proof);
+								context.onForeignInputs?.(true);
 							} else if (source) this.observeSource(source)(sourceDependencies);
 							const evaluation = await TimelineInterval.measure(() =>
 								consume(cached.value as Parameters<typeof consume>[0], cached.computation),
@@ -1165,7 +1216,7 @@ export class ResourceReadView {
 							return TimelineInterval.outside(() => {
 								TimelineInterval.use(cached.computation);
 								this.assertComplete();
-								if (!transferred && !(this.acceptProofs && cached.origin === owner && cached.dependencies))
+								if (!transferred && !(context?.acceptProofs && cached.origin === owner && cached.dependencies))
 									cached.destination.assertComplete();
 								return { value: evaluation.output };
 							});
@@ -1176,7 +1227,7 @@ export class ResourceReadView {
 						signal?.throwIfAborted();
 						return undefined;
 					} finally {
-						this.preparing?.waiting.delete(cached);
+						context?.preparing?.waiting.delete(cached);
 						withdraw();
 						if (!--cached.borrowers && cached.phase !== "retained") {
 							const released = TimelineInterval.outside(() =>
@@ -1188,7 +1239,7 @@ export class ResourceReadView {
 				};
 				const reused = cached && compatible(cached) && (await use(cached));
 				if (reused) return reused.value;
-				for await (const source of this.lookup?.(target, { binding: registration?.id, key }) ?? []) {
+				for await (const source of this.evaluation?.lookup?.(target, { binding: registration?.id, key }) ?? []) {
 					const cached = source.view.prepared?.bindings.get(identity)?.get(key);
 					if (
 						source.view.entries === this.entries ||
@@ -1201,12 +1252,12 @@ export class ResourceReadView {
 					const result = await use(cached, false, source);
 					if (result) return result.value;
 				}
+				const context = this.evaluation;
 				const inputEpoch = owner.inputEpoch; // Rejected old sources precede this new computation.
 				let resource: Awaited<ReturnType<typeof build>> | undefined;
+				let shareable = false;
 				let charged = 0;
 				let computationBytes = 0;
-				const declined = Promise.withResolvers<void>();
-				const composed = this.acceptProofs && Promise.withResolvers<void>();
 				const name = target && filesystemPathKey(target);
 				const pending: PreparedResource = {
 					phase: "building",
@@ -1217,8 +1268,7 @@ export class ResourceReadView {
 					boundary: this.boundary,
 					cancellation: new SharedAbortScope(),
 					waiting: new Set(),
-					declined: declined.promise,
-					composed: composed?.promise,
+					sharing: { kind: "building", requiresProofs: false, waiters: new Set() },
 					dispose: async () => {
 						try {
 							await pending.ready?.catch(() => undefined);
@@ -1233,8 +1283,11 @@ export class ResourceReadView {
 						}
 					},
 				};
-				let entries = prepared.bindings.get(identity);
-				if (!entries) prepared.bindings.set(identity, (entries = new Map()));
+				const retainProofs = (proofs: Iterable<ResourceVersionToken>) => {
+					for (const proof of proofs)
+						(pending.proofs ??= []).push(proof.manager.retain({ ...proof, view: undefined }, undefined, this.memory));
+				};
+				const entries = this.bindingEntries(prepared, identity);
 				if (
 					!entries.has(key) ||
 					(entries.get(key)!.phase !== "retained" && entries.get(key)!.cancellation.signal.aborted)
@@ -1243,14 +1296,15 @@ export class ResourceReadView {
 				pending.ready = prepared.lifetime.track(
 					this.evaluate(
 						async (view) => {
-							view.preparing = pending;
-							const foreign = view.onForeignInputs;
-							view.onForeignInputs = (transferable) => {
-								if (transferable) composed?.resolve();
-								else declined.resolve();
+							const frame = view.evaluation!;
+							frame.preparing = pending;
+							const foreign = frame.onForeignInputs;
+							frame.onForeignInputs = (transferable) => {
+								if (transferable) updatePreparedSharing(pending, "proof_acceptors");
+								else updatePreparedSharing(pending, { kind: "settled", shareable: false });
 								foreign?.(transferable);
 							};
-							view.collectProofs = this.acceptProofs ? new Map() : undefined;
+							frame.collectProofs = context?.acceptProofs ? new Map() : undefined;
 							const evaluation = await TimelineInterval.measure(() =>
 								build(view, pending.cancellation.signal),
 							);
@@ -1258,28 +1312,21 @@ export class ResourceReadView {
 							pending.computation = TimelineInterval.own(evaluation.computation);
 							pending.cancellation.signal.throwIfAborted();
 							computationBytes = serialize(TimelineInterval.serialize(pending.computation)).byteLength;
-							pending.shareable = !view.foreignInputs && resource.cacheable !== false;
-							if (pending.shareable && view.collectProofs?.size)
-								for (const proof of view.collectProofs.values())
-									(pending.proofs ??= []).push(
-										proof.manager.retain({ ...proof, view: undefined }, undefined, this.memory),
-									);
+							shareable = !frame.foreignInputs && resource.cacheable !== false;
+							if (!shareable) updatePreparedSharing(pending, { kind: "settled", shareable: false });
+							else if (frame.collectProofs?.size) retainProofs(frame.collectProofs.values());
 						},
 						(observed, commit) => {
-							if (commit === false) return observed && this.observed?.(observed, false);
+							if (commit === false) return observed && context?.observed?.(observed, false);
 							pending.dependencies = observed;
-							if (owner.sealed && this.missing && observed) {
-								const proofs = this.observed?.(observed, false);
+							if (owner.sealed && context?.missing && observed) {
+								const proofs = context.observed?.(observed, false);
 								if (
 									!proofs ||
 									[...observed].some((key) => !proofs.some((proof) => proof.observations.has(key)))
 								)
 									pending.dependencies = undefined;
-								else
-									for (const proof of proofs)
-										(pending.proofs ??= []).push(
-											proof.manager.retain({ ...proof, view: undefined }, undefined, this.memory),
-										);
+								else retainProofs(proofs);
 							}
 						},
 					).then(async () => {
@@ -1296,7 +1343,7 @@ export class ResourceReadView {
 							preparationMetadataBytes(key, name, pending.dependencies ?? []);
 						if (!isSafeCount(resource.bytes)) throw new Error("resource_snapshot_budget_invalid");
 						const destination = (pending.destination =
-							owner.sealed && this.missing ? (await this.missing()).view : owner);
+							owner.sealed && context?.missing ? (await context.missing()).view : owner);
 						pending.cancellation.signal.throwIfAborted();
 						this.assertComplete();
 						destination.assertComplete();
@@ -1308,8 +1355,7 @@ export class ResourceReadView {
 							!destination.sealed &&
 							bytes <= destination.remainingBytes
 						) {
-							let entries = retention.bindings.get(identity);
-							if (!entries) retention.bindings.set(identity, (entries = new Map()));
+							const entries = this.bindingEntries(retention, identity);
 							if (!entries.has(key) || entries.get(key) === pending) {
 								pending.phase = "retained";
 								charged = bytes;
@@ -1317,13 +1363,13 @@ export class ResourceReadView {
 								destination.capturedBytes += bytes;
 							}
 						}
+						updatePreparedSharing(pending, { kind: "settled", shareable });
 						// The origin keeps a borrowed lookup; the destination owns its bytes and disposal.
 					}),
 				);
 				void pending.ready
 					.finally(() => {
-						declined.resolve();
-						composed?.resolve();
+						updatePreparedSharing(pending, { kind: "settled", shareable: false });
 					})
 					.catch(() => {});
 				return (await use(pending, true))!.value;
@@ -1339,32 +1385,33 @@ export class ResourceReadView {
 					readonly root: string;
 					readonly physicalRoot: string;
 			  },
-		lookup = this.lookup,
-		missing = this.missing,
-		acceptProofs = this.acceptProofs,
-		validateInputs = this.validateInputs,
+		lookup = this.evaluation?.lookup,
+		missing = this.evaluation?.missing,
+		acceptProofs = this.evaluation?.acceptProofs,
+		validateInputs = this.evaluation?.validateInputs,
 		memory = this.memory,
 	): Promise<T> {
 		return collectResourceComputation(async () => {
-			const view = this.readOnly(true, memory);
-			view.dependencies = new Set();
-			Object.assign(view, {
+			const frame: ResourceEvaluationContext = {
+				dependencies: new Set(),
 				lookup,
 				missing,
 				acceptProofs,
 				observed,
 				validateInputs,
-				onForeignInputs: this.onForeignInputs,
-				collectProofs: this.collectProofs,
-				preparing: this.preparing,
-			});
+				onForeignInputs: this.evaluation?.onForeignInputs,
+				collectProofs: this.evaluation?.collectProofs,
+				preparing: this.evaluation?.preparing,
+				foreignInputs: false,
+			};
+			const view = this.readOnly(true, memory, frame);
 			try {
 				if (typeof root === "object") view.boundary = { root: root.root, physicalRoot: root.physicalRoot };
 				else if (
 					root === undefined ||
 					(this.boundary && filesystemPathKey(root) === filesystemPathKey(this.boundary.root))
 				) {
-					if (this.boundary?.dependency) view.dependencies.add(this.boundary.dependency);
+					if (this.boundary?.dependency) frame.dependencies!.add(this.boundary.dependency);
 				} else if (filesystemPathKey(root) === filesystemPathKey(path.parse(root).root)) {
 					view.boundary = { root, physicalRoot: root };
 				} else {
@@ -1375,8 +1422,8 @@ export class ResourceReadView {
 				const output = await operation(view);
 				await TimelineInterval.outside(() => {
 					view.assertComplete();
-					this.foreignInputs ||= view.foreignInputs;
-					observed?.(view.dependencies);
+					if (this.evaluation) this.evaluation.foreignInputs ||= frame.foreignInputs;
+					observed?.(frame.dependencies);
 				});
 				return output;
 			} finally {
@@ -1434,14 +1481,11 @@ export class ResourceReadView {
 		const sources = [...new Set([this, ...inputs])];
 		const aggregate =
 			sources.length > 1
-				? new ResourceReadView(
-						this.remainingBytes,
-						undefined,
-						this.boundary,
-						undefined,
-						this.contents,
-						this.memory,
-					)
+				? new ResourceReadView(this.remainingBytes, {
+						boundary: this.boundary,
+						contents: this.contents,
+						memory: this.memory,
+					})
 				: this;
 		try {
 			if (aggregate !== this)
@@ -1525,7 +1569,7 @@ export class ResourceReadView {
 						prepared.phase !== "retained" ||
 						!prepared.data ||
 						prepared.destination !== this ||
-						!prepared.shareable ||
+						!(prepared.sharing.kind === "settled" && prepared.sharing.shareable) ||
 						!prepared.dependencies ||
 						key.length > speculativeConfig().subcomputation.maxStepObjectNodes ||
 						(prepared.resource && !containsFilesystemPath(this.boundary.root, prepared.resource)) ||
@@ -1633,6 +1677,11 @@ export class ResourceReadView {
 			bindings: new Map(),
 		});
 	}
+	private bindingEntries(prepared = this.preparations(), binding: object | Sha256Digest) {
+		let entries = prepared.bindings.get(binding);
+		if (!entries) prepared.bindings.set(binding, (entries = new Map()));
+		return entries;
+	}
 	private retainPreparation(
 		binding: object | Sha256Digest,
 		key: string,
@@ -1641,19 +1690,17 @@ export class ResourceReadView {
 		metadata: Pick<PreparedResource, "resource" | "dependencies" | "boundary" | "computation">,
 	) {
 		const prepared = this.preparations();
-		let entries = prepared.bindings.get(binding);
-		if (!entries) prepared.bindings.set(binding, (entries = new Map()));
+		const entries = this.bindingEntries(prepared, binding);
 		const retained: PreparedResource = {
 			...metadata,
 			origin: this,
 			destination: this,
 			borrowers: 0,
 			phase: "retained",
-			shareable: true,
+			sharing: { kind: "settled", shareable: true },
 			cancellation: new SharedAbortScope(),
 			waiting: new Set(),
 			ready: Promise.resolve(),
-			declined: Promise.resolve(),
 			...snapshot,
 			dispose: () => {
 				if (entries!.get(key) === retained) entries!.delete(key);
@@ -1687,22 +1734,23 @@ export class ResourceReadView {
 		}
 		let entry: CapturedResource | undefined;
 		let resolved = filesystemPathKey(target);
+		const evaluation = this.evaluation;
 		try {
 			// Probe only this read; rejected aliases leave neither dependencies nor computation receipts.
-			({ entry, resolved } = this.validateInputs
+			({ entry, resolved } = evaluation?.validateInputs
 				? await this.evaluate(
 						async (view) => {
 							const input = view.entry(target, followsResource(scope), scope);
 							if (input.entry || input.resolved !== resolved)
 								await TimelineInterval.outside(() =>
-									this.validateInputs!(this.observed?.(view.dependencies, false) ?? []),
+									evaluation.validateInputs!(evaluation.observed?.(view.evaluation?.dependencies, false) ?? []),
 								);
 							return input;
 						},
 						(observed) => {
-							if (!observed) this.dependencies = undefined;
-							else if (this.dependencies)
-								for (const dependency of observed) this.dependencies.add(dependency);
+							if (!observed) evaluation.dependencies = undefined;
+							else if (evaluation.dependencies)
+								for (const dependency of observed) evaluation.dependencies.add(dependency);
 						},
 						this.boundary,
 					)
@@ -1720,7 +1768,7 @@ export class ResourceReadView {
 		}
 		// The local alias proof owns this translation; the source owns the resolved resource.
 		for (const query of resolved === filesystemPathKey(target) ? [target] : [resolved, target])
-			for await (const source of this.lookup?.(query) ?? []) {
+			for await (const source of evaluation?.lookup?.(query) ?? []) {
 				if (source.view.entries === this.entries || !source.view.retained) continue;
 				try {
 					source.view.assertComplete(true);
@@ -1736,7 +1784,7 @@ export class ResourceReadView {
 						async (view) => {
 							const entry = await view.get(query, scope);
 							await TimelineInterval.outside(() =>
-								this.validateInputs?.(source.observed(view.dependencies, false) ?? []),
+								evaluation?.validateInputs?.(source.observed(view.evaluation?.dependencies, false) ?? []),
 							);
 							return entry;
 						},
@@ -1747,9 +1795,9 @@ export class ResourceReadView {
 					/* An indexed name alone grants no coverage; another sealed owner may supply it. */
 				}
 			}
-		if (this.missing) {
+		if (evaluation?.missing) {
 			try {
-				const source = await this.missing();
+				const source = await evaluation.missing();
 				return await source.view.evaluate(
 					(view) => view.get(target, scope),
 					this.observeSource(source),
@@ -1765,12 +1813,13 @@ export class ResourceReadView {
 		return (dependencies: ReadonlySet<string> | undefined, commit = true) => {
 			const proofs = source.observed(dependencies, commit);
 			if (!commit) return proofs;
-			if (this.collectProofs && proofs?.length) {
-				for (const proof of proofs) this.collectProofs.set(proof.observations, proof);
-				this.onForeignInputs?.(true);
-			} else {
-				this.foreignInputs = true;
-				this.onForeignInputs?.(false);
+			const evaluation = this.evaluation;
+			if (evaluation?.collectProofs && proofs?.length) {
+				for (const proof of proofs) evaluation.collectProofs.set(proof.observations, proof);
+				evaluation.onForeignInputs?.(true);
+			} else if (evaluation) {
+				evaluation.foreignInputs = true;
+				evaluation.onForeignInputs?.(false);
 			}
 			return proofs;
 		};
@@ -1822,7 +1871,7 @@ export class ResourceReadView {
 		)
 			this.unproven(entry.realPath);
 		if (entry?.type === "alias") TimelineInterval.use(entry.computation);
-		if (entry && this.dependencies) {
+		if (entry && this.evaluation?.dependencies) {
 			const dependency =
 				entry.type !== "alias" &&
 				(scope === "type" ||
@@ -1831,8 +1880,8 @@ export class ResourceReadView {
 						!(entry.type === "file" && entry.content !== undefined)))
 					? (entry.metadata?.dependency ?? entry.dependency)
 					: entry.dependency;
-			if (dependency) this.dependencies.add(dependency);
-			else this.dependencies = undefined;
+			if (dependency) this.evaluation.dependencies.add(dependency);
+			else this.evaluation.dependencies = undefined;
 		}
 		return entry;
 	}
@@ -2192,18 +2241,15 @@ export class ResourceVersionManager {
 			);
 			let view: ResourceReadView;
 			try {
-				view = new ResourceReadView(
-					retainBytes - proofBytes,
-					undefined,
-					{
+				view = new ResourceReadView(retainBytes - proofBytes, {
+					boundary: {
 						root: this.root,
 						physicalRoot: payload.physicalRoot,
 						dependency: dependencyKey({ path: this.root, scope: "resolution" }),
 					},
-					undefined,
 					contents,
-					this.persistentInputs!.memory,
-				);
+					memory: this.persistentInputs!.memory,
+				});
 			} catch (error) {
 				observations.clear();
 				throw error;
@@ -2243,7 +2289,7 @@ export class ResourceVersionManager {
 					inputView: new WeakRef(view),
 					release,
 				};
-				const proof = new ResourceReadView(retainBytes, undefined, undefined, undefined, "verify");
+				const proof = new ResourceReadView(retainBytes, { verifyingInputs: true });
 				try {
 					if ((await this.inspect(token, false, proof)).expired) {
 						await release();
@@ -2439,11 +2485,10 @@ export class ResourceVersionManager {
 			view =
 				retainBytes === undefined
 					? undefined
-					: new ResourceReadView(
-							retainBytes,
-							dependencies ? undefined : (dependency) => capture([dependency]),
-							{ root: this.root, physicalRoot, dependency: boundaryKey },
-							dependencies
+					: new ResourceReadView(retainBytes, {
+							load: dependencies ? undefined : (dependency) => capture([dependency]),
+							boundary: { root: this.root, physicalRoot, dependency: boundaryKey },
+							observeObject: dependencies
 								? undefined
 								: (target, content) => {
 										if (
@@ -2472,12 +2517,13 @@ export class ResourceVersionManager {
 											}),
 										});
 									},
-							retainBytes !== undefined && this.persistentInputs
-								? (this.persistentInputs.contents ??
-										new ContentChunkPool(this.persistentInputs.store, this.persistentInputs.limits))
-								: undefined,
-							this.persistentInputs?.memory,
-						);
+							contents:
+								retainBytes !== undefined && this.persistentInputs
+									? (this.persistentInputs.contents ??
+											new ContentChunkPool(this.persistentInputs.store, this.persistentInputs.limits))
+									: undefined,
+							memory: this.persistentInputs?.memory,
+						});
 			if (view)
 				observations.set(boundaryKey, {
 					...boundary,
@@ -2772,8 +2818,18 @@ export class ResourceInputSession {
 		const store = this.configuration.store;
 		let catalog: ReturnType<typeof store.inputPathIndex> | undefined;
 		return async (target: string) => {
-			const limit = Math.min(store.limits.maxCertificates, speculativeConfig().filesystem.maxHistoryEntries);
-			const lookup = await (catalog ??= manager.assertPersistentStore().then(() => store.inputPathIndex(manager.root, limit, signal)));
+			if (!catalog) {
+				const limit = Math.min(store.limits.maxCertificates, speculativeConfig().filesystem.maxHistoryEntries);
+				const pending = manager
+					.assertPersistentStore()
+					.then(() => store.inputPathIndex(manager.root, limit, signal))
+					.catch((error) => {
+						if (catalog === pending) catalog = undefined;
+						throw error;
+					});
+				catalog = pending;
+			}
+			const lookup = await catalog;
 			return lookup(filesystemPathKey(path.resolve(manager.root, target)));
 		};
 	}
@@ -2842,9 +2898,6 @@ export class ResourceInputSession {
 				if (token) yield token;
 			}
 		};
-	}
-	recover(root: string, signal: AbortSignal, target?: string, preparation?: PreparationLookup) {
-		return this.reader(root, signal)(target, preparation);
 	}
 	async publish(
 		token: ResourceVersionToken,
@@ -3136,6 +3189,15 @@ async function fingerprintDependencies(
 			}
 		>
 	>();
+	const recordBinding = (target: string, captured: { info: BigIntStats; link?: string }) => {
+		if (!bindings || (!captured.info.isDirectory() && captured.link === undefined)) return;
+		const dependency = { path: target, scope: "binding" as const };
+		bindings.observations.set(dependencyKey(dependency), {
+			...dependency,
+			fingerprint: "binding",
+			stamp: digest([statStamp(captured.info), captured.link]),
+		});
+	};
 	const entries = new Map<string, ReturnType<typeof captureFilesystemEntry>>();
 	const capture = (target: string) => {
 		const key = filesystemPathKey(target);
@@ -3144,14 +3206,7 @@ async function fingerprintDependencies(
 		const pending = fingerprintIO(() => captureFilesystemEntry(target, undefined, filesystem))
 			.then((entry) => {
 				// Eager captures own namespace evidence; ordinary validation joins only pending reads.
-				if (bindings && (entry.info.isDirectory() || entry.link !== undefined)) {
-					const dependency = { path: target, scope: "binding" as const };
-					bindings.observations.set(dependencyKey(dependency), {
-						...dependency,
-						fingerprint: "binding",
-						stamp: digest([statStamp(entry.info), entry.link]),
-					});
-				}
+				recordBinding(target, entry);
 				return entry;
 			})
 			.finally(() => {
@@ -3441,14 +3496,7 @@ async function fingerprintDependencies(
 			for (const [relative, { captured }] of tree.entries) {
 				const current = path.join(target, relative);
 				entries.set(filesystemPathKey(current), Promise.resolve(captured));
-				if (bindings && (captured.info.isDirectory() || captured.link !== undefined)) {
-					const binding = { path: current, scope: "binding" as const };
-					bindings.observations.set(dependencyKey(binding), {
-						...binding,
-						fingerprint: "binding",
-						stamp: digest([statStamp(captured.info), captured.link]),
-					});
-				}
+				recordBinding(current, captured);
 			}
 			const children = await mapFilesystem([...tree.entries.keys()].sort(), async (relative) => ({
 				name: relative,

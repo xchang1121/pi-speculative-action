@@ -101,7 +101,7 @@ linux("native workspace captures and filesystem tools exchange independent file 
 		const reader = new ResourceInputSession({ store: f.store, internalCache: true }, memoryBudget);
 		try {
 			const values: string[] = [];
-			for await (const token of reader.recover(root, signal, other)) {
+			for await (const token of reader.reader(root, signal)(other)) {
 				const input = token.view?.snapshotInput(other);
 				if (input && "content" in input) values.push((await readContent(input.content)).toString());
 			}
@@ -290,23 +290,19 @@ linux("stops persistent recovery after a consumed input and releases its lease",
 		}
 		const restore = vi.spyOn(ResourceVersionManager.prototype, "restore");
 		await session.run(async () => {
-			for await (const token of session.recover(f.root, new AbortController().signal)) {
+			for await (const token of session.reader(f.root, new AbortController().signal)()) {
 				expect((await token.manager.validate(token)).expired).toBe(false);
 				break;
 			}
 		});
 		expect(restore).toHaveBeenCalledTimes(1);
 		restore.mockClear();
-		for await (const token of session.recover(
-			f.root,
-			new AbortController().signal,
-			path.join(f.root, "first"),
-		)) {
+		for await (const token of session.reader(f.root, new AbortController().signal)(path.join(f.root, "first"))) {
 			expect((await token.view!.readFile(path.join(f.root, "first"))).toString()).toBe("first");
 		}
 		expect(restore).toHaveBeenCalledTimes(1);
 		restore.mockClear();
-		for await (const _token of session.recover(f.root, new AbortController().signal, undefined, { key: "absent" }))
+		for await (const _token of session.reader(f.root, new AbortController().signal)(undefined, { key: "absent" }))
 			throw new Error("no prepared values were stored");
 		expect(restore).not.toHaveBeenCalled();
 	} finally {
@@ -562,7 +558,7 @@ linux("borrows persisted file versions on cold start without redundant SQLite wr
 				const surviving = [];
 				try {
 					for (const target of [third, fourth]) {
-						for await (const token of session.recover('/', signal, target)) {
+						for await (const token of session.reader('/', signal)(target)) {
 							const item = token.view?.snapshotInput(target);
 							if (item && 'content' in item) surviving.push([target, (await readContent(item.content)).toString()]);
 						}

@@ -460,7 +460,7 @@ test.skipIf(process.platform !== "linux")("a Bash write preserves independent fi
 		expect(fixture.backend.actorMetrics().wholeCommandPublished).toBe(0);
 		const target = path.join(fixture.workspace, "header.h");
 		const inputs: string[] = [];
-		for await (const token of session.recover(path.parse(target).root, new AbortController().signal, target)) {
+		for await (const token of session.reader(path.parse(target).root, new AbortController().signal)(target)) {
 			const file = token.view?.snapshotInput(target);
 			if (file && "content" in file) inputs.push((await readContent(file.content)).toString());
 		}

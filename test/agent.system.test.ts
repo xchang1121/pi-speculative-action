@@ -188,16 +188,15 @@ test.skipIf(process.platform !== "linux")(
 		try {
 			await f.start();
 			await f.ready();
-			const recover = vi
-				.spyOn(ResourceInputSession.prototype, "recover")
-				.mockImplementation(async function* () {
-					throw new Error("unexpected persistent discovery");
-				});
+			const cold = vi.fn(async function* () {
+				throw new Error("unexpected persistent discovery");
+			});
+			const recover = vi.spyOn(ResourceInputSession.prototype, "reader").mockReturnValue(cold);
 			try {
 				expect(textOutput(await f.execute("read", { path: "input.txt", offset: 2, limit: 1 }))).toContain(
 					"two",
 				);
-				expect(recover).not.toHaveBeenCalled();
+				expect(cold).not.toHaveBeenCalled();
 				expect(f.fallbacks).toEqual([]);
 			} finally {
 				recover.mockRestore();

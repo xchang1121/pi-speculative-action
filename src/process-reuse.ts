@@ -609,16 +609,18 @@ function contractCompatible(
 		certificate.result.replayProfile === "buffered_noninteractive"
 	);
 }
+type OwnershipState =
+	| { readonly kind: "unclaimed" }
+	| { readonly kind: "children"; count: number; consumed: boolean }
+	| {
+			readonly kind: "whole";
+			readonly apply: WeakRef<() => Promise<unknown>>;
+			readonly result: Promise<unknown>;
+			pending: boolean;
+	  };
 /** One-shot children and their enclosing branch share adoption authority. */
 export class ProcessHandoffOwnership {
-	private children = 0;
-	private claim?:
-		| "partial"
-		| {
-				readonly apply: WeakRef<() => Promise<unknown>>;
-				readonly result: Promise<unknown>;
-				pending: boolean;
-		  };
+	private state: OwnershipState = { kind: "unclaimed" };
 	private readonly observer?: WeakRef<(adoption: ExecutionOperationAdoption) => void>;
 	private readonly scopeOwner?: WeakRef<(scope: ExecutionScope, salvage?: boolean) => boolean>;
 	private readonly consumer?: ExecutionScope;
@@ -648,48 +650,55 @@ export class ProcessHandoffOwnership {
 		this.observer?.deref()?.(adoption);
 	}
 	get wholeClaimed(): boolean {
-		return typeof this.claim === "object";
+		return this.state.kind === "whole";
 	}
 	get pendingWhole(): Promise<unknown> | undefined {
-		return typeof this.claim === "object" && this.claim.pending ? this.claim.result : undefined;
+		return this.state.kind === "whole" && this.state.pending ? this.state.result : undefined;
 	}
 	claimChild(): ((consumed: boolean) => void) | undefined {
-		if (this.wholeClaimed) return;
-		this.children++;
+		if (this.state.kind === "whole") return;
+		const active =
+			this.state.kind === "children"
+				? this.state
+				: (this.state = { kind: "children", count: 0, consumed: false });
+		active.count++;
 		return releaseOnce((consumed: boolean) => {
-			this.children--;
-			if (consumed) this.claim = "partial";
+			active.count--;
+			if (consumed) active.consumed = true;
+			else if (active.count === 0 && !active.consumed && this.state === active)
+				this.state = { kind: "unclaimed" };
 		});
 	}
 	async commit<T>(apply: () => Promise<T>): Promise<T> {
-		const previous = this.claim;
-		if (typeof previous === "object" && previous.apply.deref() === apply)
+		const previous = this.state;
+		if (previous.kind === "whole" && previous.apply.deref() === apply)
 			return previous.result as Promise<T>;
-		if (previous || this.children)
+		if (previous.kind !== "unclaimed")
 			throw effectCommitFailure(
 				new Error(
-					previous === "partial"
+					previous.kind === "children" && previous.consumed
 						? "process execution was partially consumed"
 						: "process execution was already claimed",
 				),
 				"recoverable",
 			);
-		const claim = {
+		const state: Extract<OwnershipState, { kind: "whole" }> = {
+			kind: "whole",
 			apply: new WeakRef(apply),
 			pending: true,
 			result: Promise.resolve()
 				.then(apply)
 				.catch((error) => {
-					if (error instanceof EffectCommitFailure && error.disposition === "recoverable")
-						this.claim = undefined;
+					if (error instanceof EffectCommitFailure && error.disposition === "recoverable" && this.state === state)
+						this.state = { kind: "unclaimed" };
 					throw error;
 				})
 				.finally(() => {
-					claim.pending = false;
+					state.pending = false;
 				}),
 		};
-		this.claim = claim;
-		return claim.result;
+		this.state = state;
+		return state.result as Promise<T>;
 	}
 }
 export interface ProcessHandoff {
@@ -712,22 +721,18 @@ export interface ProcessExecutionBinding {
 	readonly scope: ExecutionScope;
 	readonly available: boolean;
 }
+type HandoffResult = {
+	readonly artifacts: VerifiedArtifactClosure;
+	readonly candidate: ProcessProvenanceCertificate;
+	readonly complete: boolean;
+	readonly executionMs: number;
+	readonly bytes: number;
+	readonly computation: TimelineInterval;
+};
 type HandoffState =
-	| {
-			readonly status: "running";
-			advance?: () => Promise<boolean>;
-	  }
-	| {
-			readonly status: "completed" | "retained";
-			readonly result?: {
-				readonly artifacts: VerifiedArtifactClosure;
-				readonly candidate: ProcessProvenanceCertificate;
-				readonly complete: boolean;
-				readonly executionMs: number;
-				readonly bytes: number;
-				readonly computation: TimelineInterval;
-			};
-	  };
+	| { readonly status: "running"; advance?: () => Promise<boolean> }
+	| { readonly status: "completed"; readonly result: HandoffResult }
+	| { readonly status: "retained" };
 type HandoffRecord = ReturnType<ProcessHandoffRegistry["reserve"]>;
 export type ProcessHandoffAcquisition<Plan> =
 	| {
@@ -800,7 +805,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		invocation: Invocation,
 	): ProcessExecutionBinding | undefined {
 		const record = this.record(key, handoff);
-		if (!record || record.state.status === "running" || !record.state.result?.complete) return;
+		if (!record || record.state.status !== "completed" || !record.state.result.complete) return;
 		return this.retainBinding(key, record, invocation, record.state.result.executionMs);
 	}
 	/** A completed native launch teaches preparation only; it has no result or adoption authority. */
@@ -811,22 +816,27 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		invocation: Invocation,
 		executionMs: number,
 	): ProcessExecutionBinding | undefined {
-		if (this.lifetime.sealed || !Number.isFinite(executionMs) || executionMs < 0) return;
-		const record = this.reserve(
-			key,
-			executablePath,
-			new ProcessHandoffOwnership(),
-			snapshotExecutionScope(scope),
-		);
+		if (this.lifetime.sealed || !Number.isFinite(executionMs) || executionMs < 0 || this.maxRetainedBytes <= 0) return;
+		const snapshot = immutableSnapshot(invocation);
+		if (!isImmutableSnapshot(snapshot)) return;
+		for (const previous of this.candidates(key))
+			if (
+				previous.state.status === "retained" &&
+				previous.scope?.sessionID === scope.sessionID &&
+				previous.executablePath === executablePath &&
+				previous.binding &&
+				stableEqual(this.invocations.get(previous.binding)?.value, snapshot)
+			) {
+				this.invocations.get(previous.binding)!.executionMs = executionMs;
+				return previous.binding;
+			}
+		const record = this.reserve(key, executablePath, new ProcessHandoffOwnership(), snapshotExecutionScope(scope));
 		record.state = { status: "retained" };
 		this.completedCount++;
 		record.settle();
-		let binding: ProcessExecutionBinding | undefined;
-		try {
-			return (binding = this.retainBinding(key, record, invocation, executionMs));
-		} finally {
-			if (!binding) this.remove(record);
-		}
+		const binding = this.retainBinding(key, record, snapshot, executionMs);
+		if (!binding) this.remove(record);
+		return binding;
 	}
 	private retainBinding(
 		key: Sha256Digest,
@@ -839,24 +849,6 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		if (!isImmutableSnapshot(value)) return;
 		const bytes = Buffer.byteLength(JSON.stringify(value));
 		if (bytes > this.maxRetainedBytes) return;
-		// Repeated native learning shares its launch capability; result owners remain distinct.
-		if (record.state.status === "retained" && !record.state.result)
-			for (const previous of this.executions.values()) {
-				if (
-					previous.key === key &&
-					previous !== record &&
-					previous.state.status === "retained" &&
-					!previous.state.result &&
-					previous.scope?.sessionID === record.scope.sessionID &&
-					previous.executablePath === record.executablePath &&
-					previous.binding &&
-					stableEqual(this.invocations.get(previous.binding)?.value, value)
-				) {
-					this.invocations.get(previous.binding)!.executionMs = executionMs;
-					this.remove(record);
-					return previous.binding;
-				}
-			}
 		const owner = new WeakRef(this.invocations);
 		const binding = Object.freeze({
 			key,
@@ -879,9 +871,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		return [...this.candidates(key)]
 			.reverse()
 			.flatMap((record) =>
-				record.state.status === "completed" &&
-				record.state.result &&
-				record.scope?.sessionID === scope.sessionID
+				record.state.status === "completed" && record.scope?.sessionID === scope.sessionID
 					? record.state.result.candidate
 					: [],
 			);
@@ -961,12 +951,11 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				}
 				const stop = request.signal ? AbortSignal.any([changed.signal, request.signal]) : changed.signal;
 				const records = this.candidates(request.key).filter((record) => !request.excludeHandoff?.(record));
-				const completed = [...records].reverse().find((record) => {
-					const state = record.state;
-					return state.status === "completed" && state.result && !considered.has(record);
-				});
+				const completed = [...records].reverse().find(
+					(record) => record.state.status === "completed" && !considered.has(record),
+				);
 				const state = completed?.state;
-				const result = state?.status !== "running" ? state?.result : undefined;
+				const result = state?.status === "completed" ? state.result : undefined;
 				const candidate = result?.candidate;
 				if (candidate || !historyChecked) {
 					// Preserve live producer attribution without waiting for unfinished work ahead of history.
@@ -1117,25 +1106,20 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		}
 		return true;
 	}
-	complete(
-		key: Sha256Digest,
-		handoff: ProcessHandoff,
-		result?: Extract<
-			HandoffState,
-			{
-				status: "completed" | "retained";
-			}
-		>["result"],
-	): boolean {
+	complete(key: Sha256Digest, handoff: ProcessHandoff, result?: HandoffResult): boolean {
 		const record = this.record(key, handoff);
 		if (!record || record.state.status !== "running") return false;
-		this.retainedBytes += result?.bytes ?? 0;
-		record.state = { status: "completed", result };
+		if (result && record.scope) {
+			this.retainedBytes += result.bytes;
+			record.state = { status: "completed", result };
+		} else record.state = { status: "retained" };
 		this.completedCount++;
 		record.settle();
 		this.wake(key);
-		if (!result || !record.scope) this.remove(record);
-		else this.trim();
+		if (!result || !record.scope) {
+			if (result) void this.lifetime.release(result.artifacts);
+			this.remove(record);
+		} else this.trim();
 		return true;
 	}
 	clearCompleted(): void {
@@ -1178,7 +1162,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				return record.state.status === "running" ? record.state.advance : undefined;
 			},
 			get computation(): TimelineInterval | undefined {
-				return record.state.status !== "running" ? record.state.result?.computation : undefined;
+				return record.state.status === "completed" ? record.state.result.computation : undefined;
 			},
 		};
 		this.executions.set(record, record);
@@ -1215,8 +1199,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	private trim(limit = this.maxCompleted): void {
 		const records = [...this.executions.values()];
 		let stored = records.reduce(
-			(sum, record) =>
-				sum + (record.state.status === "running" ? 0 : (record.state.result?.artifacts.bytes ?? 0)),
+			(sum, record) => sum + (record.state.status === "completed" ? record.state.result.artifacts.bytes : 0),
 			0,
 		);
 		for (const record of records) {
@@ -1227,15 +1210,15 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			)
 				break;
 			if (!record.borrowers && record.state.status !== "running") {
-				stored -= record.state.result?.artifacts.bytes ?? 0;
+				if (record.state.status === "completed") stored -= record.state.result.artifacts.bytes;
 				this.remove(record);
 			}
 		}
 	}
 	private releaseResult(record: HandoffRecord): void {
-		if (record.state.status !== "running") {
-			this.retainedBytes -= record.state.result?.bytes ?? 0;
-			void this.lifetime.release(record.state.result?.artifacts);
+		if (record.state.status === "completed") {
+			this.retainedBytes -= record.state.result.bytes;
+			void this.lifetime.release(record.state.result.artifacts);
 			record.state = { status: "retained" };
 		}
 	}
