@@ -96,7 +96,7 @@ Linux 进程证据按执行域记录未知系统调用，并标记实际调用�
 
 在 Host 管理的工具调用中调用 `await subcomputeEnvironment()`，把返回的 `PI_SUBCOMPUTE_SOCKET` 与 `PI_SUBCOMPUTE_CONTEXT` 传给子进程。Windows 使用 Named Pipe，Linux 使用 Unix socket。设置 `subcomputation.exposeToControlledProcesses: true` 可向受控进程自动注入这些变量。
 
-Linux 受控 Bash 默认共享 CPython 导入源码时的编译结果。Actor 和各推测来源在同一 Host 内都能产生和使用这些结果。Python 已有有效 `.pyc` 时仍优先使用它。需要编译时，缓存按解释器身份、源文件名、优化级别和源码 SHA-256 匹配。命中后模块顶层代码仍在调用方执行。状态报告的 `python.source_to_code` 记录实际命中次数和复用的编译耗时。可用 `subcomputation.pythonImports: false` 关闭该接入。
+Linux 受控 Bash 默认共享 CPython 导入源码时的编译结果。Actor 和各推测来源在同一 Host 内都能产生和使用这些结果。Python 已有有效 `.pyc` 时仍优先使用它。需要编译时，缓存按解释器身份、源文件名、优化级别和源码 SHA-256 匹配。命中后模块顶层代码仍在调用方执行。缓存受条目数和字节数限制，已经被再次消费的条目在下次淘汰时获得一次保留机会。状态报告的 `python.source_to_code` 记录实际命中次数和复用的编译耗时。可用 `subcomputation.pythonImports: false` 关闭该接入。
 
 每个连接使用换行分隔的 JSON，可在同一调用令牌有效期内顺序执行多个步骤，共享输入会话。每个步骤执行一次查询，未命中时再发布结果：
 

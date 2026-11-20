@@ -382,6 +382,7 @@ test.skipIf(process.platform !== "linux")("the compiler accepts verified source 
 	const cwd = await directories.create();
 	const store = new ProvenanceCertificateStore(await directories.create());
 	const service = new SubcomputeService(cwd, store, () => 1024 * 1024);
+	service.runtime = () => ({ resourceCacheMaxEntries: 2 });
 	try {
 		await service.run(async () => {
 			const env = await controlledRuntimeEnvironment({});
@@ -404,15 +405,31 @@ test.skipIf(process.platform !== "linux")("the compiler accepts verified source 
 				peer.send({ op: "source", data: source.toString("base64") });
 				const compiled = await peer.read();
 				expect(compiled.state).toBe("compiled");
-				peer.send({ op: "consumed" });
-				expect(await peer.read()).toEqual({ state: "ready" });
+				const consume = async () => {
+					peer.send({ op: "consumed" });
+					expect(await peer.read()).toEqual({ state: "ready" });
+				};
+				await consume();
 				peer.send(request);
 				expect(await peer.read()).toEqual(compiled);
-				peer.send({ op: "consumed" });
-				expect(await peer.read()).toEqual({ state: "ready" });
+				await consume();
+				for (const filename of ["y.py", "z.py"]) {
+					peer.send({ ...request, filename: path.join(cwd, filename) });
+					expect(await peer.read()).toEqual({ state: "source" });
+					peer.send({ op: "source", data: source.toString("base64") });
+					expect((await peer.read()).state).toBe("compiled");
+					await consume();
+				}
+				peer.send(request);
+				expect(await peer.read()).toEqual(compiled);
+				await consume();
+				peer.send({ ...request, filename: path.join(cwd, "y.py") });
+				expect(await peer.read()).toEqual({ state: "source" });
+				peer.send({ op: "source", data: "" });
+				expect(await peer.read()).toEqual({ state: "unavailable" });
 				peer.send({ op: "compute", context, namespace: "other", key: "work" });
 				expect(await peer.read()).toMatchObject({ state: "error" });
-				expect(service.drainMetrics()["python.source_to_code"]).toMatchObject({ hits: 1, misses: 1 });
+				expect(service.drainMetrics()["python.source_to_code"]).toMatchObject({ hits: 2, misses: 3 });
 			} finally {
 				peer.close();
 			}

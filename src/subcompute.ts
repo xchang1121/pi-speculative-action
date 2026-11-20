@@ -488,6 +488,7 @@ export class SubcomputeService {
 						}
 						await send({ state: "compiled", data: compiled.bytes.toString("base64") });
 						if ((await read())?.op !== "consumed") break;
+						compiled.consumed();
 						scope.run(() => {
 							if (compiled.hit) TimelineInterval.use(compiled.computation);
 							this.record("python.source_to_code", compiled.hit, compiled.computation);

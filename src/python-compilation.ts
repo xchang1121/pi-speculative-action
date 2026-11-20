@@ -77,7 +77,7 @@ export type PythonCompileRequest = {
 	readonly digest: string;
 };
 type Compilation = { bytes: Buffer; computation: TimelineInterval };
-type Entry = { result: Promise<Compilation | undefined>; size: number };
+type Entry = { result: Promise<Compilation | undefined>; size: number; referenced: boolean };
 
 /** Only the host's isolated compiler creates executable artifacts. Clients supply source bytes. */
 export class PythonCompilationCache {
@@ -170,7 +170,7 @@ export class PythonCompilationCache {
 				this.queue = compiled.catch(() => {});
 				return compiled;
 			});
-			entry = { result, size: 0 };
+			entry = { result, size: 0, referenced: false };
 		}
 		this.entries.set(key, entry);
 		try {
@@ -183,9 +183,13 @@ export class PythonCompilationCache {
 			while (this.entries.size > capacity || this.bytes > byteCapacity) {
 				const [oldest, victim] = this.entries.entries().next().value!;
 				this.entries.delete(oldest);
-				this.bytes -= victim.size;
+				if (victim.referenced) {
+					victim.referenced = false;
+					this.entries.set(oldest, victim);
+				} else this.bytes -= victim.size;
 			}
-			if (value.bytes.length <= Math.min(resultLimit, byteCapacity)) return { ...value, hit };
+			if (value.bytes.length <= Math.min(resultLimit, byteCapacity))
+				return { ...value, hit, consumed: () => { if (hit) entry.referenced = true; } };
 		} finally {
 			if (!entry.size && this.entries.get(key) === entry) this.entries.delete(key);
 		}
