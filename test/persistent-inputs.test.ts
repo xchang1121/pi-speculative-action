@@ -9,13 +9,15 @@ import { fileURLToPath } from "node:url";
 import type { ArtifactReference } from "../src/content-chunks.ts";
 import { digestObject, type Sha256Digest } from "../src/primitives.ts";
 import { captureFileContent, CONTENT_CHUNK_BYTES, ContentChunkPool, readContent } from "../src/content-chunks.ts";
-import { ResourceObjectInputs } from "../src/agent-execution-world.ts";
+import { evaluateResourceQuery, ResourceObjectInputs } from "../src/agent-execution-world.ts";
+import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { SpeculativeConfiguration } from "../src/config-schema.ts";
-import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
+import { WorkspaceSandboxService, WorkspaceStructureCapture } from "../src/workspace-sandbox.ts";
 import { FILESYSTEM_METADATA_FIELDS } from "../src/filesystem-evidence.ts";
 import {
 	ResourceInputSession,
 	ResourceVersionManager,
+	createSerializablePreparationBinding,
 	type ResourceVersionToken,
 } from "../src/resource-version.ts";
 import { ArtifactReadView, ProvenanceCertificateStore } from "../src/reuse-store.ts";
@@ -169,6 +171,29 @@ test("a single verified CAS block supplies its file digest without a second read
 		await expect(pool.restore({ ...manifest, digest: digestObject("other") })).rejects.toThrow("integrity");
 	} finally {
 		await release();
+		await f.close();
+	}
+});
+
+test("required workspace snapshots reject excess names and bytes before reading file bodies", async () => {
+	const f = await fixture();
+	const inputs = new ResourceObjectInputs(f.root, f.store, new AbortController().signal);
+	const borrow = vi.spyOn(inputs, "borrow");
+	const content = { maxBytes: 8, maxFileBytes: 8, pool: inputs.contents, required: true as const };
+	try {
+		await writeFile(path.join(f.root, "a"), "1234");
+		await writeFile(path.join(f.root, "b"), "56789");
+		for (const maxFiles of [1, 2]) {
+			const capture = new WorkspaceStructureCapture(f.root, { content, maxFiles });
+			await expect(capture.captureVersions(undefined, inputs)).rejects.toThrow("workspace snapshot exceeds configured limits");
+			expect(borrow).not.toHaveBeenCalled();
+		}
+		await writeFile(path.join(f.root, "b"), "5678");
+		const captured = await new WorkspaceStructureCapture(f.root, { content }).captureVersions(undefined, inputs);
+		expect((await readContent(captured.files.get("b")!.content)).toString()).toBe("5678");
+		expect(borrow).toHaveBeenCalledTimes(2);
+	} finally {
+		await inputs[Symbol.asyncDispose]();
 		await f.close();
 	}
 });
@@ -331,11 +356,64 @@ linux("reads one path catalog and restores a shared closure once for concurrent 
 		}));
 		expect(buffers).toEqual([...paths, undefined]);
 		for (const operation of [catalog, fetch, restore]) expect(operation).toHaveBeenCalledOnce();
+		const signal = new AbortController().signal;
+		const nextRead = session.reader(f.root, signal);
+		const manifest = session.fileContentReader(f.root, signal);
+		const first = async <T>(entries: AsyncIterable<T>) => {
+			for await (const entry of entries) return entry;
+		};
+		fetch.mockRejectedValueOnce(new Error("metadata temporarily unavailable"));
+		await expect(nextRead(paths[0]).next()).rejects.toThrow("metadata temporarily unavailable");
+		expect(await first(nextRead(paths[0]))).toBeDefined();
+		fetch.mockRejectedValueOnce(new Error("metadata temporarily unavailable"));
+		expect(await first(manifest(paths[0]))).toBeUndefined();
+		expect(await first(manifest(paths[0]))).toBeDefined();
 	} finally {
 		await session.dispose();
 		await f.close();
 	}
 	expect(session.contents.openChunks).toBe(0);
+});
+
+linux("a prepared step borrowed from a shared view retains only the inputs it reads", async () => {
+	const f = await fixture();
+	const sibling = path.join(f.root, "sibling");
+	const input = path.join(f.root, "input");
+	const binding = createSerializablePreparationBinding("fixture.read-one", (value) => typeof value === "string");
+	const signal = AbortSignal.timeout(15000);
+	const owners: object[] = [];
+	const session = new ResourceInputSession({ store: f.store }, 8 * 1024 * 1024);
+	try {
+		await writeFile(sibling, "before");
+		await writeFile(input, "content");
+		let builds = 0;
+		const query = async (seed: boolean) => {
+			const run = await evaluateResourceQuery(undefined, {
+				signal, inputs: () => owners, onInputSource: (owner) => owners.push(owner),
+			}, f.root, async (view) => {
+				await view.readFile(sibling);
+				if (seed) return (await view.readFile(input)).toString();
+				return view.prepare(binding, "one", async (inputs) => {
+					builds++;
+					const value = (await inputs.readFile(input)).toString();
+					return { value, bytes: value.length, dispose: () => {} };
+				}, async (value) => value, input, signal);
+			}, PI_ACTION_SEMANTICS, session.maxBytes, true, "output", undefined, session);
+			f.tokens.push(...run!.versions);
+			return run!.output;
+		};
+		await query(true);
+		expect(await query(false)).toBe("content");
+		await writeFile(sibling, "after");
+		expect(await query(false)).toBe("content");
+		expect(builds).toBe(1);
+		await writeFile(input, "changed");
+		expect(await query(false)).toBe("changed");
+		expect(builds).toBe(2);
+	} finally {
+		await session.dispose();
+		await f.close();
+	}
 });
 
 linux("rejects incomplete, corrupt, over-budget and stale persistent preparation closures", async () => {

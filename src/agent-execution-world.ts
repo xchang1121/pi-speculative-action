@@ -377,13 +377,18 @@ export async function evaluateResourceQuery<Output>(
 		dependencies: ReadonlySet<string> | undefined,
 		commit = true,
 	) => {
-		const observations = (commit && proofs.get(token)) || new Map<string, ResourceObservation>();
+		// A step owns the observations of this read. The enclosing query also validates its other reads.
+		const observations = new Map<string, ResourceObservation>();
 		for (const key of dependencies ?? token.observations.keys()) {
 			const entry = token.observations.get(key);
 			if (!entry) throw new Error("resource_input_proof_missing");
 			observations.set(key, entry);
 		}
-		if (commit) proofs.set(token, observations);
+		if (commit) {
+			const query = proofs.get(token);
+			if (query) for (const [key, entry] of observations) query.set(key, entry);
+			else proofs.set(token, new Map(observations));
+		}
 		return { ...token, observations, view: undefined };
 	};
 	const observeOwner = (

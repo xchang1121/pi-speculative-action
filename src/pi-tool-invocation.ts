@@ -278,6 +278,19 @@ export async function createClosedSearchProfile(cwd: string) {
 	return { profile, unavailable, invocations, dispose: async () => engine?.release() };
 }
 
+async function readSearchInput(
+	view: ToolFilesystemOperations,
+	file: string,
+	charge: (file: string, size: number) => void,
+): Promise<Buffer> {
+	const { size } = await view.stat!(file, "type");
+	if (!isSafeCount(size)) throw new Error("search input size unavailable");
+	charge(file, size);
+	const content = await view.readFile(file, size + 1);
+	assert.equal(content.length, size, "search input size changed");
+	return content;
+}
+
 /** Select names exclusively through the captured view; ignored directories are never enumerated. */
 async function walkSearchInputs(
 	view: ToolFilesystemOperations,
@@ -287,8 +300,8 @@ async function walkSearchInputs(
 	signal: AbortSignal,
 	engine?: Awaited<ReturnType<typeof prepareGrepEngine>>,
 	expression?: string,
-	readInput?: (view: ToolFilesystemOperations, file: string) => Promise<Buffer>,
-): Promise<string[]> {
+	ruleInputs?: [string, number][],
+): Promise<{ kind: "selected"; files: string[] } | { kind: "entry_limit" }> {
 	const limits = speculativeConfig().search;
 	const grep = !!engine;
 	const original = target;
@@ -321,14 +334,18 @@ async function walkSearchInputs(
 	type Rule = { directory: string; rank: number; matcher: import("ignore").Ignore };
 	const layers = new Map<string, Rule[]>();
 	const selected: string[] = [];
-	let entries = 0;
+	let entries = 1;
+	const entryLimit = grep ? Math.min(limits.maxEntries, limits.maxDirectoryEntries) : limits.maxEntries;
+	if (entries > entryLimit) return { kind: "entry_limit" };
 	let bytes = 0;
 	let nameBytes = 0;
 	const repositories = new Set<string>();
 	const text = async (file: string) => {
 		if (!(await view.exists!(file))) return undefined;
-		const content = readInput ? await readInput(view, file) : await view.readFile(file);
-		if ((bytes += content.length) > limits.maxInputBytes) throw resourceBudgetError("search input byte budget");
+		const content = await readSearchInput(view, file, (name, size) => {
+			if ((bytes += size) > limits.maxInputBytes) throw resourceBudgetError("search input byte budget");
+			ruleInputs?.push([name, size]);
+		});
 		return content.toString("utf8");
 	};
 	const rules = async (directory: string): Promise<Rule[]> => {
@@ -370,10 +387,8 @@ async function walkSearchInputs(
 		layers.set(directory, result);
 		return result;
 	};
-	const walk = async (file: string): Promise<void> => {
+	const walk = async (file: string): Promise<boolean> => {
 		signal.throwIfAborted();
-		if (++entries > limits.maxEntries || (grep && entries > limits.maxDirectoryEntries))
-			throw resourceBudgetError("search entry budget");
 		const stat = await view.stat!(file, "entry", false);
 		const root = file === target;
 		if (!root && (stat.type === "symlink" || stat.type === "special")) {
@@ -382,7 +397,7 @@ async function walkSearchInputs(
 					if (engine) await engine.execute(engine.root, ["--", expression!, "missing"], signal, file);
 					throw error;
 				});
-			return;
+			return true;
 		}
 		const directory = (stat.type === "symlink" ? await view.stat!(file, "type", false) : stat).isDirectory();
 		const relative = slash(path.relative(target, file));
@@ -394,13 +409,13 @@ async function walkSearchInputs(
 		let ignored = false;
 		if (!root) {
 			if ((directory && path.basename(file) === ".git") || (!grep && path.basename(file) === "node_modules"))
-				return;
+				return true;
 			for (const rule of await rules(path.dirname(file))) {
 				const result = rule.matcher.test(slash(path.relative(rule.directory, file)) + (directory ? "/" : ""));
 				if (result.ignored || result.unignored) ignored = result.ignored;
 			}
 			if (grep && matcher && matches) ignored = !!negative;
-			if (ignored) return;
+			if (ignored) return true;
 		}
 		if (directory) {
 			if (!grep && relative && matches) selected.push(file + path.sep);
@@ -410,11 +425,14 @@ async function walkSearchInputs(
 				matcher?.globParts.every((parts) => parts.length > 1) &&
 				!spellings.some((name) => matcher.match(name.replace(/\/$/u, ""), true))
 			)
-				return;
+				return true;
 			await rules(file);
-			for (const name of await view.readdir!(file)) {
+			const names = await view.readdir!(file);
+			// Every listed child requires an entry observation, including ones later excluded by a rule.
+			if ((entries += names.length) > entryLimit) return false;
+			for (const name of names) {
 				assert.ok(path.basename(name) === name && name !== "." && name !== "..", "invalid directory entry");
-				await walk(path.join(file, name));
+				if (!await walk(path.join(file, name))) return false;
 			}
 		} else if (grep ? root || !matcher || negative || matches : matches) {
 			if (grep)
@@ -424,11 +442,13 @@ async function walkSearchInputs(
 				);
 			selected.push(file);
 		}
+		return true;
 	};
-	await walk(target);
-	return (grep ? selected.map((file) => path.join(original, path.relative(target, file))) : selected).sort(
+	if (!await walk(target)) return { kind: "entry_limit" };
+	const files = (grep ? selected.map((file) => path.join(original, path.relative(target, file))) : selected).sort(
 		(a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)),
 	);
+	return { kind: "selected", files };
 }
 
 async function runCapturedFind(
@@ -440,8 +460,11 @@ async function runCapturedFind(
 	const { execute } = createFindToolDefinition(cwd, {
 		operations: {
 			exists: view.exists!,
-			glob: async (pattern, target, { limit }) =>
-				(await walkSearchInputs(view, cwd, target, pattern, signal)).slice(0, limit),
+			glob: async (pattern, target, { limit }) => {
+				const result = await walkSearchInputs(view, cwd, target, pattern, signal);
+				if (result.kind === "entry_limit") throw resourceBudgetError("search entry budget");
+				return result.files.slice(0, limit);
+			},
 		},
 	});
 	const result = await execute("captured-find", args as never, signal, undefined, {} as ExtensionContext);
@@ -544,6 +567,13 @@ async function prepareGrepEngine() {
 			{ engine: identity, namespace: "pi.captured-grep" },
 			acceptsGrepMatches,
 		);
+		const selectionBinding = createSerializablePreparationBinding(
+			{ engine: identity, jj, namespace: "pi.search-file-selection" },
+			(value) => isRecord(value) && (value.kind === "entry_limit" || (value.kind === "selected" &&
+				Array.isArray(value.files) && value.files.every(isSearchPath) &&
+				Array.isArray(value.ruleInputs) && value.ruleInputs.every((item) =>
+					Array.isArray(item) && item.length === 2 && isSearchPath(item[0]) && isSafeCount(item[1])))),
+		);
 		const paths = (query: GrepInput, directory: boolean) => [
 			"--ignore", "--no-ignore-global",
 			...(query.glob ? ["--glob", query.glob] : []),
@@ -619,7 +649,7 @@ async function prepareGrepEngine() {
 				await closed.catch(() => {});
 			}
 		};
-		return { root, identity, matchesBinding, execute, search, checkCaptureBudget, release, jj };
+		return { root, identity, matchesBinding, selectionBinding, execute, search, checkCaptureBudget, release, jj };
 	} catch (error) {
 		await release();
 		throw error;
@@ -628,6 +658,8 @@ async function prepareGrepEngine() {
 
 type GrepInput = Parameters<ReturnType<typeof createGrepToolDefinition>["execute"]>[1];
 type GrepMatch = { line_number: number; lines: { text?: string; bytes?: string } };
+const isSearchPath = (value: unknown): value is string =>
+	typeof value === "string" && !value.includes("\0") && path.isAbsolute(value);
 function acceptsGrepMatches(value: unknown): boolean {
 	return (
 		Array.isArray(value) &&
@@ -654,20 +686,38 @@ async function runCapturedGrep(
 	const active = AbortSignal.any([signal, cancelled.signal]);
 	let remaining = limits.maxInputBytes;
 	const admitted = new Map<string, number>();
-	const readInput = async (inputs: ToolFilesystemOperations, file: string) => {
-		const { size } = await inputs.stat!(file, "type");
-		if (size === undefined) throw new Error("search input size unavailable");
+	const charge = (file: string, size: number) => {
 		if (admitted.has(file)) assert.equal(size, admitted.get(file), "search input size changed");
 		else {
 			if (size > remaining) throw resourceBudgetError("search input byte budget");
 			remaining -= size;
 			admitted.set(file, size);
 		}
-		const content = await inputs.readFile(file, size + 1);
-		assert.equal(content.length, size, "search input size changed");
-		return content;
 	};
-	const files = await walkSearchInputs(view, cwd, target, query.glob, active, engine, query.pattern, readInput);
+	const select = async (inputs: ToolFilesystemOperations, signal: AbortSignal) => {
+		const ruleInputs: [string, number][] = [];
+		const result = await walkSearchInputs(inputs, cwd, target, query.glob, signal, engine, query.pattern, ruleInputs);
+		return result.kind === "entry_limit" ? result : { ...result, ruleInputs };
+	};
+	const directory = await Promise.resolve(view.stat!(target, "type", false)).then(
+		(stat) => stat.isDirectory(),
+		() => { throw new Error(`Path not found: ${target}`); },
+	);
+	const selection = view.prepare && directory
+		? await view.prepare(
+			engine.selectionBinding,
+			JSON.stringify([cwd, target, query.glob ?? null, limits.maxEntries, limits.maxDirectoryEntries,
+				limits.maxInputBytes, limits.maxResultBytes, limits.braceExpandMax]),
+			async (inputs, signal) => {
+				const value = await select(inputs, signal);
+				return { value, bytes: serialize(value).byteLength, dispose: () => {} };
+			},
+			async (value) => value, target, active,
+		)
+		: await select(view, active);
+	if (selection.kind === "entry_limit") throw resourceBudgetError("search entry budget");
+	const { files } = selection;
+	for (const [name, size] of selection.ruleInputs) charge(name, size);
 	let pending: { source: string; inputs: ToolFilesystemOperations; signal: AbortSignal }[] = [];
 	let batch: Promise<GrepMatch[][]> | undefined;
 	const enqueue = (source: string, inputs: ToolFilesystemOperations, signal: AbortSignal) => {
@@ -682,7 +732,7 @@ async function runCapturedGrep(
 			try {
 				for (const [index, item] of inputs.entries()) {
 					scope.signal.throwIfAborted();
-					const content = item.source ? await readInput(item.inputs, item.source) : Buffer.alloc(0);
+					const content = item.source ? await readSearchInput(item.inputs, item.source, charge) : Buffer.alloc(0);
 					await fs.writeFile(path.join(root, String(index)), content);
 				}
 				const args = ["--", query.pattern, root];
@@ -706,9 +756,17 @@ async function runCapturedGrep(
 			return { value, bytes: serialize(value).byteLength, dispose: () => {} };
 		};
 		const key = JSON.stringify([source, query.pattern, !!query.ignoreCase, !!query.literal]);
+		const consume = async (rows: GrepMatch[]) => {
+			if (source && !admitted.has(source)) {
+				const { size } = await view.stat!(source, "type");
+				if (!isSafeCount(size)) throw new Error("search input size unavailable");
+				charge(source, size);
+			}
+			return rows;
+		};
 		return source && view.prepare
-			? view.prepare(engine.matchesBinding, key, build, async (value) => value, source, active)
-			: build(view, active).then((result) => result.value);
+			? view.prepare(engine.matchesBinding, key, build, consume, source, active)
+			: build(view, active).then((result) => consume(result.value));
 	};
 	const limit = Math.max(1, query.limit ?? limits.grepLimit);
 	const matches: GrepMatch[][] = [];
@@ -716,7 +774,7 @@ async function runCapturedGrep(
 	const names = files.length ? files : [""]; // Still run rg to validate the expression on an empty search.
 	while (matches.length < names.length && found < limit) {
 		active.throwIfAborted();
-		const size = matches.length ? 32 : Math.min(32, limit);
+		const size = Math.min(32, limit - found);
 		const jobs = names.slice(matches.length, matches.length + size).map(matchesFor);
 		try {
 			for (const rows of await Promise.all(jobs)) {
@@ -729,8 +787,7 @@ async function runCapturedGrep(
 			throw error;
 		}
 	}
-	const directory = (await view.stat!(target, "type", false)).isDirectory();
-	return formatGrep(query, target, directory, files, matches, (file) => readInput(view, file));
+	return formatGrep(query, target, directory, files, matches, (file) => readSearchInput(view, file, charge));
 }
 async function formatGrep(query: GrepInput, target: string, directory: boolean, files: string[],
 	matches: GrepMatch[][], read: (file: string) => Buffer | Promise<Buffer>): Promise<ToolSettlement> {

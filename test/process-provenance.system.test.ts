@@ -1,10 +1,11 @@
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { lutimes, mkdir, mkdtemp, open, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { lutimes, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { ResourceInputSession } from "../src/resource-version.ts";
+import { WorkspaceStructureCapture } from "../src/workspace-sandbox.ts";
 import { readContent } from "../src/content-chunks.ts";
 import { fileURLToPath } from "node:url";
 import { nativeBuildDefinitions } from "../src/config-schema.ts";
@@ -29,6 +30,50 @@ import {
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { systemHost } from "./agent-system-fixture.ts";
 import { createLinuxProcessBenchmark, textOutput } from "./linux-process-fixture.ts";
+
+test.skipIf(process.platform !== "linux")("an incomplete private output tree cannot certify its child", async () => {
+	const f = await createLinuxProcessBenchmark("pi-private-quota-", "in_memory", {}, os.homedir());
+	const external = path.join(f.root, "external");
+	const settled = Promise.withResolvers<void>();
+	const host = systemHost(f.workspace, [f.tool], {
+		executionWorlds: [f.world],
+		resolveInvocation: (_tool, input) => f.invocation(input as Record<string, unknown>),
+		onEvent(event) {
+			if (event.type === "candidate" && (event.state.status === "failed" || event.state.status === "succeeded"))
+				settled.resolve();
+		},
+	}, { prepareObservedOperations: false });
+	const capture = WorkspaceStructureCapture.prototype.captureVersions;
+	const refused = vi.spyOn(WorkspaceStructureCapture.prototype, "captureVersions").mockImplementation(async function (this: WorkspaceStructureCapture, ...args) {
+		const result = await capture.apply(this, args);
+		return result.snapshot.root.endsWith("/private/writes/upper")
+			? { ...result, snapshot: { ...result.snapshot, complete: false } }
+			: result;
+	});
+	try {
+		await mkdir(external);
+		await f.compile("create-dir", { code: "#include <sys/stat.h>\nint main(int n, char **v) { return n != 2 || mkdir(v[1], 0700); }" });
+		await f.prepare();
+		await host.start();
+		const command = `./create-dir '${external}/done'; :`;
+		await host.preview("bash", { command });
+		await settled.promise;
+		expect(host.events).toContainEqual(expect.objectContaining({
+			type: "candidate", state: expect.objectContaining({
+				status: "failed", cause: expect.objectContaining({ detail: expect.stringContaining("external_effects:snapshot_limit") }),
+			}),
+		}));
+		expect(await readdir(external)).toEqual([]);
+		expect(f.backend.metrics().published).toBe(0);
+		await host.execute("bash", { command });
+		expect(await readdir(external)).toEqual(["done"]);
+		expect(f.backend.actorMetrics().hits).toBe(0);
+	} finally {
+		refused.mockRestore();
+		await host.dispose();
+		await f.dispose();
+	}
+}, 60000);
 
 test
 	.skipIf(process.platform !== "linux")

@@ -1509,10 +1509,8 @@ export class LinuxProcessReuseBackend {
 							session.sealing.privateSince ?? 0,
 							sessionWriters(session),
 						);
-						if (!external.complete)
-							throw new Error(
-								`unrepresentable writes outside the workspace: external_write:${[...external.before].find(([, value]) => !value)?.[0]}`,
-							);
+						if (external.proof.kind === "incomplete")
+							throw new Error(`unrepresentable writes outside the workspace: ${external.proof.reason}`);
 						const changes = [...(await sealSessionEvidence(session, external)), ...external.changes];
 						await validate();
 						return changes;
@@ -2579,7 +2577,7 @@ export class LinuxProcessReuseBackend {
 								const transferable = certificateReplayable(input, acceptedReplayTaints());
 								// A child can read an earlier child's private output. Its parent can prove that input from the combined
 								// transaction even when this child, considered alone against the host, could not.
-								if (!evidence.sourceComplete && observation.complete && external.complete)
+								if (!evidence.sourceComplete && observation.complete && external.proof.kind === "complete")
 									own.observation = observation;
 								else {
 									own.evidence = dependencyCertificate;
@@ -3402,6 +3400,7 @@ async function captureDependencies(
 	const dependencies = new Map<string, DynamicDependency | undefined>();
 	const taints = new Set<ProvenanceTaint>([...observations, ...runs].flatMap((part) => part.taints));
 	const incompleteReasons = new Set(observations.flatMap((part) => part.incompleteReasons));
+	if (external.proof.kind === "incomplete") incompleteReasons.add(external.proof.reason);
 	let complete = observations.every((part) => part.complete);
 	if (!complete) taints.add("trace_incomplete");
 	const add = (dependency: DynamicDependency | undefined, reason = "dependency_unavailable") => {
@@ -4441,7 +4440,13 @@ async function privateCommits(
 		(await privateInterference(session, new Set(before.keys()), prestate.startedAt, owned))
 	)
 		for (const target of before.keys()) before.set(target, undefined);
-	return { changes, before, complete: diff.complete && [...before.values()].every(Boolean) };
+	const unproven = [...before].find(([, dependency]) => !dependency);
+	const proof = unproven
+		? { kind: "incomplete" as const, reason: `external_write:${unproven[0]}` }
+		: diff.complete
+			? { kind: "complete" as const }
+			: { kind: "incomplete" as const, reason: `external_effects:${diff.reason ?? "incomplete"}` };
+	return { changes, before, proof };
 }
 /** The entry is flushed before a syscall runs; a partial entry seen at capture start stays unsafe after completion. */
 async function privateInterference(

@@ -374,6 +374,7 @@ export interface WorkspaceStructureCaptureOptions {
 		readonly pool?: ContentChunkPool;
 		readonly maxFileBytes: number;
 		readonly maxBytes: number;
+		readonly required?: true;
 	};
 }
 interface WorkspaceCapturedVersion {
@@ -539,6 +540,8 @@ export class WorkspaceStructureCapture {
 		const entries = new Map<string, WorkspaceStructureEntry>();
 		const excludes = new Set(options.exclude ?? speculativeConfig().filesystem.excludes);
 		const maxFiles = options.maxFiles ?? speculativeConfig().filesystem.maxTreeEntries;
+		const required = options.content?.required && options.content;
+		let remainingBytes = required ? required.maxBytes : 0;
 		const pending = [{ relative: "", replaced: false }];
 		let files = 0;
 		let complete = !this.versions || changes !== undefined;
@@ -578,10 +581,14 @@ export class WorkspaceStructureCapture {
 				return { relative, entry, children, replaced: moved };
 			});
 			for (const { relative, entry, children, replaced } of captured) {
+				if (required && entry.kind === "file" &&
+					(entry.size > required.maxFileBytes || (remainingBytes -= entry.size) < 0))
+					throw new Error("workspace snapshot exceeds configured limits");
 				entries.set(relative, entry);
 				for (const child of children.sort((left, right) => left.name.localeCompare(right.name))) {
 					if (excludes.has(child.name)) continue;
 					if (files + 1 > maxFiles) {
+						if (required) throw new Error("workspace snapshot exceeds configured limits");
 						complete = false;
 						continue;
 					}
@@ -596,6 +603,7 @@ export class WorkspaceStructureCapture {
 		const snapshot = options.layered
 			? { root: absoluteRoot, entries, complete }
 			: workspaceStructureSnapshot(absoluteRoot, entries, complete);
+		if (required && !snapshot.complete) throw new Error("workspace snapshot exceeds configured limits");
 		const content = options.content
 			? await captureWorkspaceContent(
 					snapshot,
@@ -2596,7 +2604,7 @@ export class WorkspaceSandboxService {
 			releaseContents = contents?.retain();
 			const configured = speculativeConfig().filesystem;
 			const captured = await new WorkspaceStructureCapture(sourceRoot, {
-				content: { pool: contents, maxBytes: configured.maxTreeBytes, maxFileBytes: configured.maxTreeBytes },
+				content: { pool: contents, maxBytes: configured.maxTreeBytes, maxFileBytes: configured.maxTreeBytes, required: true },
 			}).captureVersions(undefined, options.inputs);
 			if (!captured.snapshot.complete || [...captured.files.values()].some((file) => !file))
 				throw new Error("workspace snapshot exceeds configured limits");

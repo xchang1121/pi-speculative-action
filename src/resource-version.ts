@@ -2215,7 +2215,7 @@ export class ResourceVersionManager {
 			} finally {
 				proof.clear();
 			}
-		});
+		}, true); // The capture owns immutable blocks until putInputVersion atomically publishes their verified root.
 	}
 	/** Cold recovery grants a new input lease only after content integrity and current query validation. */
 	async restore(
@@ -2852,10 +2852,12 @@ export class ResourceInputSession {
 			for (const id of await candidates(name)) {
 				signal.throwIfAborted();
 				if (last?.id !== id) last = { id, files: load(id) };
+				const attempt = last;
 				try {
-					const file = (await last.files)?.get(name);
+					const file = (await attempt.files)?.get(name);
 					if (file?.content) yield { manifest: file.content, computation: TimelineInterval.restore(file.computation) };
 				} catch {
+					if (last === attempt) last = undefined;
 					signal.throwIfAborted();
 					store.signal.throwIfAborted();
 				}
@@ -2893,7 +2895,13 @@ export class ResourceInputSession {
 			for (const id of await candidates(target)) {
 				signal.throwIfAborted();
 				let pending = restored.get(id);
-				if (!pending) restored.set(id, (pending = restore(id)));
+				if (!pending) {
+					pending = restore(id).catch((error) => {
+						if (restored.get(id) === pending) restored.delete(id);
+						throw error;
+					});
+					restored.set(id, pending);
+				}
 				const token = await pending;
 				if (token) yield token;
 			}
