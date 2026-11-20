@@ -17,7 +17,7 @@ import { LinuxProcessReuseBackend } from "./linux-process-backend.ts";
 import { isRecord } from "./primitives.ts";
 import type { ProcessExecutionBinding } from "./process-reuse.ts";
 import { spawnControlled } from "./process-startup.mjs";
-import { controlledSubcomputeChannel, subcomputeEnvironment } from "./subcompute.ts";
+import { controlledRuntimeEnvironment } from "./subcompute.ts";
 import type { WorkspaceSandboxOptions } from "./workspace-sandbox.ts";
 import { WorkspaceSandboxService } from "./workspace-sandbox.ts";
 /** Public BashOperations outlet with explicit process interception. */
@@ -43,12 +43,7 @@ export function createControlledBashOperations(
 			]);
 			const fromStdin = shell.commandTransport === "stdin";
 			const environment = env ?? shellHelpers.getShellEnv();
-			const channel = controlledSubcomputeChannel(environment);
-			const transport = channel
-				? { PI_SUBCOMPUTE_SOCKET: channel.socket, PI_SUBCOMPUTE_CONTEXT: environment.PI_SUBCOMPUTE_CONTEXT }
-				: speculativeConfig().subcomputation.exposeToControlledProcesses
-					? await subcomputeEnvironment()
-					: {};
+			const transport = await controlledRuntimeEnvironment(environment);
 			const child = spawnControlled(shell.shell, fromStdin ? shell.args : [...shell.args, command], {
 				cwd,
 				detached: process.platform !== "win32",
@@ -139,14 +134,7 @@ export class ProcessExecutionCoordinator implements ProcessExecutor {
 				...request,
 				environment: projectProcessEnvironment(definedProcessEnvironment(request.environment)),
 			};
-		if (speculativeConfig().subcomputation.exposeToControlledProcesses)
-			request = {
-				...request,
-				environment: {
-					...request.environment,
-					...(await subcomputeEnvironment()),
-				},
-			};
+		request = { ...request, environment: { ...request.environment, ...await controlledRuntimeEnvironment(request.environment) } };
 		const scope = snapshotExecutionScope(currentExecutionScope() ?? request.scope);
 		if (scope) request = { ...request, scope };
 		return (this.scope.getStore() ?? this.host).execute(request);

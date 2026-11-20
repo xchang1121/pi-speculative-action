@@ -40,6 +40,7 @@ import {
 	speculativeConfig,
 } from "./config-schema.ts";
 import { controlledSubcomputeChannel } from "./subcompute.ts";
+import { compilerSearchPath } from "./python-compilation.ts";
 import {
 	captureFileContent,
 	ContentChunkPool,
@@ -2227,6 +2228,9 @@ export class LinuxProcessReuseBackend {
 										hostPath: path.dirname(dispatcher),
 										readOnly: true,
 									},
+									...(channel?.bootstrap && request.environment.PI_PYTHON_COMPILE_CONTEXT
+										? [{ virtualPath: path.dirname(channel.bootstrap), hostPath: path.dirname(channel.bootstrap), readOnly: true }]
+										: []),
 									...(session.gitDirectory
 										? [
 												{
@@ -4843,13 +4847,18 @@ function exitOutcome(outcome: SpawnOutcome): ExitOutcome {
 	};
 }
 function assertInvocationMatches(invocation: ToolProcessInvocation, request: ProcessExecutionRequest) {
+	const archive = request.environment.PI_PYTHON_COMPILE_CONTEXT && controlledSubcomputeChannel(request.environment)?.bootstrap;
 	const matches = {
 		command: request.command === invocation.command,
 		cwd: path.resolve(request.cwd) === path.resolve(invocation.cwd),
 		timeout: request.timeout === invocation.timeout,
 		environment: stableEqual(
 			projectProcessEnvironment(definedProcessEnvironment(request.environment)),
-			projectProcessEnvironment(invocation.environment),
+			projectProcessEnvironment(
+				archive
+					? { ...invocation.environment, PYTHONPATH: compilerSearchPath(invocation.environment.PYTHONPATH, archive) }
+					: invocation.environment,
+			),
 		),
 	};
 	for (const [field, valid] of Object.entries(matches))

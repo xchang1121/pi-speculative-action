@@ -285,6 +285,47 @@ test.skipIf(process.platform !== "linux")("native Actor children feed later Bash
 	}
 });
 
+test.skipIf(process.platform !== "linux")("ordinary Python Bash calls consume compilation across producers with default taints", { timeout: 60000 }, async () => {
+	const fixture = await createLinuxProcessBenchmark("pi-python-input-", "in_memory", {}, os.homedir());
+	const host = systemHost(fixture.workspace, [fixture.tool], {
+		executionWorlds: [fixture.world],
+		resolveInvocation: (_tool, input) => fixture.invocation(input as Record<string, unknown>),
+		config: { processReuse: { replayAcceptedTaints: [] } },
+	});
+	const counts = () => host.events.reduce((sum, event) => {
+		const steps = event.subcomputations?.["python.source_to_code"];
+		return { hits: sum.hits + (steps?.hits ?? 0), misses: sum.misses + (steps?.misses ?? 0) };
+	}, { hits: 0, misses: 0 });
+	const command = (suffix: string) => ({ command: `python3 -B -c 'import feature, sys; print(feature.result, sys.argv[1])' ${suffix}` });
+	try {
+		await fixture.write("feature.py", "result = 123\n");
+		await fixture.prepare();
+		await host.start();
+		await host.preview("bash", command("preview"));
+		await host.ready();
+		expect(counts().misses).toBeGreaterThan(0);
+		const before = counts();
+		expect(textOutput(await host.execute("bash", command("first")))).toBe("123 first\n");
+		expect(counts().hits).toBeGreaterThan(before.hits);
+		expect(host.actors.at(-1)?.computation?.hiddenComputeMs).toBeGreaterThan(0);
+		const first = counts();
+		expect(textOutput(await host.execute("bash", command("second")))).toBe("123 second\n");
+		expect(counts().hits).toBeGreaterThan(first.hits);
+		await fixture.write("feature.py", "result = 456\n");
+		const previous = counts();
+		expect(textOutput(await host.execute("bash", command("changed")))).toBe("456 changed\n");
+		expect(counts().misses).toBeGreaterThan(previous.misses);
+		const changed = counts();
+		await host.preview("bash", command("later-preview"));
+		await host.ready(2);
+		expect(counts().hits).toBeGreaterThan(changed.hits);
+		expect(fixture.backend.actorMetrics().wholeCommandHits).toBe(0);
+	} finally {
+		await host.dispose();
+		await fixture.dispose();
+	}
+});
+
 test.skipIf(process.platform !== "linux")("a Bash write preserves independent file inputs for other tools", { timeout: 60000 }, async () => {
 	const fixture = await createLinuxProcessBenchmark("pi-actor-input-", "in_memory", {}, os.homedir());
 	const reader = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, {

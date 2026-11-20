@@ -1,4 +1,5 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import * as evidence from "../src/filesystem-evidence.ts";
@@ -12,7 +13,7 @@ import { subcomputeEnvironment } from "../src/index.ts";
 import { SpeculativeConfiguration } from "../src/config-schema.ts";
 import { ContentChunkPool } from "../src/content-chunks.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
-import { controlledSubcomputeChannel, SubcomputeService } from "../src/subcompute.ts";
+import { controlledRuntimeEnvironment, controlledSubcomputeChannel, SubcomputeService } from "../src/subcompute.ts";
 import { systemHost } from "./agent-system-fixture.ts";
 import { temporaryDirectories } from "./filesystem.ts";
 
@@ -371,6 +372,51 @@ test("shutdown prevents late channel creation and concurrent callers share its c
 		await expect(channel).rejects.toThrow("subcompute_service_closed");
 		await closing;
 		await expect(service.socket()).rejects.toThrow("subcompute_service_closed");
+	} finally {
+		await service.dispose();
+		await store.dispose();
+	}
+});
+
+test.skipIf(process.platform !== "linux")("the compiler accepts verified source only and its private channel cannot publish steps", async () => {
+	const cwd = await directories.create();
+	const store = new ProvenanceCertificateStore(await directories.create());
+	const service = new SubcomputeService(cwd, store, () => 1024 * 1024);
+	try {
+		await service.run(async () => {
+			const env = await controlledRuntimeEnvironment({});
+			expect(env.PI_SUBCOMPUTE_CONTEXT).toBeUndefined();
+			const context = env.PI_PYTHON_COMPILE_CONTEXT!;
+			const peer = client({ PI_SUBCOMPUTE_SOCKET: env.PI_PYTHON_COMPILE_SOCKET! });
+			try {
+				const archive = controlledSubcomputeChannel(env)!.bootstrap!;
+				const main = "import sys,zipimport;exec(zipimport.zipimporter(sys.argv[1]).get_code('sitecustomize'))";
+				const engine = JSON.parse(execFileSync("python3", ["-I", "-S", "-B", "-c", main, archive], { input: "", encoding: "utf8" }));
+				const source = Buffer.from("output = 42\n");
+				const request = { op: "python_compile", context, engine, optimize: 0, filename: path.join(cwd, "x.py"),
+					digest: createHash("sha256").update(source).digest("hex") };
+				peer.send(request);
+				expect(await peer.read()).toEqual({ state: "source" });
+				peer.send({ op: "source", data: Buffer.from("output = 99\n").toString("base64") });
+				expect(await peer.read()).toEqual({ state: "unavailable" });
+				peer.send(request);
+				expect(await peer.read()).toEqual({ state: "source" });
+				peer.send({ op: "source", data: source.toString("base64") });
+				const compiled = await peer.read();
+				expect(compiled.state).toBe("compiled");
+				peer.send({ op: "consumed" });
+				expect(await peer.read()).toEqual({ state: "ready" });
+				peer.send(request);
+				expect(await peer.read()).toEqual(compiled);
+				peer.send({ op: "consumed" });
+				expect(await peer.read()).toEqual({ state: "ready" });
+				peer.send({ op: "compute", context, namespace: "other", key: "work" });
+				expect(await peer.read()).toMatchObject({ state: "error" });
+				expect(service.drainMetrics()["python.source_to_code"]).toMatchObject({ hits: 1, misses: 1 });
+			} finally {
+				peer.close();
+			}
+		});
 	} finally {
 		await service.dispose();
 		await store.dispose();

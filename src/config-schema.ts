@@ -84,6 +84,7 @@ export const DEFAULT_SPECULATIVE_CONFIG = deepFreeze({
 	},
 	subcomputation: {
 		exposeToControlledProcesses: false,
+		pythonImports: true,
 		maxStepResultBytes: 16 * 1024 * 1024,
 		maxStepObjectNodes: 65536,
 		maxStepObjectDepth: 64,
@@ -477,6 +478,8 @@ export function projectProcessEnvironment(
 				([key]) =>
 					key !== "PI_SUBCOMPUTE_SOCKET" &&
 					key !== "PI_SUBCOMPUTE_CONTEXT" &&
+					key !== "PI_PYTHON_COMPILE_SOCKET" &&
+					key !== "PI_PYTHON_COMPILE_CONTEXT" &&
 					(!keys || keys.has(key) === (mode === "allowlist")),
 			),
 		),

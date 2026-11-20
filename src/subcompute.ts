@@ -29,6 +29,7 @@ import {
 import { ProvenanceCertificateStore } from "./reuse-store.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { containsFilesystemPath, filesystemPathKey, hasErrorCode } from "./primitives.ts";
+import { PythonCompilationCache, compilerBootstrap, compilerSearchPath, type PythonCompileRequest } from "./python-compilation.ts";
 import { subcomputeTiming, TaskTimeline, TimelineInterval, type SubcomputeCounts } from "./task-timing.ts";
 import type { ObservedProcessPath, ExecutionObservation } from "./execution-observer.ts";
 type WireValue =
@@ -60,24 +61,30 @@ const fields = {
 	compute: ["op", "context", "namespace", "key", "inputResources", "envKeys", "environment", "includeInputContent"],
 	observe: ["op", "token", "reads"],
 	publish: ["op", "token", "reads", "durationMs", "value"],
+	python_compile: ["op", "context", "engine", "filename", "optimize", "digest"],
+	source: ["op", "data"],
+	consumed: ["op"],
 };
 const endpoint = new AsyncLocalStorage<SubcomputeService>();
 type SubcomputeScope = {
 	run: ReturnType<typeof AsyncLocalStorage.snapshot>;
-	timer: NodeJS.Timeout;
+	timer?: NodeJS.Timeout;
+	bootstrap?: string;
 	clients: Set<Socket>;
 	socket: string;
 	proofs: ResourceVersionToken[];
 	busy: number;
 	failed: boolean;
+	general: boolean;
 };
 const channels = new Map<string, SubcomputeScope>();
 export function controlledSubcomputeChannel(environment: Readonly<Record<string, string | undefined>>) {
-	const token = environment.PI_SUBCOMPUTE_CONTEXT;
+	const token = environment.PI_SUBCOMPUTE_CONTEXT ?? environment.PI_PYTHON_COMPILE_CONTEXT;
 	const scope = token ? channels.get(token) : undefined;
-	if (!scope || scope.socket !== environment.PI_SUBCOMPUTE_SOCKET) return undefined;
+	if (!scope || scope.socket !== (environment.PI_SUBCOMPUTE_SOCKET ?? environment.PI_PYTHON_COMPILE_SOCKET)) return undefined;
 	return {
 		socket: scope.socket,
+		bootstrap: scope.bootstrap,
 		async validate() {
 			if (
 				channels.get(token!) !== scope ||
@@ -108,6 +115,35 @@ export async function subcomputeEnvironment(): Promise<Readonly<Record<string, s
 	const service = endpoint.getStore();
 	return service ? service.environment() : {};
 }
+export async function controlledRuntimeEnvironment(environment: Readonly<Record<string, string | undefined>>): Promise<Readonly<Record<string, string>>> {
+	const service = endpoint.getStore();
+	if (!service) return {};
+	const config = service.configuration.current;
+	const general = config.subcomputation.exposeToControlledProcesses;
+	const runtime = service.runtime();
+	const archive = process.platform === "linux" && config.subcomputation.pythonImports && runtime.reuseEnabled !== false &&
+		runtime.resourceCacheMaxEntries > 0 && (runtime.resourceCacheMaxBytes ?? config.runtime.resourceCacheMaxBytes) > 0
+		? await compilerBootstrap() : undefined;
+	if (!general && !archive) return {};
+	const channel = controlledSubcomputeChannel(environment);
+	const transport = channel ? {
+		PI_SUBCOMPUTE_SOCKET: channel.socket,
+		PI_SUBCOMPUTE_CONTEXT: environment.PI_SUBCOMPUTE_CONTEXT ?? environment.PI_PYTHON_COMPILE_CONTEXT!,
+	} : await service.environment(general).catch((error: unknown) => {
+		if (general) throw error;
+		return undefined;
+	});
+	if (!transport) return {};
+	if (archive) channels.get(transport.PI_SUBCOMPUTE_CONTEXT)!.bootstrap = archive;
+	return {
+		...(general || (channel && environment.PI_SUBCOMPUTE_CONTEXT) ? transport : {}),
+		...(archive ? {
+			PI_PYTHON_COMPILE_SOCKET: transport.PI_SUBCOMPUTE_SOCKET,
+			PI_PYTHON_COMPILE_CONTEXT: transport.PI_SUBCOMPUTE_CONTEXT,
+			PYTHONPATH: compilerSearchPath(environment.PYTHONPATH, archive),
+		} : {}),
+	};
+}
 /** A protocol adapter over the same ResourceInputSession and CAS used by computeStep. */
 export class SubcomputeService {
 	readonly configuration = currentSpeculativeConfiguration();
@@ -128,9 +164,13 @@ export class SubcomputeService {
 	private cacheBytes = 0;
 	private readonly counts = new Map<string, SubcomputeCounts>();
 	private readonly cwd: string;
+	private readonly python: PythonCompilationCache;
 	private readonly maxBytes: () => number;
+	runtime: () => { reuseEnabled?: boolean; resourceCacheMaxEntries: number; resourceCacheMaxBytes?: number } =
+		() => this.configuration.current.runtime;
 	constructor(cwd: string, store: ProvenanceCertificateStore, maxBytes: () => number) {
 		this.cwd = cwd;
+		this.python = new PythonCompilationCache(cwd);
 		this.inputStorage = { store, contents: new ContentChunkPool(store) };
 		this.releaseChunks = this.inputStorage.contents.retain();
 		this.inputManager = new ResourceVersionManager(cwd, { watch: false, persistentInputs: this.inputStorage });
@@ -240,17 +280,16 @@ export class SubcomputeService {
 			}),
 		);
 	}
-	async environment(): Promise<Readonly<Record<string, string>>> {
+	async environment(general = true): Promise<Readonly<Record<string, string>>> {
 		const socket = await this.socket();
 		if (this.lifetime.sealed) throw new Error("subcompute_service_closed");
 		if (this.scopes.size >= this.configuration.current.subcomputation.maxPendingRequests)
 			throw new Error("subcompute_scope_budget_exceeded");
 		const token = randomUUID();
-		const timer = setTimeout(
+		const timer = general || !this.owners.getStore() ? setTimeout(
 			() => this.releaseScope(token),
 			this.configuration.current.subcomputation.socketTimeoutMs,
-		);
-		timer.unref();
+		).unref() : undefined;
 		const scope: SubcomputeScope = {
 			run: subcomputeTiming.run(this.record, () => AsyncLocalStorage.snapshot()),
 			timer,
@@ -259,6 +298,7 @@ export class SubcomputeService {
 			proofs: [],
 			busy: 0,
 			failed: false,
+			general,
 		};
 		this.scopes.set(token, scope);
 		channels.set(token, scope);
@@ -371,7 +411,8 @@ export class SubcomputeService {
 			if (next.done) return undefined;
 			frames--;
 			if (Buffer.byteLength(next.value) > limit()) throw new Error("subcompute_request_budget_exceeded");
-			const frame = JSON.parse(next.value) as Begin | Observation | Publication;
+			const frame = JSON.parse(next.value) as Begin | Observation | Publication | PythonCompileRequest |
+				{ op: "consumed" } | { op: "source"; data: string };
 			if (!frame || !Object.hasOwn(fields, frame.op) || Object.keys(frame).some((key) => !fields[frame.op].includes(key)))
 				throw new Error("invalid_subcompute_frame");
 			return frame;
@@ -392,7 +433,7 @@ export class SubcomputeService {
 				await send({ state: "miss", token, inputResources });
 				for (;;) {
 					const frame = await read();
-					if (!frame || frame.op === "compute" || frame.token !== token) throw new Error("invalid_subcompute_token");
+					if (!frame || (frame.op !== "observe" && frame.op !== "publish") || frame.token !== token) throw new Error("invalid_subcompute_token");
 					if (frame.op === "observe" && !Array.isArray(frame.reads)) throw new Error("invalid_subcompute_resource");
 					let repeated = false;
 					for (const resource of this.resources(frame.reads) ?? []) {
@@ -413,18 +454,51 @@ export class SubcomputeService {
 			TimelineInterval.own(TimelineInterval.retained(randomUUID(), publication.durationMs));
 			return decodeValue(publication.value);
 		};
-		const session = new ResourceInputSession({ store: this.inputStorage.store, inputs: this.inputs }, this.maxBytes());
+		let inputSession: ResourceInputSession | undefined;
 		let scope: SubcomputeScope | undefined;
 		try {
 			for (;;) {
 				const request = await read();
 				if (request === undefined) break;
-				if (request.op !== "compute") throw new Error("invalid_subcompute_request");
+				if (request.op !== "compute" && request.op !== "python_compile") throw new Error("invalid_subcompute_request");
 				const requestedScope = this.scopes.get(request.context);
 				if (scope && scope !== requestedScope) throw new Error("subcompute_context_changed");
 				scope = requestedScope;
 				if (!scope) throw new Error("subcompute_context_unavailable");
 				scope.clients.add(socket);
+				if (request.op === "python_compile") {
+					if (!scope.bootstrap) throw new Error("subcompute_context_unavailable");
+					const { subcomputation } = this.configuration.current;
+					const runtime = this.runtime();
+					scope.busy++;
+					try {
+						const source = async () => {
+							await send({ state: "source" });
+							const frame = await read();
+							if (frame?.op === "source") return frame.data;
+						};
+						const resultLimit = Math.min(subcomputation.maxStepResultBytes, Math.floor((limit() - 128) * 3 / 4));
+						const compiled = await scope.run(() =>
+							this.python.get(request, source, runtime.reuseEnabled === false ? 0 : runtime.resourceCacheMaxEntries,
+								runtime.resourceCacheMaxBytes ?? this.maxBytes(), resultLimit)
+						).catch(() => undefined);
+						if (!compiled) {
+							await send({ state: "unavailable" });
+							continue;
+						}
+						await send({ state: "compiled", data: compiled.bytes.toString("base64") });
+						if ((await read())?.op !== "consumed") break;
+						scope.run(() => {
+							if (compiled.hit) TimelineInterval.use(compiled.computation);
+							this.record("python.source_to_code", compiled.hit, compiled.computation);
+						});
+						await send({ state: "ready" });
+					} finally {
+						scope.busy--;
+					}
+					continue;
+				}
+				if (!scope.general) throw new Error("subcompute_context_unavailable");
 				if (
 					!Object.hasOwn(request, "key") ||
 					typeof request.namespace !== "string" ||
@@ -442,6 +516,7 @@ export class SubcomputeService {
 				)
 					throw new Error("invalid_subcompute_request");
 				const contract = { ...request, inputResources: this.resources(request.inputResources) };
+				const session = inputSession ??= new ResourceInputSession({ store: this.inputStorage.store, inputs: this.inputs }, this.maxBytes());
 				let produced = false;
 				scope.busy++;
 				try {
@@ -493,11 +568,12 @@ export class SubcomputeService {
 			scope?.clients.delete(socket);
 			lines.close();
 			socket.off("data", count);
-			await session.dispose();
+			await inputSession?.dispose();
 		}
 	}
 	dispose(): Promise<void> {
 		return this.lifetime.close(async () => {
+			this.python.close();
 			for (const token of this.scopes.keys()) this.releaseScope(token);
 			for (const [socket, controller] of this.clients) {
 				controller.abort(new Error("subcompute_service_closed"));

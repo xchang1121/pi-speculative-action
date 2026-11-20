@@ -680,6 +680,7 @@ function assembleAgentExecutionHost(
 		enabled: false,
 		resourceCacheMaxEntries: speculativeConfig().runtime.resourceCacheMaxEntries,
 	};
+	if (service) service.runtime = () => currentSettings;
 	let timeline = new TaskTimeline(performance.now());
 	let sequence = 0;
 	let decision = 0;
