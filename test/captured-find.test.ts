@@ -84,6 +84,9 @@ test("large live searches skip evidence collection and preserve the native Actor
 			await grep.checkCaptureBudget!(request);
 			await writeFile(path.join(cwd, "c"), "match\n");
 			await expect(grep.checkCaptureBudget!(request)).rejects.toMatchObject({ code: "ERR_RESOURCE_BUDGET" });
+			const filtered = { ...request, args: { ...request.args, glob: "a" } };
+			await expect(grep.checkCaptureBudget!(filtered)).rejects.toMatchObject({ code: "ERR_RESOURCE_BUDGET" });
+			expect((await grep.authoritative!(filtered)).result.content).toEqual([{ type: "text", text: "a:1: match" }]);
 			const capture = grep.captureInputs!(undefined, 1024 * 1024, request.callID);
 			try {
 				const output = await grep.authoritative!(request);

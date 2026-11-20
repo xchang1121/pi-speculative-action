@@ -670,6 +670,49 @@ test("one connection can repeatedly consume a large trusted result within one sn
 	}
 });
 
+test.each(["complete", "disconnect"])("in-flight trusted values survive immediate eviction or producer loss (%s)", async (outcome) => {
+	const store = new ProvenanceCertificateStore(await directories.create());
+	const joined = Promise.withResolvers<void>();
+	let onAdmission: (() => void) | undefined;
+	const step = { namespace: "bytes.copy", implementation: "identity",
+		enabled: () => { onAdmission?.(); return true; },
+		build: vi.fn(async ({ input }: import("../src/subcompute.ts").TrustedStepBuild) => input()) };
+	const service = new SubcomputeService(await directories.create(), store, () => 65536, [step]);
+	service.runtime = () => ({ resourceCacheMaxEntries: 1, resourceCacheMaxBytes: 512 });
+	const env = await service.environment();
+	const followerEnv = await service.environment();
+	const producer = client(env), follower = client(followerEnv);
+	const bytes = Buffer.alloc(430, 42); // The bytes fit the response limit; the encoded value alone exceeds the cache.
+	const lookup = vi.spyOn(store, "findPreparedInputCandidates");
+	try {
+		producer.send({ op: "compute", context: env.PI_SUBCOMPUTE_CONTEXT, namespace: step.namespace,
+			key: null, inputDigest: createHash("sha256").update(bytes).digest("hex") });
+		const first = await producer.read();
+		expect(first.state).toBe("input");
+		onAdmission = joined.resolve;
+		const result = trustedCompute(follower, followerEnv, step.namespace, null, bytes);
+		await joined.promise;
+		if (outcome === "complete") {
+			producer.send({ op: "input", token: first.token, value: { encoding: "base64", value: bytes.toString("base64") } });
+			const published = await producer.read();
+			expect(published.state).toBe("published");
+			producer.send({ op: "consumed", token: published.token });
+			expect((await producer.read()).state).toBe("ready");
+		} else producer.close();
+		const reply = await result;
+		expect(reply.state).toBe(outcome === "complete" ? "hit" : "published");
+		expect(reply.value).toEqual({ encoding: "base64", value: bytes.toString("base64") });
+		expect(lookup).toHaveBeenCalledTimes(outcome === "complete" ? 1 : 2);
+		expect((await trustedCompute(follower, followerEnv, step.namespace, null, bytes)).state).toBe("hit");
+		expect(lookup).toHaveBeenCalledTimes(outcome === "complete" ? 2 : 3);
+	} finally {
+		producer.close();
+		follower.close();
+		await service.dispose();
+		await store.dispose();
+	}
+});
+
 test("large prepared values restore from verified CAS blocks and rebuild a corrupt block", async () => {
 	const cwd = await directories.create();
 	const storage = await directories.create();

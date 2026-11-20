@@ -574,9 +574,9 @@ async function prepareGrepEngine() {
 				Array.isArray(value.ruleInputs) && value.ruleInputs.every((item) =>
 					Array.isArray(item) && item.length === 2 && isSearchPath(item[0]) && isSafeCount(item[1])))),
 		);
-		const paths = (query: GrepInput, directory: boolean) => [
+		const paths = (glob: string | undefined, directory: boolean) => [
 			"--ignore", "--no-ignore-global",
-			...(query.glob ? ["--glob", query.glob] : []),
+			...(glob ? ["--glob", glob] : []),
 			...(directory ? ["--glob", "!.git/"] : []),
 		];
 		const checkCaptureBudget = async (cwd: string, query: GrepInput, signal: AbortSignal) => {
@@ -586,9 +586,11 @@ async function prepareGrepEngine() {
 			const { maxDirectoryEntries, maxEntries } = speculativeConfig().search;
 			const limit = Math.min(maxDirectoryEntries, maxEntries);
 			if (!limit) throw resourceBudgetError("search entry budget");
-			// Every selected name needs an entry proof, including the root. Stop at the first excess name.
+			// The captured walk inspects entries before applying a positive output glob. Even the
+			// ordinary, ignore-filtered files alone can prove that walk exceeds its entry budget.
 			let entries = 1;
-			const child = spawn(executable, ["--no-config", "--hidden", ...paths(query, true), "--files", "--null", "--", target], {
+			const exclusion = query.glob?.startsWith("!") ? query.glob : undefined;
+			const child = spawn(executable, ["--no-config", "--hidden", ...paths(exclusion, true), "--files", "--null", "--", target], {
 				cwd, env: environment, signal, windowsHide: true, stdio: ["ignore", "pipe", "ignore"],
 			});
 			await new Promise<void>((resolve, reject) => {
@@ -613,7 +615,7 @@ async function prepareGrepEngine() {
 				throw new Error(`Path not found: ${target}`);
 			});
 			const limit = Math.max(1, query.limit ?? limits.grepLimit);
-			const args = [...flags, ...paths(query, directory)];
+			const args = [...flags, ...paths(query.glob, directory)];
 			if (query.literal) args.push("--fixed-strings");
 			if (query.ignoreCase) args.push("--ignore-case");
 			const child = spawn(executable, [...args, "--", query.pattern, target], {

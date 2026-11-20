@@ -21,6 +21,7 @@ import {
 	type ResourceVersionToken,
 } from "../src/resource-version.ts";
 import { ArtifactReadView, ProvenanceCertificateStore } from "../src/reuse-store.ts";
+import { TimelineInterval } from "../src/task-timing.ts";
 import { storeMetadata, storePeer } from "./process-fixture.ts";
 
 vi.mock("node:fs/promises", { spy: true });
@@ -117,7 +118,7 @@ linux("native workspace captures and filesystem tools exchange independent file 
 	}
 });
 
-test("a native file reader can reuse one verified file after a sibling in its persisted closure changes", async () => {
+test.each([false, true])("a native reader keeps the consumed file's receipt after a sibling changes (merged owners %s)", async (merge) => {
 	const f = await fixture();
 	const root = path.parse(f.root).root;
 	const manager = new ResourceVersionManager(root, { watch: false, persistentInputs: { store: f.store, internalCache: true } });
@@ -130,11 +131,16 @@ test("a native file reader can reuse one verified file after a sibling in its pe
 		await writeFile(sibling, "other");
 		await writeFile(second, "second");
 		vi.spyOn(Date, "now").mockReturnValue(Date.now() + 3000);
-		const source = await manager.capture([target, sibling, second].map((path) => ({ path, scope: "content" })), memoryBudget);
+		const source = await manager.capture((merge ? [sibling] : [target, sibling, second]).map((path) => ({ path, scope: "content" })), memoryBudget);
+		const other = merge ? await manager.capture([target, second].map((path) => ({ path, scope: "content" })), memoryBudget) : undefined;
+		const original = (other ?? source).view!.snapshotInput(target);
+		if (!original || !("computation" in original) || !original.computation) throw new Error("missing producer receipt");
+		const receipt = TimelineInterval.serialize(original.computation)!.root;
 		try {
-			await manager.persist(source);
+			await manager.persist(source, other ? [other] : []);
 		} finally {
 			await source.release();
+			await other?.release();
 		}
 		await writeFile(sibling, "newer");
 		await using native = new ResourceObjectInputs(f.root, f.store, signal);
@@ -143,7 +149,7 @@ test("a native file reader can reuse one verified file after a sibling in its pe
 		const hit = await borrow();
 		expect(hit?.shared).toBe(true);
 		expect((await readContent(hit!.content)).toString()).toBe("first");
-		expect(hit!.computation).toBeDefined();
+		expect(TimelineInterval.serialize(hit!.computation!)?.root).toBe(receipt);
 		native.remember(target, hit!);
 		expect(await readContent((await borrow(second))!.content)).toEqual(Buffer.from("second"));
 		expect(fetch).toHaveBeenCalledOnce();
@@ -412,6 +418,54 @@ linux("a prepared step borrowed from a shared view retains only the inputs it re
 		expect(builds).toBe(2);
 	} finally {
 		await session.dispose();
+		await f.close();
+	}
+});
+
+linux("cold step reuse validates its own inputs across sibling changes and reads only the selected artifact", async () => {
+	const f = await fixture();
+	const signal = AbortSignal.timeout(15000);
+	const files = ["first", "sibling"].map((name) => path.join(f.root, name));
+	const binding = createSerializablePreparationBinding("steps.read", (value) => typeof value === "string");
+	const prepare = (view: NonNullable<ResourceVersionToken["view"]>, file: string, built: () => void) =>
+		view.prepare(binding, file, async (inputs) => {
+			built();
+			const value = (await inputs.readFile(file)).toString();
+			return { value, bytes: Buffer.byteLength(value), dispose() {} };
+		}, async (value) => value, file, signal);
+	try {
+		for (const file of files) await writeFile(file, path.basename(file));
+		const seed = await f.manager.capture(undefined, memoryBudget);
+		f.tokens.push(seed);
+		for (const file of files) await prepare(seed.view!, file, () => {});
+		seed.view!.seal();
+		const record = (await f.store.getInputVersion(await f.manager.persist(seed)))!;
+		const { preparations } = record.payload as { preparations: { key: string; value: ArtifactReference }[] };
+		expect(preparations).toHaveLength(2);
+		// Both the stored record and the live consumer own an unrelated, now stale file.
+		const base = await f.manager.capture([{ path: files[1]!, scope: "content" }], memoryBudget);
+		f.tokens.push(base);
+		base.view!.seal();
+		await writeFile(files[1]!, "updated");
+		expect(await f.manager.restore(record, memoryBudget)).toBeUndefined();
+		const fetch = vi.spyOn(f.store.artifacts, "get");
+		const builds = vi.fn();
+		const run = async () => {
+			const session = new ResourceInputSession({ store: f.store }, memoryBudget);
+			try {
+				const result = await evaluateResourceQuery([base], { signal }, f.root,
+					(view) => prepare(view, files[0]!, builds), PI_ACTION_SEMANTICS, memoryBudget, false, "output", undefined, session);
+				f.tokens.push(...result!.versions);
+				return result!.output;
+			} finally { await session.dispose(); }
+		};
+		expect(await run()).toBe("first");
+		expect(builds).not.toHaveBeenCalled();
+		expect(fetch.mock.calls.map(([ref]) => ref.digest)).toEqual([preparations.find((item) => item.key === files[0])!.value.digest]);
+		await writeFile(files[0]!, "other");
+		expect(await run()).toBe("other");
+		expect(builds).toHaveBeenCalledOnce();
+	} finally {
 		await f.close();
 	}
 });

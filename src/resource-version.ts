@@ -1174,10 +1174,11 @@ export class ResourceReadView {
 						if (readiness.status !== "completed" || !readiness.value) return undefined;
 						if (registration && !registration.accepts(cached.value))
 							throw new Error("resource_preparation_data_invalid");
-						const dependencies =
-							cached.origin === owner && cached.dependencies && context?.dependencies
-								? new Set([...context.dependencies, ...cached.dependencies])
-								: undefined;
+						// Foreign observations belong to their source. Only a local step extends this owner's read set.
+						const local = cached.origin === owner ? cached.dependencies : undefined;
+						const foreign = source && cached.origin !== owner;
+						const dependencies = foreign ? context?.dependencies
+							: local && context?.dependencies && new Set([...context.dependencies, ...local]);
 						const sourceDependencies =
 							source && cached.origin.entries === source.view.entries ? cached.dependencies : undefined;
 						// Relocated preparations retain their own input proofs; their new owner may also contain unrelated effects.
@@ -1198,7 +1199,10 @@ export class ResourceReadView {
 							await context?.validateInputs?.([...(context.observed?.(dependencies, false) ?? []), ...proofs]);
 							signal?.throwIfAborted();
 							accepted = true;
-							if (context) context.dependencies = dependencies;
+							if (!foreign && context?.dependencies) {
+								if (!local) context.dependencies = undefined;
+								else for (const key of local) context.dependencies.add(key);
+							}
 							// Retain the validated proof before effects; its source may already have retired.
 							const transferred =
 								context?.acceptProofs &&
@@ -1502,11 +1506,11 @@ export class ResourceReadView {
 						const {
 							object: _object,
 							objectBytes: _objectBytes,
-							computation: _computation,
 							...data
 						} = selected;
 						aggregate.capture(target, {
 							...data,
+							computation: selected.type === "file" && selected.content ? selected.computation : undefined,
 							metadata: selected.metadata && {
 								...selected.metadata,
 								computation: undefined,
@@ -2222,6 +2226,7 @@ export class ResourceVersionManager {
 		record: StoredInputVersion,
 		retainBytes: number,
 		signal?: AbortSignal,
+		preparation?: PreparationLookup,
 	): Promise<ResourceVersionToken | undefined> {
 		if (!this.open || !this.persistentInputs || this.snapshotExcludes.size)
 			throw new Error("persistent input owner changed");
@@ -2229,7 +2234,12 @@ export class ResourceVersionManager {
 		const { store, limits } = this.persistentInputs;
 		return store.read(async (signal) => {
 			const payload = parsePersistentResourcePayload(record.payload, this.root);
-			const proofBytes = payload.observations.reduce(
+			const selected = preparation && payload.preparations.find((item) =>
+				item.binding === preparation.binding && item.key === preparation.key);
+			if (preparation && !selected) return;
+			const keys = selected && new Set(selected.dependencies);
+			const required = keys ? payload.observations.filter((entry) => keys.has(dependencyKey(entry))) : payload.observations;
+			const proofBytes = required.reduce(
 				(sum, entry) => sum + observationBytes(dependencyKey(entry), entry),
 				0,
 			);
@@ -2237,7 +2247,7 @@ export class ResourceVersionManager {
 			const contents = this.persistentInputs!.contents ?? new ContentChunkPool(store, limits);
 			const observations = new ResourceObservations(
 				this.persistentInputs!.memory,
-				payload.observations.map((observation) => [dependencyKey(observation), observation]),
+				required.map((observation) => [dependencyKey(observation), observation]),
 			);
 			let view: ResourceReadView;
 			try {
@@ -2259,9 +2269,10 @@ export class ResourceVersionManager {
 			try {
 				const references = new Map<Sha256Digest, number>();
 				for (const [target, entry] of payload.entries) {
+					for (const reference of entry.content?.chunks ?? [])
+						if (reference) validateArtifact(reference, references);
+					if (selected) continue;
 					const content = entry.content && (await contents.restore(entry.content, undefined, signal));
-					for (const reference of content?.manifest.chunks ?? [])
-						if (reference) references.set(reference.digest, reference.size);
 					view.capture(target, {
 						...entry,
 						computation: entry.computation && TimelineInterval.restore(entry.computation),
@@ -2275,7 +2286,7 @@ export class ResourceVersionManager {
 					record.artifacts.some((reference) => references.get(reference.digest) !== reference.size)
 				)
 					throw new Error("persistent input artifact closure mismatch");
-				await view.restorePreparations(payload.preparations, store, signal);
+				await view.restorePreparations(selected ? [selected] : payload.preparations, store, signal);
 				view.seal();
 				const token: ResourceVersionToken = {
 					root: this.root,
@@ -2289,14 +2300,15 @@ export class ResourceVersionManager {
 					inputView: new WeakRef(view),
 					release,
 				};
-				const proof = new ResourceReadView(retainBytes, { verifyingInputs: true });
+				// A step-only view exposes its verified value. Full restores also expose and compare file images.
+				const proof = selected ? undefined : new ResourceReadView(retainBytes, { verifyingInputs: true });
 				try {
-					if ((await this.inspect(token, false, proof)).expired) {
+					if ((await this.inspect(token, false, proof, !!selected)).expired) {
 						await release();
 						return;
 					}
 				} finally {
-					await proof.dispose();
+					await proof?.dispose();
 				}
 				signal.throwIfAborted();
 				if (!this.open) throw new Error("persistent input owner changed");
@@ -2373,7 +2385,7 @@ export class ResourceVersionManager {
 				continue;
 			let token: ResourceVersionToken | undefined;
 			try {
-				token = await this.restore(record, budget(), signal);
+				token = await this.restore(record, budget(), signal, preparation);
 				signal?.throwIfAborted();
 				store.signal.throwIfAborted();
 				if (!this.open) throw new Error("persistent input owner changed");

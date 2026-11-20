@@ -255,7 +255,7 @@ export class FilesystemReadView {
 	open(
 		target: string,
 		flags: number,
-		observe = (fd: number) => adoptFilesystemDescriptor(fd, flags),
+		observe: (fd: number, resolved: string) => number = (fd) => adoptFilesystemDescriptor(fd, flags),
 	): number {
 		if (typeof this.descriptor !== "number" || !this.reader)
 			throw new Error("read-only filesystem view is closed or unavailable");
@@ -267,18 +267,19 @@ export class FilesystemReadView {
 		request.writeUInt32LE(flags, 4);
 		request.write(absolute, 8);
 		const descriptor = this.reader(-6, request, (fd) => {
-			this.observed.add(readlinkSync(`/proc/self/fd/${fd}`));
-			return observe(fd);
+			const resolved = readlinkSync(`/proc/self/fd/${fd}`);
+			this.observed.add(resolved);
+			return observe(fd, resolved);
 		});
 		if (!Number.isInteger(descriptor)) throw new Error("native filesystem open unavailable");
 		if (descriptor < 0)
 			throw filesystemReadError(`filesystem open failed: ${target} (flags=${flags})`, descriptor);
 		return descriptor;
 	}
-	private observe<Value>(target: string, follow: boolean, read: (fd: number) => Value): Value {
+	private observe<Value>(target: string, follow: boolean, read: (fd: number, resolved: string) => Value): Value {
 		let value!: Value;
-		this.open(target, 0x200000 | (follow ? 0 : constants.O_NOFOLLOW), (fd) => {
-			value = read(fd);
+		this.open(target, 0x200000 | (follow ? 0 : constants.O_NOFOLLOW), (fd, resolved) => {
+			value = read(fd, resolved);
 			return 0;
 		});
 		return value;
@@ -294,7 +295,7 @@ export class FilesystemReadView {
 	}
 	async realpath(target: string): Promise<string> {
 		if (this.ambient) return fs.realpath(target);
-		return this.observe(target, true, (fd) => readlinkSync(`/proc/self/fd/${fd}`));
+		return this.observe(target, true, (_fd, resolved) => resolved);
 	}
 	async readlink(target: string): Promise<string> {
 		if (this.ambient) return fs.readlink(target);

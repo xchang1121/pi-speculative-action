@@ -55,7 +55,7 @@ export interface TrustedStepBuild {
 	readonly maxResultBytes: number;
 }
 const unavailable = Symbol("step unavailable");
-type PreparedBytes = { data: Buffer; computation: TimelineInterval; bytes: number; referenced: boolean };
+type PreparedValue = { framePrefix: Buffer; size: number; computation: TimelineInterval; bytes: number; referenced: boolean };
 type WireValue =
 	| {
 			readonly encoding: "json";
@@ -180,8 +180,8 @@ export class SubcomputeService {
 	private readonly counts = new Map<string, SubcomputeCounts>();
 	private readonly cwd: string;
 	private readonly trusted = new Map<string, TrustedSubcomputeStep>();
-	private readonly building = new Map<string, Promise<void>>();
-	private readonly prepared = new Map<string, PreparedBytes>();
+	private readonly building = new Map<string, Promise<PreparedValue>>();
+	private readonly prepared = new Map<string, PreparedValue>();
 	private preparedBytes = 0;
 	private readonly maxBytes: () => number;
 	runtime: () => { reuseEnabled?: boolean; resourceCacheMaxEntries: number; resourceCacheMaxBytes?: number } =
@@ -479,10 +479,12 @@ export class SubcomputeService {
 				throw new Error("invalid_subcompute_frame");
 			return frame;
 		};
-		const send = async (message: object) => {
+		const send = async (message: object, prefix?: Buffer) => {
 			signal.throwIfAborted();
-			const frame = JSON.stringify(message) + "\n";
-			if (Buffer.byteLength(frame) > limit()) throw new Error("subcompute_response_budget_exceeded");
+			const fields = JSON.stringify(message);
+			const tail = (prefix ? fields.slice(1) : fields) + "\n";
+			if ((prefix?.length ?? 0) + Buffer.byteLength(tail) > limit()) throw new Error("subcompute_response_budget_exceeded");
+			const frame = prefix ? Buffer.concat([prefix, Buffer.from(tail)]) : tail;
 			await new Promise<void>((resolve, reject) =>
 				socket.write(frame, (error) => (error ? reject(error) : resolve())),
 			);
@@ -588,18 +590,16 @@ export class SubcomputeService {
 									return value;
 								}, maxResultBytes), signal);
 								if (active.state.kind === "closed") throw new Error("subcompute_context_closed");
-								const value = deserialize(result.data);
-								if (wireBytes(value) > maxResultBytes) {
+								if (result.size > maxResultBytes) {
 									releaseBusy();
 									await send({ state: "local" });
 									return;
 								}
-								await send({ state: produced ? "published" : "hit", value: encodeValue(value), token });
+								await send({ state: produced ? "published" : "hit", token }, result.framePrefix);
 								const ack = await read();
 								if (ack?.op !== "consumed" || ack.token !== token) throw new Error("invalid_subcompute_receipt");
 								if (!produced) {
-									const retained = this.prepared.get(key);
-									if (retained?.data === result.data) retained.referenced = true;
+									result.referenced = true;
 									TimelineInterval.use(result.computation);
 								}
 								subcomputeTiming.getStore()?.(step.namespace, !produced, result.computation);
@@ -652,7 +652,7 @@ export class SubcomputeService {
 		}
 	}
 	/** Inline inputs are completely identified by the host binding, exact key and verified content digest. */
-	private async prepareBytes(key: string, signal: AbortSignal, build: () => Promise<unknown>, limit: number): Promise<PreparedBytes> {
+	private async prepareBytes(key: string, signal: AbortSignal, build: () => Promise<unknown>, limit: number): Promise<PreparedValue> {
 		const store = this.inputStorage.store;
 		const root = `content:${this.inputManager.root}`;
 		const binding = "host.content";
@@ -665,34 +665,44 @@ export class SubcomputeService {
 		}
 		const [record] = await store.findPreparedInputCandidates({ root, binding, prepKey: digestObject(key), limit: 1 }, signal);
 		const payload = record?.payload as { root?: string; preparations?: { binding: string; key: string }[]; data?: string; computation?: unknown } | undefined;
-		let data: Buffer | undefined;
-		let computation: TimelineInterval | undefined;
+		const encode = (value: unknown, receipt: unknown, id: string, maxSize = Infinity): PreparedValue => {
+			const size = wireBytes(value, true);
+			if (size > maxSize) throw unavailable;
+			// Delivery adds the consumer's own state and receipt token to this immutable value.
+			const framePrefix = Buffer.from(`{"value":${JSON.stringify(encodeValue(value))},`);
+			return {
+				framePrefix, size, computation: TimelineInterval.restore(receipt) ?? TimelineInterval.unknownReuse(id),
+				referenced: false, bytes: framePrefix.length + key.length + Buffer.byteLength(JSON.stringify(receipt ?? null)),
+			};
+		};
+		let result: PreparedValue | undefined;
 		if (record && payload?.root === root && payload.preparations?.length === 1 &&
 			payload.preparations[0]?.binding === binding && payload.preparations[0].key === key) {
 			try {
+				let data: Buffer | undefined;
 				if (!record.artifacts.length && typeof payload.data === "string") data = Buffer.from(payload.data, "base64");
 				else if (record.artifacts.length === 1 && payload.data === undefined)
 					data = await store.artifacts.get(record.artifacts[0]!, signal);
-				if (data && !snapshotTrusted(deserialize(data))) data = undefined;
-				if (data) computation = TimelineInterval.restore(payload.computation) ?? TimelineInterval.unknownReuse(record.id);
+				const owned = data && snapshotTrusted(deserialize(data));
+				if (owned) result = encode(owned.value, payload.computation, record.id);
 			} catch (error) {
 				if (hasErrorCode(error, "ERR_PROVENANCE_SCHEMA")) throw error;
 				signal.throwIfAborted();
 				store.signal.throwIfAborted();
-				data = undefined;
-				computation = undefined;
 			}
 		}
-		if (!data || !computation) {
+		if (!result) {
 			signal.throwIfAborted();
 			const measured = await TimelineInterval.measure(build);
-			computation = TimelineInterval.own(measured.computation);
+			const computation = TimelineInterval.own(measured.computation);
 			signal.throwIfAborted();
 			const owned = snapshotTrusted(measured.output);
-			if (!owned || wireBytes(owned.value, true) > limit) throw unavailable;
-			data = owned.data;
+			if (!owned) throw unavailable;
+			const data = owned.data;
+			const receipt = TimelineInterval.serialize(computation);
+			result = encode(owned.value, receipt, key, limit);
 			const metadata = { root, preparations: [{ binding, key }], computation: this.configuration.current.subcomputation.persistTimelineIntervals
-				? TimelineInterval.serialize(computation) : undefined };
+				? receipt : undefined };
 			const envelope = { id: key, createdAt: Date.now(), artifacts: [], payload: { ...metadata, data: "" } };
 			if (Buffer.byteLength(JSON.stringify(envelope)) + 4 * Math.ceil(data.length / 3) <= this.configuration.current.storage.maxRecordBytes)
 				await store.putInputVersion({ ...metadata, data: data.toString("base64") }, []);
@@ -701,14 +711,12 @@ export class SubcomputeService {
 				await store.withPublication(async () => store.putInputVersion(metadata, [await store.artifacts.put(bytes)]));
 			}
 		}
-		const receipt = TimelineInterval.serialize(computation);
-		const result = { data, computation, referenced: false, bytes: data.byteLength + key.length + Buffer.byteLength(JSON.stringify(receipt ?? null)) };
 		const prior = this.prepared.get(key);
 		if (prior) {
 			this.prepared.delete(key);
 			this.preparedBytes -= prior.bytes;
 		}
-		this.prepared.set(key, { ...result, computation: TimelineInterval.restore(receipt) ?? TimelineInterval.unknownReuse(key) });
+		this.prepared.set(key, result);
 		this.preparedBytes += result.bytes;
 		this.trimPrepared();
 		return result;
@@ -734,18 +742,24 @@ export class SubcomputeService {
 		}
 	}
 	/** Followers can retry immediately after owner cancellation. */
-	private async sharedBuild<T>(key: string, evaluate: () => Promise<T>, signal: AbortSignal): Promise<T> {
-		while (this.building.has(key)) {
-			await waitForCompletion(this.building.get(key)!, signal);
+	private async sharedBuild(key: string, evaluate: () => Promise<PreparedValue>, signal: AbortSignal): Promise<PreparedValue> {
+		for (;;) {
+			const active = this.building.get(key);
+			if (!active) break;
+			try {
+				const ready = await waitForCompletion(active, signal);
+				if (ready.status === "completed") return ready.value;
+			} catch {
+				// Each surviving caller can provide its own input after the elected producer fails.
+			}
 			signal.throwIfAborted();
 		}
-		const done = Promise.withResolvers<void>();
-		this.building.set(key, done.promise);
+		const pending = evaluate();
+		this.building.set(key, pending);
 		try {
-			return await evaluate();
+			return await pending;
 		} finally {
 			this.building.delete(key);
-			done.resolve();
 		}
 	}
 	dispose(): Promise<void> {
@@ -787,7 +801,7 @@ function wireBytes(value: unknown, checkJson = false): number {
 }
 function encodeValue(value: unknown): WireValue {
 	return value instanceof Uint8Array
-		? { encoding: "base64", value: Buffer.from(value).toString("base64") }
+		? { encoding: "base64", value: Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("base64") }
 		: { encoding: "json", value };
 }
 function decodeValue(wire: WireValue): unknown {
