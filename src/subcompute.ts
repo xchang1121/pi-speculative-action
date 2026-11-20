@@ -5,12 +5,14 @@ import { createServer, type Server, type Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import { isDeepStrictEqual } from "node:util";
 import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import { ContentChunkPool } from "./content-chunks.ts";
 import { settledFilesystemStat } from "./filesystem-evidence.ts";
 import { evaluateResourceQuery } from "./agent-execution-world.ts";
 import { currentSpeculativeConfiguration, withSpeculativeConfig } from "./config-schema.ts";
 import {
+	collectResourceComputation,
 	computeStepInView,
 	dependencyKey,
 	observeStepInput,
@@ -19,6 +21,7 @@ import {
 	ResourceVersionManager,
 	resourceProofBytes,
 	resourceStatSignature,
+	snapshotPreparation,
 	type ResourceDependency,
 	type ResourceInputPersistence,
 	validateResourceVersion,
@@ -27,11 +30,31 @@ import {
 	type ToolFilesystemOperations,
 } from "./resource-version.ts";
 import { ProvenanceCertificateStore } from "./reuse-store.ts";
-import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
-import { containsFilesystemPath, filesystemPathKey, hasErrorCode } from "./primitives.ts";
-import { PythonCompilationCache, compilerBootstrap, compilerSearchPath, type PythonCompileRequest } from "./python-compilation.ts";
+import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
+import { containsFilesystemPath, digestObject, filesystemPathKey, hasErrorCode, sha256DigestAsync } from "./primitives.ts";
 import { subcomputeTiming, TaskTimeline, TimelineInterval, type SubcomputeCounts } from "./task-timing.ts";
 import type { ObservedProcessPath, ExecutionObservation } from "./execution-observer.ts";
+/** A host-owned deterministic transform. The key identifies all options and input() supplies verified bytes. */
+export interface TrustedSubcomputeStep {
+	readonly namespace: string;
+	readonly implementation: string;
+	readonly enabled?: () => boolean;
+	readonly runtime?: () => Promise<TrustedStepRuntime | undefined>;
+	build(request: TrustedStepBuild): unknown | Promise<unknown>;
+	dispose?(): void | Promise<void>;
+}
+/** Optional host-supplied files and environment needed to install a caller-side adapter. */
+export interface TrustedStepRuntime {
+	readonly readOnlyDirectories: readonly string[];
+	environment(base: Readonly<Record<string, string | undefined>>): Readonly<Record<string, string>>;
+}
+export interface TrustedStepBuild {
+	readonly key: unknown;
+	readonly input: () => Promise<Buffer>;
+	readonly signal: AbortSignal;
+	readonly maxResultBytes: number;
+}
+const unavailable = Symbol("step unavailable");
 type WireValue =
 	| {
 			readonly encoding: "json";
@@ -43,6 +66,7 @@ type WireValue =
 	  };
 type Begin = ComputeStepRequest & {
 	readonly op: "compute";
+	readonly inputDigest?: string;
 	readonly context: string;
 };
 type Observation = {
@@ -58,36 +82,44 @@ type Publication = {
 	readonly durationMs: number;
 };
 const fields = {
-	compute: ["op", "context", "namespace", "key", "inputResources", "envKeys", "environment", "includeInputContent"],
+	compute: ["op", "context", "namespace", "key", "inputResources", "envKeys", "environment", "includeInputContent", "inputDigest"],
 	observe: ["op", "token", "reads"],
 	publish: ["op", "token", "reads", "durationMs", "value"],
-	python_compile: ["op", "context", "engine", "executable", "filename", "optimize", "digest"],
-	source: ["op", "data"],
-	consumed: ["op"],
+	input: ["op", "token", "value"],
+	consumed: ["op", "token"],
 };
 const endpoint = new AsyncLocalStorage<SubcomputeService>();
 type SubcomputeScope = {
 	run: ReturnType<typeof AsyncLocalStorage.snapshot>;
 	timer?: NodeJS.Timeout;
-	bootstrap?: string;
+	runtimes?: readonly TrustedStepRuntime[];
 	clients: Set<Socket>;
 	socket: string;
+	identity: string;
+	currentIdentity: () => string;
 	proofs: ResourceVersionToken[];
 	busy: number;
 	failed: boolean;
 	general: boolean;
 };
 const channels = new Map<string, SubcomputeScope>();
+function adapterEnvironment(scope: SubcomputeScope, base: Readonly<Record<string, string | undefined>>) {
+	const variables: Record<string, string> = {};
+	for (const runtime of scope.runtimes ?? []) Object.assign(variables, runtime.environment({ ...base, ...variables }));
+	return variables;
+}
 export function controlledSubcomputeChannel(environment: Readonly<Record<string, string | undefined>>) {
-	const token = environment.PI_SUBCOMPUTE_CONTEXT ?? environment.PI_PYTHON_COMPILE_CONTEXT;
+	const token = environment.PI_SUBCOMPUTE_CONTEXT;
 	const scope = token ? channels.get(token) : undefined;
-	if (!scope || scope.socket !== (environment.PI_SUBCOMPUTE_SOCKET ?? environment.PI_PYTHON_COMPILE_SOCKET)) return undefined;
+	if (!scope || scope.socket !== environment.PI_SUBCOMPUTE_SOCKET) return undefined;
 	return {
 		socket: scope.socket,
-		bootstrap: scope.bootstrap,
+		identity: scope.identity,
+		readOnlyDirectories: [...new Set(scope.runtimes?.flatMap((runtime) => runtime.readOnlyDirectories))],
+		environment: (base: Readonly<Record<string, string | undefined>>) => adapterEnvironment(scope, base),
 		async validate() {
 			if (
-				channels.get(token!) !== scope ||
+				channels.get(token!) !== scope || scope.currentIdentity() !== scope.identity ||
 				scope.failed ||
 				scope.busy ||
 				(scope.proofs.length && (await validateResourceVersion(scope.proofs)).expired)
@@ -115,34 +147,12 @@ export async function subcomputeEnvironment(): Promise<Readonly<Record<string, s
 	const service = endpoint.getStore();
 	return service ? service.environment() : {};
 }
+/** Own temporary controlled endpoints until a background execution has sealed its result. */
+export function withSubcomputeScope<T>(execute: () => Promise<T>): Promise<T> {
+	return endpoint.getStore()?.run(execute) ?? execute();
+}
 export async function controlledRuntimeEnvironment(environment: Readonly<Record<string, string | undefined>>): Promise<Readonly<Record<string, string>>> {
-	const service = endpoint.getStore();
-	if (!service) return {};
-	const config = service.configuration.current;
-	const general = config.subcomputation.exposeToControlledProcesses;
-	const runtime = service.runtime();
-	const archive = process.platform === "linux" && config.subcomputation.pythonImports && runtime.reuseEnabled !== false &&
-		runtime.resourceCacheMaxEntries > 0 && (runtime.resourceCacheMaxBytes ?? config.runtime.resourceCacheMaxBytes) > 0
-		? await compilerBootstrap() : undefined;
-	if (!general && !archive) return {};
-	const channel = controlledSubcomputeChannel(environment);
-	const transport = channel ? {
-		PI_SUBCOMPUTE_SOCKET: channel.socket,
-		PI_SUBCOMPUTE_CONTEXT: environment.PI_SUBCOMPUTE_CONTEXT ?? environment.PI_PYTHON_COMPILE_CONTEXT!,
-	} : await service.environment(general).catch((error: unknown) => {
-		if (general) throw error;
-		return undefined;
-	});
-	if (!transport) return {};
-	if (archive) channels.get(transport.PI_SUBCOMPUTE_CONTEXT)!.bootstrap = archive;
-	return {
-		...(general || (channel && environment.PI_SUBCOMPUTE_CONTEXT) ? transport : {}),
-		...(archive ? {
-			PI_PYTHON_COMPILE_SOCKET: transport.PI_SUBCOMPUTE_SOCKET,
-			PI_PYTHON_COMPILE_CONTEXT: transport.PI_SUBCOMPUTE_CONTEXT,
-			PYTHONPATH: compilerSearchPath(environment.PYTHONPATH, archive),
-		} : {}),
-	};
+	return endpoint.getStore()?.controlledEnvironment(environment) ?? {};
 }
 /** A protocol adapter over the same ResourceInputSession and CAS used by computeStep. */
 export class SubcomputeService {
@@ -164,26 +174,55 @@ export class SubcomputeService {
 	private cacheBytes = 0;
 	private readonly counts = new Map<string, SubcomputeCounts>();
 	private readonly cwd: string;
-	private readonly python: PythonCompilationCache;
+	private readonly trusted = new Map<string, TrustedSubcomputeStep>();
+	private readonly building = new Map<string, Promise<void>>();
 	private readonly maxBytes: () => number;
 	runtime: () => { reuseEnabled?: boolean; resourceCacheMaxEntries: number; resourceCacheMaxBytes?: number } =
 		() => this.configuration.current.runtime;
-	constructor(cwd: string, store: ProvenanceCertificateStore, maxBytes: () => number) {
+	constructor(cwd: string, store: ProvenanceCertificateStore, maxBytes: () => number, steps: readonly TrustedSubcomputeStep[] = []) {
 		this.cwd = cwd;
-		this.python = new PythonCompilationCache(cwd);
+		for (const step of steps) {
+			if (!step.namespace.trim() || !step.implementation.trim() || this.trusted.has(step.namespace))
+				throw new Error("invalid_trusted_step_registration");
+			this.trusted.set(step.namespace, step);
+		}
 		this.inputStorage = { store, contents: new ContentChunkPool(store) };
 		this.releaseChunks = this.inputStorage.contents.retain();
 		this.inputManager = new ResourceVersionManager(cwd, { watch: false, persistentInputs: this.inputStorage });
 		this.maxBytes = maxBytes;
 		this.configuration.bind(this);
 	}
-	drainMetrics() {
-		const metrics = Object.fromEntries(this.counts);
-		this.counts.clear();
+	async controlledEnvironment(base: Readonly<Record<string, string | undefined>>): Promise<Readonly<Record<string, string>>> {
+		const general = this.configuration.current.subcomputation.exposeToControlledProcesses;
+		const steps = [...this.trusted.values()].filter((step) => this.trustedEnabled(step));
+		if (!general && !steps.length) return {};
+		const existing = base.PI_SUBCOMPUTE_CONTEXT && this.scopes.get(base.PI_SUBCOMPUTE_CONTEXT);
+		const transport = existing && existing.socket === base.PI_SUBCOMPUTE_SOCKET && existing.currentIdentity() === existing.identity ? {
+			PI_SUBCOMPUTE_SOCKET: existing.socket, PI_SUBCOMPUTE_CONTEXT: base.PI_SUBCOMPUTE_CONTEXT!,
+		} : await this.environment(general).catch((error: unknown) => {
+			if (general) throw error;
+			return undefined;
+		});
+		if (!transport) return {};
+		const scope = this.scopes.get(transport.PI_SUBCOMPUTE_CONTEXT)!;
+		scope.runtimes ??= (await Promise.all(steps.map((step) => step.runtime?.()))).filter((runtime) => runtime !== undefined);
+		return { ...adapterEnvironment(scope, base), ...transport };
+	}
+	private trustedEnabled(step: TrustedSubcomputeStep): boolean {
+		const runtime = this.runtime();
+		if (runtime.reuseEnabled === false || runtime.resourceCacheMaxEntries <= 0 || (runtime.resourceCacheMaxBytes ?? this.maxBytes()) <= 0) return false;
+		return step.enabled?.() ?? true;
+	}
+	withMetrics<T>(counts: Map<string, SubcomputeCounts>, execute: () => T): T {
+		return subcomputeTiming.run((namespace, hit, receipt) => this.record(namespace, hit, receipt, counts), execute);
+	}
+	drainMetrics(counts = this.counts) {
+		const metrics = Object.fromEntries(counts);
+		counts.clear();
 		return metrics;
 	}
-	private readonly record = (namespace: string, hit: boolean, computation?: TimelineInterval) => {
-		const counts = this.counts.get(namespace) ?? { hits: 0, misses: 0, reusedMs: 0 };
+	private readonly record = (namespace: string, hit: boolean, computation?: TimelineInterval, totals = this.counts) => {
+		const counts = totals.get(namespace) ?? { hits: 0, misses: 0, reusedMs: 0 };
 		if (hit) {
 			counts.hits++;
 			if (computation) {
@@ -191,7 +230,7 @@ export class SubcomputeService {
 				counts.reusedMs += new TaskTimeline(now).recordTool(computation, now, true).toolComputeMs ?? 0;
 			}
 		} else counts.misses++;
-		this.counts.set(namespace, counts);
+		totals.set(namespace, counts);
 	};
 	private evict(key: string): void {
 		const entry = this.files.get(key);
@@ -269,7 +308,7 @@ export class SubcomputeService {
 		return endpoint.run(this, () =>
 			this.owners.run(tokens, () => {
 				try {
-					const output = subcomputeTiming.run(this.record, operation);
+					const output = subcomputeTiming.run(subcomputeTiming.getStore() ?? this.record, operation);
 					if (output instanceof Promise) return output.finally(finish) as T;
 					finish();
 					return output;
@@ -290,8 +329,15 @@ export class SubcomputeService {
 			() => this.releaseScope(token),
 			this.configuration.current.subcomputation.socketTimeoutMs,
 		).unref() : undefined;
+		const currentIdentity = () => digestObject({
+			general,
+			steps: Object.fromEntries([...this.trusted.values()].map((step) =>
+				[step.namespace, this.trustedEnabled(step) ? step.implementation : null])),
+		});
 		const scope: SubcomputeScope = {
-			run: subcomputeTiming.run(this.record, () => AsyncLocalStorage.snapshot()),
+			identity: currentIdentity(),
+			currentIdentity,
+			run: subcomputeTiming.run(subcomputeTiming.getStore() ?? this.record, () => AsyncLocalStorage.snapshot()),
 			timer,
 			clients: new Set(),
 			socket,
@@ -411,8 +457,8 @@ export class SubcomputeService {
 			if (next.done) return undefined;
 			frames--;
 			if (Buffer.byteLength(next.value) > limit()) throw new Error("subcompute_request_budget_exceeded");
-			const frame = JSON.parse(next.value) as Begin | Observation | Publication | PythonCompileRequest |
-				{ op: "consumed" } | { op: "source"; data: string };
+			const frame = JSON.parse(next.value) as Begin | Observation | Publication |
+				{ op: "consumed"; token: string } | { op: "input"; token: string; value: WireValue };
 			if (!frame || !Object.hasOwn(fields, frame.op) || Object.keys(frame).some((key) => !fields[frame.op].includes(key)))
 				throw new Error("invalid_subcompute_frame");
 			return frame;
@@ -460,48 +506,14 @@ export class SubcomputeService {
 			for (;;) {
 				const request = await read();
 				if (request === undefined) break;
-				if (request.op !== "compute" && request.op !== "python_compile") throw new Error("invalid_subcompute_request");
-				const requestedScope = this.scopes.get(request.context);
-				if (scope && scope !== requestedScope) throw new Error("subcompute_context_changed");
-				scope = requestedScope;
-				if (!scope) throw new Error("subcompute_context_unavailable");
+				if (request.op !== "compute") throw new Error("invalid_subcompute_request");
+				const active = this.scopes.get(request.context);
+				if (scope && scope !== active) throw new Error("subcompute_context_changed");
+				if (!active) throw new Error("subcompute_context_unavailable");
+				scope = active;
 				scope.clients.add(socket);
-				if (request.op === "python_compile") {
-					if (!scope.bootstrap) throw new Error("subcompute_context_unavailable");
-					const { subcomputation } = this.configuration.current;
-					const runtime = this.runtime();
-					scope.busy++;
-					try {
-						let requestedSource = false;
-						const source = async () => {
-							requestedSource = true;
-							await send({ state: "source" });
-							const frame = await read();
-							if (frame?.op === "source") return frame.data;
-						};
-						const resultLimit = Math.min(subcomputation.maxStepResultBytes, Math.floor((limit() - 128) * 3 / 4));
-						const compiled = await scope.run(() =>
-							this.python.get(request, source, runtime.reuseEnabled === false ? 0 : runtime.resourceCacheMaxEntries,
-								runtime.resourceCacheMaxBytes ?? this.maxBytes(), resultLimit)
-						).catch(() => undefined);
-						if (!compiled || compiled === "local") {
-							await send({ state: compiled === "local" && !requestedSource ? "local" : "unavailable" });
-							continue;
-						}
-						await send({ state: "compiled", data: compiled.bytes.toString("base64") });
-						if ((await read())?.op !== "consumed") break;
-						compiled.consumed();
-						scope.run(() => {
-							if (compiled.hit) TimelineInterval.use(compiled.computation);
-							this.record("python.source_to_code", compiled.hit, compiled.computation);
-						});
-						await send({ state: "ready" });
-					} finally {
-						scope.busy--;
-					}
-					continue;
-				}
-				if (!scope.general) throw new Error("subcompute_context_unavailable");
+				const step = this.trusted.get(request.namespace);
+				if (!scope.general && !step) throw new Error("subcompute_context_unavailable");
 				if (
 					!Object.hasOwn(request, "key") ||
 					typeof request.namespace !== "string" ||
@@ -518,48 +530,86 @@ export class SubcomputeService {
 							)))
 				)
 					throw new Error("invalid_subcompute_request");
-				const contract = { ...request, inputResources: this.resources(request.inputResources) };
+				if (step ? typeof request.inputDigest !== "string" || !/^[a-f0-9]{64}$/.test(request.inputDigest) || request.inputResources !== undefined ||
+					request.envKeys !== undefined || request.environment !== undefined || request.includeInputContent !== undefined : request.inputDigest !== undefined)
+					throw new Error("invalid_subcompute_request");
+				if (step && !snapshotPreparation(request.key)) throw new Error("compute_step_input_budget_exceeded");
+				if (step && !this.trustedEnabled(step)) {
+					await send({ state: "unavailable" });
+					continue;
+				}
+				const trustedKey = step && digestObject([step.namespace, step.implementation, request.key, request.inputDigest]);
+				const contract = { ...request, key: trustedKey ?? request.key, inputResources: this.resources(request.inputResources) };
 				const session = inputSession ??= new ResourceInputSession({ store: this.inputStorage.store, inputs: this.inputs }, this.maxBytes());
 				let produced = false;
-				scope.busy++;
-				try {
-					const query = await scope.run(() =>
-						session.run(() =>
-							evaluateResourceQuery(
-								undefined,
-								{ signal },
-								this.cwd,
-								(view) =>
-									computeStepInView(
-										view,
-										contract,
-										async (inputs) => {
-											produced = true;
-											return publish(inputs as ResourceReadView, contract);
-										},
-										signal,
-									),
-								PI_ACTION_SEMANTICS,
-								this.maxBytes(),
-								true,
-								"output",
-								undefined,
-								session,
-							),
-						),
-					);
+				const token = randomUUID();
+				let input: Promise<Buffer> | undefined;
+				const receiveInput = async () => {
+					await send({ state: "input", token });
+					const frame = await read();
+					if (frame?.op !== "input" || frame.token !== token || frame.value?.encoding !== "base64") throw new Error("invalid_subcompute_input");
+					const bytes = decodeValue(frame.value) as Buffer;
+					if (await sha256DigestAsync(bytes) !== `sha256:${request.inputDigest}`) throw new Error("subcompute_input_digest_mismatch");
+					return bytes;
+				};
+				let hitReceipt: TimelineInterval | undefined;
+				const maxResultBytes = Math.min(this.configuration.current.subcomputation.maxStepResultBytes,
+					this.runtime().resourceCacheMaxBytes ?? this.maxBytes(), Math.floor((limit() - 160) * 3 / 4));
+				const build = async (view: ToolFilesystemOperations, sharedSignal: AbortSignal) => {
+					produced = true;
+					if (!step) return publish(view as ResourceReadView, contract);
+					const value = await step.build({
+						key: request.key,
+						input: () => input ??= TimelineInterval.outside(receiveInput),
+						signal: sharedSignal,
+						maxResultBytes,
+					});
+					if (value === undefined) throw unavailable;
+					if (TimelineInterval.outsideSync(() => wireBytes(value, true)) > maxResultBytes) throw unavailable;
+					return value;
+				};
+				const evaluate = () => session.run(() => evaluateResourceQuery(
+					undefined, { signal }, this.cwd,
+					(view) => computeStepInView(view, contract, build, signal, step?.implementation),
+					PI_ACTION_SEMANTICS, this.maxBytes(), true, "output", undefined, session,
+				));
+				const deliver = async () => {
+					const query = trustedKey ? await this.sharedBuild(trustedKey, evaluate, signal) : await evaluate();
 					if (!query) throw new Error("subcompute_retention_budget_exceeded");
 					try {
-						if (this.scopes.get(request.context) !== scope) throw new Error("subcompute_context_closed");
-						for (const proof of query.versions)
-							scope.proofs.push(session.retain({ ...proof, view: undefined }));
+						if (this.scopes.get(request.context) !== active) throw new Error("subcompute_context_closed");
+						if (step && !produced && wireBytes(query.output) > maxResultBytes) {
+							await send({ state: "local" });
+							return false;
+						}
+						// A host transform takes only verified inline bytes. Files read by its caller have their own evidence.
+						if (!step) for (const proof of query.versions)
+							active.proofs.push(session.retain({ ...proof, view: undefined }));
 						await send({
 							state: produced ? "published" : "hit",
 							value: encodeValue(query.output),
+							...(step && { token }),
 						});
+						if (step) {
+							const ack = await read();
+							if (ack?.op !== "consumed" || ack.token !== token) throw new Error("invalid_subcompute_receipt");
+							active.run(() => subcomputeTiming.getStore()?.(step.namespace, !produced, hitReceipt));
+							await send({ state: "ready" });
+						}
+						return true;
 					} finally {
 						await Promise.allSettled(query.versions.map((token) => token.release()));
 					}
+				};
+				scope.busy++;
+				try {
+					if (step) await scope.run(() => subcomputeTiming.run((_namespace, hit, receipt) => {
+						if (hit) hitReceipt = receipt;
+					}, () => collectResourceComputation(deliver, (consumed) => consumed)));
+					else await scope.run(deliver);
+				} catch (error) {
+					if (error !== unavailable) throw error;
+					await send({ state: input ? "local" : "unavailable" });
 				} finally {
 					scope.busy--;
 				}
@@ -574,15 +624,29 @@ export class SubcomputeService {
 			await inputSession?.dispose();
 		}
 	}
+	/** Followers validate the indexed preparation after the owner publishes, including after owner cancellation. */
+	private async sharedBuild<T>(key: string, evaluate: () => Promise<T>, signal: AbortSignal): Promise<T> {
+		while (this.building.has(key)) {
+			await waitForCompletion(this.building.get(key)!, signal);
+			signal.throwIfAborted();
+		}
+		const done = Promise.withResolvers<void>();
+		this.building.set(key, done.promise);
+		try {
+			return await evaluate();
+		} finally {
+			this.building.delete(key);
+			done.resolve();
+		}
+	}
 	dispose(): Promise<void> {
 		return this.lifetime.close(async () => {
-			const compilers = this.python.close();
 			for (const token of this.scopes.keys()) this.releaseScope(token);
 			for (const [socket, controller] of this.clients) {
 				controller.abort(new Error("subcompute_service_closed"));
 				socket.destroy();
 			}
-			await compilers;
+			await Promise.all([...this.trusted.values()].map((step) => step.dispose?.()));
 			await this.ready?.catch(() => undefined);
 			if (this.server?.listening)
 				await new Promise<void>((resolve, reject) =>
@@ -596,6 +660,12 @@ export class SubcomputeService {
 			if (this.directory) await rm(this.directory, { recursive: true, force: true });
 		});
 	}
+}
+function wireBytes(value: unknown, checkJson = false): number {
+	if (value instanceof Uint8Array) return value.byteLength;
+	const json = JSON.stringify(value);
+	if (json === undefined || (checkJson && !isDeepStrictEqual(JSON.parse(json), value))) throw unavailable;
+	return Buffer.byteLength(json);
 }
 function encodeValue(value: unknown): WireValue {
 	return value instanceof Uint8Array

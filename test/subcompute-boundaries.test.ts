@@ -10,11 +10,18 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { afterEach, expect, test, vi } from "vitest";
 import { Type } from "typebox";
+import { createReadTool } from "@earendil-works/pi-coding-agent";
+import { parseJsonConfig } from "../examples/config-parsing.ts";
+import { bindResourceOperation } from "../src/agent-execution-world.ts";
+import { PATTERN_AWARE_DEFAULTS, PatternAwareStore } from "../src/pattern-aware.ts";
+import { createActorForkPlanSource } from "../src/self-speculation.ts";
+import { digestObject } from "../src/primitives.ts";
+import { toolUse } from "./model.ts";
 import { subcomputeEnvironment } from "../src/index.ts";
 import { SpeculativeConfiguration } from "../src/config-schema.ts";
 import { ContentChunkPool } from "../src/content-chunks.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
-import { compilerBootstrap, PythonCompilationCache } from "../src/python-compilation.ts";
+import { compilerBootstrap, PythonImportStep } from "../src/python-compilation.ts";
 import { controlledRuntimeEnvironment, controlledSubcomputeChannel, SubcomputeService } from "../src/subcompute.ts";
 import { systemHost } from "./agent-system-fixture.ts";
 import { temporaryDirectories } from "./filesystem.ts";
@@ -380,66 +387,36 @@ test("shutdown prevents late channel creation and concurrent callers share its c
 	}
 });
 
-test.skipIf(process.platform !== "linux")("the compiler accepts verified source only and its private channel cannot publish steps", async () => {
+test.skipIf(process.platform !== "linux")("controlled imports use host-owned steps and reject untrusted interpreters before requesting bytes", async () => {
 	const cwd = await directories.create();
 	const store = new ProvenanceCertificateStore(await directories.create());
-	const service = new SubcomputeService(cwd, store, () => 1024 * 1024);
-	service.runtime = () => ({ resourceCacheMaxEntries: 2 });
+	const service = new SubcomputeService(cwd, store, () => 1024 * 1024, [new PythonImportStep(cwd)]);
 	try {
 		await service.run(async () => {
 			const env = await controlledRuntimeEnvironment({});
-			expect(env.PI_SUBCOMPUTE_CONTEXT).toBeUndefined();
-			const context = env.PI_PYTHON_COMPILE_CONTEXT!;
-			const peer = client({ PI_SUBCOMPUTE_SOCKET: env.PI_PYTHON_COMPILE_SOCKET! });
+			const peer = client(env);
 			try {
-				const archive = controlledSubcomputeChannel(env)!.bootstrap!;
+				const archive = (await compilerBootstrap())!;
+				expect(controlledSubcomputeChannel(env)?.readOnlyDirectories).toEqual([path.dirname(archive)]);
 				const main = "import sys,zipimport;exec(zipimport.zipimporter(sys.argv[1]).get_code('sitecustomize'))";
 				const engine = JSON.parse(execFileSync("python3", ["-I", "-S", "-B", "-c", main, archive], { input: "", encoding: "utf8" }));
+				const executable = execFileSync("python3", ["-c", "import os,sys; print(os.path.realpath(sys.executable))"], { encoding: "utf8" }).trim();
+				const key = { engine, executable, filename: path.join(cwd, "x.py"), optimize: 0 };
+				const namespace = "python.source_to_code";
 				const source = Buffer.from("output = 42\n");
-				const executable = execFileSync("python3", ["-c", "import os, sys; print(os.path.realpath(sys.executable))"], { encoding: "utf8" }).trim();
-				const request = { op: "python_compile", context, engine, executable, optimize: 0, filename: path.join(cwd, "x.py"),
-					digest: createHash("sha256").update(source).digest("hex") };
-				peer.send(request);
-				expect(await peer.read()).toEqual({ state: "source" });
-				peer.send({ op: "source", data: Buffer.from("output = 99\n").toString("base64") });
-				expect(await peer.read()).toEqual({ state: "unavailable" });
-				peer.send(request);
-				expect(await peer.read()).toEqual({ state: "source" });
-				peer.send({ op: "source", data: source.toString("base64") });
-				const compiled = await peer.read();
-				expect(compiled.state).toBe("compiled");
-				const consume = async () => {
-					peer.send({ op: "consumed" });
-					expect(await peer.read()).toEqual({ state: "ready" });
-				};
-				await consume();
+				const compile = (options = key) => trustedCompute(peer, env, namespace, options, source);
+				const first = await compile();
+				expect(first.state).toBe("published");
+				expect(first.value.encoding).toBe("base64");
 				const other = path.join(cwd, "python3");
 				await copyFile(executable, other);
-				peer.send({ ...request, executable: other });
-				expect(await peer.read()).toEqual({ state: "unavailable" });
-				peer.send(request);
-				expect(await peer.read()).toEqual(compiled);
-				await consume();
-				for (const filename of ["y.py", "z.py"]) {
-					peer.send({ ...request, filename: path.join(cwd, filename) });
-					expect(await peer.read()).toEqual({ state: "source" });
-					peer.send({ op: "source", data: source.toString("base64") });
-					expect((await peer.read()).state).toBe("compiled");
-					await consume();
-				}
-				peer.send(request);
-				expect(await peer.read()).toEqual(compiled);
-				await consume();
-				peer.send({ ...request, filename: path.join(cwd, "y.py") });
-				expect(await peer.read()).toEqual({ state: "source" });
-				peer.send({ op: "source", data: "" });
-				expect(await peer.read()).toEqual({ state: "unavailable" });
-				peer.send({ op: "compute", context, namespace: "other", key: "work" });
+				expect(await compile({ ...key, executable: other })).toEqual({ state: "unavailable" });
+				expect(await compile({ ...key, engine: "0".repeat(64) })).toEqual({ state: "unavailable" });
+				expect(await compile()).toMatchObject({ state: "hit", value: first.value });
+				peer.send({ op: "compute", namespace: "other", context: env.PI_SUBCOMPUTE_CONTEXT, key: null });
 				expect(await peer.read()).toMatchObject({ state: "error" });
-				expect(service.drainMetrics()["python.source_to_code"]).toMatchObject({ hits: 2, misses: 3 });
-			} finally {
-				peer.close();
-			}
+				expect(service.drainMetrics()[namespace]).toMatchObject({ hits: 1, misses: 1 });
+			} finally { peer.close(); }
 		});
 	} finally {
 		await service.dispose();
@@ -450,7 +427,7 @@ test.skipIf(process.platform !== "linux")("the compiler accepts verified source 
 test.skipIf(process.platform !== "linux")("concurrent venv imports share one connection per process and reopen it after fork", async () => {
 	const cwd = await directories.create();
 	const store = new ProvenanceCertificateStore(await directories.create());
-	const service = new SubcomputeService(cwd, store, () => 1024 * 1024);
+	const service = new SubcomputeService(cwd, store, () => 1024 * 1024, [new PythonImportStep(cwd)]);
 	try {
 		const hostPython = execFileSync("python3", ["-c", "import sys; print(sys.executable)"], { encoding: "utf8" }).trim();
 		const venvBin = path.join(cwd, ".venv", "bin");
@@ -517,21 +494,6 @@ print(sum(values) + mod_a.value)`;
 			expect(connections).toBe(2);
 			expect(service.drainMetrics()["python.source_to_code"]).toMatchObject({ hits: 4, misses: 1 });
 
-			const peer = client({ PI_SUBCOMPUTE_SOCKET: env.PI_PYTHON_COMPILE_SOCKET! });
-			try {
-				peer.send({
-					op: "python_compile",
-					context: env.PI_PYTHON_COMPILE_CONTEXT!,
-					engine: "0".repeat(64),
-					executable: path.join(cwd, "untrusted-python3"),
-					optimize: 0,
-					filename: path.join(cwd, "mod_a.py"),
-					digest: "1".repeat(64),
-				});
-				expect(await peer.read()).toEqual({ state: "unavailable" });
-			} finally {
-				peer.close();
-			}
 		});
 	} finally {
 		await service.dispose();
@@ -543,9 +505,8 @@ test.skipIf(process.platform !== "linux")("four compiler slots keep active impor
 	const installations = await directories.create(os.homedir());
 	const cwd = await directories.create();
 	vi.stubEnv("UV_PYTHON_INSTALL_DIR", installations);
-	const cache = new PythonCompilationCache(cwd);
+	const compiler = new PythonImportStep(cwd);
 	const source = Buffer.from("value = 10\n");
-	const digest = createHash("sha256").update(source).digest("hex");
 	const gates = Array.from({ length: 4 }, () => Promise.withResolvers<void>());
 	const active = gates.map(() => Promise.withResolvers<void>());
 	try {
@@ -557,9 +518,9 @@ test.skipIf(process.platform !== "linux")("four compiler slots keep active impor
 			const executable = path.join(bin, "python3");
 			await copyFile("/usr/bin/python3", executable);
 			const engine = JSON.parse(execFileSync(executable, ["-I", "-S", "-B", "-c", main, bootstrap], { input: "", encoding: "utf8" }));
-			return { op: "python_compile" as const, context: "", executable, engine, optimize: 0, filename: path.join(cwd, "x.py"), digest };
+			return { executable, engine, optimize: 0, filename: path.join(cwd, "x.py") };
 		}));
-		const get = (i: number) => cache.get(requests[i]!, async () => {
+		const get = (i: number) => compiler.build({ key: requests[i], maxResultBytes: 65536, signal: new AbortController().signal, input: async () => {
 			if (i < gates.length) {
 				active[i]!.resolve();
 				await gates[i]!.promise;
@@ -567,18 +528,18 @@ test.skipIf(process.platform !== "linux")("four compiler slots keep active impor
 			const ids = (await readFile(`/proc/self/task/${process.pid}/children`, "utf8")).trim().split(/\s+/);
 			const images = await Promise.all(ids.map((id) => readlink(`/proc/${id}/exe`).catch(() => "")));
 			expect(images.filter((file) => file.startsWith(installations + "/")).length).toBeLessThanOrEqual(4);
-			return source.toString("base64");
-		}, 16, 65536, 65536);
+			return source;
+		} });
 		const first = gates.map((_, i) => get(i));
 		await Promise.all(active.map((item) => item.promise));
 		const fifth = get(4);
 		gates[3]!.resolve();
-		expect(await fifth).toMatchObject({ hit: false });
+		expect(await fifth).toBeInstanceOf(Buffer);
 		for (const gate of gates) gate.resolve();
-		for (const result of await Promise.all(first)) expect(result).toMatchObject({ hit: false });
+		for (const result of await Promise.all(first)) expect(result).toBeInstanceOf(Buffer);
 	} finally {
 		for (const gate of gates) gate.resolve();
-		await cache.close();
+		await compiler.dispose();
 		vi.unstubAllEnvs();
 	}
 });
@@ -602,6 +563,176 @@ function client(environment: Readonly<Record<string, string>>) {
 		},
 	};
 }
+
+async function trustedCompute(peer: ReturnType<typeof client>, environment: Readonly<Record<string, string>>, namespace: string, key: unknown, bytes: Buffer) {
+	peer.send({ op: "compute", namespace, key, context: environment.PI_SUBCOMPUTE_CONTEXT, inputDigest: createHash("sha256").update(bytes).digest("hex") });
+	let reply = await peer.read();
+	if (reply.state === "input") {
+		peer.send({ op: "input", token: reply.token, value: { encoding: "base64", value: bytes.toString("base64") } });
+		reply = await peer.read();
+	}
+	if (reply.state === "hit" || reply.state === "published") {
+		peer.send({ op: "consumed", token: reply.token });
+		expect(await peer.read()).toEqual({ state: "ready" });
+	}
+	return reply;
+}
+
+test("trusted configuration parsing publishes once, survives restart and isolates host evidence from client publication", async () => {
+	const cwd = await directories.create();
+	const storage = await directories.create();
+	const bytes = Buffer.from('{"target":"library"}');
+	const namespace = parseJsonConfig.namespace;
+	const digest = createHash("sha256").update(bytes).digest("hex");
+	const build = vi.fn(parseJsonConfig.build);
+	let store = new ProvenanceCertificateStore(storage);
+	const open = (implementation: string) => new SubcomputeService(cwd, store, () => 1024 * 1024, [{ namespace, implementation, build }]);
+	let service = new SubcomputeService(cwd, store, () => 1024 * 1024);
+	const peerFor = async () => {
+		const env = await service.environment();
+		return { env, peer: client(env) };
+	};
+	try {
+		const key = { format: "json" };
+		const publicClient = await peerFor();
+		publicClient.peer.send({ op: "compute", context: publicClient.env.PI_SUBCOMPUTE_CONTEXT, namespace,
+			key: digestObject([namespace, parseJsonConfig.implementation, key, digest]) });
+		const miss = await publicClient.peer.read();
+		publicClient.peer.send({ op: "publish", token: miss.token, durationMs: 1, value: { encoding: "json", value: "unverified" } });
+		expect((await publicClient.peer.read()).state).toBe("published");
+		publicClient.peer.close();
+		await service.dispose();
+		service = open(parseJsonConfig.implementation);
+		const packet = { op: "compute", namespace, key, inputDigest: digest };
+		for (const mode of ["wrong bytes", "client publication", "disconnected"] as const) {
+			const { peer, env } = await peerFor();
+			peer.send({ ...packet, context: env.PI_SUBCOMPUTE_CONTEXT });
+			const prompt = await peer.read();
+			expect(prompt.state).toBe("input");
+			if (mode !== "disconnected") {
+				peer.send({ op: mode === "wrong bytes" ? "input" : "publish", token: prompt.token,
+					value: { encoding: "base64", value: Buffer.from("different").toString("base64") } });
+				expect((await peer.read()).state).toBe("error");
+			}
+			peer.close();
+		}
+		build.mockClear();
+		const use = async (payload = bytes) => {
+			const { env, peer } = await peerFor();
+			try { return await trustedCompute(peer, env, namespace, key, payload); }
+			finally { peer.close(); }
+		};
+		const replies = await Promise.all([use(), use()]);
+		expect(replies.map((reply) => reply.state).sort()).toEqual(["hit", "published"]);
+		for (const reply of replies) expect(reply.value).toEqual({ encoding: "json", value: { target: "library" } });
+		expect(build).toHaveBeenCalledTimes(1);
+		const offered = await peerFor();
+		offered.peer.send({ ...packet, context: offered.env.PI_SUBCOMPUTE_CONTEXT });
+		expect((await offered.peer.read()).state).toBe("hit");
+		offered.peer.close();
+		expect(service.drainMetrics()[namespace]).toMatchObject({ misses: 1, hits: 1 });
+		await service.dispose();
+		await store.dispose();
+		store = new ProvenanceCertificateStore(storage);
+		service = open(parseJsonConfig.implementation);
+		expect((await use()).state).toBe("hit");
+		expect((await use(Buffer.from('{"target":"application"}')))).toMatchObject({ state: "published", value: { value: { target: "application" } } });
+		await service.dispose();
+		service = open("JSON with a different decoder");
+		expect((await use()).state).toBe("published");
+		expect(build).toHaveBeenCalledTimes(3);
+		// JSON.parse preserves negative zero, which a JSON response frame would turn into zero.
+		expect((await use(Buffer.from('{"weight":-0}'))).state).toBe("local");
+	} finally {
+		await service.dispose();
+		await store.dispose();
+	}
+});
+
+test("one connection can repeatedly consume a large trusted result within one snapshot budget", async () => {
+	const cwd = await directories.create();
+	const store = new ProvenanceCertificateStore(await directories.create());
+	const step = { namespace: "bytes.copy", implementation: "identity", build: vi.fn(({ input }: import("../src/subcompute.ts").TrustedStepBuild) => input()) };
+	const service = new SubcomputeService(cwd, store, () => 64 * 1024, [step]);
+	const env = await service.environment();
+	const peer = client(env);
+	try {
+		const payload = Buffer.alloc(12 * 1024, 42);
+		for (let i = 0; i < 16; i++) {
+			const reply = await trustedCompute(peer, env, step.namespace, null, payload);
+			expect(reply.state, JSON.stringify(reply.error)).toBe(i ? "hit" : "published");
+		}
+		expect(step.build).toHaveBeenCalledTimes(1);
+	} finally {
+		peer.close();
+		await service.dispose();
+		await store.dispose();
+	}
+});
+
+test.each(["drafter", "pattern_aware", "self-speculation"])("%s and the Actor consume each other's parsed configuration", async (source) => {
+	const cwd = await directories.create();
+	const storage = await directories.create();
+	for (const [file, names] of Object.entries({ "warm.json": ["a"], "producer.json": ["a", "b"], "consumer.json": ["b"] }))
+		await writeFile(path.join(cwd, file), JSON.stringify(names));
+	const tool = createReadTool(cwd);
+	const seen = new Map<string, string[]>();
+	const build = vi.fn(parseJsonConfig.build);
+	const operation = bindResourceOperation(async (fs, request) => {
+		const { path: file } = request.args as { path: string };
+		const names: string[] = JSON.parse((await fs.readFile(path.resolve(cwd, file))).toString());
+		const env = await subcomputeEnvironment();
+		const peer = client(env);
+		try {
+			const states: string[] = [];
+			const values = [];
+			for (const name of names) {
+				const bytes = Buffer.from(JSON.stringify({ name }));
+				const reply = await trustedCompute(peer, env, parseJsonConfig.namespace, null, bytes);
+				states.push(reply.state);
+				values.push(reply.value.value.name);
+			}
+			seen.set(file, states);
+			return { isError: false, result: { content: [{ type: "text", text: values.join(",") }], details: {} } };
+		} finally { peer.close(); }
+	}, cwd);
+	const options = { config: { storage: { root: storage } }, trustedSteps: [{ ...parseJsonConfig, build }],
+		resolveInvocation: () => ({ executor: "test.config-reader", identity: "config-reader", ...operation }) };
+	const warm = systemHost(cwd, [tool], options, { enabled: false });
+	try {
+		await warm.start();
+		expect((await warm.execute("read", { path: "warm.json" })).content).toEqual([{ type: "text", text: "a" }]);
+	} finally { await warm.dispose(); }
+	const policy = { ...PATTERN_AWARE_DEFAULTS, enabled: source === "pattern_aware", maxFutureGap: 0, maxContextLength: 1, multiStepEnabled: false };
+	const pattern = new PatternAwareStore(policy);
+	if (policy.enabled) {
+		for (let i = 0; i < 8; i++) {
+			const fact = { sessionID: String(i), turnID: "train", durationMs: 1, outcome: "success" as const };
+			pattern.observe({ ...fact, tool: "catalog", input: {}, outputPaths: [i + ".json"] });
+			pattern.observe({ ...fact, tool: "read", input: { path: i + ".json" } });
+			pattern.finishSession(fact.sessionID);
+		}
+		pattern.observe({ sessionID: "live", turnID: "previous", durationMs: 1, outcome: "success", tool: "catalog", input: {}, outputPaths: ["producer.json"] });
+	}
+	const fork = createActorForkPlanSource();
+	const self = source === "self-speculation";
+	const h = systemHost(cwd, [tool], { ...options, patternStore: pattern, actorForkPlanSource: self ? fork : undefined,
+		complete: async () => toolUse("read", { path: "producer.json" }) }, {
+		drafterEnabled: source === "drafter", drafterMaxDepth: 0, patternAware: policy,
+		selfSpeculation: { enabled: self, forkEnabled: self, forkActionEnabled: self, forkTransport: "sidecar" },
+	}, "live");
+	try {
+		if (self) fork.startTurn("first");
+		await h.start();
+		if (self) fork.publish("first", [{ id: "fork", calls: [{ id: "config", index: 0, tool: "read", input: { path: "producer.json" } }] }]);
+		await h.ready(["producer.json"], source);
+		expect((await h.execute("read", { path: "consumer.json" })).content).toEqual([{ type: "text", text: "b" }]);
+		expect(Object.fromEntries(seen)).toEqual({ "warm.json": ["published"], "producer.json": ["hit", "published"], "consumer.json": ["hit"] });
+		expect(build).toHaveBeenCalledTimes(2);
+		expect(h.completed("producer.json", source)[0]?.subcomputations?.[parseJsonConfig.namespace]).toMatchObject({ hits: 1, misses: 1 });
+		expect(h.actors.at(-1)?.subcomputations?.[parseJsonConfig.namespace]).toMatchObject({ hits: 1, misses: 0 });
+	} finally { await h.dispose(); }
+});
 
 test("public protocol rejects abandoned and oversized work and revalidates changing inputs", async () => {
 	const cwd = await directories.create();

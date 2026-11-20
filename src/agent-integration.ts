@@ -68,8 +68,9 @@ import type { ActorForkPlanSource, SelfSpeculationSettingsInput } from "./self-s
 import { normalizeSelfSpeculationSettings } from "./self-speculation.ts";
 import type { ToolOperation } from "./settlement.ts";
 import { speculativeToolInvocation, speculativeToolPatternIdentity } from "./speculative-tool.ts";
-import { SubcomputeService } from "./subcompute.ts";
-import { TaskTimeline, TimelineInterval } from "./task-timing.ts";
+import { SubcomputeService, type TrustedSubcomputeStep } from "./subcompute.ts";
+import { PythonImportStep } from "./python-compilation.ts";
+import { TaskTimeline, TimelineInterval, type SubcomputeCounts } from "./task-timing.ts";
 export interface DraftOptionsContext {
 	readonly actorModel: Model<Api>;
 	readonly draftModel: Model<Api>;
@@ -322,6 +323,7 @@ export interface SpeculativeAgentPreflightContext
 	readonly route: SpeculativeExecutionRoute;
 }
 export interface CreateSpeculativeActionHostOptions extends DrafterModelOptions {
+	readonly trustedSteps?: readonly TrustedSubcomputeStep[];
 	readonly executionSession?: ExecutionSession<ToolSettlement>;
 	readonly config?: SpeculativeConfigInput;
 	readonly configuration?: SpeculativeConfiguration;
@@ -426,7 +428,8 @@ export function createAgentExecutionHost(
 		? undefined
 		: withSpeculativeConfig(
 				config,
-				() => new SubcomputeService(options.cwd, store, () => config.current.runtime.resourceCacheMaxBytes),
+				() => new SubcomputeService(options.cwd, store, () => config.current.runtime.resourceCacheMaxBytes,
+					[...(process.platform === "linux" ? [new PythonImportStep(options.cwd)] : []), ...(options.trustedSteps ?? [])]),
 			);
 	const bind = <T extends object>(target: T): T =>
 		new Proxy(target, {
@@ -665,8 +668,11 @@ function assembleAgentExecutionHost(
 		executor?: Parameters<SpeculativeActionHost["execute"]>[2];
 		error?: { value: unknown };
 		rejections: CandidateRejection[];
+		steps?: Map<string, SubcomputeCounts>;
 	};
 	const bound = new WeakMap<ExecutionCall, Bound>();
+	const measured = <T>(call: ExecutionCall, execute: () => T) =>
+		service ? service.withMetrics(bound.get(call)!.steps ??= new Map(), execute) : execute();
 	const attribution = new WeakMap<ExecutionCall, Prediction>();
 	const subscriptions = new RuntimeSubscriptions<AgentRuntimeEvents>();
 	const pending = new PendingTasks();
@@ -717,9 +723,9 @@ function assembleAgentExecutionHost(
 	type Envelope = "sessionID" | "turnID" | "timestamp" | "cache";
 	type Payload =
 		SpeculativeActionEvent<string> extends infer E ? (E extends {} ? Omit<E, Envelope> : never) : never;
-	const event = (turnID: string, payload: Payload) => {
+	const event = (turnID: string, payload: Payload, steps?: Map<string, SubcomputeCounts>) => {
 		if (!options.onEvent) return;
-		const subcomputations = service?.drainMetrics();
+		const subcomputations = service?.drainMetrics(steps);
 		const full = {
 			...payload,
 			sessionID,
@@ -965,7 +971,7 @@ function assembleAgentExecutionHost(
 								: status === "succeeded"
 									? { status, executionMs: ms }
 									: { status, cause: failure ?? cause("execution", status), executionMs: ms },
-					});
+					}, status !== "running" && source !== "actor_result" ? state.steps : undefined);
 					if (status !== "running")
 						void subscriptions.publish("execution_settled", {
 							sessionID,
@@ -1044,10 +1050,10 @@ function assembleAgentExecutionHost(
 				attribution.set(call, prediction);
 				const effect = actionSemantics.effect(key) ?? "unbounded";
 				const after = effect !== "observation" ? (opts.previousWrite ?? opts.after) : opts.after;
-				const run = session.speculate(call, {
+				const run = measured(call, () => session.speculate(call, {
 					after,
 					signal: preview && opts.signal ? opts.signal : external,
-				});
+				}));
 				if (!preview) {
 					const identity = {
 						id: run.runID,
@@ -1203,7 +1209,7 @@ function assembleAgentExecutionHost(
 								});
 								const call: ExecutionCall = { tool: tool.name, input: key.input };
 								bound.set(call, { tool, turnID, binding: { action: op }, rejections: [] });
-								const run = local.speculate(call);
+								const run = measured(call, () => local.speculate(call));
 								void run.completion.then(() => local.release(run.runID));
 							})(),
 						)
@@ -1314,7 +1320,7 @@ function assembleAgentExecutionHost(
 						tool: call.tool,
 						input: action.input,
 					});
-				const result = await session.execute(call, { signal });
+				const result = await measured(call, () => session.execute(call, { signal }));
 				const durationMs = result.toolExecution.completedAt - result.toolExecution.startedAt;
 				const roots = [{ computation: result.toolExecution, reused: result.reusedInterval ?? result.served }];
 				const computation = timeline.recordCall(roots, issued, performance.now());
@@ -1402,7 +1408,7 @@ function assembleAgentExecutionHost(
 					computation,
 					candidate,
 					actualAction: diagnosticAction(call.tool, call.input, action),
-				});
+				}, state.steps);
 				void subscriptions.publish("actor_settled", feedback);
 				if (turn)
 					await subscriptions.publish("actor_observed", {

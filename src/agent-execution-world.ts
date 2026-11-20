@@ -349,7 +349,8 @@ export async function evaluateResourceQuery<Output>(
 	acceptObservation?: (observation: ResourceObservation) => boolean,
 ) {
 	signal.throwIfAborted();
-	const recover = session?.reader(root, signal);
+	const borrowed: ResourceVersionToken[] = [];
+	const recover = session?.reader(root, signal, (token) => { borrowed.push(token); });
 	const capture = () =>
 		session
 			? session.capture(undefined, root, semantics, maxBytes)
@@ -510,7 +511,7 @@ export async function evaluateResourceQuery<Output>(
 	} finally {
 		await TimelineInterval.outside(async () => {
 			if (inputSource && !sealed) resourceVersions.delete(inputSource);
-			await Promise.allSettled([...retained, captured, initial].map(releaseResourceVersion));
+			await Promise.allSettled([...borrowed, ...retained, captured, initial].map(releaseResourceVersion));
 		});
 	}
 }

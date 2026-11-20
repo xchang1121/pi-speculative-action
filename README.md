@@ -94,9 +94,13 @@ Linux 进程证据按执行域记录未知系统调用，并标记实际调用�
 
 ## 外部程序协议
 
-在 Host 管理的工具调用中调用 `await subcomputeEnvironment()`，把返回的 `PI_SUBCOMPUTE_SOCKET` 与 `PI_SUBCOMPUTE_CONTEXT` 传给子进程。Windows 使用 Named Pipe，Linux 使用 Unix socket。设置 `subcomputation.exposeToControlledProcesses: true` 可向受控进程自动注入这些变量。
+在 Host 管理的工具调用中调用 `await subcomputeEnvironment()`，把返回的 `PI_SUBCOMPUTE_SOCKET` 与 `PI_SUBCOMPUTE_CONTEXT` 传给子进程。Windows 使用 Named Pipe，Linux 使用 Unix socket。Host 会把受信步骤的受限通道提供给受控进程。设置 `subcomputation.exposeToControlledProcesses: true` 可同时开放由客户端执行并发布的步骤。
 
-Linux 受控 Bash 默认共享 CPython 导入源码时的编译结果。Actor 和各推测来源在同一 Host 内都能产生和使用这些结果。Python 已有有效 `.pyc` 时仍优先使用它。需要编译时，缓存按解释器身份、源文件名、优化级别和源码 SHA-256 匹配。命中后模块顶层代码仍在调用方执行。缓存受条目数和字节数限制，已经被再次消费的条目在下次淘汰时获得一次保留机会。状态报告的 `python.source_to_code` 记录实际命中次数和复用的编译耗时。可用 `subcomputation.pythonImports: false` 关闭该接入。
+通过 Host 选项 `trustedSteps` 注册确定性计算。每个步骤声明 `namespace`、实现身份 `implementation` 和 `build({ key, input, signal, maxResultBytes })`。调用方把影响结果的选项放在 `key` 中，提交原始输入的 SHA-256 摘要。未命中时，`input()` 取回并核验对应字节，宿主构建并发布结果。输入、选项或实现身份变化都会重新计算。受控进程的证书也绑定到通道开放的步骤及其实现身份。受信步骤使用公共准备态索引、CAS 和持久化存储配额。Actor、Drafter、PatternAware 和 Self-Speculation 的调用可以相互提供结果。配置解析的完整注册示例见 [config-parsing.ts](examples/config-parsing.ts)。
+
+受信步骤沿用 `compute` 帧，例如 `{"op":"compute","context":"调用令牌","namespace":"config.parse","key":null,"inputDigest":"输入字节的 SHA-256 十六进制摘要"}`。收到 `state: "input"` 时发送 `{"op":"input","token":"步骤令牌","value":{"encoding":"base64","value":"输入内容"}}`。命中返回 `hit`，新构建返回 `published`。二进制结果使用 Base64。结构化结果须能通过 JSON 无损往返，需调用方自行计算的输入返回 `local`。调用方成功解码后发送 `{"op":"consumed","token":"步骤令牌"}`，收到 `ready` 即可继续使用同一连接。各命名空间在消费确认后计入命中与耗时。
+
+Linux 受控 Bash 的 CPython 导入使用同一接口注册 `python.source_to_code`。已有有效 `.pyc` 时由解释器直接加载。需要编译时，解释器身份、源文件名和优化级别构成步骤选项。调用方接回代码对象并执行模块顶层代码。设置 `subcomputation.pythonImports: false` 可关闭该适配。
 
 每个 Python 进程的导入共用一条连接，fork 出来的子进程在首次编译时建立自己的连接。宿主按解释器的真实路径复用最多四个编译进程，支持指向宿主 PATH、uv 或 pyenv 受信安装的虚拟环境符号链接。使用自定义安装位置时，在启动宿主前设置 `UV_PYTHON_INSTALL_DIR` 或 `PYENV_ROOT`。解释器无法核验时，该 Python 进程继续使用自身的编译器。
 

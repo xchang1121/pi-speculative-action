@@ -1,12 +1,14 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { access, link, mkdir, open, readFile, realpath, stat, unlink, writeFile } from "node:fs/promises";
-import { constants } from "node:fs";
+import { constants, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { crc32 } from "node:zlib";
 import { containsFilesystemPath } from "./primitives.ts";
+import { speculativeConfig } from "./config-schema.ts";
+import type { TrustedSubcomputeStep, TrustedStepBuild } from "./subcompute.ts";
 import { TimelineInterval } from "./task-timing.ts";
 
 async function trustedPath(target: string, workspace?: string) {
@@ -64,21 +66,12 @@ let bootstrap: Promise<string | undefined> | undefined;
 export function compilerBootstrap() {
 	return bootstrap ??= installBootstrap().catch(() => undefined);
 }
-export function compilerSearchPath(value: string | undefined, archive: string): string {
+function compilerSearchPath(value: string | undefined, archive: string): string {
 	if (value?.split(path.delimiter).includes(archive)) return value;
 	return value === undefined ? archive : value + path.delimiter + archive;
 }
-export type PythonCompileRequest = {
-	readonly op: "python_compile";
-	readonly context: string;
-	readonly engine: string;
-	readonly executable: string;
-	readonly filename: string;
-	readonly optimize: number;
-	readonly digest: string;
-};
+type CompilerKey = { engine: string; executable: string; filename: string; optimize: number };
 type Compilation = { bytes: Buffer; computation: TimelineInterval };
-type Entry = { result: Promise<Compilation | "local" | undefined>; size: number; referenced: boolean };
 type CompilerWorker = {
 	readonly child: ReturnType<typeof spawn>;
 	readonly engine: string;
@@ -107,14 +100,22 @@ async function executableElf(target: string): Promise<boolean> {
 }
 
 /** Only the host's isolated compiler creates executable artifacts. Clients supply source bytes. */
-export class PythonCompilationCache {
+export class PythonImportStep implements TrustedSubcomputeStep {
+	readonly namespace = "python.source_to_code";
+	readonly implementation = createHash("sha256").update(readFileSync(new URL("../src/python-runtime/sitecustomize.py", import.meta.url))).digest("hex");
+	enabled = () => process.platform === "linux" && speculativeConfig().subcomputation.pythonImports;
+	async runtime() {
+		const archive = await compilerBootstrap();
+		if (archive) return {
+			readOnlyDirectories: [path.dirname(archive)],
+			environment: (base: Readonly<Record<string, string | undefined>>) => ({ PYTHONPATH: compilerSearchPath(base.PYTHONPATH, archive) }),
+		};
+	}
 	private readonly workers = new Map<string, {
 		ready: Promise<CompilerWorker | undefined>;
 		users: number;
 		idle: ReturnType<typeof Promise.withResolvers<void>>;
 	}>();
-	private readonly entries = new Map<string, Entry>();
-	private bytes = 0;
 	private closed = false;
 	private readonly searchPath = (process.env.PATH ?? "").split(path.delimiter).filter(path.isAbsolute);
 	private readonly installations = [
@@ -212,7 +213,7 @@ export class PythonCompilationCache {
 			if (!slot.users++) slot.idle = Promise.withResolvers<void>();
 			try {
 				const worker = await slot.ready;
-				if (worker && worker.engine === engine && !this.closed) return (await compile(worker)) ?? "local";
+				if (worker && worker.engine === engine && !this.closed) return await compile(worker);
 			} finally {
 				if (!--slot.users) slot.idle.resolve();
 			}
@@ -220,76 +221,38 @@ export class PythonCompilationCache {
 		}
 	}
 
-	async get(request: PythonCompileRequest, source: () => Promise<string | undefined>,
-		capacity: number, byteCapacity: number, resultLimit: number) {
-		if (this.closed || capacity < 1 || byteCapacity < 1 || resultLimit < 1 ||
-			typeof request.engine !== "string" || !/^[a-f0-9]{64}$/.test(request.engine) ||
+	async build({ key, input, signal, maxResultBytes }: TrustedStepBuild): Promise<Buffer | undefined> {
+		const request = key as Partial<CompilerKey> | null;
+		if (!request || typeof request.engine !== "string" || !/^[a-f0-9]{64}$/.test(request.engine) ||
 			typeof request.executable !== "string" || !path.isAbsolute(request.executable) || request.executable.includes("\0") ||
 			typeof request.filename !== "string" || !path.isAbsolute(request.filename) || request.filename.includes("\0") ||
-			typeof request.digest !== "string" || !/^[a-f0-9]{64}$/.test(request.digest) ||
-			!Number.isInteger(request.optimize) || request.optimize < 0 || request.optimize > 2)
-			return;
+			typeof request.optimize !== "number" || !Number.isInteger(request.optimize) || request.optimize < 0 || request.optimize > 2) return;
 		const binary = await realpath(request.executable).catch(() => undefined);
 		if (!binary) return;
-		const key = JSON.stringify([binary, request.engine, request.filename, request.optimize, request.digest]);
-		let entry = this.entries.get(key);
-		const hit = !!entry;
-		if (entry) this.entries.delete(key);
-		else {
-			const build = async (worker: CompilerWorker, data: string) => {
-				if (this.closed) return;
+		const result = await TimelineInterval.outside(() => this.withWorker(binary, request.engine!, async (worker) => {
+			const bytes = await input();
+			if (bytes.length > 2 * 1024 * 1024) return;
+			const compiled = worker.queue.then(async () => {
+				signal.throwIfAborted();
+				const data = bytes.toString("base64");
 				const start = performance.now();
-				worker.child.stdin!.write(JSON.stringify({
-					data, filename: request.filename, optimize: request.optimize,
-					limit: Math.min(resultLimit, byteCapacity),
-				}) + "\n");
-				const reply: unknown = await worker.receive();
+				worker.child.stdin!.write(JSON.stringify({ data, filename: request.filename, optimize: request.optimize, limit: maxResultBytes }) + "\n");
+				const reply = await worker.receive();
 				if (!Array.isArray(reply) || typeof reply[0] !== "string" || !Number.isFinite(reply[1]) || !Number.isFinite(reply[2])) return;
 				const end = Math.min(performance.now(), Math.max(start + reply[1], reply[2] - performance.timeOrigin));
 				return { bytes: Buffer.from(reply[0], "base64"), computation: new TimelineInterval(Math.max(start, end - reply[1]), end) };
-			};
-			const result = this.withWorker(binary, request.engine, async (worker) => {
-				const data = await source();
-				if (typeof data !== "string" || data.length > 4 * Math.ceil(Math.min(byteCapacity, 2 * 1024 * 1024) / 3)) return;
-				const raw = Buffer.from(data, "base64");
-				if (raw.toString("base64") !== data || createHash("sha256").update(raw).digest("hex") !== request.digest) return;
-				const compiled = worker.queue.then(() => build(worker, data));
-				worker.queue = compiled.catch(() => {});
-				return compiled;
 			});
-			entry = { result, size: 0, referenced: false };
-		}
-		this.entries.set(key, entry);
-		try {
-			const value = await entry.result;
-			if (!value || this.closed) return;
-			if (value === "local") return value;
-			if (this.entries.get(key) === entry && !entry.size) {
-				entry.size = value.bytes.length;
-				this.bytes += entry.size;
-			}
-			while (this.entries.size > capacity || this.bytes > byteCapacity) {
-				const [oldest, victim] = this.entries.entries().next().value!;
-				this.entries.delete(oldest);
-				if (victim.referenced) {
-					victim.referenced = false;
-					this.entries.set(oldest, victim);
-				} else this.bytes -= victim.size;
-			}
-			if (value.bytes.length <= Math.min(resultLimit, byteCapacity))
-				return { ...value, hit, consumed: () => { if (hit) entry.referenced = true; } };
-			return "local" as const;
-		} finally {
-			if (!entry.size && this.entries.get(key) === entry) this.entries.delete(key);
-		}
+			worker.queue = compiled.catch(() => {});
+			return compiled;
+		}));
+		if (result) TimelineInterval.own(result.computation);
+		return result?.bytes;
 	}
 
-	async close() {
+	async dispose() {
 		this.closed = true;
 		const stopped = [...this.workers.values()].map((slot) => this.stopWorker(slot.ready));
 		this.workers.clear();
-		this.entries.clear();
-		this.bytes = 0;
 		await Promise.all(stopped);
 	}
 }

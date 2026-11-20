@@ -40,8 +40,7 @@ import {
 	projectProcessEnvironment,
 	speculativeConfig,
 } from "./config-schema.ts";
-import { controlledSubcomputeChannel } from "./subcompute.ts";
-import { compilerSearchPath } from "./python-compilation.ts";
+import { controlledRuntimeEnvironment, controlledSubcomputeChannel, withSubcomputeScope } from "./subcompute.ts";
 import {
 	captureFileContent,
 	ContentChunkPool,
@@ -583,7 +582,14 @@ interface ProcessArguments extends ProcessLaunchOptions {
 	readonly imageSource?: string;
 	readonly streams?: true; // inherited pipes the launcher holds and settles
 }
+function boundEnvironment(environment: ProcessArguments["environment"]) {
+	const channel = controlledSubcomputeChannel(environment);
+	if (!channel) return { environment };
+	const { PI_SUBCOMPUTE_SOCKET: _socket, PI_SUBCOMPUTE_CONTEXT: _token, ...variables } = environment;
+	return { environment: variables, stepIdentity: channel.identity };
+}
 type BoundProcessInvocation = ProcessArguments & {
+	readonly stepIdentity?: string;
 	readonly sourceRoot: string;
 	readonly executable: string;
 	readonly producer?: ProcessProducerProof;
@@ -603,6 +609,7 @@ interface DispatcherResponse {
 }
 /** A brokered run writing into a session's workspace: its launcher's pid and, once known, what it and the runs brokered from its tree wrote. */
 interface SessionWriter {
+	readonly channel?: ReturnType<typeof controlledSubcomputeChannel>;
 	readonly id: string;
 	readonly owner: string;
 	readonly startedAt: number;
@@ -621,6 +628,7 @@ interface SessionWriter {
 	observation?: ExecutionObservation;
 }
 interface DomainExecution {
+	readonly channel?: ReturnType<typeof controlledSubcomputeChannel>;
 	readonly pid: number;
 	readonly trace: TraceTail;
 	readonly endpoints: readonly [string, string];
@@ -1111,8 +1119,10 @@ export class LinuxProcessReuseBackend {
 			const began = performance.now();
 			let outputEndpoints: readonly [string, string] | undefined;
 			const native = this.nativeObservation(options.sourceRoot, this.observations.getStore()?.scope, request.signal);
+			const dispatcherExecutable = await realpath(ready.dispatcher).catch(() => ready.dispatcher);
 			const shellExecutable = await realpath(invocation.shell).catch(() => invocation.shell);
 			let rootPid: number | undefined;
+			let rootShellContinued = false;
 			const replayed = new Set<number>();
 			// The installed child, its exit and all evidence come from this one execution domain.
 			const record: ActorImageRecorder = async (pid, child, image, installed, clock) => {
@@ -1156,7 +1166,15 @@ export class LinuxProcessReuseBackend {
 					descriptors: true,
 					decide: async (held) => {
 						rootPid ??= held.pid;
-						const decision = await this.decideHeldExec(held, held.scope, record);
+						if (held.pid === rootPid && !rootShellContinued) {
+							const exe = await readlink(`/proc/${held.pid}/exe`).catch(() => undefined);
+							if (exe === dispatcherExecutable) return { kind: "continue" };
+							if (exe === shellExecutable) {
+								rootShellContinued = true;
+								return { kind: "continue" };
+							}
+						}
+						const decision = await this.decideHeldExec(held, held.scope, record, channel?.identity);
 						if (decision.kind !== "replay") return decision;
 						return {
 							...decision,
@@ -1283,13 +1301,16 @@ export class LinuxProcessReuseBackend {
 		const captured = new Map<string, FileContentVersion>();
 		if (!files) return captured;
 		const denied = sensitivePaths(this.options.storeRoot, this.options.deniedPaths);
+		const candidates: { target: string; file: FileContentVersion; dependency: DynamicDependency }[] = [];
+		const seen = new Set<string>();
 		await using view = await FilesystemReadView.open();
 		for (const input of observation.paths) {
 			if (input.role === "metadata" || input.lookupFailure || !pathContains(root, input.path)) continue;
 			try {
 				const target = await view.realpath(input.path);
-				if (!pathContains(root, target) || denied.some((dir) => pathContains(dir, target)) || captured.has(target))
+				if (!pathContains(root, target) || denied.some((dir) => pathContains(dir, target)) || seen.has(target))
 					continue;
+				seen.add(target);
 				const stat = await view.stat(target, false);
 				const limit = Math.min(files.remainingBytes, speculativeConfig().filesystem.maxReadBytes);
 				if (!stat.isFile() || stat.size > BigInt(limit)) continue;
@@ -1298,9 +1319,17 @@ export class LinuxProcessReuseBackend {
 				const dependency = { kind: "file", path: target, role: input.role, contentDigest: contentDigest(file.content) } as const;
 				// This file read owns its own snapshot. Crediting it to the process also requires continuity since launch.
 				files.remember(target, file);
-				if (proof.seal([dependency], (name) => name)()) captured.set(target, file);
+				candidates.push({ target, file, dependency });
 			} catch {
 				this.store.signal.throwIfAborted();
+			}
+		}
+		if (candidates.length) {
+			if (proof.seal(candidates.map((item) => item.dependency), (name) => name)()) {
+				for (const { target, file } of candidates) captured.set(target, file);
+			} else if (candidates.length > 1) {
+				for (const { target, file, dependency } of candidates)
+					if (proof.seal([dependency], (name) => name)()) captured.set(target, file);
 			}
 		}
 		await this.publishFileInputs(files);
@@ -1546,7 +1575,7 @@ export class LinuxProcessReuseBackend {
 						}),
 				},
 				executeBinding: (binding) =>
-					execute("operation", async () => {
+					withSubcomputeScope(() => execute("operation", async () => {
 						const invocation = this.boundInvocation(binding, session.scope);
 						if (
 							invocation.sourceRoot !== session.sourceRoot ||
@@ -1558,7 +1587,7 @@ export class LinuxProcessReuseBackend {
 							computation: preparation,
 						} = await TimelineInterval.outside(() =>
 							TimelineInterval.measure(() =>
-								this.boundRequest(binding, invocation, session.projection, session.signal),
+								this.boundRequest(binding, invocation, session.projection, session.signal, true),
 							),
 						);
 						const resultsBefore = session.preparedResults;
@@ -1585,7 +1614,7 @@ export class LinuxProcessReuseBackend {
 							output: result.output ?? [],
 							exit: result.exit!,
 						};
-					}),
+					})),
 				metrics: () => Object.freeze({ ...session.metrics }),
 				seal,
 				validate,
@@ -1953,6 +1982,7 @@ export class LinuxProcessReuseBackend {
 			const start = (await source.read()).journal(held.pid)?.length;
 			if (start === undefined) return native;
 			const domain = {
+				channel: owner.channel,
 				pid: held.pid,
 				trace: traceTail(source, session.projection.toLogical(cwd), { execution: { pid: held.pid, start } }),
 				endpoints: context.outputEndpoints,
@@ -2007,13 +2037,13 @@ export class LinuxProcessReuseBackend {
 			session,
 			async () => {
 				const { outputRoute } = request;
-				const channel = controlledSubcomputeChannel(request.environment);
+				const channel = controlledSubcomputeChannel(request.environment) ?? domain?.channel;
 				const signal = AbortSignal.any([session.signal, ...(outlet?.signal ? [outlet.signal] : [])]);
 				signal.throwIfAborted();
 				const captured = "prototype" in options
 					? { output: options.prototype, computation: options.preparation }
 					: await TimelineInterval.outside(() =>
-							TimelineInterval.measure(() => this.prototype(session.projection, request, executable)),
+							TimelineInterval.measure(() => this.prototype(session.projection, request, executable, channel?.identity)),
 						);
 				const { computation: preparation, output: observedPrototype } = captured;
 				const weakKey = processWeakKey(observedPrototype);
@@ -2248,9 +2278,7 @@ export class LinuxProcessReuseBackend {
 										hostPath: path.dirname(dispatcher),
 										readOnly: true,
 									},
-									...(channel?.bootstrap && request.environment.PI_PYTHON_COMPILE_CONTEXT
-										? [{ virtualPath: path.dirname(channel.bootstrap), hostPath: path.dirname(channel.bootstrap), readOnly: true }]
-										: []),
+									...(channel?.readOnlyDirectories ?? []).map((dir) => ({ virtualPath: dir, hostPath: dir, readOnly: true })),
 									...(session.gitDirectory
 										? [
 												{
@@ -2287,6 +2315,7 @@ export class LinuxProcessReuseBackend {
 						const processStarted = performance.now();
 						session.writers.add(
 							(writer = {
+								channel,
 								id: `${session.token}:${requestID}`,
 								owner: session.token,
 								startedAt: Date.now(),
@@ -2633,6 +2662,7 @@ export class LinuxProcessReuseBackend {
 									!outlet &&
 									this.handoffs.bind(weakKey, work, {
 										...invocation,
+										...boundEnvironment(invocation.environment),
 										cwd: logicalCwd,
 										executable: image,
 										sourceRoot: session.sourceRoot,
@@ -2733,6 +2763,7 @@ export class LinuxProcessReuseBackend {
 			signal?: AbortSignal;
 		} = {},
 	): Promise<ReadyProcessPlan | undefined> {
+		if (!live && !(await this.store.hasWeakKey(weakKey, executablePath, signal))) return;
 		await using privateReads = session ? FilesystemReadView.ambient() : undefined;
 		let proof = session
 			? undefined
@@ -2813,7 +2844,7 @@ export class LinuxProcessReuseBackend {
 			proof?.close();
 		}
 	}
-	private async decideHeldExec(process: HeldExecProcess, scope?: ExecutionScope, record?: ActorImageRecorder): Promise<HeldExecDecision> {
+	private async decideHeldExec(process: HeldExecProcess, scope?: ExecutionScope, record?: ActorImageRecorder, parentSteps?: string): Promise<HeldExecDecision> {
 		const observation = this.observations.getStore();
 		let releaseLearning: (() => void) | undefined;
 		const measured = (decision: HeldExecDecision): HeldExecDecision => {
@@ -2918,6 +2949,7 @@ export class LinuxProcessReuseBackend {
 				projection,
 				digest,
 				await this.resolvePlatformFingerprint(),
+				controlledSubcomputeChannel(snapshot.environment)?.identity ?? parentSteps,
 			);
 			const weakKey = processWeakKey(prototype);
 			const continued = () => measured({
@@ -2927,7 +2959,7 @@ export class LinuxProcessReuseBackend {
 					if (learning && !observation!.closed && snapshot.outputRoute) {
 						const { argv, context: _context, ...invocation } = snapshot;
 						const binding = this.handoffs.observe(weakKey, executablePath, scope!, {
-							...invocation, argv0: argv[0]!, args: argv.slice(1),
+							...invocation, ...boundEnvironment(invocation.environment), argv0: argv[0]!, args: argv.slice(1),
 							cwd: projection.toLogical(snapshot.cwd), executable: executablePath, sourceRoot,
 							outputRoute: snapshot.outputRoute,
 						}, durationMs);
@@ -3086,12 +3118,17 @@ export class LinuxProcessReuseBackend {
 		invocation: BoundProcessInvocation,
 		projection: ExecutionPathProjection,
 		signal: AbortSignal,
+		launch = false,
 	) {
 		const cwd = projection.toPhysical(invocation.cwd);
 		const executable = projection.toPhysical(invocation.executable);
 		if (!cwd || !executable) throw new Error("bound process paths are unmapped");
-		let request = { ...invocation, cwd };
-		let prototype = await this.prototype(projection, request, executable);
+		const environment = launch && invocation.stepIdentity
+			? { ...invocation.environment, ...await controlledRuntimeEnvironment(invocation.environment) }
+			: invocation.environment;
+		const request = { ...invocation, cwd, environment };
+		const identity = launch ? controlledSubcomputeChannel(environment)?.identity : invocation.stepIdentity;
+		const prototype = await this.prototype(projection, request, executable, identity);
 		if (processWeakKey(prototype) !== binding.key) throw new Error("bound process execution context changed");
 		signal.throwIfAborted();
 		return { request, executable, prototype };
@@ -3100,10 +3137,10 @@ export class LinuxProcessReuseBackend {
 		projection: ExecutionPathProjection,
 		request: ProcessArguments,
 		executable: string,
-		executableDigest?: Sha256Digest,
+		stepIdentity = controlledSubcomputeChannel(request.environment)?.identity,
 	): Promise<ExecPrototype> {
 		const [digest, ready] = await Promise.all([
-			executableDigest ?? hashExecutableFile(request.imageSource ?? executable),
+			hashExecutableFile(request.imageSource ?? executable),
 			this.resolveReady(),
 		]);
 		return bufferedProcessPrototype(
@@ -3116,6 +3153,7 @@ export class LinuxProcessReuseBackend {
 			projection,
 			digest,
 			await this.resolvePlatformFingerprint(),
+			stepIdentity,
 		);
 	}
 }
@@ -3124,8 +3162,10 @@ function bufferedProcessPrototype(
 	projection: ExecutionPathProjection,
 	executableDigest: Sha256Digest,
 	platformFingerprint: string,
+	stepIdentity?: string,
 ) {
 	const { context } = snapshot;
+	const contextDigest = (key: string) => stepIdentity ? digestObject([key, stepIdentity]) : sha256Digest(key);
 	const streamKey = byteStreamContextKey(context);
 	return createExecPrototype({
 		executablePath: projection.toLogical(snapshot.executable),
@@ -3135,8 +3175,8 @@ function bufferedProcessPrototype(
 		logicalCwd: projection.toLogical(snapshot.cwd),
 		environment: snapshot.environment,
 		umask: context.umask,
-		processContextDigest: sha256Digest(context.key),
-		...(streamKey ? { byteStreamContextDigest: sha256Digest(streamKey) } : {}),
+		processContextDigest: contextDigest(context.key),
+		...(streamKey ? { byteStreamContextDigest: contextDigest(streamKey) } : {}),
 		stdin: { type: "closed", eof: true },
 		fileDescriptorTableComplete: true,
 		inheritedFDs: context.descriptorTypes.map((type, fd) => ({
@@ -4737,6 +4777,7 @@ async function topLevelProcessPrototype(
 		environment,
 		umask: process.umask(),
 		processContextDigest: digestObject({
+			subcomputations: controlledSubcomputeChannel(request.environment)?.identity,
 			limits: sha256Digest(await readFile("/proc/self/limits", { signal: request.signal })),
 			credentials: {
 				uid: process.getuid?.(),
@@ -4973,18 +5014,14 @@ function exitOutcome(outcome: SpawnOutcome): ExitOutcome {
 	};
 }
 function assertInvocationMatches(invocation: ToolProcessInvocation, request: ProcessExecutionRequest) {
-	const archive = request.environment.PI_PYTHON_COMPILE_CONTEXT && controlledSubcomputeChannel(request.environment)?.bootstrap;
+	const channel = controlledSubcomputeChannel(request.environment);
 	const matches = {
 		command: request.command === invocation.command,
 		cwd: path.resolve(request.cwd) === path.resolve(invocation.cwd),
 		timeout: request.timeout === invocation.timeout,
 		environment: stableEqual(
 			projectProcessEnvironment(definedProcessEnvironment(request.environment)),
-			projectProcessEnvironment(
-				archive
-					? { ...invocation.environment, PYTHONPATH: compilerSearchPath(invocation.environment.PYTHONPATH, archive) }
-					: invocation.environment,
-			),
+			projectProcessEnvironment({ ...invocation.environment, ...channel?.environment(invocation.environment) }),
 		),
 	};
 	for (const [field, valid] of Object.entries(matches))

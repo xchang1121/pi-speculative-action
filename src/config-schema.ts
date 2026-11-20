@@ -478,8 +478,6 @@ export function projectProcessEnvironment(
 				([key]) =>
 					key !== "PI_SUBCOMPUTE_SOCKET" &&
 					key !== "PI_SUBCOMPUTE_CONTEXT" &&
-					key !== "PI_PYTHON_COMPILE_SOCKET" &&
-					key !== "PI_PYTHON_COMPILE_CONTEXT" &&
 					(!keys || keys.has(key) === (mode === "allowlist")),
 			),
 		),

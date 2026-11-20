@@ -509,7 +509,7 @@ test.skipIf(process.platform !== "linux").for([false, true])(
 			DECLARED: "one",
 			UNOBSERVED: "initial",
 		};
-		const open = () => {
+		const open = (configField?: "debug" | "release") => {
 			const backend = new LinuxProcessReuseBackend({ storeRoot });
 			const raw = adaptProcessToolOperations(createControlledBashOperations({ shellPath: "/bin/bash" }));
 			const coordinator = new ProcessExecutionCoordinator(
@@ -544,6 +544,10 @@ test.skipIf(process.platform !== "linux").for([false, true])(
 				[tool],
 				{
 					executionWorlds: [world],
+					trustedSteps: configField ? [{
+						namespace: "config.parse", implementation: configField,
+						build: async ({ input }) => Buffer.from(JSON.parse((await input()).toString())[configField] + "\n"),
+					}] : [],
 					resolveInvocation: (_tool, input) =>
 						resolvePiToolInvocation("bash", input, {
 							cwd,
@@ -558,14 +562,14 @@ test.skipIf(process.platform !== "linux").for([false, true])(
 							environmentKeys: ["PATH", "HOME", "LANG", "DECLARED"],
 							replayAcceptedTaints: ["clock", "random", "pid_observation", "descriptor_observation"],
 						},
-						runtime: { resourceCacheMaxEntries: 0 },
+						runtime: { resourceCacheMaxEntries: configField ? 8 : 0 },
 						subcomputation: { exposeToControlledProcesses },
 					},
 				},
 				{
 					enabled: false,
 					prepareObservedOperations: false,
-					resourceCacheMaxEntries: 0,
+					resourceCacheMaxEntries: configField ? 8 : 0,
 				},
 			);
 			return Object.assign(host, { backend });
@@ -605,6 +609,19 @@ test.skipIf(process.platform !== "linux").for([false, true])(
 			environment = { ...environment, DECLARED: "two" };
 			expect(textOutput(await host.execute("bash", { command }))).toBe("changed\n");
 			expect(host.backend.actorMetrics().wholeCommandHits).toBe(2);
+			if (exposeToControlledProcesses) {
+				const run = (suffix: string) => host.execute("bash", { command: "./subcompute-process --trusted; printf " + suffix }).then(textOutput);
+				for (const [index, field] of (["debug", "debug", "release"] as const).entries()) {
+					await host.dispose();
+					host = open(field);
+					await host.start();
+					const expected = field === "debug" ? "first" : "second";
+					expect(await run("A")).toBe(expected + "\nA");
+					expect(await run("B")).toBe(expected + "\nB");
+					if (index === 1) expect(host.backend.actorMetrics().wholeCommandHits).toBeGreaterThan(0);
+					if (field === "release") expect(host.backend.actorMetrics().wholeCommandHits).toBe(0);
+				}
+			}
 		} finally {
 			await host.dispose();
 			await rm(root, { recursive: true, force: true });

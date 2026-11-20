@@ -504,6 +504,11 @@ export class ProvenanceCertificateStore {
 		active: boolean;
 	}>();
 	private control?: DatabaseSync;
+	private readonlyDb?: {
+		readonly db: DatabaseSync;
+		readonly dev: bigint;
+		readonly ino: bigint;
+	};
 	constructor(root: string, options: ProvenanceStoreOptions = {}) {
 		this.options = options;
 		this.root = path.resolve(root);
@@ -714,6 +719,22 @@ export class ProvenanceCertificateStore {
 		))
 			if (certificate.weakKey === weakKey && !excludedCertificates?.has(certificate.id)) yield certificate;
 	}
+	async hasWeakKey(weakKey: Sha256Digest, executablePath: string, signal?: AbortSignal): Promise<boolean> {
+		try {
+			return Boolean(
+				(
+					await this.query(
+						"SELECT 1 FROM certificates WHERE weakKey = ? AND executable = ? LIMIT 1",
+						[weakKey, executablePath],
+						signal,
+					)
+				).length,
+			);
+		} catch (error) {
+			if (hasErrorCode(error, "ERR_PROVENANCE_SCHEMA")) throw error;
+			return false;
+		}
+	}
 	/** An unavailable optional cache is a miss; live handoffs have their own availability check. */
 	async mayHaveCertificates(executablePath?: string, signal?: AbortSignal): Promise<boolean> {
 		try {
@@ -786,6 +807,8 @@ export class ProvenanceCertificateStore {
 	private async closeDatabase(): Promise<void> {
 		clearTimeout(this.maintenance);
 		this.maintenance = undefined;
+		this.readonlyDb?.db.close();
+		this.readonlyDb = undefined;
 		this.control?.close();
 		this.control = undefined;
 	}
@@ -1030,12 +1053,27 @@ export class ProvenanceCertificateStore {
 		signal: AbortSignal,
 	): Promise<Record<string, SQLOutputValue>[] | undefined> {
 		const target = path.join(this.root, "metadata.sqlite");
-		const present = await stat(target).catch(ignoreMissing);
-		if (!present) return;
+		const present = await stat(target, { bigint: true }).catch(ignoreMissing);
+		if (!present) {
+			this.readonlyDb?.db.close();
+			this.readonlyDb = undefined;
+			return;
+		}
 		signal.throwIfAborted();
-		const database = new DatabaseSync(target, { readOnly: true });
+		let database =
+			this.readonlyDb?.dev === present.dev && this.readonlyDb?.ino === present.ino
+				? this.readonlyDb.db
+				: undefined;
+		if (!database) {
+			this.readonlyDb?.db.close();
+			this.readonlyDb = undefined;
+			const opened = new DatabaseSync(target, { readOnly: true });
+			opened.exec("PRAGMA query_only=ON");
+			this.readonlyDb = { db: opened, dev: present.dev, ino: present.ino };
+			database = opened;
+		}
+		database.exec("BEGIN");
 		try {
-			database.exec("PRAGMA query_only=ON; BEGIN");
 			if (!hasMetadataSchema(database)) return;
 			const rows: Record<string, SQLOutputValue>[] = [];
 			let bytes = 0;
@@ -1047,7 +1085,7 @@ export class ProvenanceCertificateStore {
 			}
 			return rows;
 		} finally {
-			database.close();
+			if (database.isTransaction) database.exec("ROLLBACK");
 		}
 	}
 	private async exclusive<T>(

@@ -1,4 +1,4 @@
-import { chmod, link, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { expect, test } from "vitest";
@@ -80,6 +80,9 @@ test.skipIf(process.platform !== "linux").each([
 			expect(proof.reason).toContain(reason);
 			expect(report.warnings).toBe(true);
 		} else {
+			const writer = await open(path.join(root, "input"), "r+");
+			try { expect(valid()).toBe(false); }
+			finally { await writer.close(); }
 			await writeFile(path.join(root, "input"), "changed");
 			expect(valid()).toBe(false);
 		}

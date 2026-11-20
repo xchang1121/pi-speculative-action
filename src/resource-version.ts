@@ -148,6 +148,7 @@ export async function computeStepInView<Value>(
 	request: ComputeStepRequest,
 	calculate: (view: ToolFilesystemOperations, signal: AbortSignal) => Value | Promise<Value>,
 	signal: AbortSignal = new AbortController().signal,
+	hostImplementation?: string,
 ): Promise<Value> {
 	if (!request.namespace.trim()) throw new Error("A compute step requires a namespace");
 	signal.throwIfAborted();
@@ -156,7 +157,10 @@ export async function computeStepInView<Value>(
 	const input = snapshotPreparation([request.key, request.inputResources ?? [], selectedEnvironment()]);
 	if (!input) throw new Error("compute_step_input_budget_exceeded");
 	const key = hash("sha256", input.data);
-	const binding = createSerializablePreparationBinding({ namespace: request.namespace }, () => true);
+	const binding = createSerializablePreparationBinding(
+		hostImplementation === undefined ? { namespace: request.namespace } : { namespace: request.namespace, hostImplementation },
+		() => true,
+	);
 	let built = false;
 	const build = async (inputs: ToolFilesystemOperations, sharedSignal: AbortSignal) => {
 		built = true;
@@ -2768,7 +2772,7 @@ export class ResourceInputSession {
 		);
 	}
 	/** Concurrent reads in one evaluation share discovery and a single validated lease per closure. */
-	reader(root: string, signal: AbortSignal) {
+	reader(root: string, signal: AbortSignal, retain = (token: ResourceVersionToken) => { this.lifecycle.own({ dispose: token.release }); }) {
 		const manager = this.root(root);
 		const store = this.configuration.store;
 		let catalog: ReturnType<typeof store.inputPathIndex> | undefined;
@@ -2779,7 +2783,7 @@ export class ResourceInputSession {
 			if (!record) return;
 			try {
 				const token = await manager.restore(record, session.remainingBytes, signal);
-				if (token) session.lifecycle.own({ dispose: token.release });
+				if (token) retain(token);
 				return token;
 			} catch {
 				signal.throwIfAborted();
@@ -2790,7 +2794,7 @@ export class ResourceInputSession {
 		return async function* (target?: string, preparation?: PreparationLookup) {
 			if (target === undefined || preparation || session.persistence.inputs) {
 				for await (const { token } of manager.recover(() => session.remainingBytes, { signal, target, preparation })) {
-					session.lifecycle.own({ dispose: token.release });
+					retain(token);
 					yield token;
 				}
 				return;

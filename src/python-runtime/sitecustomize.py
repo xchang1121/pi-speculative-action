@@ -142,8 +142,9 @@ def _transport(address, token):
         nonlocal disabled
         if disabled or not (0 <= optimize <= 2) or "\0" in path or _limits() != limits:
             return
-        request = dict(op="python_compile", context=token, engine=engine, executable=exe, filename=path,
-                       optimize=optimize, digest=hashlib.sha256(data).hexdigest())
+        key = dict(engine=engine, executable=exe, filename=path, optimize=optimize)
+        request = dict(op="compute", context=token, namespace="python.source_to_code", key=key,
+                       inputDigest=hashlib.sha256(data).hexdigest())
         payload = json.dumps(request).encode("ascii") + b"\n"
         fresh = client is None
         try:
@@ -161,24 +162,25 @@ def _transport(address, token):
                 disabled = True
                 close()
                 return
-            if state == "source":
-                frame = {"op": "source", "data": base64.b64encode(data).decode("ascii")}
+            if state == "input":
+                frame = {"op": "input", "token": reply["token"],
+                         "value": {"encoding": "base64", "value": base64.b64encode(data).decode("ascii")}}
                 sock.sendall(json.dumps(frame).encode("ascii") + b"\n")
                 line = stream.readline(24 * 1024 * 1024)
                 if not line:
                     raise EOFError("compiler channel closed")
                 reply = json.loads(line)
                 state = reply.get("state")
-                if state == "unavailable":
+                if state == "local":
                     return
-            if state != "compiled":
+            if state not in ("published", "hit") or reply["value"]["encoding"] != "base64":
                 close()
                 return
-            code = marshal.loads(base64.b64decode(reply["data"], validate=True))
+            code = marshal.loads(base64.b64decode(reply["value"]["value"], validate=True))
             if type(code) is not types.CodeType or code.co_filename != path:
                 close()
                 return
-            sock.sendall(b'{"op":"consumed"}\n')
+            sock.sendall(json.dumps({"op": "consumed", "token": reply["token"]}).encode("ascii") + b"\n")
             line = stream.readline(256)
             if not line or json.loads(line).get("state") != "ready":
                 close()
@@ -208,8 +210,8 @@ def _install():
     import builtins
     from importlib.machinery import SourceFileLoader
 
-    address = os.environ.get("PI_PYTHON_COMPILE_SOCKET")
-    token = os.environ.get("PI_PYTHON_COMPILE_CONTEXT")
+    address = os.environ.get("PI_SUBCOMPUTE_SOCKET")
+    token = os.environ.get("PI_SUBCOMPUTE_CONTEXT")
     if not address or not token or sys.implementation.name != "cpython":
         return
     if (sys._xoptions or sys.flags.debug or sys.flags.dev_mode or os.environ.get("PYTHONNODEBUGRANGES")

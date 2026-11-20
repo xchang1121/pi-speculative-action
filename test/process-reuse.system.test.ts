@@ -8,6 +8,7 @@ import {
 	captureFileDigest,
 	captureStableFile,
 	hashExecutableFile,
+	settledFilesystemStat,
 } from "../src/filesystem-evidence.ts";
 import { executionRecords, observeExecution, traceTail, writesWithin } from "../src/execution-observer.ts";
 import { temporaryDirectories } from "./filesystem.ts";
@@ -379,10 +380,10 @@ test("rejects orphan and truncated binary records before they can qualify an exe
 test("keeps file admission and change detection after a digest is cached", async () => {
 	const input = path.join(await directories.create(), "input");
 	await writeFile(input, "original");
-	await new Promise((resolve) => setTimeout(resolve, 2100)); // Settle even a filesystem with coarse timestamps.
 	const bytes = await captureStableFile(input, 1024, true, { digest: false });
 	expect(bytes.content?.toString()).toBe("original");
 	expect(cachedCapture(bytes.stat, input)).toBeUndefined();
+	await expect.poll(() => settledFilesystemStat(bytes.stat, Date.now(), input), { timeout: 10000 }).toBe(true);
 	const captured = await captureStableFile(input, 1024);
 	expect(await captureFileDigest(input)).toMatchObject({
 		hash: captured.hash,

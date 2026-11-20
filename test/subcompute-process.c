@@ -5,7 +5,8 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-int main(void) {
+int main(int argc, char **argv) {
+  int trusted = argc == 2 && !strcmp(argv[1], "--trusted");
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   struct sockaddr_un address = {.sun_family = AF_UNIX};
   const char *socket_path = getenv("PI_SUBCOMPUTE_SOCKET");
@@ -19,7 +20,11 @@ int main(void) {
   FILE *stream = fdopen(fd, "r+");
   if (!stream)
     return 4;
-  fprintf(stream,
+  if (trusted)
+    fprintf(stream, "{\"op\":\"compute\",\"context\":\"%s\",\"namespace\":\"config.parse\",\"key\":null,"
+                    "\"inputDigest\":\"a25b48de30e7b8f6c6b99c3b565f62521ec46bc75e82d6b93fc381efe3997e79\"}\n", context);
+  else
+    fprintf(stream,
           "{\"op\":\"compute\",\"context\":\"%s\","
           "\"namespace\":\"process-input\",\"key\":\"input\","
           "\"inputResources\":[{\"path\":\"input.txt\",\"scope\":\"content\"}],"
@@ -33,8 +38,15 @@ int main(void) {
   int miss = strstr(line, "\"state\":\"miss\"") != NULL;
   char token[37];
   char *id = strstr(line, "\"token\":\"");
-  if (miss && (!id || sscanf(id, "\"token\":\"%36[0-9a-f-]", token) != 1))
+  if ((trusted || miss) && (!id || sscanf(id, "\"token\":\"%36[0-9a-f-]", token) != 1))
     return 6;
+  if (trusted && strstr(line, "\"state\":\"input\"")) {
+    /* {"debug":"first","release":"second"} */
+    fprintf(stream, "{\"op\":\"input\",\"token\":\"%s\",\"value\":{\"encoding\":\"base64\","
+                    "\"value\":\"eyJkZWJ1ZyI6ImZpcnN0IiwicmVsZWFzZSI6InNlY29uZCJ9\"}}\n", token);
+    fflush(stream);
+    if (getline(&line, &size, stream) < 0) return 5;
+  }
   char *value = strstr(line, "\"value\":\"");
   if (!value)
     return 6;
@@ -65,7 +77,11 @@ int main(void) {
       putchar((bits >> count) & 255);
     }
   }
-  if (miss && getline(&line, &size, stream) < 0)
+  if (trusted) {
+    fprintf(stream, "{\"op\":\"consumed\",\"token\":\"%s\"}\n", token);
+    fflush(stream);
+  }
+  if ((miss || trusted) && getline(&line, &size, stream) < 0)
     return 9;
   free(line);
   fclose(stream);

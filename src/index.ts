@@ -73,5 +73,5 @@ export {
 	type ComputeStepRequest,
 	type ToolFilesystemOperations,
 } from "./resource-version.ts";
-export { subcomputeEnvironment } from "./subcompute.ts";
+export { subcomputeEnvironment, type TrustedSubcomputeStep, type TrustedStepBuild, type TrustedStepRuntime } from "./subcompute.ts";
 export { createControlledBashOperations } from "./linux-process-world.ts";

@@ -210,6 +210,7 @@ test("reads leave an empty SQLite database untouched and reject a missing curren
 		expect(storeMetadata(f.cache, (db) => db.prepare("SELECT name FROM sqlite_master").all())).toEqual([]);
 		await f.store.putInputVersion({ root: f.root, preparations: [] }, []);
 		await f.store.drain();
+		expect(await lookup()).toEqual([]); // Open the reusable reader before another connection changes the schema.
 		storeMetadata(f.cache, (db) => db.exec("DROP INDEX input_preparations_recent"));
 		await expect(lookup()).rejects.toThrow("incompatible provenance store schema");
 		await expect(f.store.putInputVersion({ root: f.root, preparations: [] }, [])).rejects.toThrow("incompatible provenance store schema");
