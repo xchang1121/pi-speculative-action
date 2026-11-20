@@ -307,6 +307,7 @@ export function byteStreamContextKey(context) {
 	if ((BigInt("0x" + semantic.signals.blocked) | BigInt("0x" + semantic.signals.ignored)) & sigpipe) return;
 	for (const descriptor of semantic.descriptors)
 		if (descriptor.fd === 1 || descriptor.fd === 2) {
+			if (descriptor.type === "device" && descriptor.endpoint === "/dev/null") continue;
 			if (!["pipe", "socket"].includes(descriptor.type)) return;
 			descriptor.type = "byte-stream";
 			descriptor.flags &= ~(3 | 0x8000);

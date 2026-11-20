@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, open, rm, stat, writeFile } from "node:fs/promises";
+import { lutimes, mkdir, mkdtemp, open, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -13,7 +13,7 @@ import { executionRecords, observeExecution, traceTail } from "../src/execution-
 import { createBashTool, createReadTool } from "@earendil-works/pi-coding-agent";
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import {
 	createControlledBashOperations,
 	resolveSpeculativeConfig,
@@ -284,6 +284,117 @@ test.skipIf(process.platform !== "linux")("native Actor children feed later Bash
 		await fixture.dispose();
 	}
 });
+
+test.skipIf(process.platform !== "linux")(
+	"Actor provenance reuses execve chains, /dev/null redirects, subtrees, and 2>&1 streams without cross-stream aliasing",
+	{ timeout: 60000 },
+	async () => {
+		const fixture = await createLinuxProcessBenchmark("pi-actor-expanded-", "in_memory", {}, os.homedir());
+		const external = path.join(fixture.root, "external.txt");
+		const host = systemHost(
+			fixture.workspace,
+			[fixture.tool],
+			{
+				executionWorlds: [fixture.world],
+				resolveInvocation: (_tool, input) => fixture.invocation(input as Record<string, unknown>),
+				config: {
+					processReuse: {
+						environmentMode: "allowlist",
+						environmentKeys: ["PATH", "LANG", "HOME"],
+						stableDevices: ["/dev/null", "/dev/tty", "/dev/zero", "/dev/full", external],
+						replayAcceptedTaints: ["clock", "random", "pid_observation", "descriptor_observation"],
+					},
+				},
+			},
+			{ enabled: false, prepareObservedOperations: false },
+		);
+		try {
+			await fixture.write("source.txt", "hello\n");
+			await fixture.write("check.sh", "cat source.txt | wc -c\n");
+			execFileSync("cc", ["-x", "c", "-", "-o", path.join(fixture.workspace, "emit")], {
+				input: '#include <unistd.h>\nint main(void) { return write(1, "hello\\n", 6) != 6; }\n',
+			});
+			await symlink("/bin/sh", path.join(fixture.workspace, "script-shell"));
+			// Establish stable link metadata before the first exec (Linux relatime includes ctime).
+			await lutimes(path.join(fixture.workspace, "script-shell"), new Date(Date.now() + 60_000), new Date(0));
+			await readFile(path.join(fixture.workspace, "emit"));
+			await fixture.read("source.txt");
+			await fixture.read("check.sh");
+			await fixture.prepare();
+			await host.start();
+			const run = (command: string) => host.execute("bash", { command }).then(textOutput);
+
+			const plans = vi.spyOn(fixture.backend.planner, "plan");
+			const expectChild = async (command: string, executable: string) => {
+				plans.mockClear();
+				const before = fixture.backend.actorMetrics().hits;
+				const output = await run(command);
+				const lookups = await Promise.all(plans.mock.results.map((call) => call.value));
+				const served = lookups.flatMap((plan) => plan.kind === "completed_replay" ? [plan.certificate.prototype.executablePath] : []);
+				expect(served).toEqual([await realpath(executable)]);
+				expect(fixture.backend.actorMetrics().hits).toBe(before + 1);
+				return output;
+			};
+
+			// 1. Whole-command and child /dev/null discard writes + execve chains across pipe -> socket
+			expect(await run("cat source.txt 2>/dev/null")).toBe("hello\n");
+			const afterWholeNull = fixture.backend.actorMetrics();
+			expect(afterWholeNull.wholeCommandPublished, afterWholeNull.lastError).toBeGreaterThan(0);
+			expect(await run("cat source.txt 2>/dev/null")).toBe("hello\n");
+			expect(fixture.backend.actorMetrics().wholeCommandHits).toBeGreaterThan(afterWholeNull.wholeCommandHits);
+
+			// This child only writes bytes. GNU cat can stat stdout, which requires the exact descriptor type.
+			expect(await run('out=$(/usr/bin/env ./emit 2>/dev/null); printf "%s:A" "$out"')).toBe("hello:A");
+			expect(await expectChild("/usr/bin/env ./emit 2>/dev/null; printf B", "/usr/bin/env")).toBe("hello\nB");
+
+			// 2. Multi-process shell subtree (script with internal pipeline) + dependency invalidation
+			const beforeSubtree = fixture.backend.actorMetrics();
+			expect((await run("./script-shell check.sh; printf A")).replace(/\s+/g, "")).toBe("6A");
+			expect(fixture.backend.actorMetrics().published).toBeGreaterThan(beforeSubtree.published);
+			expect((await expectChild("./script-shell check.sh; printf B", "/bin/sh")).replace(/\s+/g, "")).toBe("6B");
+			await fixture.write("source.txt", "updated-text\n");
+			const afterMutate = fixture.backend.actorMetrics();
+			expect((await run("./script-shell check.sh; printf C")).replace(/\s+/g, "")).toBe("13C");
+			expect(fixture.backend.actorMetrics().hits).toBe(afterMutate.hits);
+
+			// 3. Merged 2>&1 stream reuse and non-aliasing against 2>/dev/null
+			const beforeMerged = fixture.backend.actorMetrics();
+			expect(await run("sh -c 'printf out; printf err >&2' 2>&1; printf A")).toBe("outerrA");
+			const afterMergedPublish = fixture.backend.actorMetrics();
+			expect(afterMergedPublish.published, afterMergedPublish.lastError).toBeGreaterThan(beforeMerged.published);
+			expect(await run("sh -c 'printf out; printf err >&2' 2>&1; printf B")).toBe("outerrB");
+			expect(fixture.backend.actorMetrics().hits, fixture.backend.actorMetrics().lastError).toBeGreaterThan(
+				afterMergedPublish.hits,
+			);
+			expect(await run("sh -c 'printf out; printf err >&2' 2>/dev/null; printf C")).toBe("outC");
+
+			expect(await run('out=$(sh -c \'printf out; printf err >&2\'); printf "<%s>" "$out"')).toBe("err<out>");
+
+			// 4. Symlinked Python interpreter child sub-command reuse across Bash commands
+			await fixture.read("source.txt");
+			expect(await run("python3 -B -c 'print(open(\"source.txt\").read(), end=\"\")'; printf A")).toBe(
+				"updated-text\nA",
+			);
+			const afterPythonPublish = fixture.backend.actorMetrics();
+			expect(await run("python3 -B -c 'print(open(\"source.txt\").read(), end=\"\")'; printf B")).toBe(
+				"updated-text\nB",
+			);
+			expect(fixture.backend.actorMetrics().hits, fixture.backend.actorMetrics().lastError).toBeGreaterThan(
+				afterPythonPublish.hits,
+			);
+
+			const redirect = "printf written > ../external.txt";
+			await writeFile(external, "first");
+			await run(redirect);
+			await writeFile(external, "reset");
+			await run(redirect);
+			expect(await readFile(external, "utf8")).toBe("written");
+		} finally {
+			await host.dispose();
+			await fixture.dispose();
+		}
+	},
+);
 
 test.skipIf(process.platform !== "linux")("ordinary Python Bash calls consume compilation across producers with default taints", { timeout: 60000 }, async () => {
 	const fixture = await createLinuxProcessBenchmark("pi-python-input-", "in_memory", {}, os.homedir());

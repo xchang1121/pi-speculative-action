@@ -22,6 +22,7 @@ import {
 	readdir,
 	readFile,
 	readlink,
+	realpath,
 	rm,
 	rmdir,
 	stat,
@@ -76,6 +77,7 @@ import {
 	hashExecutableFile,
 	mapFilesystem,
 	sameFilesystemIdentity,
+	settledFilesystemStat,
 	sharedWalk,
 } from "./filesystem-evidence.ts";
 import type {
@@ -170,7 +172,7 @@ import { ProvenanceCertificateStore } from "./reuse-store.ts";
 import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
 import { cause, zeroValidationMetrics, type ResourceValidation } from "./settlement.ts";
 import type { ExecutionObservation, TracedWrite, TraceTail } from "./execution-observer.ts";
-import { executionRecords, observeExecution, traceTail, UTSNAME_BYTES, writesWithin } from "./execution-observer.ts";
+import { executionRecords, installedImageStart, observeExecution, traceTail, UTSNAME_BYTES, writesWithin } from "./execution-observer.ts";
 import type { TimelineDependency } from "./task-timing.ts";
 import { TimelineInterval } from "./task-timing.ts";
 import type {
@@ -653,6 +655,7 @@ type ActorImageRecorder = (
 	pid: number,
 	prototype: ExecPrototype,
 	image: Awaited<ReturnType<typeof inspectHeldExecProcess>>,
+	installed: { dev: bigint; ino: bigint },
 	clock: HeldExecClock,
 ) => Promise<void>;
 interface NativeObservation {
@@ -1108,44 +1111,51 @@ export class LinuxProcessReuseBackend {
 			const began = performance.now();
 			let outputEndpoints: readonly [string, string] | undefined;
 			const native = this.nativeObservation(options.sourceRoot, this.observations.getStore()?.scope, request.signal);
+			const shellExecutable = await realpath(invocation.shell).catch(() => invocation.shell);
+			let rootPid: number | undefined;
 			const replayed = new Set<number>();
 			// The installed child, its exit and all evidence come from this one execution domain.
-			const record: ActorImageRecorder = async (pid, child, image, clock) => {
-				const events = (await trace.read()).journal(pid);
-				const endpoints = image.context.outputEndpoints;
-				if (!events || endpoints[0] === endpoints[1] || !endpoints.every((name) => /^(socket|pipe):\[\d+\]$/.test(name)))
-					return;
-				const start = events.findIndex((event) => event.name === "image" && event.image === image.executable);
-				const terminal = events.at(-1);
-				if (
-					start < 0 ||
-					terminal?.name !== "terminated" ||
-					terminal.result === undefined ||
-					(terminal.result & 127) !== 0 ||
-					events.some((event, index) =>
-						index < start ? event.name === "terminated" : index > start && (event.child || event.name === "image"),
-					)
-				) return;
-				let observed = await observeExecution(trace, image.executable, image.cwd, {
-					execution: { pid, start },
-					captureOutput: true,
-					outputEndpoints: endpoints,
-					outputFlags: image.outputFlags ?? [0, 0],
-					platformFingerprint: child.platformFingerprint,
-					controlledSocket: channel?.socket,
-					guardFilesystemSemanticsWithin: [options.sourceRoot],
-				});
-				if (channel) observed = await channel.observe(observed);
-				await this.publishActorProcess(
-					child, observed, { kind: "code", code: terminal.result >> 8 },
-					new TimelineInterval(clock.startedAt, clock.completedAt), proof!, request.signal, channel,
-				);
+			const record: ActorImageRecorder = async (pid, child, image, installed, clock) => {
+				if (pid === rootPid && image.executable === shellExecutable) return;
+				try {
+					const events = (await trace.read()).journal(pid);
+					const endpoints = image.context.outputEndpoints;
+					if (!events || !endpoints.every((name) => name === "/dev/null" || /^(socket|pipe):\[\d+\]$/.test(name)))
+						return;
+					const start = installedImageStart(events, installed);
+					const terminal = events.at(-1);
+					if (
+						start < 0 ||
+						terminal?.name !== "terminated" ||
+						terminal.result === undefined ||
+						(terminal.result & 127) !== 0 ||
+						events.slice(0, start).some((event) => event.name === "terminated")
+					) return;
+					let observed = await observeExecution(trace, image.executable, image.cwd, {
+						execution: { pid, start },
+						captureOutput: true,
+						outputEndpoints: endpoints,
+						outputFlags: image.outputFlags ?? [0, 0],
+						platformFingerprint: child.platformFingerprint,
+						controlledSocket: channel?.socket,
+						guardFilesystemSemanticsWithin: [options.sourceRoot],
+					});
+					if (observed.pids?.some((member) => replayed.has(member))) return;
+					if (channel) observed = await channel.observe(observed);
+					await this.publishActorProcess(
+						child, observed, { kind: "code", code: terminal.result >> 8 },
+						new TimelineInterval(clock.startedAt, clock.completedAt), proof!, request.signal, channel,
+					);
+				} catch (error) {
+					this.setError(undefined, `actor_child:${errorMessage(error)}`);
+				}
 			};
 			output = await boundary.trace(
 				{
 					...native,
 					descriptors: true,
 					decide: async (held) => {
+						rootPid ??= held.pid;
 						const decision = await this.decideHeldExec(held, held.scope, record);
 						if (decision.kind !== "replay") return decision;
 						return {
@@ -1219,7 +1229,17 @@ export class LinuxProcessReuseBackend {
 			this.setError(undefined, `actor_${whole ? "command" : "child"}_unpublished:${reasons.join(",")}`, "tainted");
 			return;
 		}
-		const dependencies = await captureActorDependencies(observation, signal, files);
+		const { dependencies, taints } = await captureActorDependencies(
+			observation,
+			sensitivePaths(this.options.storeRoot, this.options.deniedPaths),
+			signal,
+			files,
+		);
+		const lateTaints = taints.filter((taint) => !acceptedReplayTaints().includes(taint));
+		if (lateTaints.length) {
+			this.setError(undefined, `actor_${whole ? "command" : "child"}_unpublished:${lateTaints.join(",")}`, "tainted");
+			return;
+		}
 		const validate = proof.seal(dependencies, (target) => target);
 		if (!validate()) return;
 		await this.store.withPublication(async () => {
@@ -1240,7 +1260,7 @@ export class LinuxProcessReuseBackend {
 					observer: { provider: "execution_domain", fingerprint: OBSERVER_FINGERPRINT },
 					execution: { authority: "actor" },
 				},
-				dependencyCertificate: { complete: true, dependencies, taints: observation.taints },
+				dependencyCertificate: { complete: true, dependencies, taints },
 				result: {
 					replayProfile: "buffered_noninteractive",
 					journal,
@@ -2861,7 +2881,8 @@ export class LinuxProcessReuseBackend {
 			const sourceRoot = path.resolve(process.sourceRoot);
 			const installed = `/proc/${process.pid}/exe`;
 			const name = await readlink(installed);
-			const executable = (await stat(installed)).nlink ? name : name.replace(/ \(deleted\)$/, "");
+			const installedStat = await stat(installed, { bigint: true });
+			const executable = installedStat.nlink ? name : name.replace(/ \(deleted\)$/, "");
 			const projection = new ExecutionPathProjection({
 				sourceRoot,
 				workspaceRoot: sourceRoot,
@@ -2924,7 +2945,7 @@ export class LinuxProcessReuseBackend {
 							}
 						}
 					}
-					if (clock && snapshot.outputRoute) await record?.(process.pid, prototype, snapshot, clock);
+					if (clock && snapshot.outputRoute) await record?.(process.pid, prototype, snapshot, installedStat, clock);
 				} : undefined,
 			});
 			if (!available) {
@@ -3651,20 +3672,14 @@ async function captureDependencies(
 			!(session.gitDirectory && pathContains(session.gitDirectory, observedPath))
 				? (session.projection.toPhysical(observedPath) ?? observedPath)
 				: observedPath;
-		// A loose object or pack is named by its content: its presence and size stand for its bytes.
 		if (
 			item.role !== "metadata" &&
 			speculativeConfig().processReuse.contentAddressedPaths.some((root) => pathContains(root, physical))
 		) {
 			const info = await lstat(physical, { bigint: true }).catch(() => undefined);
-			if (info?.isFile()) {
-				add({
-					kind: "metadata",
-					path: slash(physical),
-					followSymlinks: false,
-					fields: ["mode", "size"],
-					digest: filesystemObservationDigest(info, ["mode", "size"]),
-				});
+			const dependency = contentAddressedIdentity(physical, info);
+			if (dependency) {
+				add(dependency);
 				continue;
 			}
 		}
@@ -4757,71 +4772,182 @@ async function topLevelProcessPrototype(
 		platformFingerprint,
 	});
 }
+function contentAddressedIdentity(target: string, info?: BigIntStats): DynamicDependency | undefined {
+	if (!info?.isFile() || !settledFilesystemStat(info, Date.now(), target)) return;
+	const fields = ["dev", "ino", "mode", "size", "mtimeNs", "ctimeNs"] as const;
+	return { kind: "metadata", path: slash(target), followSymlinks: false, fields, digest: filesystemObservationDigest(info, fields) };
+}
 async function captureActorDependencies(
 	observation: ExecutionObservation,
+	deniedPaths: readonly string[],
 	signal?: AbortSignal,
 	files?: ReadonlyMap<string, FileContentVersion>,
-): Promise<DynamicDependency[]> {
+): Promise<{ dependencies: DynamicDependency[]; taints: ProvenanceTaint[] }> {
 	const dependencies = new Map<string, DynamicDependency>();
+	const taints = new Set<ProvenanceTaint>(observation.taints);
+	const settings = speculativeConfig().processReuse;
 	await using view = await FilesystemReadView.open();
 	const add = (dependency: DynamicDependency) => {
 		const key = dynamicDependencyIdentity(dependency);
 		const previous = dependencies.get(key);
+		if (
+			previous?.kind === "file" &&
+			dependency.kind === "file" &&
+			stableEqual({ ...previous, role: dependency.role }, dependency)
+		) {
+			if (previous.role !== "executable" && dependency.role === "executable") dependencies.set(key, dependency);
+			return;
+		}
+		if (
+			previous?.kind === dependency.kind &&
+			(dependency.kind === "directory" || dependency.kind === "absence") &&
+			Object.entries(dependency).every(
+				([field, value]) => !(field in previous) || stableEqual(Reflect.get(previous, field), value),
+			)
+		) {
+			dependencies.set(key, { ...previous, ...dependency });
+			return;
+		}
 		if (previous && !stableEqual(previous, dependency)) throw new Error(`actor_dependency_conflict:${key}`);
 		dependencies.set(key, dependency);
 	};
+	const prefixes = new Map<string, Promise<DynamicDependency | undefined>>();
+	const symlinkAt = (prefix: string) => {
+		let pending = prefixes.get(prefix);
+		if (!pending)
+			prefixes.set(
+				prefix,
+				(pending = view
+					.stat(prefix, false)
+					.catch(ignoreMissing)
+					.then((info) => (info?.isSymbolicLink() ? captureSymlinkDependency(prefix, prefix, view) : info && undefined))),
+			);
+		return pending;
+	};
+	const relevant: ExecutionObservation["paths"][number][] = [];
 	for (const input of observation.paths) {
 		signal?.throwIfAborted();
-		if (speculativeConfig().processReuse.stableDevices.includes(input.path)) continue;
-		// Record every symlink in the observed pathname before following its final object.
-		let prefix = path.parse(input.path).root;
-		for (const segment of input.path.slice(prefix.length).split(path.sep).filter(Boolean)) {
-			prefix = path.join(prefix, segment);
-			const info = await view.stat(prefix, false).catch(ignoreMissing);
-			if (!info) break;
-			if (info.isSymbolicLink()) add(await captureSymlinkDependency(prefix, prefix, view));
+		const observedPath = path.resolve(input.path);
+		if (deniedPaths.some((denied) => pathContains(denied, observedPath)))
+			throw new Error(`actor_denied_input:${observedPath}`);
+		// These links are resolved in the tracee's filesystem context, which ends at exit.
+		if (/^\/proc\/(?:self|thread-self|\d+)\/(?:task\/\d+\/)?(?:cwd|root|fd|map_files)\//.test(input.path) ||
+			/^\/dev\/fd\/\d+\//.test(input.path))
+			throw new Error(`actor_unresolved_process_path:${input.path}`);
+		if (
+			settings.stableDevices.includes(observedPath) ||
+			settings.kernelConfigurationPaths.some((root) => pathContains(root, observedPath))
+		)
+			continue;
+		if (/^\/proc\/(?:self|thread-self|\d+)(?:\/|$)/.test(observedPath)) {
+			taints.add(observedPath.endsWith("/limits") ? "confinement_observation" : "pid_observation");
+			continue;
 		}
-		const info = await view
-			.stat(input.path, input.role === "metadata" ? input.followSymlinks : true)
-			.catch(ignoreMissing);
-		if (!info) {
-			const absence = await captureAbsenceDependency(input.path, input.path, false, [], undefined, view);
-			if (!absence) throw new Error(`actor_absence_changed:${input.path}`);
-			add(absence);
-		} else if (input.role === "metadata") {
-			const captured = await captureMetadataDependency(
-				input.path,
-				input.path,
-				input.followSymlinks,
-				input.fields,
-				view,
-			);
-			if (captured.digest !== input.digest) throw new Error(`actor_metadata_changed:${input.path}`);
-			add(captured);
-		} else if (info.isDirectory())
-			add(
-				await captureDirectoryDependency(input.path, input.path, true, [], !!input.listed, undefined, view),
-			);
-		else if (info.isFile()) {
-			const target = await view.realpath(input.path);
-			const file = files?.get(target);
-			if (file && sameFilesystemIdentity(info, file.stat)) {
-				add({
-					kind: "file",
-					path: target,
-					role: input.role,
-					contentDigest: contentDigest(file.content),
-					metadataDigest: filesystemMetadataDigest(info),
-				});
-				if (file.shared) TimelineInterval.use(file.computation);
-			} else {
-				add((await captureFileDependency(target, target, input.role, {
-					signal, view, includeMetadata: true, maxFileBytes: speculativeConfig().filesystem.maxReadBytes,
-				})).dependency);
-			}
-		} else throw new Error(`actor_special_input:${input.path}`);
+		if (/^\/dev\/fd\/\d+$/.test(observedPath)) {
+			taints.add("descriptor_observation");
+			continue;
+		}
+		if (/^\/dev\/u?random$/.test(observedPath)) {
+			taints.add("random");
+			continue;
+		}
+		if (
+			/^\/sys\/(?:devices\/system\/cpu|fs\/cgroup)(?:\/|$)|^\/proc\/(?:meminfo|version|version_signature|cpuinfo|stat|loadavg|uptime)$/.test(
+				observedPath,
+			)
+		) {
+			taints.add("clock");
+			continue;
+		}
+		relevant.push(input);
 	}
-	return [...dependencies.values()];
+	const captured = await mapFilesystem(
+		relevant,
+		async (input) => {
+			signal?.throwIfAborted();
+			const observedPath = path.resolve(input.path);
+			const items: DynamicDependency[] = [];
+			let sharedComputation: TimelineInterval | undefined;
+			// Record every symlink in the observed pathname before following its final object.
+			let prefix = path.parse(input.path).root;
+			for (const segment of input.path.slice(prefix.length).split(path.sep).filter(Boolean)) {
+				prefix = path.join(prefix, segment);
+				const link = await symlinkAt(prefix);
+				if (link) {
+					const resolved = await view.realpath(prefix).catch(ignoreMissing);
+					if (resolved && deniedPaths.some((denied) => pathContains(denied, resolved)))
+						throw new Error(`actor_denied_input:${resolved}`);
+					items.push(link);
+				}
+			}
+			if (
+				input.role !== "metadata" &&
+				settings.contentAddressedPaths.some((root) => pathContains(root, observedPath))
+			) {
+				const info = await view.stat(observedPath, false).catch(ignoreMissing);
+				const dependency = contentAddressedIdentity(observedPath, info);
+				if (dependency) {
+					items.push(dependency);
+					return { items, sharedComputation };
+				}
+			}
+			const info = await view
+				.stat(input.path, input.role === "metadata" ? input.followSymlinks : true)
+				.catch(ignoreMissing);
+			if (!info) {
+				const absence = await captureAbsenceDependency(input.path, input.path, false, [], undefined, view);
+				if (!absence) throw new Error(`actor_absence_changed:${input.path}`);
+				items.push(absence);
+			} else if (input.role === "metadata") {
+				const item = await captureMetadataDependency(
+					input.path,
+					input.path,
+					input.followSymlinks,
+					input.fields,
+					view,
+				);
+				if (item.digest !== input.digest) throw new Error(`actor_metadata_changed:${input.path}`);
+				items.push(item);
+			} else if (info.isDirectory())
+				items.push(
+					await captureDirectoryDependency(input.path, input.path, true, [], !!input.listed, undefined, view),
+				);
+			else if (info.isFile()) {
+				const target = await view.realpath(input.path);
+				if (deniedPaths.some((denied) => pathContains(denied, target)))
+					throw new Error(`actor_denied_input:${target}`);
+				const file = files?.get(target);
+				if (file && sameFilesystemIdentity(info, file.stat)) {
+					items.push({
+						kind: "file",
+						path: target,
+						role: input.role,
+						contentDigest: contentDigest(file.content),
+						metadataDigest: filesystemMetadataDigest(info),
+					});
+					if (file.shared) sharedComputation = file.computation;
+				} else {
+					items.push(
+						(
+							await captureFileDependency(target, target, input.role, {
+								signal,
+								view,
+								includeMetadata: true,
+								maxFileBytes: settings.maxCaptureBytes,
+							})
+						).dependency,
+					);
+				}
+			} else throw new Error(`actor_special_input:${input.path}`);
+			return { items, sharedComputation };
+		},
+		signal,
+	);
+	for (const { items, sharedComputation } of captured) {
+		for (const item of items) add(item);
+		if (sharedComputation) TimelineInterval.use(sharedComputation);
+	}
+	return { dependencies: [...dependencies.values()], taints: [...taints].sort() };
 }
 function actorReplayProducer(producer: ProcessProducerProof, deniedPaths: readonly string[]) {
 	if (

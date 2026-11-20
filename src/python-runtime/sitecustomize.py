@@ -17,7 +17,7 @@ def _engine():
         st = os.stat(name)
         return (st.st_dev, st.st_ino, st.st_size, st.st_ctime_ns)
 
-    images = {identity(sys.executable)}
+    images = {identity(os.path.realpath(sys.executable))}
     with open("/proc/self/maps", "rb") as maps:
         for line in maps:
             fields = line.rstrip(b"\n").split(None, 5)
@@ -70,6 +70,8 @@ def _worker():
 
 
 def _transport(address, token):
+    import _thread
+    import atexit
     import base64
     import hashlib
     import json
@@ -77,35 +79,127 @@ def _transport(address, token):
     import socket
     import types
 
+    exe = os.path.realpath(sys.executable)
     engine = _engine()
     limits = _limits()
+    client = None
+    reader = None
+    disabled = False
+    lock = _thread.RLock()
+    active = False
+
+    def close():
+        nonlocal client, reader
+        stream, sock = reader, client
+        reader = client = None
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    atexit.register(close)
+    if hasattr(os, "register_at_fork"):
+        def reset_child():
+            nonlocal active
+            try:
+                close()
+                active = False
+            finally:
+                lock.release()
+
+        os.register_at_fork(before=lock.acquire, after_in_parent=lock.release, after_in_child=reset_child)
+
+    def connect():
+        nonlocal client, reader
+        if client is None:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.settimeout(5)
+                sock.connect(address)
+                stream = sock.makefile("rb")
+            except BaseException:
+                sock.close()
+                raise
+            client = sock
+            reader = stream
+        return client, reader
+
+    def begin(payload):
+        sock, stream = connect()
+        sock.sendall(payload)
+        line = stream.readline(24 * 1024 * 1024)
+        if not line:
+            raise EOFError("compiler channel closed")
+        return sock, stream, json.loads(line)
+
+    def exchange(data, path, optimize):
+        nonlocal disabled
+        if disabled or not (0 <= optimize <= 2) or "\0" in path or _limits() != limits:
+            return
+        request = dict(op="python_compile", context=token, engine=engine, executable=exe, filename=path,
+                       optimize=optimize, digest=hashlib.sha256(data).hexdigest())
+        payload = json.dumps(request).encode("ascii") + b"\n"
+        fresh = client is None
+        try:
+            sock, stream, reply = begin(payload)
+        except (OSError, ValueError, EOFError):
+            close()
+            if fresh:
+                raise
+            sock, stream, reply = begin(payload)
+        try:
+            state = reply.get("state")
+            if state == "local":
+                return
+            if state == "unavailable":
+                disabled = True
+                close()
+                return
+            if state == "source":
+                frame = {"op": "source", "data": base64.b64encode(data).decode("ascii")}
+                sock.sendall(json.dumps(frame).encode("ascii") + b"\n")
+                line = stream.readline(24 * 1024 * 1024)
+                if not line:
+                    raise EOFError("compiler channel closed")
+                reply = json.loads(line)
+                state = reply.get("state")
+                if state == "unavailable":
+                    return
+            if state != "compiled":
+                close()
+                return
+            code = marshal.loads(base64.b64decode(reply["data"], validate=True))
+            if type(code) is not types.CodeType or code.co_filename != path:
+                close()
+                return
+            sock.sendall(b'{"op":"consumed"}\n')
+            line = stream.readline(256)
+            if not line or json.loads(line).get("state") != "ready":
+                close()
+                return
+            return code
+        except BaseException:
+            close()
+            raise
 
     def compile_source(data, path, optimize):
-        if _limits() != limits:
+        nonlocal active
+        if disabled:
             return
-        request = dict(op="python_compile", context=token, engine=engine, filename=path, optimize=optimize,
-                       digest=hashlib.sha256(data).hexdigest())
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(5)
-            client.connect(address)
-            with client.makefile("rwb") as stream:
-                stream.write(json.dumps(request).encode("ascii") + b"\n")
-                stream.flush()
-                reply = json.loads(stream.readline(24 * 1024 * 1024))
-                if reply.get("state") == "source":
-                    frame = {"op": "source", "data": base64.b64encode(data).decode("ascii")}
-                    stream.write(json.dumps(frame).encode("ascii") + b"\n")
-                    stream.flush()
-                    reply = json.loads(stream.readline(24 * 1024 * 1024))
-                if reply.get("state") != "compiled":
-                    return
-                code = marshal.loads(base64.b64decode(reply["data"], validate=True))
-                if type(code) is not types.CodeType or code.co_filename != path:
-                    return
-                stream.write(b'{"op":"consumed"}\n')
-                stream.flush()
-                if json.loads(stream.readline(256)).get("state") == "ready":
-                    return code
+        with lock:
+            if active:
+                return
+            active = True
+            try:
+                return exchange(data, path, optimize)
+            finally:
+                active = False
 
     return compile_source
 

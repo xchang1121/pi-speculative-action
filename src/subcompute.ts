@@ -61,7 +61,7 @@ const fields = {
 	compute: ["op", "context", "namespace", "key", "inputResources", "envKeys", "environment", "includeInputContent"],
 	observe: ["op", "token", "reads"],
 	publish: ["op", "token", "reads", "durationMs", "value"],
-	python_compile: ["op", "context", "engine", "filename", "optimize", "digest"],
+	python_compile: ["op", "context", "engine", "executable", "filename", "optimize", "digest"],
 	source: ["op", "data"],
 	consumed: ["op"],
 };
@@ -472,7 +472,9 @@ export class SubcomputeService {
 					const runtime = this.runtime();
 					scope.busy++;
 					try {
+						let requestedSource = false;
 						const source = async () => {
+							requestedSource = true;
 							await send({ state: "source" });
 							const frame = await read();
 							if (frame?.op === "source") return frame.data;
@@ -482,8 +484,8 @@ export class SubcomputeService {
 							this.python.get(request, source, runtime.reuseEnabled === false ? 0 : runtime.resourceCacheMaxEntries,
 								runtime.resourceCacheMaxBytes ?? this.maxBytes(), resultLimit)
 						).catch(() => undefined);
-						if (!compiled) {
-							await send({ state: "unavailable" });
+						if (!compiled || compiled === "local") {
+							await send({ state: compiled === "local" && !requestedSource ? "local" : "unavailable" });
 							continue;
 						}
 						await send({ state: "compiled", data: compiled.bytes.toString("base64") });
@@ -574,12 +576,13 @@ export class SubcomputeService {
 	}
 	dispose(): Promise<void> {
 		return this.lifetime.close(async () => {
-			this.python.close();
+			const compilers = this.python.close();
 			for (const token of this.scopes.keys()) this.releaseScope(token);
 			for (const [socket, controller] of this.clients) {
 				controller.abort(new Error("subcompute_service_closed"));
 				socket.destroy();
 			}
+			await compilers;
 			await this.ready?.catch(() => undefined);
 			if (this.server?.listening)
 				await new Promise<void>((resolve, reject) =>

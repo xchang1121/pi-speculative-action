@@ -3,8 +3,9 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import * as evidence from "../src/filesystem-evidence.ts";
-import { lstat, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, readFile, readlink, symlink, writeFile } from "node:fs/promises";
 import { connect } from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { afterEach, expect, test, vi } from "vitest";
@@ -13,6 +14,7 @@ import { subcomputeEnvironment } from "../src/index.ts";
 import { SpeculativeConfiguration } from "../src/config-schema.ts";
 import { ContentChunkPool } from "../src/content-chunks.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
+import { compilerBootstrap, PythonCompilationCache } from "../src/python-compilation.ts";
 import { controlledRuntimeEnvironment, controlledSubcomputeChannel, SubcomputeService } from "../src/subcompute.ts";
 import { systemHost } from "./agent-system-fixture.ts";
 import { temporaryDirectories } from "./filesystem.ts";
@@ -394,7 +396,8 @@ test.skipIf(process.platform !== "linux")("the compiler accepts verified source 
 				const main = "import sys,zipimport;exec(zipimport.zipimporter(sys.argv[1]).get_code('sitecustomize'))";
 				const engine = JSON.parse(execFileSync("python3", ["-I", "-S", "-B", "-c", main, archive], { input: "", encoding: "utf8" }));
 				const source = Buffer.from("output = 42\n");
-				const request = { op: "python_compile", context, engine, optimize: 0, filename: path.join(cwd, "x.py"),
+				const executable = execFileSync("python3", ["-c", "import os, sys; print(os.path.realpath(sys.executable))"], { encoding: "utf8" }).trim();
+				const request = { op: "python_compile", context, engine, executable, optimize: 0, filename: path.join(cwd, "x.py"),
 					digest: createHash("sha256").update(source).digest("hex") };
 				peer.send(request);
 				expect(await peer.read()).toEqual({ state: "source" });
@@ -410,6 +413,10 @@ test.skipIf(process.platform !== "linux")("the compiler accepts verified source 
 					expect(await peer.read()).toEqual({ state: "ready" });
 				};
 				await consume();
+				const other = path.join(cwd, "python3");
+				await copyFile(executable, other);
+				peer.send({ ...request, executable: other });
+				expect(await peer.read()).toEqual({ state: "unavailable" });
 				peer.send(request);
 				expect(await peer.read()).toEqual(compiled);
 				await consume();
@@ -437,6 +444,142 @@ test.skipIf(process.platform !== "linux")("the compiler accepts verified source 
 	} finally {
 		await service.dispose();
 		await store.dispose();
+	}
+});
+
+test.skipIf(process.platform !== "linux")("concurrent venv imports share one connection per process and reopen it after fork", async () => {
+	const cwd = await directories.create();
+	const store = new ProvenanceCertificateStore(await directories.create());
+	const service = new SubcomputeService(cwd, store, () => 1024 * 1024);
+	try {
+		const hostPython = execFileSync("python3", ["-c", "import sys; print(sys.executable)"], { encoding: "utf8" }).trim();
+		const venvBin = path.join(cwd, ".venv", "bin");
+		await mkdir(venvBin, { recursive: true });
+		const venvPython = path.join(venvBin, "python3");
+		await symlink(hostPython, venvPython);
+		for (const [index, name] of ["mod_a", "mod_b", "mod_c", "mod_d"].entries())
+			await writeFile(path.join(cwd, `${name}.py`), `value = ${(index + 1) * 10}\n`);
+
+		let connections = 0;
+		await service.socket();
+		(service as unknown as { server: import("node:net").Server }).server.on("connection", () => {
+			connections++;
+		});
+
+		await service.run(async () => {
+			const env = await controlledRuntimeEnvironment({});
+			const program = `import _thread, os, sys, mod_a
+names = ("mod_b", "mod_c", "mod_d")
+locks = [_thread.allocate_lock() for _ in names]
+gate = _thread.allocate_lock()
+values = [0] * len(names)
+def load(i):
+    try:
+        with gate:
+            pass
+        values[i] = __import__(names[i]).value
+    finally:
+        locks[i].release()
+with gate:
+    for i, lock in enumerate(locks):
+        lock.acquire()
+        _thread.start_new_thread(load, (i,))
+for lock in locks:
+    lock.acquire()
+if len(sys.argv) > 1:
+    pid = os.fork()
+    if pid == 0:
+        import mod_child
+        sys.exit(0 if mod_child.value == 50 else 1)
+    assert os.waitpid(pid, 0)[1] == 0
+print(sum(values) + mod_a.value)`;
+			const runVenv = async (...args: string[]) => {
+				const { stdout, stderr } = await promisify(execFile)(venvPython, ["-B", "-W", "error", "-c", program, ...args], {
+					cwd, encoding: "utf8", timeout: 10000, env: { PATH: "/usr/bin:/bin", HOME: os.homedir(), ...env },
+				});
+				expect(stderr).toBe("");
+				return stdout.trim();
+			};
+
+			connections = 0;
+			expect(await runVenv()).toBe("100");
+			expect(connections).toBe(1);
+			expect(service.drainMetrics()["python.source_to_code"]).toMatchObject({ hits: 0, misses: 4 });
+
+			connections = 0;
+			expect(await runVenv()).toBe("100");
+			expect(connections).toBe(1);
+			expect(service.drainMetrics()["python.source_to_code"]).toMatchObject({ hits: 4, misses: 0 });
+
+			await writeFile(path.join(cwd, "mod_child.py"), "value = 50\n");
+			connections = 0;
+			expect(await runVenv("fork")).toBe("100");
+			expect(connections).toBe(2);
+			expect(service.drainMetrics()["python.source_to_code"]).toMatchObject({ hits: 4, misses: 1 });
+
+			const peer = client({ PI_SUBCOMPUTE_SOCKET: env.PI_PYTHON_COMPILE_SOCKET! });
+			try {
+				peer.send({
+					op: "python_compile",
+					context: env.PI_PYTHON_COMPILE_CONTEXT!,
+					engine: "0".repeat(64),
+					executable: path.join(cwd, "untrusted-python3"),
+					optimize: 0,
+					filename: path.join(cwd, "mod_a.py"),
+					digest: "1".repeat(64),
+				});
+				expect(await peer.read()).toEqual({ state: "unavailable" });
+			} finally {
+				peer.close();
+			}
+		});
+	} finally {
+		await service.dispose();
+		await store.dispose();
+	}
+});
+
+test.skipIf(process.platform !== "linux")("four compiler slots keep active imports pinned across interpreter changes", async () => {
+	const installations = await directories.create(os.homedir());
+	const cwd = await directories.create();
+	vi.stubEnv("UV_PYTHON_INSTALL_DIR", installations);
+	const cache = new PythonCompilationCache(cwd);
+	const source = Buffer.from("value = 10\n");
+	const digest = createHash("sha256").update(source).digest("hex");
+	const gates = Array.from({ length: 4 }, () => Promise.withResolvers<void>());
+	const active = gates.map(() => Promise.withResolvers<void>());
+	try {
+		const bootstrap = (await compilerBootstrap())!;
+		const main = "import sys,zipimport;exec(zipimport.zipimporter(sys.argv[1]).get_code('sitecustomize'))";
+		const requests = await Promise.all(Array.from({ length: 5 }, async (_, index) => {
+			const bin = path.join(installations, String(index), "bin");
+			await mkdir(bin, { recursive: true });
+			const executable = path.join(bin, "python3");
+			await copyFile("/usr/bin/python3", executable);
+			const engine = JSON.parse(execFileSync(executable, ["-I", "-S", "-B", "-c", main, bootstrap], { input: "", encoding: "utf8" }));
+			return { op: "python_compile" as const, context: "", executable, engine, optimize: 0, filename: path.join(cwd, "x.py"), digest };
+		}));
+		const get = (i: number) => cache.get(requests[i]!, async () => {
+			if (i < gates.length) {
+				active[i]!.resolve();
+				await gates[i]!.promise;
+			}
+			const ids = (await readFile(`/proc/self/task/${process.pid}/children`, "utf8")).trim().split(/\s+/);
+			const images = await Promise.all(ids.map((id) => readlink(`/proc/${id}/exe`).catch(() => "")));
+			expect(images.filter((file) => file.startsWith(installations + "/")).length).toBeLessThanOrEqual(4);
+			return source.toString("base64");
+		}, 16, 65536, 65536);
+		const first = gates.map((_, i) => get(i));
+		await Promise.all(active.map((item) => item.promise));
+		const fifth = get(4);
+		gates[3]!.resolve();
+		expect(await fifth).toMatchObject({ hit: false });
+		for (const gate of gates) gate.resolve();
+		for (const result of await Promise.all(first)) expect(result).toMatchObject({ hit: false });
+	} finally {
+		for (const gate of gates) gate.resolve();
+		await cache.close();
+		vi.unstubAllEnvs();
 	}
 });
 

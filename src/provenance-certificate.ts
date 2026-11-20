@@ -247,7 +247,7 @@ export function byteStreamPrototype(prototype: ExecPrototype): ExecPrototype | u
 		!context ||
 		prototype.inheritedFDs.some(
 			(descriptor) =>
-				descriptor.fd > 2 || (descriptor.fd > 0 && !["pipe", "socket"].includes(descriptor.type)),
+				descriptor.fd > 2 || (descriptor.fd > 0 && !["pipe", "socket", "device"].includes(descriptor.type)),
 		)
 	)
 		return;
@@ -258,7 +258,9 @@ export function byteStreamPrototype(prototype: ExecPrototype): ExecPrototype | u
 		// Every descriptor digest includes the entire context. Re-key stdin too;
 		// its own type, flags and identity remain exact inside the projected context.
 		inheritedFDs: prototype.inheritedFDs.map((descriptor) => ({
-			...(descriptor.fd === 0 ? descriptor : { fd: descriptor.fd, type: "pipe" as const }),
+			...(descriptor.fd === 0 || descriptor.type === "device"
+				? descriptor
+				: { fd: descriptor.fd, type: "pipe" as const }),
 			flagsDigest: sha256Digest(context + "\0" + descriptor.fd),
 		})),
 	});

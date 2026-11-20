@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { access, link, mkdir, readFile, realpath, stat, unlink, writeFile } from "node:fs/promises";
+import { access, link, mkdir, open, readFile, realpath, stat, unlink, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -72,55 +72,91 @@ export type PythonCompileRequest = {
 	readonly op: "python_compile";
 	readonly context: string;
 	readonly engine: string;
+	readonly executable: string;
 	readonly filename: string;
 	readonly optimize: number;
 	readonly digest: string;
 };
 type Compilation = { bytes: Buffer; computation: TimelineInterval };
-type Entry = { result: Promise<Compilation | undefined>; size: number; referenced: boolean };
+type Entry = { result: Promise<Compilation | "local" | undefined>; size: number; referenced: boolean };
+type CompilerWorker = {
+	readonly child: ReturnType<typeof spawn>;
+	readonly engine: string;
+	readonly exited: Promise<void>;
+	queue: Promise<unknown>;
+	readonly receive: () => Promise<unknown>;
+};
+
+const ELF_MAGIC = Buffer.from([0x7f, 0x45, 0x4c, 0x46]);
+const MAX_COMPILER_WORKERS = 4;
+
+async function executableElf(target: string): Promise<boolean> {
+	if (!await access(target, constants.X_OK).then(() => true, () => false)) return false;
+	const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK).catch(() => undefined);
+	if (!handle) return false;
+	try {
+		if (!(await handle.stat()).isFile()) return false;
+		const header = Buffer.alloc(4);
+		const { bytesRead } = await handle.read(header, 0, 4, 0);
+		return bytesRead === 4 && header.equals(ELF_MAGIC);
+	} catch {
+		return false;
+	} finally {
+		await handle.close();
+	}
+}
 
 /** Only the host's isolated compiler creates executable artifacts. Clients supply source bytes. */
 export class PythonCompilationCache {
-	private worker?: ReturnType<typeof spawn>;
-	private connection?: ReturnType<PythonCompilationCache["connect"]>;
-	private queue: Promise<unknown> = Promise.resolve();
+	private readonly workers = new Map<string, {
+		ready: Promise<CompilerWorker | undefined>;
+		users: number;
+		idle: ReturnType<typeof Promise.withResolvers<void>>;
+	}>();
 	private readonly entries = new Map<string, Entry>();
 	private bytes = 0;
 	private closed = false;
-	private readonly searchPath = process.env.PATH ?? "";
+	private readonly searchPath = (process.env.PATH ?? "").split(path.delimiter).filter(path.isAbsolute);
+	private readonly installations = [
+		path.join(process.env.PYENV_ROOT ?? path.join(homedir(), ".pyenv"), "versions"),
+		process.env.UV_PYTHON_INSTALL_DIR ?? path.join(process.env.XDG_DATA_HOME ?? path.join(homedir(), ".local/share"), "uv/python"),
+	];
 	private readonly workspace: string;
 	constructor(workspace: string) {
 		this.workspace = workspace;
 	}
 
-	private async connect() {
-		// Select from the host's configured toolchain, independent of the command's environment and the wire request.
-		const root = await realpath(this.workspace);
-		let binary: string | undefined;
-		for (const directory of this.searchPath.split(path.delimiter)) {
-			if (!path.isAbsolute(directory)) continue;
-			const target = await realpath(path.join(directory, "python3")).catch(() => undefined);
-			if (target && await trustedPath(directory, root).catch(() => false) && await trustedPath(target, root).catch(() => false) &&
-				await access(target, constants.X_OK).then(() => true, () => false)) {
-				binary = target;
-				break;
-			}
+	private async hostInterpreter(binary: string, root: string): Promise<boolean> {
+		if (!/^python(?:\d+(?:\.\d+)*t?)?$/.test(path.basename(binary)) ||
+			!await trustedPath(binary, root) || !await executableElf(binary)) return false;
+		const bin = path.dirname(binary);
+		if (path.basename(bin) === "bin") {
+			const installationRoot = path.dirname(path.dirname(bin));
+			for (const directory of this.installations)
+				if (path.isAbsolute(directory) && await realpath(directory).catch(() => undefined) === installationRoot) return true;
 		}
+		for (const directory of this.searchPath) {
+			const hostBin = await realpath(directory).catch(() => undefined);
+			if (!hostBin || !await trustedPath(hostBin, root).catch(() => false)) continue;
+			if (hostBin === bin) return true;
+			for (const name of [path.basename(binary), "python3"])
+				if (await realpath(path.join(hostBin, name)).catch(() => undefined) === binary) return true;
+		}
+		return false;
+	}
+
+	private async spawnWorker(binary: string): Promise<CompilerWorker | undefined> {
+		const root = await realpath(this.workspace);
+		if (this.closed || !await this.hostInterpreter(binary, root)) return;
 		const archive = await compilerBootstrap();
-		if (this.closed || !binary || !archive || !await trustedPath(archive, root)) return;
+		if (this.closed || !archive || !await trustedPath(archive, root)) return;
 		const main = "import sys,zipimport;exec(zipimport.zipimporter(sys.argv[1]).get_code('sitecustomize'))";
 		const child = spawn(binary, ["-I", "-S", "-B", "-c", main, archive], {
 			cwd: "/", env: {}, stdio: ["pipe", "pipe", "ignore"],
 		});
-		this.worker = child;
 		child.on("error", () => child.stdout.destroy());
 		child.stdin.on("error", () => child.stdout.destroy());
-		child.once("close", () => {
-			if (this.worker === child) {
-				this.worker = undefined;
-				this.connection = undefined;
-			}
-		});
+		const exited = new Promise<void>((resolve) => child.once("close", () => resolve()));
 		const lines = createInterface({ input: child.stdout, crlfDelay: Infinity })[Symbol.asyncIterator]();
 		const receive = async () => {
 			const timeout = setTimeout(() => child.kill("SIGKILL"), 5000).unref();
@@ -132,28 +168,78 @@ export class PythonCompilationCache {
 				clearTimeout(timeout);
 			}
 		};
-		const engine = await receive();
-		return { child, engine, receive };
+		try {
+			const engine = await receive();
+			if (typeof engine !== "string" || !/^[a-f0-9]{64}$/.test(engine) || this.closed)
+				throw new Error("invalid compiler identity");
+			return { child, engine, queue: Promise.resolve(), receive, exited };
+		} catch {
+			child.kill("SIGKILL");
+			await exited;
+		}
+	}
+
+	private async stopWorker(ready: Promise<CompilerWorker | undefined>) {
+		const worker = await ready;
+		if (worker) {
+			worker.child.kill("SIGKILL");
+			await worker.exited;
+		}
+	}
+
+	private async withWorker(binary: string, engine: string, compile: (worker: CompilerWorker) => Promise<Compilation | undefined>) {
+		while (!this.closed) {
+			let slot = this.workers.get(binary);
+			if (!slot) {
+				let previous: Promise<void> | undefined;
+				if (this.workers.size >= MAX_COMPILER_WORKERS) {
+					const idle = [...this.workers].find(([, slot]) => !slot.users);
+					if (!idle) {
+						await Promise.race([...this.workers.values()].map((slot) => slot.idle.promise));
+						continue;
+					}
+					this.workers.delete(idle[0]);
+					previous = this.stopWorker(idle[1].ready);
+				}
+				const ready = Promise.resolve(previous).then(() => this.spawnWorker(binary)).catch(() => undefined);
+				slot = { ready, users: 0, idle: Promise.withResolvers<void>() };
+				void ready.then((worker) => worker?.exited).then(() => {
+					if (this.workers.get(binary) === slot) this.workers.delete(binary);
+				});
+			}
+			this.workers.delete(binary);
+			this.workers.set(binary, slot);
+			if (!slot.users++) slot.idle = Promise.withResolvers<void>();
+			try {
+				const worker = await slot.ready;
+				if (worker && worker.engine === engine && !this.closed) return (await compile(worker)) ?? "local";
+			} finally {
+				if (!--slot.users) slot.idle.resolve();
+			}
+			return;
+		}
 	}
 
 	async get(request: PythonCompileRequest, source: () => Promise<string | undefined>,
 		capacity: number, byteCapacity: number, resultLimit: number) {
 		if (this.closed || capacity < 1 || byteCapacity < 1 || resultLimit < 1 ||
 			typeof request.engine !== "string" || !/^[a-f0-9]{64}$/.test(request.engine) ||
+			typeof request.executable !== "string" || !path.isAbsolute(request.executable) || request.executable.includes("\0") ||
 			typeof request.filename !== "string" || !path.isAbsolute(request.filename) || request.filename.includes("\0") ||
 			typeof request.digest !== "string" || !/^[a-f0-9]{64}$/.test(request.digest) ||
 			!Number.isInteger(request.optimize) || request.optimize < 0 || request.optimize > 2)
 			return;
-		const key = JSON.stringify([request.engine, request.filename, request.optimize, request.digest]);
+		const binary = await realpath(request.executable).catch(() => undefined);
+		if (!binary) return;
+		const key = JSON.stringify([binary, request.engine, request.filename, request.optimize, request.digest]);
 		let entry = this.entries.get(key);
 		const hit = !!entry;
 		if (entry) this.entries.delete(key);
 		else {
-			const build = async (data: string) => {
-				const worker = await (this.connection ??= this.connect());
-				if (!worker || this.closed || worker.engine !== request.engine) return;
+			const build = async (worker: CompilerWorker, data: string) => {
+				if (this.closed) return;
 				const start = performance.now();
-				worker.child.stdin.write(JSON.stringify({
+				worker.child.stdin!.write(JSON.stringify({
 					data, filename: request.filename, optimize: request.optimize,
 					limit: Math.min(resultLimit, byteCapacity),
 				}) + "\n");
@@ -162,12 +248,13 @@ export class PythonCompilationCache {
 				const end = Math.min(performance.now(), Math.max(start + reply[1], reply[2] - performance.timeOrigin));
 				return { bytes: Buffer.from(reply[0], "base64"), computation: new TimelineInterval(Math.max(start, end - reply[1]), end) };
 			};
-			const result = source().then((data) => {
+			const result = this.withWorker(binary, request.engine, async (worker) => {
+				const data = await source();
 				if (typeof data !== "string" || data.length > 4 * Math.ceil(Math.min(byteCapacity, 2 * 1024 * 1024) / 3)) return;
 				const raw = Buffer.from(data, "base64");
 				if (raw.toString("base64") !== data || createHash("sha256").update(raw).digest("hex") !== request.digest) return;
-				const compiled = this.queue.then(() => build(data));
-				this.queue = compiled.catch(() => {});
+				const compiled = worker.queue.then(() => build(worker, data));
+				worker.queue = compiled.catch(() => {});
 				return compiled;
 			});
 			entry = { result, size: 0, referenced: false };
@@ -176,6 +263,7 @@ export class PythonCompilationCache {
 		try {
 			const value = await entry.result;
 			if (!value || this.closed) return;
+			if (value === "local") return value;
 			if (this.entries.get(key) === entry && !entry.size) {
 				entry.size = value.bytes.length;
 				this.bytes += entry.size;
@@ -190,15 +278,18 @@ export class PythonCompilationCache {
 			}
 			if (value.bytes.length <= Math.min(resultLimit, byteCapacity))
 				return { ...value, hit, consumed: () => { if (hit) entry.referenced = true; } };
+			return "local" as const;
 		} finally {
 			if (!entry.size && this.entries.get(key) === entry) this.entries.delete(key);
 		}
 	}
 
-	close() {
+	async close() {
 		this.closed = true;
-		this.worker?.kill("SIGKILL");
+		const stopped = [...this.workers.values()].map((slot) => this.stopWorker(slot.ready));
+		this.workers.clear();
 		this.entries.clear();
 		this.bytes = 0;
+		await Promise.all(stopped);
 	}
 }

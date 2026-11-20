@@ -28,8 +28,11 @@ import {
 } from "./execution-world.ts";
 import {
 	cachedCapture,
+	captureFileDigest,
+	mapFilesystem,
 	openFilesystemFile,
 	sameFilesystemIdentity,
+	settledFilesystemStat,
 	withFilesystemReadView,
 } from "./filesystem-evidence.ts";
 import { containsFilesystemPath, relativeFilesystemPath } from "./primitives.ts";
@@ -211,6 +214,8 @@ export class ResourceObjectInputs {
 	private readonly reader: ReturnType<ResourceInputSession["reader"]>;
 	private readonly session: ResourceInputSession;
 	private readonly captured = new Map<string, ResourceInput>();
+	private readonly seen = new Set<string>();
+	private readonly persisted = new WeakSet<object>();
 	private bytes = 0;
 	hits = 0;
 	private readonly root: string;
@@ -231,25 +236,31 @@ export class ResourceObjectInputs {
 		this.session = new ResourceInputSession({ store, internalCache: true }, speculativeConfig().runtime.resourceCacheMaxBytes);
 		this.reader = this.session.reader(this.root, signal);
 	}
-	private async *versions(target: string) {
-		for (const source of this.lookup?.(target) ?? []) yield* resourceVersions.get(source)?.() ?? [];
-		yield* this.reader(target);
+	private async *versions(target: string, warm: boolean) {
+		if (warm)
+			for (const source of this.lookup?.(target) ?? [])
+				for (const token of resourceVersions.get(source)?.() ?? []) yield { token, persisted: false };
+		for await (const token of this.reader(target)) yield { token, persisted: true };
 	}
 	async borrow(target: string, stat: BigIntStats, destination: ContentChunkPool): Promise<FileContentVersion | undefined> {
 		if (!stat.isFile() || !containsFilesystemPath(this.workspace, target)) return;
-		const current = cachedCapture(stat, target);
-		if (!current) return;
+		let current = cachedCapture(stat, target);
+		if (!current && !settledFilesystemStat(stat, Date.now(), target)) return;
 		try {
-			for await (const token of this.versions(target)) {
+			for await (const { token, persisted } of this.versions(target, current !== undefined)) {
 				const input = token.view?.snapshotInput(target);
-				if (!input || !("content" in input) || contentDigest(input.content) !== `sha256:${current.hash}`) continue;
+				if (!input || !("content" in input)) continue;
+				current ??= await captureFileDigest(target, this.session.maxBytes, this.signal);
+				if (!sameFilesystemIdentity(stat, current.stat) || contentDigest(input.content) !== `sha256:${current.hash}`) continue;
 				const { handle, binding, stat: opened } = await openFilesystemFile(target, true);
 				try {
 					if (!sameFilesystemIdentity(stat, opened)) return;
 					const content = await captureContent(destination, input.content);
 					this.signal.throwIfAborted();
 					if (!sameFilesystemIdentity(stat, await fs.lstat(target, { bigint: true }))) return;
-					return { ...current, content, computation: input.computation };
+					const borrowed: FileContentVersion = { ...current, shared: true, content, computation: input.computation };
+					if (persisted) this.persisted.add(borrowed);
+					return borrowed;
 				} finally {
 					try {
 						await handle.close();
@@ -264,11 +275,15 @@ export class ResourceObjectInputs {
 	}
 	/** Only publish immutable inputs from the current workspace; each consumer validates its own read. */
 	remember(target: string, file: Pick<FileContentVersion, "content" | "computation" | "shared">) {
-		if (this.captured.has(target) || !containsFilesystemPath(this.workspace, target)) return;
-		if (file.content.byteLength > this.session.maxBytes - this.bytes) return;
-		this.bytes += file.content.byteLength;
+		if (this.seen.has(target) || !containsFilesystemPath(this.workspace, target)) return;
+		const persisted = this.persisted.has(file);
+		if (!persisted && file.content.byteLength > this.session.maxBytes - this.bytes) return;
+		this.seen.add(target);
+		if (!persisted) {
+			this.bytes += file.content.byteLength;
+			this.captured.set(target, file.computation ? { content: file.content, computation: file.computation } : file.content);
+		}
 		if (file.shared) this.hits++;
-		this.captured.set(target, file.computation ? { content: file.content, computation: file.computation } : file.content);
 		return true;
 	}
 	get remainingBytes() {
@@ -278,28 +293,38 @@ export class ResourceObjectInputs {
 		return this.session.contents;
 	}
 	async publish() {
-		let published = 0;
-		for (const entry of this.captured) {
-			this.signal.throwIfAborted();
-			try {
-				const token = await this.session.capture(
-					undefined, this.root, PI_ACTION_SEMANTICS, this.session.maxBytes, new Map([entry]),
-				);
+		if (!this.captured.size) return 0;
+		const owned: ResourceVersionToken[] = [];
+		try {
+			const validated = await mapFilesystem([...this.captured], async (entry) => {
 				try {
+					const token = await this.session.capture(
+						undefined, this.root, PI_ACTION_SEMANTICS, this.session.maxBytes, new Map([entry]),
+					);
+					owned.push(token);
 					token.view?.seal();
-					if (!(await validateResourceVersion([token], true)).expired && await this.session.publish(token, this.signal))
-						published++;
-				} finally {
-					await token.release();
+					if (!(await validateResourceVersion([token], true)).expired) return token;
+				} catch {
+					this.signal.throwIfAborted();
 				}
-			} catch {
+			}, this.signal);
+			const tokens = validated.filter((token) => token !== undefined);
+			if (!tokens.length) return 0;
+			return await this.session.configuration.store.withPublication(async () => {
+				for (const token of tokens) {
+					this.signal.throwIfAborted();
+					if (!await this.session.publish(token, this.signal)) throw new Error("file input publication failed");
+				}
 				this.signal.throwIfAborted();
-			}
+				return tokens.length;
+			});
+		} finally {
+			await Promise.all(owned.map((token) => token.release()));
 		}
-		return published;
 	}
 	[Symbol.asyncDispose]() {
 		this.captured.clear();
+		this.seen.clear();
 		return this.session.dispose();
 	}
 }

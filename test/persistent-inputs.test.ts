@@ -381,6 +381,179 @@ linux("rejects incomplete, corrupt, over-budget and stale persistent preparation
 	}
 });
 
+linux("a failed file input batch rolls back every row and releases the captured tokens", async () => {
+	const f = await fixture();
+	try {
+		const abort = new AbortController();
+		await using files = new ResourceObjectInputs(f.root, f.store, abort.signal);
+		for (const name of ["one", "two"]) {
+			const target = path.join(f.root, name);
+			await writeFile(target, name);
+			files.remember(target, await captureFileContent(target, memoryBudget, files.contents));
+		}
+		const capture = ResourceInputSession.prototype.capture;
+		const released: ReturnType<typeof vi.fn>[] = [];
+		vi.spyOn(ResourceInputSession.prototype, "capture").mockImplementation(async function (this: ResourceInputSession, ...args) {
+			const token = await capture.apply(this, args);
+			const release = vi.fn(token.release);
+			released.push(release);
+			if (released.length === 4) abort.abort(new Error("capture cancelled"));
+			return { ...token, release };
+		});
+		const put = f.store.putInputVersion.bind(f.store);
+		let inserted = 0;
+		vi.spyOn(f.store, "putInputVersion").mockImplementation(async (...args) => {
+			const record = await put(...args);
+			if (++inserted === 2) throw new Error("injected publication failure");
+			return record;
+		});
+		await expect(files.publish()).rejects.toThrow("file input publication failed");
+		expect(inserted).toBe(2);
+		expect((await f.store.stats()).inputVersions).toBe(0);
+		expect(released).toHaveLength(2);
+		await expect(files.publish()).rejects.toThrow("capture cancelled");
+		expect(released).toHaveLength(4);
+		expect(inserted).toBe(2);
+		for (const release of released) expect(release).toHaveBeenCalledOnce();
+	} finally {
+		await f.close();
+	}
+});
+
+linux("borrows persisted file versions on cold start without redundant SQLite writes and batches new publications", async () => {
+	const f = await fixture();
+	const root = path.parse(f.root).root;
+	const tool = new ResourceVersionManager(root, { watch: false, persistentInputs: { store: f.store, internalCache: true } });
+	const first = path.join(f.root, "first");
+	const second = path.join(f.root, "second");
+	const third = path.join(f.root, "third");
+	const fourth = path.join(f.root, "fourth");
+	try {
+		for (const [target, text] of [
+			[first, "alpha\n"],
+			[second, "beta\n"],
+			[third, "gamma\n"],
+			[fourth, "delta\n"],
+		] as const) {
+			await writeFile(target, text);
+			await utimes(target, 915148800, 946684800);
+		}
+		for (const target of [first, second]) {
+			const token = await tool.capture([{ path: target, scope: "content" }], memoryBudget);
+			try {
+				await tool.persist(token);
+			} finally {
+				await token.release();
+			}
+		}
+		tool.close();
+		await f.manager.close();
+		await f.store.dispose();
+
+		const worker = `
+			import { DatabaseSync } from 'node:sqlite';
+			import { lstat, writeFile, utimes } from 'node:fs/promises';
+			import { captureFileContent, readContent } from './src/content-chunks.ts';
+			import { ResourceObjectInputs } from './src/agent-execution-world.ts';
+			import { ResourceInputSession } from './src/resource-version.ts';
+			import { ProvenanceCertificateStore } from './src/reuse-store.ts';
+			import { SpeculativeConfiguration } from './src/config-schema.ts';
+			const [workspace, cache, first, second, third, fourth] = process.argv.slice(2);
+			await new SpeculativeConfiguration({ filesystem: {
+				maxDigestEntries: 0, timestampQuietMs: 0, timestampQuietByFilesystem: {}
+			} }).run(async () => {
+			const store = new ProvenanceCertificateStore(cache);
+			const signal = new AbortController().signal;
+			let commits = 0;
+			const exec = DatabaseSync.prototype.exec;
+			DatabaseSync.prototype.exec = function (sql, ...rest) {
+				if (typeof sql === 'string' && sql === 'COMMIT') commits++;
+				return exec.call(this, sql, ...rest);
+			};
+			try {
+				const beforeStats = await store.stats();
+				let borrowedValues = [];
+				let republished = -1;
+				let hits = 0;
+				{
+					await using native = new ResourceObjectInputs(workspace, store, signal);
+					for (const target of [first, second]) {
+						const borrowed = await native.borrow(target, await lstat(target, { bigint: true }), native.contents);
+						if (!borrowed?.shared || !borrowed.computation) throw new Error('cold borrow missed ' + target);
+						borrowedValues.push((await readContent(borrowed.content)).toString());
+						if (!native.remember(target, borrowed)) throw new Error('remember rejected borrowed input');
+					}
+					hits = native.hits;
+					republished = await native.publish();
+				}
+				const afterBorrowStats = await store.stats();
+				const borrowCommits = commits;
+				commits = 0;
+				let batchPublished = 0;
+				{
+					await using native = new ResourceObjectInputs(workspace, store, signal);
+					for (const target of [third, fourth])
+						native.remember(target, await captureFileContent(target, 262144, native.contents));
+					batchPublished = await native.publish();
+				}
+				const batchCommits = commits;
+				await writeFile(third, 'mutated\\n');
+				await utimes(third, 915148800, 946684900);
+				const session = new ResourceInputSession({ store, internalCache: true }, 262144);
+				const surviving = [];
+				try {
+					for (const target of [third, fourth]) {
+						for await (const token of session.recover('/', signal, target)) {
+							const item = token.view?.snapshotInput(target);
+							if (item && 'content' in item) surviving.push([target, (await readContent(item.content)).toString()]);
+						}
+					}
+				} finally {
+					await session.dispose();
+				}
+				console.log(JSON.stringify({
+					borrowedValues,
+					hits,
+					republished,
+					addedOnBorrow: afterBorrowStats.inputVersions - beforeStats.inputVersions,
+					borrowCommits,
+					batchPublished,
+					batchCommits,
+					surviving,
+				}));
+			} finally {
+				await store.dispose();
+			}
+			});
+		`;
+		const { stdout } = await promisify(execFile)(process.execPath, [
+			"--input-type=module",
+			"-e",
+			worker,
+			"cold-borrow-worker",
+			f.root,
+			f.cache,
+			first,
+			second,
+			third,
+			fourth,
+		]);
+		expect(JSON.parse(stdout)).toEqual({
+			borrowedValues: ["alpha\n", "beta\n"],
+			hits: 2,
+			republished: 0,
+			addedOnBorrow: 0,
+			borrowCommits: 0,
+			batchPublished: 2,
+			batchCommits: 1,
+			surviving: [[fourth, "delta\n"]],
+		});
+	} finally {
+		tool.close();
+		await f.close();
+	}
+});
+
 linux("recovers actual input bytes, names, aliases and current proofs in a cold process", async () => {
 	const f = await fixture();
 	const file = path.join(f.root, "input");

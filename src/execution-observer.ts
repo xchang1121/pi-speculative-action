@@ -1,3 +1,5 @@
+import type { BigIntStats } from "node:fs";
+import { lstat } from "node:fs/promises";
 import path from "node:path";
 import { speculativeConfig } from "./config-schema.ts";
 import {
@@ -619,6 +621,19 @@ function nativeStatObservation(bytes: Buffer, extended: boolean): StatObservatio
 function linuxDevice(major: bigint, minor: bigint): bigint {
 	return ((major & 0xfffn) << 8n) | (minor & 0xffn) | ((minor & ~0xffn) << 12n) | ((major & ~0xfffn) << 32n);
 }
+function sameKernelFile(file: FileIdentity, stat: Pick<BigIntStats, "dev" | "ino">) {
+	return file.inode === stat.ino && linuxDevice(BigInt(file.device >>> 20), BigInt(file.device & 0xfffff)) === stat.dev;
+}
+/** Match the kernel's installed image to the file stat taken while this exec was stopped. */
+export function installedImageStart(events: readonly BinaryRecord[], image: { dev: bigint; ino: bigint }): number {
+	let start = -1;
+	for (const [index, { name, broker, file }] of events.entries()) {
+		if (name !== "image" || broker || !file || !sameKernelFile(file, image)) continue;
+		if (start >= 0) return -1;
+		start = index;
+	}
+	return start;
+}
 export interface TracedWrite {
 	readonly paths?: readonly string[];
 	readonly at: number;
@@ -642,6 +657,7 @@ function writesFile(record: BinaryRecord) {
 	}
 	return writeCalls.has(record.name);
 }
+const discardDevices = new Map([["/dev/null", 3n], ["/dev/zero", 5n], ["/dev/full", 7n]]);
 const writeCalls = new Set(
 	"truncate ftruncate rename renameat renameat2 link linkat symlink symlinkat mknod mknodat unlink unlinkat mkdir mkdirat rmdir utime utimes utimensat futimesat chmod fchmod fchmodat fchmodat2 chown lchown fchown fchownat descriptor_write write writev pwrite64 pwritev pwritev2 fallocate sendfile copy_file_range splice tee mmap".split(
 		" ",
@@ -957,6 +973,7 @@ export async function observeExecution(
 	};
 	const written = new Set<string>();
 	const external = new Set<string>();
+	const sinks = new Map<string, BigIntStats | undefined>();
 	const mapped = new Map<string, DependencyRole>();
 	const failures = new Map<string, "ENOENT" | "ENOTDIR" | undefined>();
 	const listed = new Set<string>();
@@ -1014,7 +1031,17 @@ export async function observeExecution(
 				taints.add("untracked_fd");
 				incomplete.add("unresolved_fd_write");
 			}
-			for (const target of paths ?? []) mutation(target);
+			for (const target of paths ?? []) {
+				const sink = isOpen(name) ? record.file : ["descriptor_write", "write", "writev"].includes(name) ? file : undefined;
+				const minor = discardDevices.get(target);
+				if (sink && (sink.mode & 0xf000) === 0x2000 && minor !== undefined &&
+					speculativeConfig().processReuse.stableDevices.includes(target)) {
+					if (!sinks.has(target)) sinks.set(target, await lstat(target, { bigint: true }).catch(() => undefined));
+					const stat = sinks.get(target);
+					if (stat?.isCharacterDevice() && stat.rdev === linuxDevice(1n, minor) && sameKernelFile(sink, stat)) continue;
+				}
+				mutation(target);
+			}
 		}
 		const channel = endpoint(file) ?? (isStat(name) ? record.descriptorPath : undefined);
 		const destination = channel ? (options.outputEndpoints?.indexOf(channel) ?? -1) : -1;
