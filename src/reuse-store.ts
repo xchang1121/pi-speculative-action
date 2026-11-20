@@ -615,14 +615,15 @@ export class ProvenanceCertificateStore {
 			artifacts,
 		};
 		const id = digestObject(body);
-		const record = decodeInputVersion(stableStringify({ ...body, id }));
+		const encoded = stableStringify({ ...body, id });
+		const record = decodeInputVersion(encoded);
 		if (!record) throw new Error("invalid persistent input version");
 		return this.publishRoot(`input:${id}`, record.artifacts, (database) => {
 			const input = record.payload as { root: string; preparations: readonly { binding: string; key: string }[] };
 			if (typeof input?.root !== "string" || !Array.isArray(input.preparations))
 				throw new Error("invalid persistent input scope");
 			database.prepare("INSERT OR REPLACE INTO input_versions(id, root, value) VALUES (?, ?, ?)")
-				.run(id, input.root, stableStringify(record));
+				.run(id, input.root, encoded);
 			const index = database.prepare("INSERT OR IGNORE INTO input_preparations VALUES (?, ?, ?, ?, ?)");
 			for (const { binding, key } of input.preparations) {
 				if (typeof binding !== "string" || typeof key !== "string") throw new Error("invalid preparation key");
@@ -988,10 +989,12 @@ export class ProvenanceCertificateStore {
 		return this.exclusive(
 			async (database) => {
 				const result = await publish(database);
-				await this.artifacts.materialize(references);
-				const closure = await this.loadArtifacts(references);
-				if (!closure) throw new Error("persistent root artifacts are unavailable");
-				await closure.dispose();
+				if (references.length) {
+					await this.artifacts.materialize(references);
+					const closure = await this.loadArtifacts(references);
+					if (!closure) throw new Error("persistent root artifacts are unavailable");
+					await closure.dispose();
+				}
 				return result;
 			},
 			[key, ...references.map((reference) => this.objectKey(this.artifacts.artifactPath(reference.digest)))],

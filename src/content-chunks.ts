@@ -127,13 +127,16 @@ export class ContentChunkPool {
 						throw new Error("content transfer is unavailable");
 					}
 					if (!verifiedManifests.has(manifest)) {
-						const digest = createHash("sha256");
-						for (let index = 0; index < manifest.chunks.length; index++) {
-							signal.throwIfAborted();
-							digest.update(await this.block(manifest, index));
+						// A single verified artifact already covers the complete file, including its length.
+						if (manifest.chunks.length !== 1 || manifest.chunks[0]?.digest !== manifest.digest) {
+							const digest = createHash("sha256");
+							for (let index = 0; index < manifest.chunks.length; index++) {
+								signal.throwIfAborted();
+								digest.update(await this.block(manifest, index));
+							}
+							if (`sha256:${digest.digest("hex")}` !== manifest.digest)
+								throw new Error("content manifest integrity check failed");
 						}
-						if (`sha256:${digest.digest("hex")}` !== manifest.digest)
-							throw new Error("content manifest integrity check failed");
 						verifiedManifests.add(manifest);
 					}
 					signal.throwIfAborted();

@@ -211,7 +211,7 @@ const inputBytes = (versions: readonly ResourceVersionToken[]) =>
 	versions.reduce((bytes, token) => bytes + (token.view?.bytes ?? 0), 0);
 /** A native call borrows and publishes the same file-content records as filesystem tools. */
 export class ResourceObjectInputs {
-	private readonly reader: ReturnType<ResourceInputSession["reader"]>;
+	private readonly reader: ReturnType<ResourceInputSession["fileContentReader"]>;
 	private readonly session: ResourceInputSession;
 	private readonly captured = new Map<string, ResourceInput>();
 	private readonly seen = new Set<string>();
@@ -234,28 +234,33 @@ export class ResourceObjectInputs {
 		this.lookup = lookup;
 		this.root = path.parse(workspace).root;
 		this.session = new ResourceInputSession({ store, internalCache: true }, speculativeConfig().runtime.resourceCacheMaxBytes);
-		this.reader = this.session.reader(this.root, signal);
+		this.reader = this.session.fileContentReader(this.root, signal);
 	}
-	private async *versions(target: string, warm: boolean) {
-		if (warm)
-			for (const source of this.lookup?.(target) ?? [])
-				for (const token of resourceVersions.get(source)?.() ?? []) yield { token, persisted: false };
-		for await (const token of this.reader(target)) yield { token, persisted: true };
+	private async *versions(target: string) {
+		for (const source of this.lookup?.(target) ?? [])
+			for (const token of resourceVersions.get(source)?.() ?? []) {
+				const input = token.view?.snapshotInput(target);
+				if (input && "content" in input) yield input;
+			}
+		yield* this.reader(target);
 	}
 	async borrow(target: string, stat: BigIntStats, destination: ContentChunkPool): Promise<FileContentVersion | undefined> {
 		if (!stat.isFile() || !containsFilesystemPath(this.workspace, target)) return;
 		let current = cachedCapture(stat, target);
 		if (!current && !settledFilesystemStat(stat, Date.now(), target)) return;
 		try {
-			for await (const { token, persisted } of this.versions(target, current !== undefined)) {
-				const input = token.view?.snapshotInput(target);
-				if (!input || !("content" in input)) continue;
+			for await (const input of this.versions(target)) {
+				const persisted = "manifest" in input;
+				if (stat.size !== BigInt(persisted ? input.manifest.size : input.content.byteLength)) continue;
+				const digest = persisted ? input.manifest.digest : contentDigest(input.content);
 				current ??= await captureFileDigest(target, this.session.maxBytes, this.signal);
-				if (!sameFilesystemIdentity(stat, current.stat) || contentDigest(input.content) !== `sha256:${current.hash}`) continue;
+				if (!sameFilesystemIdentity(stat, current.stat) || digest !== `sha256:${current.hash}`) continue;
 				const { handle, binding, stat: opened } = await openFilesystemFile(target, true);
 				try {
 					if (!sameFilesystemIdentity(stat, opened)) return;
-					const content = await captureContent(destination, input.content);
+					const content = persisted
+						? await destination.restore(input.manifest, undefined, this.signal)
+						: await captureContent(destination, input.content);
 					this.signal.throwIfAborted();
 					if (!sameFilesystemIdentity(stat, await fs.lstat(target, { bigint: true }))) return;
 					const borrowed: FileContentVersion = { ...current, shared: true, content, computation: input.computation };

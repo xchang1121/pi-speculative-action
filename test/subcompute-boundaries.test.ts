@@ -670,6 +670,73 @@ test("one connection can repeatedly consume a large trusted result within one sn
 	}
 });
 
+test("large prepared values restore from verified CAS blocks and rebuild a corrupt block", async () => {
+	const cwd = await directories.create();
+	const storage = await directories.create();
+	const config = new SpeculativeConfiguration({ storage: { maxRecordBytes: 2048 } });
+	const store = config.run(() => new ProvenanceCertificateStore(storage));
+	const publish = vi.spyOn(store, "putInputVersion");
+	const build = vi.fn(async ({ input }: import("../src/subcompute.ts").TrustedStepBuild) => input());
+	const step = { namespace: "bytes.copy", implementation: "identity", build };
+	const open = () => config.run(() => new SubcomputeService(cwd, store, () => 65536, [step]));
+	const bytes = Buffer.alloc(8192, 42);
+	let service = open();
+	const use = async () => {
+		const env = await service.environment();
+		const peer = client(env);
+		try {
+			const reply = await trustedCompute(peer, env, step.namespace, null, bytes);
+			expect(reply.value).toEqual({ encoding: "base64", value: bytes.toString("base64") });
+			return reply.state;
+		} finally { peer.close(); }
+	};
+	try {
+		expect(await use()).toBe("published");
+		const record = await publish.mock.results[0]!.value;
+		expect(record.artifacts).toHaveLength(1);
+		await service.dispose();
+		service = open();
+		expect(await use()).toBe("hit");
+		await service.dispose();
+		const ref = record.artifacts[0]!;
+		await writeFile(store.artifacts.artifactPath(ref.digest), Buffer.alloc(ref.size));
+		service = open();
+		expect(await use()).toBe("published");
+		expect(build).toHaveBeenCalledTimes(2);
+	} finally {
+		await service.dispose();
+		await store.dispose();
+	}
+});
+
+test("consumed preparations survive a cold scan and evicted results return from the shared store", async () => {
+	const cwd = await directories.create();
+	const store = new ProvenanceCertificateStore(await directories.create());
+	const lookup = vi.spyOn(store, "findPreparedInputCandidates");
+	const build = vi.fn(parseJsonConfig.build);
+	const service = new SubcomputeService(cwd, store, () => 65536, [{ ...parseJsonConfig, build }]);
+	service.runtime = () => ({ resourceCacheMaxEntries: 2, resourceCacheMaxBytes: 65536 });
+	const env = await service.environment();
+	const peer = client(env);
+	const use = (name: string) => trustedCompute(peer, env, parseJsonConfig.namespace, null, Buffer.from(JSON.stringify(name)));
+	try {
+		expect((await use("warm")).state).toBe("published");
+		expect((await use("warm")).state).toBe("hit");
+		expect((await use("cold")).state).toBe("published");
+		expect((await use("another")).state).toBe("published");
+		lookup.mockClear();
+		expect((await use("warm")).state).toBe("hit");
+		expect(lookup).not.toHaveBeenCalled();
+		expect((await use("cold")).state).toBe("hit");
+		expect(lookup).toHaveBeenCalledTimes(1);
+		expect(build).toHaveBeenCalledTimes(3);
+	} finally {
+		peer.close();
+		await service.dispose();
+		await store.dispose();
+	}
+});
+
 test.each(["drafter", "pattern_aware", "self-speculation"])("%s and the Actor consume each other's parsed configuration", async (source) => {
 	const cwd = await directories.create();
 	const storage = await directories.create();
@@ -845,3 +912,114 @@ test("public protocol rejects abandoned and oversized work and revalidates chang
 		await host.dispose();
 	}
 }, 30000);
+
+test("trusted steps degrade cleanly at serialization limits, accept internal store roots, and scope speculative forks", async () => {
+	const cwd = await directories.create();
+	const internalStore = path.join(cwd, ".pi", "store");
+	const store = new ProvenanceCertificateStore(internalStore);
+	const service = new SubcomputeService(
+		cwd,
+		store,
+		() => 1024 * 1024,
+		[
+			{
+				namespace: "boundary.step",
+				implementation: "boundary-transform",
+				build: async ({ key, input, maxResultBytes }) => {
+					await input();
+					if (key === "exact-limit") return Buffer.alloc(maxResultBytes, 7);
+					if (key === "non-plain") return new Date(0);
+					return { ok: true };
+				},
+			},
+		],
+	);
+	service.configuration.update({
+		...service.configuration.current,
+		subcomputation: { ...service.configuration.current.subcomputation, maxStepResultBytes: 1024, socketTimeoutMs: 50 },
+	});
+	try {
+		await service.run(async () => {
+			const env = await controlledRuntimeEnvironment({});
+			const channel = controlledSubcomputeChannel(env)!;
+			const peer = client(env);
+			try {
+				const bytes = Buffer.from("payload");
+				expect(await trustedCompute(peer, env, "boundary.step", "exact-limit", bytes)).toEqual({ state: "local" });
+				expect(await trustedCompute(peer, env, "boundary.step", "non-plain", bytes)).toEqual({ state: "local" });
+				expect(await trustedCompute(peer, env, "boundary.step", "ok", bytes)).toMatchObject({
+					state: "published",
+					value: { encoding: "json", value: { ok: true } },
+				});
+				await expect(channel.validate()).resolves.toBeUndefined();
+			} finally {
+				peer.close();
+			}
+		});
+
+		// A task outliving an outer service.run receives a timeout-bounded scope instead of leaking an unowned token.
+		let detachedPromise!: Promise<Readonly<Record<string, string>>>;
+		await service.run(async () => {
+			detachedPromise = new Promise<void>((resolve) => setTimeout(resolve, 10)).then(() => service.controlledEnvironment({}));
+		});
+		const detached = await detachedPromise;
+		expect(controlledSubcomputeChannel(detached)).toBeDefined();
+		await expect.poll(() => controlledSubcomputeChannel(detached), { timeout: 1000 }).toBeUndefined();
+	} finally {
+		await service.dispose();
+		await store.dispose();
+	}
+
+	// Speculative forks keep their controlled channel alive after startTurn returns and release it upon settlement.
+	await writeFile(path.join(cwd, "target.json"), '{"name":"spec"}');
+	const readTool = createReadTool(cwd);
+	let forkEnv: Readonly<Record<string, string>> = {};
+	const started = Promise.withResolvers<void>();
+	const releaseFork = Promise.withResolvers<void>();
+	const operation = bindResourceOperation(async (fs, request) => {
+		const { path: file } = request.args as { path: string };
+		const raw = await fs.readFile(path.resolve(cwd, file));
+		forkEnv = await controlledRuntimeEnvironment({});
+		started.resolve();
+		await releaseFork.promise;
+		await expect(controlledSubcomputeChannel(forkEnv)?.validate()).resolves.toBeUndefined();
+		const peer = client(forkEnv);
+		try {
+			const reply = await trustedCompute(peer, forkEnv, parseJsonConfig.namespace, null, raw);
+			return { isError: false, result: { content: [{ type: "text" as const, text: reply.value.value.name }], details: {} } };
+		} finally {
+			peer.close();
+		}
+	}, cwd);
+	let calls = 0;
+	const host = systemHost(
+		cwd,
+		[readTool],
+		{
+			config: { storage: { root: path.join(cwd, ".pi", "host-store") } },
+			trustedSteps: [parseJsonConfig],
+			resolveInvocation: () => ({ executor: "test.fork-scope", identity: "fork-scope", ...operation }),
+			complete: async () => {
+				if (calls++ > 0) {
+					await started.promise;
+					return { ...toolUse("read", { path: "target.json" }), content: [] };
+				}
+				return toolUse("read", { path: "target.json" });
+			},
+		},
+		{ drafterEnabled: true, drafterMaxDepth: 0, candidateLimit: 2 },
+		"fork-scope",
+	);
+	try {
+		await host.start();
+		await started.promise;
+		// startTurn has now returned, while the speculative fork is still awaiting releaseFork!
+		await expect(controlledSubcomputeChannel(forkEnv)?.validate()).resolves.toBeUndefined();
+		releaseFork.resolve();
+		await host.ready(["target.json"], "drafter");
+		await expect.poll(() => controlledSubcomputeChannel(forkEnv), { timeout: 1000 }).toBeUndefined();
+	} finally {
+		releaseFork.resolve();
+		await host.dispose();
+	}
+});

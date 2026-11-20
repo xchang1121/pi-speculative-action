@@ -148,7 +148,6 @@ export async function computeStepInView<Value>(
 	request: ComputeStepRequest,
 	calculate: (view: ToolFilesystemOperations, signal: AbortSignal) => Value | Promise<Value>,
 	signal: AbortSignal = new AbortController().signal,
-	hostImplementation?: string,
 ): Promise<Value> {
 	if (!request.namespace.trim()) throw new Error("A compute step requires a namespace");
 	signal.throwIfAborted();
@@ -157,10 +156,7 @@ export async function computeStepInView<Value>(
 	const input = snapshotPreparation([request.key, request.inputResources ?? [], selectedEnvironment()]);
 	if (!input) throw new Error("compute_step_input_budget_exceeded");
 	const key = hash("sha256", input.data);
-	const binding = createSerializablePreparationBinding(
-		hostImplementation === undefined ? { namespace: request.namespace } : { namespace: request.namespace, hostImplementation },
-		() => true,
-	);
+	const binding = createSerializablePreparationBinding({ namespace: request.namespace }, () => true);
 	let built = false;
 	const build = async (inputs: ToolFilesystemOperations, sharedSignal: AbortSignal) => {
 		built = true;
@@ -2771,11 +2767,50 @@ export class ResourceInputSession {
 			this.persistence,
 		);
 	}
+	private fileCandidates(root: string, signal: AbortSignal) {
+		const manager = this.root(root);
+		const store = this.configuration.store;
+		let catalog: ReturnType<typeof store.inputPathIndex> | undefined;
+		return async (target: string) => {
+			const limit = Math.min(store.limits.maxCertificates, speculativeConfig().filesystem.maxHistoryEntries);
+			const lookup = await (catalog ??= manager.assertPersistentStore().then(() => store.inputPathIndex(manager.root, limit, signal)));
+			return lookup(filesystemPathKey(path.resolve(manager.root, target)));
+		};
+	}
+	/** A native reader verifies its own live file digest. It only needs that file's immutable blocks and receipt. */
+	fileContentReader(root: string, signal: AbortSignal) {
+		const candidates = this.fileCandidates(root, signal);
+		const store = this.configuration.store;
+		const load = async (id: Sha256Digest) => {
+			const record = await store.getInputVersion(id, signal);
+			if (!record) return;
+			const sizes = new Map(record.artifacts.map((ref) => [ref.digest, ref.size]));
+			const entries = parsePersistentResourcePayload(record.payload, root).entries;
+			return new Map(entries.filter(([, file]) =>
+				file.content?.chunks.every((ref) => !ref || sizes.get(ref.digest) === ref.size)));
+		};
+		// Consecutive paths often belong to one multi-file record. Retain at most that one metadata row.
+		let last: { id: Sha256Digest; files: ReturnType<typeof load> } | undefined;
+		return async function* (target: string) {
+			const name = filesystemPathKey(target);
+			for (const id of await candidates(name)) {
+				signal.throwIfAborted();
+				if (last?.id !== id) last = { id, files: load(id) };
+				try {
+					const file = (await last.files)?.get(name);
+					if (file?.content) yield { manifest: file.content, computation: TimelineInterval.restore(file.computation) };
+				} catch {
+					signal.throwIfAborted();
+					store.signal.throwIfAborted();
+				}
+			}
+		};
+	}
 	/** Concurrent reads in one evaluation share discovery and a single validated lease per closure. */
 	reader(root: string, signal: AbortSignal, retain = (token: ResourceVersionToken) => { this.lifecycle.own({ dispose: token.release }); }) {
 		const manager = this.root(root);
 		const store = this.configuration.store;
-		let catalog: ReturnType<typeof store.inputPathIndex> | undefined;
+		const candidates = this.fileCandidates(root, signal);
 		const restored = new Map<Sha256Digest, Promise<ResourceVersionToken | undefined>>();
 		const session = this;
 		const restore = async (id: Sha256Digest) => {
@@ -2799,10 +2834,7 @@ export class ResourceInputSession {
 				}
 				return;
 			}
-			const limit = Math.min(store.limits.maxCertificates, speculativeConfig().filesystem.maxHistoryEntries);
-			const lookup = await (catalog ??= manager.assertPersistentStore().then(() =>
-				store.inputPathIndex(manager.root, limit, signal)));
-			for (const id of lookup(filesystemPathKey(path.resolve(manager.root, target)))) {
+			for (const id of await candidates(target)) {
 				signal.throwIfAborted();
 				let pending = restored.get(id);
 				if (!pending) restored.set(id, (pending = restore(id)));

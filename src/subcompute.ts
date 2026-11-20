@@ -6,13 +6,13 @@ import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { isDeepStrictEqual } from "node:util";
+import { deserialize } from "node:v8";
 import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import { ContentChunkPool } from "./content-chunks.ts";
 import { settledFilesystemStat } from "./filesystem-evidence.ts";
 import { evaluateResourceQuery } from "./agent-execution-world.ts";
 import { currentSpeculativeConfiguration, withSpeculativeConfig } from "./config-schema.ts";
 import {
-	collectResourceComputation,
 	computeStepInView,
 	dependencyKey,
 	observeStepInput,
@@ -31,7 +31,7 @@ import {
 } from "./resource-version.ts";
 import { ProvenanceCertificateStore } from "./reuse-store.ts";
 import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
-import { containsFilesystemPath, digestObject, filesystemPathKey, hasErrorCode, sha256DigestAsync } from "./primitives.ts";
+import { containsFilesystemPath, digestObject, filesystemPathKey, hasErrorCode, sha256Digest, sha256DigestAsync } from "./primitives.ts";
 import { subcomputeTiming, TaskTimeline, TimelineInterval, type SubcomputeCounts } from "./task-timing.ts";
 import type { ObservedProcessPath, ExecutionObservation } from "./execution-observer.ts";
 /** A host-owned deterministic transform. The key identifies all options and input() supplies verified bytes. */
@@ -55,6 +55,7 @@ export interface TrustedStepBuild {
 	readonly maxResultBytes: number;
 }
 const unavailable = Symbol("step unavailable");
+type PreparedBytes = { data: Buffer; computation: TimelineInterval; bytes: number; referenced: boolean };
 type WireValue =
 	| {
 			readonly encoding: "json";
@@ -163,9 +164,9 @@ export class SubcomputeService {
 	private readonly lifetime = new RuntimeLifecycleLane();
 	private readonly clients = new Map<Socket, AbortController>();
 	private readonly scopes = new Map<string, SubcomputeScope>();
-	private readonly owners = new AsyncLocalStorage<Set<string>>();
+	private readonly owners = new AsyncLocalStorage<{ readonly tokens: Set<string>; closed: boolean }>();
 	private readonly inputManager: ResourceVersionManager;
-	private readonly inputStorage: { store: ProvenanceCertificateStore; contents: ContentChunkPool };
+	private readonly inputStorage: { store: ProvenanceCertificateStore; contents: ContentChunkPool; internalCache: true };
 	private releaseChunks: () => Promise<void>;
 	private readonly files = new Map<
 		string,
@@ -176,6 +177,8 @@ export class SubcomputeService {
 	private readonly cwd: string;
 	private readonly trusted = new Map<string, TrustedSubcomputeStep>();
 	private readonly building = new Map<string, Promise<void>>();
+	private readonly prepared = new Map<string, PreparedBytes>();
+	private preparedBytes = 0;
 	private readonly maxBytes: () => number;
 	runtime: () => { reuseEnabled?: boolean; resourceCacheMaxEntries: number; resourceCacheMaxBytes?: number } =
 		() => this.configuration.current.runtime;
@@ -186,7 +189,7 @@ export class SubcomputeService {
 				throw new Error("invalid_trusted_step_registration");
 			this.trusted.set(step.namespace, step);
 		}
-		this.inputStorage = { store, contents: new ContentChunkPool(store) };
+		this.inputStorage = { store, contents: new ContentChunkPool(store), internalCache: true };
 		this.releaseChunks = this.inputStorage.contents.retain();
 		this.inputManager = new ResourceVersionManager(cwd, { watch: false, persistentInputs: this.inputStorage });
 		this.maxBytes = maxBytes;
@@ -286,6 +289,7 @@ export class SubcomputeService {
 			if (!entry.bytes) {
 				entry.bytes = token.view!.bytes + resourceProofBytes([token]);
 				this.cacheBytes += entry.bytes;
+				this.trimPrepared();
 			}
 			while (this.cacheBytes + this.inputStorage.contents.storedBytes > budget && this.files.size)
 				this.evict(this.files.keys().next().value!);
@@ -301,12 +305,14 @@ export class SubcomputeService {
 		}
 	};
 	run<T>(operation: () => T): T {
-		const tokens = new Set<string>();
+		const owner = { tokens: new Set<string>(), closed: false };
 		const finish = () => {
-			for (const token of tokens) this.releaseScope(token);
+			owner.closed = true;
+			for (const token of owner.tokens) this.releaseScope(token);
+			owner.tokens.clear();
 		};
 		return endpoint.run(this, () =>
-			this.owners.run(tokens, () => {
+			this.owners.run(owner, () => {
 				try {
 					const output = subcomputeTiming.run(subcomputeTiming.getStore() ?? this.record, operation);
 					if (output instanceof Promise) return output.finally(finish) as T;
@@ -325,7 +331,9 @@ export class SubcomputeService {
 		if (this.scopes.size >= this.configuration.current.subcomputation.maxPendingRequests)
 			throw new Error("subcompute_scope_budget_exceeded");
 		const token = randomUUID();
-		const timer = general || !this.owners.getStore() ? setTimeout(
+		const owner = this.owners.getStore();
+		const activeOwner = owner && !owner.closed ? owner : undefined;
+		const timer = general || !activeOwner ? setTimeout(
 			() => this.releaseScope(token),
 			this.configuration.current.subcomputation.socketTimeoutMs,
 		).unref() : undefined;
@@ -348,7 +356,7 @@ export class SubcomputeService {
 		};
 		this.scopes.set(token, scope);
 		channels.set(token, scope);
-		this.owners.getStore()?.add(token);
+		activeOwner?.tokens.add(token);
 		return { PI_SUBCOMPUTE_SOCKET: socket, PI_SUBCOMPUTE_CONTEXT: token };
 	}
 	private releaseScope(token: string): void {
@@ -533,85 +541,95 @@ export class SubcomputeService {
 				if (step ? typeof request.inputDigest !== "string" || !/^[a-f0-9]{64}$/.test(request.inputDigest) || request.inputResources !== undefined ||
 					request.envKeys !== undefined || request.environment !== undefined || request.includeInputContent !== undefined : request.inputDigest !== undefined)
 					throw new Error("invalid_subcompute_request");
-				if (step && !snapshotPreparation(request.key)) throw new Error("compute_step_input_budget_exceeded");
 				if (step && !this.trustedEnabled(step)) {
 					await send({ state: "unavailable" });
 					continue;
 				}
-				const trustedKey = step && digestObject([step.namespace, step.implementation, request.key, request.inputDigest]);
-				const contract = { ...request, key: trustedKey ?? request.key, inputResources: this.resources(request.inputResources) };
-				const session = inputSession ??= new ResourceInputSession({ store: this.inputStorage.store, inputs: this.inputs }, this.maxBytes());
-				let produced = false;
-				const token = randomUUID();
-				let input: Promise<Buffer> | undefined;
-				const receiveInput = async () => {
-					await send({ state: "input", token });
-					const frame = await read();
-					if (frame?.op !== "input" || frame.token !== token || frame.value?.encoding !== "base64") throw new Error("invalid_subcompute_input");
-					const bytes = decodeValue(frame.value) as Buffer;
-					if (await sha256DigestAsync(bytes) !== `sha256:${request.inputDigest}`) throw new Error("subcompute_input_digest_mismatch");
-					return bytes;
+				let busy = true;
+				active.busy++;
+				const releaseBusy = () => {
+					if (!busy) return;
+					busy = false;
+					active.busy--;
 				};
-				let hitReceipt: TimelineInterval | undefined;
-				const maxResultBytes = Math.min(this.configuration.current.subcomputation.maxStepResultBytes,
-					this.runtime().resourceCacheMaxBytes ?? this.maxBytes(), Math.floor((limit() - 160) * 3 / 4));
-				const build = async (view: ToolFilesystemOperations, sharedSignal: AbortSignal) => {
-					produced = true;
-					if (!step) return publish(view as ResourceReadView, contract);
-					const value = await step.build({
-						key: request.key,
-						input: () => input ??= TimelineInterval.outside(receiveInput),
-						signal: sharedSignal,
-						maxResultBytes,
-					});
-					if (value === undefined) throw unavailable;
-					if (TimelineInterval.outsideSync(() => wireBytes(value, true)) > maxResultBytes) throw unavailable;
-					return value;
-				};
-				const evaluate = () => session.run(() => evaluateResourceQuery(
-					undefined, { signal }, this.cwd,
-					(view) => computeStepInView(view, contract, build, signal, step?.implementation),
-					PI_ACTION_SEMANTICS, this.maxBytes(), true, "output", undefined, session,
-				));
-				const deliver = async () => {
-					const query = trustedKey ? await this.sharedBuild(trustedKey, evaluate, signal) : await evaluate();
-					if (!query) throw new Error("subcompute_retention_budget_exceeded");
-					try {
-						if (this.scopes.get(request.context) !== active) throw new Error("subcompute_context_closed");
-						if (step && !produced && wireBytes(query.output) > maxResultBytes) {
-							await send({ state: "local" });
-							return false;
-						}
-						// A host transform takes only verified inline bytes. Files read by its caller have their own evidence.
-						if (!step) for (const proof of query.versions)
-							active.proofs.push(session.retain({ ...proof, view: undefined }));
-						await send({
-							state: produced ? "published" : "hit",
-							value: encodeValue(query.output),
-							...(step && { token }),
-						});
-						if (step) {
-							const ack = await read();
-							if (ack?.op !== "consumed" || ack.token !== token) throw new Error("invalid_subcompute_receipt");
-							active.run(() => subcomputeTiming.getStore()?.(step.namespace, !produced, hitReceipt));
-							await send({ state: "ready" });
-						}
-						return true;
-					} finally {
-						await Promise.allSettled(query.versions.map((token) => token.release()));
-					}
-				};
-				scope.busy++;
 				try {
-					if (step) await scope.run(() => subcomputeTiming.run((_namespace, hit, receipt) => {
-						if (hit) hitReceipt = receipt;
-					}, () => collectResourceComputation(deliver, (consumed) => consumed)));
-					else await scope.run(deliver);
-				} catch (error) {
-					if (error !== unavailable) throw error;
-					await send({ state: input ? "local" : "unavailable" });
+					if (step) {
+						const identity = snapshotPreparation([step.namespace, step.implementation, request.key, request.inputDigest]);
+						if (!identity) throw new Error("compute_step_input_budget_exceeded");
+						const key = sha256Digest(identity.data);
+						const token = randomUUID();
+						let input: Promise<Buffer> | undefined;
+						const receiveInput = async () => {
+							await send({ state: "input", token });
+							const frame = await read();
+							if (frame?.op !== "input" || frame.token !== token || frame.value?.encoding !== "base64")
+								throw new Error("invalid_subcompute_input");
+							const bytes = decodeValue(frame.value) as Buffer;
+							if (await sha256DigestAsync(bytes) !== `sha256:${request.inputDigest}`) throw new Error("subcompute_input_digest_mismatch");
+							return bytes;
+						};
+						const maxResultBytes = Math.min(this.configuration.current.subcomputation.maxStepResultBytes, this.maxBytes(),
+							this.runtime().resourceCacheMaxBytes ?? Infinity, Math.floor((limit() - 160) * 3 / 4));
+						try {
+							await active.run(async () => {
+								let produced = false;
+								const result = await this.sharedBuild(key, () => this.prepareBytes(key, signal, async () => {
+									produced = true;
+									const value = await step.build({ key: request.key, input: () => input ??= TimelineInterval.outside(receiveInput), signal, maxResultBytes });
+									if (value === undefined) throw unavailable;
+									return value;
+								}, maxResultBytes), signal);
+								if (this.scopes.get(request.context) !== active) throw new Error("subcompute_context_closed");
+								const value = deserialize(result.data);
+								if (wireBytes(value) > maxResultBytes) {
+									releaseBusy();
+									await send({ state: "local" });
+									return;
+								}
+								await send({ state: produced ? "published" : "hit", value: encodeValue(value), token });
+								const ack = await read();
+								if (ack?.op !== "consumed" || ack.token !== token) throw new Error("invalid_subcompute_receipt");
+								if (!produced) {
+									const retained = this.prepared.get(key);
+									if (retained?.data === result.data) retained.referenced = true;
+									TimelineInterval.use(result.computation);
+								}
+								subcomputeTiming.getStore()?.(step.namespace, !produced, result.computation);
+								releaseBusy();
+								await send({ state: "ready" });
+							});
+						} catch (error) {
+							if (error !== unavailable) throw error;
+							releaseBusy();
+							await send({ state: input ? "local" : "unavailable" });
+						}
+					} else {
+						const contract = { ...request, inputResources: this.resources(request.inputResources) };
+						const session = inputSession ??= new ResourceInputSession(
+							{ store: this.inputStorage.store, inputs: this.inputs, internalCache: true },
+							this.maxBytes(),
+						);
+						await active.run(async () => {
+							let produced = false;
+							const query = await session.run(() => evaluateResourceQuery(
+								undefined, { signal }, this.cwd, (view) => computeStepInView(view, contract, (view) => {
+									produced = true;
+									return publish(view as ResourceReadView, contract);
+								}, signal), PI_ACTION_SEMANTICS, this.maxBytes(), true, "output", undefined, session,
+							));
+							if (!query) throw new Error("subcompute_retention_budget_exceeded");
+							try {
+								if (this.scopes.get(request.context) !== active) throw new Error("subcompute_context_closed");
+								for (const proof of query.versions) active.proofs.push(session.retain({ ...proof, view: undefined }));
+								releaseBusy();
+								await send({ state: produced ? "published" : "hit", value: encodeValue(query.output) });
+							} finally {
+								await Promise.allSettled(query.versions.map((version) => version.release()));
+							}
+						});
+					}
 				} finally {
-					scope.busy--;
+					releaseBusy();
 				}
 			}
 		} catch (error) {
@@ -624,7 +642,82 @@ export class SubcomputeService {
 			await inputSession?.dispose();
 		}
 	}
-	/** Followers validate the indexed preparation after the owner publishes, including after owner cancellation. */
+	/** Inline inputs are completely identified by the host binding, exact key and verified content digest. */
+	private async prepareBytes(key: string, signal: AbortSignal, build: () => Promise<unknown>, limit: number): Promise<PreparedBytes> {
+		const store = this.inputStorage.store;
+		const root = `content:${this.inputManager.root}`;
+		const binding = "host.content";
+		const hot = this.prepared.get(key);
+		if (hot) {
+			this.prepared.delete(key);
+			this.prepared.set(key, hot);
+			this.trimPrepared();
+			if (this.prepared.has(key)) return hot;
+		}
+		const [record] = await store.findPreparedInputCandidates({ root, binding, prepKey: digestObject(key), limit: 1 }, signal);
+		const payload = record?.payload as { root?: string; preparations?: { binding: string; key: string }[]; data?: string; computation?: unknown } | undefined;
+		let data: Buffer | undefined;
+		let computation: TimelineInterval | undefined;
+		if (record && payload?.root === root && payload.preparations?.length === 1 &&
+			payload.preparations[0]?.binding === binding && payload.preparations[0].key === key) {
+			try {
+				if (!record.artifacts.length && typeof payload.data === "string") data = Buffer.from(payload.data, "base64");
+				else if (record.artifacts.length === 1 && payload.data === undefined)
+					data = await store.artifacts.get(record.artifacts[0]!, signal);
+				if (data && !snapshotTrusted(deserialize(data))) data = undefined;
+				if (data) computation = TimelineInterval.restore(payload.computation) ?? TimelineInterval.unknownReuse(record.id);
+			} catch (error) {
+				if (hasErrorCode(error, "ERR_PROVENANCE_SCHEMA")) throw error;
+				signal.throwIfAborted();
+				store.signal.throwIfAborted();
+				data = undefined;
+				computation = undefined;
+			}
+		}
+		if (!data || !computation) {
+			signal.throwIfAborted();
+			const measured = await TimelineInterval.measure(build);
+			computation = TimelineInterval.own(measured.computation);
+			signal.throwIfAborted();
+			const owned = snapshotTrusted(measured.output);
+			if (!owned || wireBytes(owned.value, true) > limit) throw unavailable;
+			data = owned.data;
+			const metadata = { root, preparations: [{ binding, key }], computation: this.configuration.current.subcomputation.persistTimelineIntervals
+				? TimelineInterval.serialize(computation) : undefined };
+			const envelope = { id: key, createdAt: Date.now(), artifacts: [], payload: { ...metadata, data: "" } };
+			if (Buffer.byteLength(JSON.stringify(envelope)) + 4 * Math.ceil(data.length / 3) <= this.configuration.current.storage.maxRecordBytes)
+				await store.putInputVersion({ ...metadata, data: data.toString("base64") }, []);
+			else {
+				const bytes = data;
+				await store.withPublication(async () => store.putInputVersion(metadata, [await store.artifacts.put(bytes)]));
+			}
+		}
+		const receipt = TimelineInterval.serialize(computation);
+		const result = { data, computation, referenced: false, bytes: data.byteLength + key.length + Buffer.byteLength(JSON.stringify(receipt ?? null)) };
+		const prior = this.prepared.get(key);
+		if (prior) {
+			this.prepared.delete(key);
+			this.preparedBytes -= prior.bytes;
+		}
+		this.prepared.set(key, { ...result, computation: TimelineInterval.restore(receipt) ?? TimelineInterval.unknownReuse(key) });
+		this.preparedBytes += result.bytes;
+		this.trimPrepared();
+		return result;
+	}
+	private trimPrepared(): void {
+		const runtime = this.runtime();
+		const budget = Math.min(this.maxBytes(), runtime.resourceCacheMaxBytes ?? Infinity);
+		while (this.prepared.size && (this.prepared.size > runtime.resourceCacheMaxEntries ||
+			this.cacheBytes + this.inputStorage.contents.storedBytes + this.preparedBytes > budget)) {
+			const [key, value] = this.prepared.entries().next().value!;
+			this.prepared.delete(key);
+			if (value.referenced) {
+				value.referenced = false;
+				this.prepared.set(key, value);
+			} else this.preparedBytes -= value.bytes;
+		}
+	}
+	/** Followers can retry immediately after owner cancellation. */
 	private async sharedBuild<T>(key: string, evaluate: () => Promise<T>, signal: AbortSignal): Promise<T> {
 		while (this.building.has(key)) {
 			await waitForCompletion(this.building.get(key)!, signal);
@@ -656,9 +749,18 @@ export class SubcomputeService {
 			for (const key of this.files.keys()) this.evict(key);
 			await this.lifetime.drain();
 			await this.releaseChunks();
+			this.prepared.clear();
+			this.preparedBytes = 0;
 			this.inputManager.close();
 			if (this.directory) await rm(this.directory, { recursive: true, force: true });
 		});
+	}
+}
+function snapshotTrusted(value: unknown) {
+	try {
+		return snapshotPreparation(value);
+	} catch {
+		return undefined;
 	}
 }
 function wireBytes(value: unknown, checkJson = false): number {

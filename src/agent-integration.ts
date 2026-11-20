@@ -324,6 +324,7 @@ export interface SpeculativeAgentPreflightContext
 }
 export interface CreateSpeculativeActionHostOptions extends DrafterModelOptions {
 	readonly trustedSteps?: readonly TrustedSubcomputeStep[];
+	readonly provenanceStore?: ProvenanceCertificateStore;
 	readonly executionSession?: ExecutionSession<ToolSettlement>;
 	readonly config?: SpeculativeConfigInput;
 	readonly configuration?: SpeculativeConfiguration;
@@ -419,17 +420,26 @@ export function createAgentExecutionHost(
 	) => string | undefined,
 ): SpeculativeActionHost {
 	const config = options.configuration ?? new SpeculativeConfiguration(options.config);
-	const ownsRoot = !config.current.storage.root;
-	const storeRoot = config.current.storage.root ?? path.join(os.tmpdir(), "pi-host-reuse-" + randomUUID());
+	const ownsStore = !options.provenanceStore;
+	const ownsRoot = ownsStore && !config.current.storage.root;
+	const storeRoot = options.provenanceStore?.root ?? config.current.storage.root ?? path.join(os.tmpdir(), "pi-host-reuse-" + randomUUID());
 	const store = options.executionSession
 		? undefined
-		: withSpeculativeConfig(config, () => new ProvenanceCertificateStore(storeRoot));
-	const service = !store
+		: options.provenanceStore ?? withSpeculativeConfig(config, () => new ProvenanceCertificateStore(storeRoot));
+	const service: SubcomputeService | undefined = !store
 		? undefined
 		: withSpeculativeConfig(
 				config,
-				() => new SubcomputeService(options.cwd, store, () => config.current.runtime.resourceCacheMaxBytes,
-					[...(process.platform === "linux" ? [new PythonImportStep(options.cwd)] : []), ...(options.trustedSteps ?? [])]),
+				() =>
+					new SubcomputeService(
+						options.cwd,
+						store,
+						() => service!.runtime().resourceCacheMaxBytes ?? config.current.runtime.resourceCacheMaxBytes,
+						[
+							...(process.platform === "linux" ? [new PythonImportStep(options.cwd)] : []),
+							...(options.trustedSteps ?? []),
+						],
+					),
 			);
 	const bind = <T extends object>(target: T): T =>
 		new Proxy(target, {
@@ -457,8 +467,10 @@ export function createAgentExecutionHost(
 				try {
 					await service?.dispose();
 				} finally {
-					await store?.dispose();
-					if (store && ownsRoot) await rm(storeRoot, { recursive: true, force: true });
+					if (ownsStore) {
+						await store?.dispose();
+						if (store && ownsRoot) await rm(storeRoot, { recursive: true, force: true });
+					}
 				}
 			}
 		},
@@ -807,23 +819,25 @@ function assembleAgentExecutionHost(
 					const { tool, turnID } = bound.get(call)!;
 					if (!tool) throw new Error("tool_unavailable");
 					const scope = { sessionID, turnID, callID };
-					return executionGateway.executeSpeculative(
-						{ tool: call.tool, callID, input: action.input, signal, action, scope },
-						route,
-						{
-							...resources,
-							cwd: options.cwd,
-							tool,
-							toolName: call.tool,
-							args: structuredClone(action.input),
-							action,
-							callID,
-							signal,
-							executionScope: scope,
-							acceptOperationScope: (s) => s.sessionID === sessionID,
-							parentCheckpoint: parent?.checkpoint,
-						},
-					);
+					const runFork = () =>
+						executionGateway.executeSpeculative(
+							{ tool: call.tool, callID, input: action.input, signal, action, scope },
+							route,
+							{
+								...resources,
+								cwd: options.cwd,
+								tool,
+								toolName: call.tool,
+								args: structuredClone(action.input),
+								action,
+								callID,
+								signal,
+								executionScope: scope,
+								acceptOperationScope: (s) => s.sessionID === sessionID,
+								parentCheckpoint: parent?.checkpoint,
+							},
+						);
+					return service ? service.run(() => measured(call, runFork)) : runFork();
 				},
 				capture: async (call, action, signal) => {
 					const { tool, turnID, binding } = bound.get(call)!;

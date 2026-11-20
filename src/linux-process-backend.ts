@@ -75,6 +75,7 @@ import {
 	FilesystemReadView,
 	hashExecutableFile,
 	mapFilesystem,
+	withFilesystemReadView,
 	sameFilesystemIdentity,
 	settledFilesystemStat,
 	sharedWalk,
@@ -1211,7 +1212,8 @@ export class LinuxProcessReuseBackend {
 			await using files = this.fileInputs(
 				options.sourceRoot, request.signal ?? this.store.signal, this.observations.getStore()?.inputs,
 			);
-			const workspaceFiles = await this.captureActorFiles(observation, options.sourceRoot, files, proof);
+			const workspaceFiles = files && await withFilesystemReadView(undefined, (view) =>
+				this.captureActorFiles(observation, options.sourceRoot, files, proof!, view));
 			if (output.captureComplete !== false && !observation.pids?.some((pid) => replayed.has(pid)))
 				await this.publishActorProcess(prototype, observation, exitOutcome(output),
 					new TimelineInterval(began, ended), proof, request.signal, channel, workspaceFiles, true);
@@ -1295,15 +1297,14 @@ export class LinuxProcessReuseBackend {
 	private async captureActorFiles(
 		observation: ExecutionObservation,
 		root: string,
-		files: ResourceObjectInputs | undefined,
+		files: ResourceObjectInputs,
 		proof: ReturnType<typeof executionDomainProof>,
+		view: FilesystemReadView,
 	) {
 		const captured = new Map<string, FileContentVersion>();
-		if (!files) return captured;
 		const denied = sensitivePaths(this.options.storeRoot, this.options.deniedPaths);
 		const candidates: { target: string; file: FileContentVersion; dependency: DynamicDependency }[] = [];
 		const seen = new Set<string>();
-		await using view = await FilesystemReadView.open();
 		for (const input of observation.paths) {
 			if (input.role === "metadata" || input.lookupFailure || !pathContains(root, input.path)) continue;
 			try {

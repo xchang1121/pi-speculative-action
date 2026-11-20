@@ -622,6 +622,7 @@ async function installController(
 			});
 		},
 		executionWorlds,
+		provenanceStore: processBackend.store,
 		speculativeExecutionWorldEnabled,
 		actorForkPlanSource: selfSpeculation.actorForkPlanSource,
 		patternStateDirectory: getAgentDir(),

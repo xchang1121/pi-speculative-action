@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ArtifactReference } from "../src/content-chunks.ts";
 import { digestObject, type Sha256Digest } from "../src/primitives.ts";
-import { captureFileContent, CONTENT_CHUNK_BYTES, readContent } from "../src/content-chunks.ts";
+import { captureFileContent, CONTENT_CHUNK_BYTES, ContentChunkPool, readContent } from "../src/content-chunks.ts";
 import { ResourceObjectInputs } from "../src/agent-execution-world.ts";
 import { SpeculativeConfiguration } from "../src/config-schema.ts";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
@@ -18,7 +18,7 @@ import {
 	ResourceVersionManager,
 	type ResourceVersionToken,
 } from "../src/resource-version.ts";
-import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
+import { ArtifactReadView, ProvenanceCertificateStore } from "../src/reuse-store.ts";
 import { storeMetadata, storePeer } from "./process-fixture.ts";
 
 vi.mock("node:fs/promises", { spy: true });
@@ -111,6 +111,64 @@ linux("native workspace captures and filesystem tools exchange independent file 
 		}
 	} finally {
 		tool.close();
+		await f.close();
+	}
+});
+
+test("a native file reader can reuse one verified file after a sibling in its persisted closure changes", async () => {
+	const f = await fixture();
+	const root = path.parse(f.root).root;
+	const manager = new ResourceVersionManager(root, { watch: false, persistentInputs: { store: f.store, internalCache: true } });
+	const signal = new AbortController().signal;
+	const target = path.join(f.root, "used");
+	const sibling = path.join(f.root, "sibling");
+	const second = path.join(f.root, "also-used");
+	try {
+		await writeFile(target, "first");
+		await writeFile(sibling, "other");
+		await writeFile(second, "second");
+		vi.spyOn(Date, "now").mockReturnValue(Date.now() + 3000);
+		const source = await manager.capture([target, sibling, second].map((path) => ({ path, scope: "content" })), memoryBudget);
+		try {
+			await manager.persist(source);
+		} finally {
+			await source.release();
+		}
+		await writeFile(sibling, "newer");
+		await using native = new ResourceObjectInputs(f.root, f.store, signal);
+		const fetch = vi.spyOn(f.store, "getInputVersion");
+		const borrow = async (file = target) => native.borrow(file, await lstat(file, { bigint: true }), native.contents);
+		const hit = await borrow();
+		expect(hit?.shared).toBe(true);
+		expect((await readContent(hit!.content)).toString()).toBe("first");
+		expect(hit!.computation).toBeDefined();
+		native.remember(target, hit!);
+		expect(await readContent((await borrow(second))!.content)).toEqual(Buffer.from("second"));
+		expect(fetch).toHaveBeenCalledOnce();
+		expect(await native.publish()).toBe(0);
+		await writeFile(target, "later");
+		expect(await borrow()).toBeUndefined();
+	} finally {
+		manager.close();
+		await f.close();
+	}
+});
+
+test("a single verified CAS block supplies its file digest without a second read", async () => {
+	const f = await fixture();
+	const pool = new ContentChunkPool(f.store);
+	const release = pool.retain();
+	try {
+		const bytes = Buffer.from("one block");
+		const reference = await f.store.artifacts.put(bytes);
+		const manifest = { ...reference, chunks: [reference] };
+		const reads = vi.spyOn(ArtifactReadView.prototype, "readRange");
+		const file = await pool.restore(manifest);
+		expect(reads).not.toHaveBeenCalled();
+		expect(await readContent(file)).toEqual(bytes);
+		await expect(pool.restore({ ...manifest, digest: digestObject("other") })).rejects.toThrow("integrity");
+	} finally {
+		await release();
 		await f.close();
 	}
 });
