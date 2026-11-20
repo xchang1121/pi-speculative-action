@@ -262,7 +262,25 @@ function appendGrouped<K, V>(map: Map<K, V[]>, key: K, value: V) {
 	if (values) values.push(value);
 	else map.set(key, [value]);
 }
-export function executionRecords(read: () => Buffer, privateUpper?: string) {
+/** One kernel fence ends on a record boundary. Individual file reads can split either header or body. */
+function* executionFrames(chunks: Iterable<Buffer>, maxBody: number) {
+	let carry: Buffer | undefined;
+	for (const chunk of chunks) {
+		const bytes: Buffer = carry ? Buffer.concat([carry, chunk]) : chunk;
+		let start = 0;
+		while (bytes.length - start >= 48) {
+			const size = bytes.readUInt32LE(start + 40);
+			if (size > maxBody) throw new Error("invalid execution record envelope");
+			const end = start + Math.ceil((48 + size) / 8) * 8;
+			if (end > bytes.length) break;
+			yield bytes.subarray(start, end);
+			start = end;
+		}
+		carry = start === bytes.length ? undefined : bytes.subarray(start);
+	}
+	if (carry) throw new Error("truncated execution record");
+}
+export function executionRecords(read: () => Iterable<Buffer>, privateUpper?: string) {
 	const journal: BinaryRecord[] = [];
 	const unsupportedCalls = new Map<bigint, { name?: string }>();
 	const calls = new Map<bigint, BinaryRecord>();
@@ -300,28 +318,18 @@ export function executionRecords(read: () => Buffer, privateUpper?: string) {
 		read() {
 			if (failure) throw failure;
 			try {
-				const bytes = read();
-				for (let offset = 0; offset < bytes.length; ) {
-					if (bytes.length - offset < 48) throw new Error("truncated execution record");
-					const owner = bytes.readBigUInt64LE(offset);
-					const task = bytes.readBigUInt64LE(offset + 8);
-					const stamp = Number(bytes.readBigUInt64LE(offset + 16)) / 1e6;
-					const id = bytes.readBigUInt64LE(offset + 24);
-					const kind = Number(bytes.readBigUInt64LE(offset + 32));
-					const size = bytes.readUInt32LE(offset + 40);
-					const error = bytes.readInt32LE(offset + 44);
-					const end = offset + ((48 + size + 7) & ~7);
+				const { nativeBuild, processReuse } = speculativeConfig();
+				for (const frame of executionFrames(read(), nativeBuild.domainEventBytes)) {
+					const owner = frame.readBigUInt64LE(0);
+					const task = frame.readBigUInt64LE(8);
+					const stamp = Number(frame.readBigUInt64LE(16)) / 1e6;
+					const id = frame.readBigUInt64LE(24);
+					const kind = Number(frame.readBigUInt64LE(32));
+					const size = frame.readUInt32LE(40);
+					const error = frame.readInt32LE(44);
 					domain ??= owner;
-					if (
-						!id ||
-						!task ||
-						owner !== domain ||
-						size > speculativeConfig().nativeBuild.domainEventBytes ||
-						end > bytes.length
-					)
-						throw new Error("invalid execution record envelope");
-					const body = bytes.subarray(offset + 48, offset + 48 + size);
-					offset = end;
+					if (!id || !task || owner !== domain) throw new Error("invalid execution record envelope");
+					const body = frame.subarray(48, 48 + size);
 					const pid = Number(task & 0xffffffffn);
 					if ([10, 11, 138, 139].includes(kind)) {
 						let frame = inputFrames.get(id);
@@ -329,7 +337,7 @@ export function executionRecords(read: () => Buffer, privateUpper?: string) {
 							throw new Error("invalid native input frame");
 						if (!frame) inputFrames.set(id, (frame = { chunks: [], bytes: 0 }));
 						frame.bytes += size;
-						frame.chunks.push(body);
+						frame.chunks.push(Buffer.from(body));
 						if (
 							frame.bytes > speculativeConfig().nativeBuild.domainInputBytes ||
 							inputFrames.size > speculativeConfig().nativeBuild.domainInputFrames
@@ -381,6 +389,7 @@ export function executionRecords(read: () => Buffer, privateUpper?: string) {
 						continue;
 					}
 					const append = (name: string): BinaryRecord => {
+						if (journal.length >= processReuse.maxTraceRecords) throw new Error("execution_record_limit");
 						const record: BinaryRecord = {
 							pid,
 							start: stamp,
@@ -550,6 +559,12 @@ export function executionRecords(read: () => Buffer, privateUpper?: string) {
 					} else throw new Error("unexpected execution frame " + kind);
 				}
 			} catch (error) {
+				journal.length = 0;
+				unsupportedCalls.clear();
+				calls.clear();
+				executing.clear();
+				inputs.clear();
+				inputFrames.clear();
 				throw (failure = error instanceof Error ? error : new Error(String(error)));
 			}
 		},

@@ -95,6 +95,7 @@ export const DEFAULT_SPECULATIVE_CONFIG = deepFreeze({
 	},
 	processReuse: {
 		maxObservedInputs: 8192,
+		maxTraceRecords: 65536,
 		invocationPathBytes: 8192,
 		startupTimeoutMs: 10000,
 		terminateGraceMs: 1000,

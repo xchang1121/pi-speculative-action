@@ -293,7 +293,8 @@ function canonicalPiAction(tool: string, input: unknown, cwd: string): Canonical
 		? normalizeRelativeRoot(record.path, cwd)
 		: normalizeWorkspacePath(record.path as string, cwd);
 	if (resource === undefined || ((tool === "write" || tool === "edit") && resource === ".")) return undefined;
-	fields.path = resource;
+	// Stock mutation receipts echo the caller's path verbatim.
+	if (query || tool === "read") fields.path = resource;
 	return { resources: [resource], input: fields };
 }
 function normalizeDefinition(source: ActionSemanticsDefinition): ActionSemanticsDefinition {

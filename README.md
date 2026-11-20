@@ -96,7 +96,7 @@ Linux 进程证据按执行域记录未知系统调用，并标记实际调用�
 
 在 Host 管理的工具调用中调用 `await subcomputeEnvironment()`，把返回的 `PI_SUBCOMPUTE_SOCKET` 与 `PI_SUBCOMPUTE_CONTEXT` 传给子进程。Windows 使用 Named Pipe，Linux 使用 Unix socket。Host 会把受信步骤的受限通道提供给受控进程。设置 `subcomputation.exposeToControlledProcesses: true` 可同时开放由客户端执行并发布的步骤。
 
-通过 Host 选项 `trustedSteps` 注册确定性计算。每个步骤声明 `namespace`、实现身份 `implementation` 和 `build({ key, input, signal, maxResultBytes })`。调用方把影响结果的选项放在 `key` 中，提交原始输入的 SHA-256 摘要。未命中时，`input()` 取回并核验对应字节，宿主构建并发布结果。输入、选项或实现身份变化都会重新计算。受控进程的证书也绑定到通道开放的步骤及其实现身份。受信步骤使用公共准备态索引、CAS 和持久化存储配额。Actor、Drafter、PatternAware 和 Self-Speculation 的调用可以相互提供结果。配置解析的完整注册示例见 [config-parsing.ts](examples/config-parsing.ts)。
+通过 Host 选项 `trustedSteps` 注册确定性计算。每个步骤声明 `namespace`、实现身份 `implementation` 和 `build({ key, input, signal, maxResultBytes })`。调用方把影响结果的选项放在 `key` 中，提交原始输入的 SHA-256 摘要。未命中时，`input()` 取回并核验对应字节，宿主构建并发布结果。输入、选项或实现身份变化都会重新计算。受控进程的证书也绑定到通道开放的步骤及其实现身份。受信步骤使用公共准备态索引、CAS 和持久化存储配额。默认按工作区保存结果。完全由输入字节和键决定的步骤可以实现 `acceptShared(key, signal)`，在同一个宿主存储中跨工作区共享。消费方必须通过当前宿主的绑定检查并提交摘要匹配的原始字节，收到消费回执后才计入掩盖时间。Actor、Drafter、PatternAware 和 Self-Speculation 的调用可以相互提供结果。配置解析的完整注册示例见 [config-parsing.ts](examples/config-parsing.ts)。
 
 受信步骤沿用 `compute` 帧，例如 `{"op":"compute","context":"调用令牌","namespace":"config.parse","key":null,"inputDigest":"输入字节的 SHA-256 十六进制摘要"}`。收到 `state: "input"` 时发送 `{"op":"input","token":"步骤令牌","value":{"encoding":"base64","value":"输入内容"}}`。命中返回 `hit`，新构建返回 `published`。二进制结果使用 Base64。结构化结果须能通过 JSON 无损往返，需调用方自行计算的输入返回 `local`。调用方成功解码后发送 `{"op":"consumed","token":"步骤令牌"}`，收到 `ready` 即可继续使用同一连接。各命名空间在消费确认后计入命中与耗时。
 
@@ -135,6 +135,8 @@ Linux 后端把工具与 Bash 实际读取的工作区文件按路径和内容�
 `actorObservationMode: "provenance"` 为真实 Actor 执行采集依赖；当前 Actor 沉淀支持可完整验证的只读命令。写入、外部状态或不完整观测会阻止该次进程证书发布。独立文件输入按各自的版本验证。编辑后主动重跑旧命令的 `prepareObservedOperations` 默认关闭。
 
 Actor 观测与普通受控执行共享子进程采用通道。纯字节输出的子进程可以多次重放，环境和非确定性接纳范围由显式契约控制。内核观测容量位于 `nativeBuild`；观测历史丢失时诊断报告 `observer_history_incomplete` 及原因位。
+
+原生观测器按块解码每个执行域的二进制记录。`config.processReuse.maxTraceRecords` 限制单个日志保留的系统调用及生命周期记录数，默认 65,536。超限时撤销该日志的证据，Actor 继续返回原命令的输出和退出状态。
 
 标准输出能否跨 pipe/socket 载体复用，由真实 syscall 观测决定。程序探测标准流元数据时，证书保留载体约束。受控异步启动使用 `createControlledBashOperations`。子进程观察另需合格的 `PI_SPEC_HELD_EXEC_OBSERVER`，安装脚本和环境诊断会报告当前资格。
 

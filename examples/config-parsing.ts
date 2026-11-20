@@ -4,6 +4,7 @@ import type { TrustedSubcomputeStep } from "@earendil-works/pi-speculative-actio
 export const parseJsonConfig: TrustedSubcomputeStep = {
 	namespace: "config.parse",
 	implementation: "JSON.parse(UTF-8)",
+	acceptShared: () => true,
 	async build({ input }) {
 		return JSON.parse((await input()).toString("utf8"));
 	},

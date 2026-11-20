@@ -45,6 +45,7 @@ import {
 	isSafeCount,
 	isSha256Digest,
 	isMissing as missing,
+	sha256Digest,
 	sha256DigestAsync,
 	stableStringify,
 	type Sha256Digest,
@@ -614,9 +615,10 @@ export class ProvenanceCertificateStore {
 			payload,
 			artifacts,
 		};
-		const id = digestObject(body);
-		const encoded = stableStringify({ ...body, id });
-		const record = decodeInputVersion(encoded);
+		const canonical = stableStringify(body);
+		const id = sha256Digest(canonical);
+		const encoded = `${canonical.slice(0, -1)},"id":"${id}"}`;
+		const record = decodeInputVersion(encoded, id);
 		if (!record) throw new Error("invalid persistent input version");
 		return this.publishRoot(`input:${id}`, record.artifacts, (database) => {
 			const input = record.payload as { root: string; preparations: readonly { binding: string; key: string }[] };
@@ -669,12 +671,12 @@ export class ProvenanceCertificateStore {
 		if (!isSafeCount(limit, 1, this.configuration.current.filesystem.maxHistoryEntries))
 			throw new Error("invalid input discovery limit");
 		const rows = await this.query(
-			`WITH recent AS MATERIALIZED (
-				SELECT rowid AS age, id, value FROM input_versions WHERE root = ? ORDER BY rowid DESC LIMIT ?
-			)
-			SELECT recent.id AS id, e.value ->> '$[0]' AS name, e.value ->> '$[1].type' AS kind
-			FROM recent, json_each(CASE WHEN json_valid(recent.value) THEN recent.value END, '$.payload.entries') AS e
-			WHERE e.type = 'array' ORDER BY age DESC`,
+			`SELECT i.id, e.value ->> '$[0]' AS name, e.value ->> '$[1].type' AS kind
+			FROM input_versions AS i
+			CROSS JOIN json_each(CASE WHEN json_valid(i.value) THEN i.value END, '$.payload.entries') AS e
+			WHERE e.type = 'array' AND i.rowid IN (
+				SELECT rowid FROM input_versions WHERE root = ? ORDER BY rowid DESC LIMIT ?
+			) ORDER BY i.rowid DESC`,
 			[root, limit], signal,
 		);
 		const paths = new Map<string, Sha256Digest[]>();
@@ -1278,7 +1280,7 @@ function decodeCertificate(value: unknown): ProcessProvenanceCertificate | undef
 		return undefined;
 	}
 }
-function decodeInputVersion(value: unknown): StoredInputVersion | undefined {
+function decodeInputVersion(value: unknown, writtenID?: Sha256Digest): StoredInputVersion | undefined {
 	try {
 		if (typeof value !== "string" || Buffer.byteLength(value) > speculativeConfig().storage.maxRecordBytes)
 			return;
@@ -1288,7 +1290,7 @@ function decodeInputVersion(value: unknown): StoredInputVersion | undefined {
 			Object.keys(record).some((key) => !["id", "createdAt", "payload", "artifacts"].includes(key)) ||
 			!Number.isFinite(record.createdAt) ||
 			!isSha256Digest(id) ||
-			digestObject(body) !== id ||
+			(writtenID ?? digestObject(body)) !== id ||
 			!Array.isArray(record.artifacts) ||
 			record.artifacts.length > speculativeConfig().filesystem.maxManifestChunks
 		)

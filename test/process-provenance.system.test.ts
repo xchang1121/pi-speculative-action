@@ -31,6 +31,31 @@ import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { systemHost } from "./agent-system-fixture.ts";
 import { createLinuxProcessBenchmark, textOutput } from "./linux-process-fixture.ts";
 
+test.skipIf(process.platform !== "linux")("an exhausted trace returns the native Actor output without publishing partial evidence", async () => {
+	const f = await createLinuxProcessBenchmark("pi-actor-trace-budget-", "in_memory", {}, os.homedir());
+	const host = systemHost(f.workspace, [f.tool], {
+		config: { processReuse: { maxTraceRecords: 2 } },
+		executionWorlds: [f.world],
+		resolveInvocation: (_tool, input) => f.invocation(input as Record<string, unknown>),
+	}, { enabled: false, prepareObservedOperations: false });
+	try {
+		await f.write("input", "original");
+		await f.prepare();
+		await host.start();
+		const run = (command: string) => host.execute("bash", { command }).then(textOutput);
+		for (let i = 0; i < 2; i++) expect(await run("cat input; printf :done")).toBe("original:done");
+		expect(await run("printf x >> marker; cat input")).toBe("original");
+		expect(await readFile(path.join(f.workspace, "marker"), "utf8")).toBe("x");
+		expect(f.backend.actorMetrics()).toMatchObject({
+			hits: 0, wholeCommandHits: 0, published: 0, wholeCommandPublished: 0,
+			lastError: expect.stringContaining("execution_record_limit"),
+		});
+	} finally {
+		await host.dispose();
+		await f.dispose();
+	}
+});
+
 test.skipIf(process.platform !== "linux")("an incomplete private output tree cannot certify its child", async () => {
 	const f = await createLinuxProcessBenchmark("pi-private-quota-", "in_memory", {}, os.homedir());
 	const external = path.join(f.root, "external");
@@ -179,14 +204,14 @@ test.skipIf(process.platform !== "linux")(
 					const definitions: number[] = [];
 					const numbers = [254, 301, 241, 244, 129, 297, 444, 70000];
 					const records = executionRecords(() => {
-						const bytes = read();
+						const bytes = Buffer.concat([...read()]);
 						for (let offset = 0; offset < bytes.length; ) {
 							const size = bytes.readUInt32LE(offset + 40);
 							if (bytes.readBigUInt64LE(offset + 32) === 26n)
 								definitions.push(Number(bytes.readBigUInt64LE(offset + 48)));
 							offset += (48 + size + 7) & ~7;
 						}
-						return bytes;
+						return [bytes];
 					});
 					await using tail = traceTail(records, root);
 					const observation = await observeExecution(tail, probe, root);

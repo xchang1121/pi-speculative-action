@@ -2,6 +2,7 @@ import { writeFile } from "node:fs/promises";
 import * as filesystem from "node:fs/promises";
 import path from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
+import { resolveSpeculativeConfig, withSpeculativeConfig } from "../src/config-schema.ts";
 import { sha256Digest } from "../src/process-reuse.ts";
 import {
 	cachedCapture,
@@ -48,7 +49,7 @@ test("rejects malformed process exit outcomes at the public certificate boundary
 
 function executionTrace() {
 	const frames: Buffer[] = [];
-	const native = executionRecords(() => Buffer.concat(frames.splice(0)), "/private");
+	const native = executionRecords(() => frames.splice(0), "/private");
 	const tail = traceTail(native, "/work");
 	cleanup.push(() => tail[Symbol.asyncDispose]());
 	let id = 0;
@@ -365,13 +366,32 @@ test("uses the kernel order and returned length for writes through output aliase
 	]);
 });
 
+test("decodes split frames and revokes every retained record on an exhausted journal", () => {
+	const exit = Buffer.alloc(56);
+	exit.writeBigUInt64LE(1n, 8);
+	exit.writeBigUInt64LE(1n, 24);
+	exit.writeBigUInt64LE(15n, 32);
+	exit.writeUInt32LE(4, 40);
+	const chunks = [exit.subarray(0, 9), exit.subarray(9, 49), exit.subarray(49), exit];
+	const records = executionRecords(() => chunks.splice(0));
+	withSpeculativeConfig(resolveSpeculativeConfig({ processReuse: { maxTraceRecords: 2 } }), () => {
+		records.read();
+		expect(records.journal.map((record) => record.name)).toEqual(["terminated", "terminated"]);
+		chunks.push(exit);
+		expect(() => records.read()).toThrow("execution_record_limit");
+		expect(records.journal).toHaveLength(0);
+		expect(() => records.inputs).toThrow("execution_record_limit");
+		expect(() => records.read()).toThrow("execution_record_limit");
+	});
+});
+
 test("rejects orphan and truncated binary records before they can qualify an execution", () => {
 	const orphan = Buffer.alloc(48);
 	orphan.writeBigUInt64LE(1n, 8);
 	orphan.writeBigUInt64LE(1n, 24);
 	orphan.writeBigUInt64LE(20n, 32);
 	for (const bytes of [orphan, orphan.subarray(0, 47)]) {
-		const records = executionRecords(() => bytes);
+		const records = executionRecords(() => [bytes]);
 		expect(() => records.read()).toThrow();
 		expect(() => records.read()).toThrow();
 	}

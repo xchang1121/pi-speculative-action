@@ -413,6 +413,23 @@ test.skipIf(process.platform !== "linux")("controlled imports use host-owned ste
 				expect(await compile({ ...key, executable: other })).toEqual({ state: "unavailable" });
 				expect(await compile({ ...key, engine: "0".repeat(64) })).toEqual({ state: "unavailable" });
 				expect(await compile()).toMatchObject({ state: "hit", value: first.value });
+				const sibling = await directories.create();
+				const consumer = new SubcomputeService(sibling, store, () => 1024 * 1024, [new PythonImportStep(sibling)]);
+				try {
+					const counts = new Map();
+					const consumerEnv = await consumer.withMetrics(counts, () => consumer.environment());
+					const otherPeer = client(consumerEnv);
+					try {
+						const shared = await trustedCompute(otherPeer, consumerEnv, namespace, key, source);
+						expect(shared).toMatchObject({ state: "hit", value: first.value });
+						expect(consumer.drainMetrics(counts)[namespace]).toMatchObject({ hits: 1, misses: 0 });
+						const verify = "import marshal,sys; data=sys.stdin.buffer.read(); actual=marshal.loads(data); " +
+							"expected=compile(b'output = 42\\n',sys.argv[1],'exec',dont_inherit=True,optimize=0); " +
+							"assert actual == expected and actual.co_filename == expected.co_filename; " +
+							"ns={};exec(actual,ns);assert ns['output']==42";
+						execFileSync(executable, ["-I", "-S", "-c", verify, key.filename], { input: Buffer.from(shared.value.value, "base64") });
+					} finally { otherPeer.close(); }
+				} finally { await consumer.dispose(); }
 				peer.send({ op: "compute", namespace: "other", context: env.PI_SUBCOMPUTE_CONTEXT, key: null });
 				expect(await peer.read()).toMatchObject({ state: "error" });
 				expect(service.drainMetrics()[namespace]).toMatchObject({ hits: 1, misses: 1 });
@@ -645,6 +662,51 @@ test("trusted configuration parsing publishes once, survives restart and isolate
 		expect((await use(Buffer.from('{"weight":-0}'))).state).toBe("local");
 	} finally {
 		await service.dispose();
+		await store.dispose();
+	}
+});
+
+test("shared host results require the consuming workspace to authorize the binding and supply the original bytes", async () => {
+	const [a, b, root] = await Promise.all([directories.create(), directories.create(), directories.create()]);
+	const store = new ProvenanceCertificateStore(root);
+	let allowed = true;
+	const build = vi.fn(parseJsonConfig.build);
+	const step = { ...parseJsonConfig, build, acceptShared: () => allowed };
+	const first = new SubcomputeService(a, store, () => 65536, [step]);
+	const second = new SubcomputeService(b, store, () => 65536, [step]);
+	const bytes = Buffer.from('{"target":"library"}');
+	try {
+		const from = await first.environment();
+		const producer = client(from);
+		try {
+			expect((await trustedCompute(producer, from, step.namespace, null, bytes)).state).toBe("published");
+		} finally { producer.close(); }
+		await first.dispose();
+		const to = await second.environment();
+		const packet = { op: "compute", context: to.PI_SUBCOMPUTE_CONTEXT, namespace: step.namespace,
+			key: null, inputDigest: createHash("sha256").update(bytes).digest("hex") };
+		const wrong = client(to);
+		try {
+			wrong.send(packet);
+			const ask = await wrong.read();
+			expect(ask.state).toBe("input");
+			wrong.send({ op: "input", token: ask.token, value: { encoding: "base64", value: Buffer.from("other").toString("base64") } });
+			expect((await wrong.read()).state).toBe("error");
+		} finally { wrong.close(); }
+		const consumer = client(to);
+		try {
+			allowed = false;
+			consumer.send(packet);
+			expect(await consumer.read()).toEqual({ state: "unavailable" });
+			allowed = true;
+			expect(await trustedCompute(consumer, to, step.namespace, null, bytes)).toMatchObject({
+				state: "hit", value: { value: { target: "library" } },
+			});
+			expect(build).toHaveBeenCalledTimes(1);
+			expect(second.drainMetrics()[step.namespace]).toMatchObject({ hits: 1, misses: 0 });
+		} finally { consumer.close(); }
+	} finally {
+		await Promise.all([first.dispose(), second.dispose()]);
 		await store.dispose();
 	}
 });

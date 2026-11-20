@@ -363,11 +363,14 @@ export class ExecutionPathProjection {
 		return containsFilesystemPath(this.workspaceRoot, physicalPath);
 	}
 }
+type DirectoryDepth = "entries" | "subtree" | "bounded";
+export type WorkspaceDirectoryReads = Map<string, DirectoryDepth>;
 export interface WorkspaceStructureCaptureOptions {
 	readonly maxFiles?: number;
 	readonly exclude?: readonly string[];
 	readonly observeStat?: (relative: string, stat: BigIntStats, unchanged?: boolean) => void | Promise<void>;
 	readonly visitEntry?: (relative: string, entry: FilesystemTypeEvidence) => boolean | Promise<boolean>;
+	readonly directories?: ReadonlyMap<string, DirectoryDepth>;
 	readonly view?: FilesystemReadView;
 	readonly layered?: true;
 	readonly content?: {
@@ -481,6 +484,62 @@ export async function captureWorkspaceStructure(
 ): Promise<WorkspaceStructureSnapshot> {
 	return new WorkspaceStructureCapture(root, options).capture();
 }
+export class UnprovenWorkspaceRead extends Error {
+	readonly retry?: "full" | "directories";
+	constructor(message: string, retry?: "full" | "directories") {
+		super(message);
+		this.retry = retry;
+	}
+}
+
+class WorkspaceSizeLimit extends Error {
+	readonly paths: string[] = [];
+	constructor(entries?: ReadonlyMap<string, WorkspaceCapturedVersion>, maxBytes = 0) {
+		super("workspace snapshot exceeds configured limits");
+		if (!entries) return;
+		const seen = new Set<string>();
+		let remaining = BigInt(maxBytes);
+		const files = [...entries].filter(([, { captured }]) => captured.info.isFile())
+			.sort((a, b) => Number(b[1].captured.info.size - a[1].captured.info.size));
+		for (const [name, { captured: { info } }] of files) {
+			const id = `${info.dev}:${info.ino}`;
+			if (seen.has(id)) continue;
+			seen.add(id);
+			this.paths.push(name);
+			if ((remaining -= info.size) < 0n) return;
+		}
+		this.paths.length = 0;
+	}
+
+	async exceeds(root: string, maxBytes: number, excludes: readonly string[]) {
+		if (!this.paths.length || this.paths.some((file) => file.split(path.sep).some((part) => excludes.includes(part)))) return false;
+		const names = new Set(this.paths);
+		for (const name of this.paths) for (const parent of workspaceAncestors(name)) names.add(parent);
+		return withFilesystemReadView(undefined, async (view) => {
+			const sample = () => mapFilesystem([...names], (name) => view.stat(path.join(root, name), false));
+			const first = await sample();
+			const second = await sample();
+			const files = new Set(this.paths);
+			const objects = new Set<string>();
+			let size = 0n;
+			let i = 0;
+			for (const name of names) {
+				const stat = first[i]!;
+				if (!sameFilesystemIdentity(stat, second[i++]!)) return false;
+				if (!files.has(name)) {
+					if (!stat.isDirectory()) return false;
+					continue;
+				}
+				if (!stat.isFile()) return false;
+				const id = `${stat.dev}:${stat.ino}`;
+				if (!objects.has(id)) size += stat.size;
+				objects.add(id);
+			}
+			return size > BigInt(maxBytes);
+		}).catch(() => false);
+	}
+}
+
 /** Original observations survive only while the kernel proves their objects and names unchanged. */
 export class WorkspaceStructureCapture {
 	private retained?: WorkspaceCapturedVersions & {
@@ -542,19 +601,21 @@ export class WorkspaceStructureCapture {
 		const maxFiles = options.maxFiles ?? speculativeConfig().filesystem.maxTreeEntries;
 		const required = options.content?.required && options.content;
 		let remainingBytes = required ? required.maxBytes : 0;
-		const pending = [{ relative: "", replaced: false }];
+		const pending = [{ relative: "", replaced: false, subtree: false }];
 		let files = 0;
 		let complete = !this.versions || changes !== undefined;
 		for (let cursor = 0; cursor < pending.length;) {
 			const batch = pending.slice(cursor, cursor + speculativeConfig().filesystem.concurrency);
 			cursor += batch.length;
-			const captured = await mapFilesystem(batch, async ({ relative, replaced }) => {
+			const captured = await mapFilesystem(batch, async ({ relative, replaced, subtree }) => {
+				subtree ||= options.directories?.get(relative) === "subtree";
 				const prior = previous?.get(relative);
 				const reused =
 					prior && !replaced && !objects!.has(`${prior.captured.info.dev}:${prior.captured.info.ino}`);
 				const captured = reused
 					? prior.captured
-					: await captureFilesystemEntry(path.join(absoluteRoot, relative), "directory", options.view);
+					: await captureFilesystemEntry(path.join(absoluteRoot, relative),
+						!options.directories || subtree || options.directories.has(relative) ? "directory" : "identity", options.view);
 				if (!reused)
 					admission.push({
 						dev: captured.info.dev,
@@ -569,7 +630,10 @@ export class WorkspaceStructureCapture {
 					previous ? !!reused : undefined,
 				);
 				const children = captured.entries ?? [];
-				const entry = reused ? prior.entry : captureWorkspaceStructureEntry(captured, [...excludes]);
+				const entry = reused ? prior.entry : captureWorkspaceStructureEntry(
+					options.directories && captured.info.isDirectory() && !captured.entries ? { ...captured, entries: [] } : captured,
+					[...excludes],
+				);
 				capturedEntries.set(relative, reused ? prior : { captured, entry });
 				const moved =
 					replaced ||
@@ -578,24 +642,24 @@ export class WorkspaceStructureCapture {
 							captured.info.ino !== prior.captured.info.ino)) ||
 					(captured.info.isDirectory() &&
 						!!changes?.unstable?.has(`${captured.info.dev}:${captured.info.ino}`));
-				return { relative, entry, children, replaced: moved };
+				return { relative, entry, children, replaced: moved, subtree };
 			});
-			for (const { relative, entry, children, replaced } of captured) {
+			for (const { relative, entry, children, replaced, subtree } of captured) {
 				if (required && entry.kind === "file" &&
 					(entry.size > required.maxFileBytes || (remainingBytes -= entry.size) < 0))
-					throw new Error("workspace snapshot exceeds configured limits");
+					throw new WorkspaceSizeLimit(capturedEntries, required.maxBytes);
 				entries.set(relative, entry);
 				for (const child of children.sort((left, right) => left.name.localeCompare(right.name))) {
 					if (excludes.has(child.name)) continue;
 					if (files + 1 > maxFiles) {
-						if (required) throw new Error("workspace snapshot exceeds configured limits");
+						if (required) throw new WorkspaceSizeLimit();
 						complete = false;
 						continue;
 					}
 					files++;
 					if (options.visitEntry && !(await options.visitEntry(path.join(relative, child.name), child)))
 						continue;
-					pending.push({ relative: path.join(relative, child.name), replaced });
+					pending.push({ relative: path.join(relative, child.name), replaced, subtree });
 				}
 			}
 		}
@@ -620,7 +684,7 @@ export class WorkspaceStructureCapture {
 			: { snapshot, files: new Map<string, FileContentVersion | undefined>() };
 		// Keep the starting epoch: writes during this walk are visited again on the next capture.
 		// A temporarily busy writer cannot revoke the older observations of unrelated objects.
-		if (snapshot.complete && version !== undefined)
+		if (!options.directories && snapshot.complete && version !== undefined)
 			this.retained = {
 				version,
 				...content,
@@ -634,7 +698,10 @@ export class WorkspaceStructureCapture {
 					).values(),
 				],
 			};
-		return { ...content, entries: capturedEntries };
+		const partial = options.directories && [...capturedEntries.values()].some(
+			({ captured }) => captured.info.isDirectory() && !captured.entries,
+		);
+		return { ...content, snapshot: partial ? { ...snapshot, complete: false } : snapshot, entries: capturedEntries };
 	}
 }
 /** Resolve namespace aliases in the same captured structure, including layered mutation frontiers. */
@@ -1130,6 +1197,12 @@ export interface SandboxWorkspaceContext {
 	readonly sandboxRoot: string;
 	readonly processRoot: string;
 	readonly baselineFile?: (relative: string) => FileContentVersion | undefined;
+	/** A traced private read may discover a directory needed by a fresh isolated attempt. */
+	readonly processCoverage?: {
+		readonly covers: (relative: string, listed: boolean) => boolean;
+		readonly observeWrite: () => void;
+		readonly retry: "full" | "directories" | undefined;
+	};
 	/** Native metadata for pinned snapshot objects; shared by every process in this private workspace. */
 	readonly metadataImage?: string;
 	/** Mount policy used to project source access times; adoption must revalidate it. */
@@ -1437,6 +1510,7 @@ export class WorkspaceSandboxService {
 		readonly ownedRoot?: string;
 	}>;
 	private readonly contents = new Set<ContentChunkPool>();
+	private oversize?: { root: string; witness: WorkspaceSizeLimit };
 	/** Checkpoints belong to this service, including its sibling execution worlds. */
 	private readonly checkpoints = new WeakMap<WorldCheckpoint, WorkspaceCheckpoint>();
 	private readonly lifetime = new RuntimeLifecycleLane();
@@ -2097,6 +2171,7 @@ export class WorkspaceSandboxService {
 	async capture(
 		options: Omit<SandboxWorkspaceBranchOptions, "action" | "parentCheckpoint">,
 		parent?: WorkspaceCheckpoint,
+		processDirectories?: WorkspaceDirectoryReads,
 	): Promise<WorkspaceExecutionSnapshot> {
 		this.assertOpen();
 		const sourceRoot = path.resolve(options.cwd);
@@ -2128,6 +2203,14 @@ export class WorkspaceSandboxService {
 					const changes = ownSandboxChanges(
 						(await options.afterCapture?.(workspace, captured)) ?? captured.changes,
 					);
+					if (workspace.processCoverage) {
+						if (changes.some((change) => !change.validationOnly)) workspace.processCoverage.observeWrite();
+						const result = await options.validate?.();
+						if (workspace.processCoverage.retry)
+							throw new UnprovenWorkspaceRead("workspace observation requires another private capture", workspace.processCoverage.retry);
+						if (result?.status !== "valid")
+							throw new UnprovenWorkspaceRead(result?.cause?.detail ?? result?.cause?.code ?? "private execution is unproven");
+					}
 					return (capturedSnapshot = {
 						output: captured.output,
 						changes,
@@ -2136,6 +2219,7 @@ export class WorkspaceSandboxService {
 					});
 				},
 				parent,
+				processDirectories,
 			);
 		} catch (error) {
 			await capturedSnapshot?.dispose?.();
@@ -2563,8 +2647,13 @@ export class WorkspaceSandboxService {
 		cwd: string,
 		driver: QualifiedWorkspaceSandboxDriver["driver"],
 		options: WorkspaceSandboxOptions,
+		processDirectories?: WorkspaceDirectoryReads,
 	) {
 		const sourceRoot = path.resolve(cwd);
+		const configured = speculativeConfig().filesystem;
+		const prior = this.oversize;
+		if (!processDirectories && prior?.root === sourceRoot &&
+			await prior.witness.exceeds(sourceRoot, configured.maxTreeBytes, configured.excludes)) throw prior.witness;
 		const versions = new ResourceVersionManager(sourceRoot);
 		const cursor = await versions.observeChanges();
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-workspace-"));
@@ -2598,15 +2687,30 @@ export class WorkspaceSandboxService {
 					versions.close();
 					await releaseContents?.();
 				}
-			})());
+			})().catch((error) => { throw effectCommitFailure(error, "poisoned"); }));
 		try {
 			const contents = await this.createContentPool();
 			releaseContents = contents?.retain();
-			const configured = speculativeConfig().filesystem;
-			const captured = await new WorkspaceStructureCapture(sourceRoot, {
+			const capture = () => new WorkspaceStructureCapture(sourceRoot, {
+				directories: processDirectories,
 				content: { pool: contents, maxBytes: configured.maxTreeBytes, maxFileBytes: configured.maxTreeBytes, required: true },
 			}).captureVersions(undefined, options.inputs);
-			if (!captured.snapshot.complete || [...captured.files.values()].some((file) => !file))
+			const captured = await capture().catch((error: unknown) => {
+				if (processDirectories && (error instanceof WorkspaceSizeLimit || isMissing(error) ||
+					hasErrorCode(error, "EACCES") || hasErrorCode(error, "EPERM"))) {
+					// An enumerated subtree can exceed the private image budget. Its exact listings still fit independently.
+					const subtrees = [...processDirectories].filter(([, depth]) => depth === "subtree");
+					if (subtrees.length) {
+						for (const [name] of subtrees) processDirectories.set(name, "bounded");
+						return capture();
+					}
+				}
+				if (!processDirectories && error instanceof WorkspaceSizeLimit && error.paths.length)
+					this.oversize = { root: sourceRoot, witness: error };
+				throw error;
+			});
+			if (!processDirectories && this.oversize === prior) this.oversize = undefined;
+			if ((!processDirectories && !captured.snapshot.complete) || [...captured.files.values()].some((file) => !file))
 				throw new Error("workspace snapshot exceeds configured limits");
 			const original = new Map([...captured.entries].map(([name, entry]) => [name, entry.captured.info]));
 			await mkdir(processRoot);
@@ -2667,7 +2771,28 @@ export class WorkspaceSandboxService {
 				hints: sourceChanges(),
 			};
 			workspace = createWorkspaceObservation(data, sourceChanges, contents);
-			return { ...workspace, dispose, pinObject };
+			let retry: "full" | "directories" | undefined;
+			const covers = (relative: string, listed: boolean) => {
+				// Only complete directory listings can establish a child name or its absence.
+				const parents = workspaceAncestors(listed ? relative : path.dirname(relative)).reverse();
+				const first = parents.findIndex((name) => {
+					const directory = captured.entries.get(name)?.captured;
+					return directory?.info.isDirectory() && !directory.entries;
+				});
+				if (first < 0) return true;
+				for (const name of parents.slice(first)) {
+					if (processDirectories!.size >= configured.maxTreeEntries) { retry = "full"; break; }
+					if (!processDirectories!.has(name)) processDirectories!.set(name, "entries");
+				}
+				if (listed && retry !== "full" && !parents.some((name) => processDirectories!.get(name) === "bounded"))
+					processDirectories!.set(parents[first]!, "subtree");
+				retry ??= "directories";
+				return false;
+			};
+			const processCoverage = processDirectories && !captured.snapshot.complete ? {
+				covers, observeWrite: () => { retry = "full"; }, get retry() { return retry; },
+			} : undefined;
+			return { ...workspace, dispose, pinObject, processCoverage };
 		} catch (error) {
 			await dispose();
 			throw error;
@@ -2682,8 +2807,9 @@ export class WorkspaceSandboxService {
 		overlayOptions: WorkspaceSandboxOptions,
 		run: (workspace: PrivateSandboxWorkspace) => Promise<T>,
 		checkpoint?: WorkspaceCheckpoint,
+		processDirectories?: WorkspaceDirectoryReads,
 	): Promise<T> {
-		const workspace = await this.createPrivateSandboxWorkspace(cwd, driver, overlayOptions);
+		const workspace = await this.createPrivateSandboxWorkspace(cwd, driver, overlayOptions, processDirectories);
 		try {
 			if (checkpoint) await this.materializeCheckpoint(workspace, checkpoint);
 			return await run(workspace);

@@ -7,6 +7,7 @@ import { projectProcessEnvironment, speculativeConfig } from "./config-schema.ts
 import type { ExecutionOperationBinding, ExecutionScope, ToolInvocation } from "./execution-world.ts";
 import {
 	currentExecutionScope,
+	isPoisonedEffectCommit,
 	registerExecutionWorld,
 	snapshotExecutionScope,
 	toolErrorSettlement,
@@ -18,8 +19,8 @@ import { isRecord } from "./primitives.ts";
 import type { ProcessExecutionBinding } from "./process-reuse.ts";
 import { spawnControlled } from "./process-startup.mjs";
 import { controlledRuntimeEnvironment } from "./subcompute.ts";
-import type { WorkspaceSandboxOptions } from "./workspace-sandbox.ts";
-import { WorkspaceSandboxService } from "./workspace-sandbox.ts";
+import type { WorkspaceDirectoryReads, WorkspaceSandboxOptions } from "./workspace-sandbox.ts";
+import { UnprovenWorkspaceRead, WorkspaceSandboxService } from "./workspace-sandbox.ts";
 /** Public BashOperations outlet with explicit process interception. */
 export function createControlledBashOperations(
 	options: {
@@ -374,99 +375,111 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 					const sourceRoot = path.resolve(context.cwd);
 					const selected = (operation && qualifiedDrivers.get(sourceRoot)) || (await qualify(sourceRoot));
 					const parent = workspaceSandbox.checkpoint(context.parentCheckpoint, sourceRoot);
-					await using inputs = !parent ? backend.fileInputs(sourceRoot, context.signal, context.inputs) : undefined;
-					let session: LinuxProcessSession | undefined;
-					let launches = 0;
-					let exitCode: number | null | undefined;
-					try {
-						const snapshot = await backend.withProducer(() =>
-							workspaceSandbox.capture(
-								{
-									...workspaceOptions,
-									inputs,
-									cwd: sourceRoot,
-									driver: selected.driver,
-									executionMetrics: () => ({ reuse: session?.metrics() }),
-									validate: () => session!.validate(),
-									afterCapture: () => session!.seal([]),
-									execute: async (workspace) => {
-										session = await backend.open({
-											sourceRoot,
-											inputs,
-											workspace,
-											invocation,
-											scope: context.executionScope,
-											signal: context.signal,
-											onOperationAdopted: context.onOperationAdopted,
-											acceptOperationScope: context.acceptOperationScope,
-										});
-										try {
-											if (operation) {
-												const result = await session.executeBinding(operation);
-												return {
-													result: {
-														content: [],
-														details: { exit: result.exit },
+					let preparation: { kind: "full" } | { kind: "observed"; directories: WorkspaceDirectoryReads } =
+						!parent && !operation && selected.driver === "in_memory" ? { kind: "observed", directories: new Map([["", "entries"]]) } : { kind: "full" };
+					for (;;) {
+						await using inputs = !parent ? backend.fileInputs(sourceRoot, context.signal, context.inputs) : undefined;
+						const directories = preparation.kind === "observed" ? preparation.directories : undefined;
+						const initialDirectories = directories?.size;
+						let session: LinuxProcessSession | undefined;
+						let launches = 0;
+						let exitCode: number | null | undefined;
+						try {
+							const snapshot = await backend.withProducer(() =>
+								workspaceSandbox.capture(
+									{
+										...workspaceOptions,
+										inputs,
+										cwd: sourceRoot,
+										driver: selected.driver,
+										executionMetrics: () => ({ reuse: session?.metrics() }),
+										validate: () => session!.validate(),
+										afterCapture: () => session!.seal([]),
+										execute: async (workspace) => {
+											if (!workspace.processCoverage) preparation = { kind: "full" };
+											session = await backend.open({
+												sourceRoot,
+												inputs,
+												workspace,
+												invocation,
+												scope: context.executionScope,
+												signal: context.signal,
+												onOperationAdopted: context.onOperationAdopted,
+												acceptOperationScope: context.acceptOperationScope,
+											});
+											try {
+												if (operation) {
+													const result = await session.executeBinding(operation);
+													return {
+														result: {
+															content: [],
+															details: { exit: result.exit },
+														},
+														isError: false,
+													};
+												}
+												const result = await coordinator.runWith(
+													{
+														execute: async (request) => {
+															launches++;
+															return ({ exitCode } = await session!.executor.execute(request));
+														},
 													},
-													isError: false,
-												};
+													() => context.tool.execute(context.callID, context.args as never, context.signal),
+												);
+												if (!launches)
+													throw new Error("process-backed tool bypassed the process execution outlet");
+												return { result, isError: false };
+											} catch (error) {
+												if (launches !== 1 || typeof exitCode !== "number" || exitCode === 0) throw error;
+												return { ...toolErrorSettlement(error), exitCode };
+											} finally {
+												await session.close();
 											}
-											const result = await coordinator.runWith(
-												{
-													execute: async (request) => {
-														launches++;
-														return ({ exitCode } = await session!.executor.execute(request));
-													},
-												},
-												() => context.tool.execute(context.callID, context.args as never, context.signal),
-											);
-											if (!launches)
-												throw new Error("process-backed tool bypassed the process execution outlet");
-											return { result, isError: false };
-										} catch (error) {
-											if (launches !== 1 || typeof exitCode !== "number" || exitCode === 0) throw error;
-											return { ...toolErrorSettlement(error), exitCode };
-										} finally {
-											await session.close();
-										}
+										},
 									},
+									parent,
+									directories,
+								),
+							);
+							const branch = workspaceSandbox.branch(
+								{
+									cwd: sourceRoot,
+									action: context.action,
+									parentCheckpoint: context.parentCheckpoint,
+									validate: () => session!.validate(),
 								},
-								parent,
-							),
-						);
-						const branch = workspaceSandbox.branch(
-							{
-								cwd: sourceRoot,
-								action: context.action,
-								parentCheckpoint: context.parentCheckpoint,
-								validate: () => session!.validate(),
-							},
-							snapshot,
-						);
-						const commit = branch.commit.bind(branch);
-						const dispose = branch.dispose?.bind(branch);
-						return Object.assign(branch, {
-							computationDependencies: session!.computationDependencies(),
-							operations: Object.freeze(
-								options.completedOnly
-									? []
-									: session!.executionBindings().map((binding) => describeOperation(binding, context.action)),
-							),
-							commit: () => {
-								if (operation) throw new Error("internal process output cannot commit an enclosing tool");
-								return session!.ownership.commit(commit);
-							},
-							dispose: async () => {
-								try {
-									await dispose?.();
-								} finally {
-									await session!.dispose?.();
-								}
-							},
-						});
-					} catch (error) {
-						await session?.dispose?.();
-						throw error;
+								snapshot,
+							);
+							const commit = branch.commit.bind(branch);
+							const dispose = branch.dispose?.bind(branch);
+							return Object.assign(branch, {
+								computationDependencies: session!.computationDependencies(),
+								operations: Object.freeze(
+									options.completedOnly
+										? []
+										: session!.executionBindings().map((binding) => describeOperation(binding, context.action)),
+								),
+								commit: () => {
+									if (operation) throw new Error("internal process output cannot commit an enclosing tool");
+									return session!.ownership.commit(commit);
+								},
+								dispose: async () => {
+									try {
+										await dispose?.();
+									} finally {
+										await session!.dispose?.();
+									}
+								},
+							});
+						} catch (error) {
+							await session?.dispose?.();
+							context.signal.throwIfAborted();
+							if (preparation.kind === "full" || isPoisonedEffectCommit(error)) throw error;
+							if (!(error instanceof UnprovenWorkspaceRead) || !error.retry) throw error;
+							const retry = error.retry;
+							if (retry === "full" || preparation.directories.size === initialDirectories) preparation = { kind: "full" };
+						}
 					}
 				},
 			},

@@ -316,10 +316,9 @@ export class ResourceObjectInputs {
 			const tokens = validated.filter((token) => token !== undefined);
 			if (!tokens.length) return 0;
 			return await this.session.configuration.store.withPublication(async () => {
-				for (const token of tokens) {
-					this.signal.throwIfAborted();
+				await mapFilesystem(tokens, async (token) => {
 					if (!await this.session.publish(token, this.signal)) throw new Error("file input publication failed");
-				}
+				}, this.signal);
 				this.signal.throwIfAborted();
 				return tokens.length;
 			});

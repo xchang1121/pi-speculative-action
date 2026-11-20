@@ -5,6 +5,7 @@ import type { SpeculativeActionEvent } from "../src/settlement.ts";
 type Event = SpeculativeActionEvent<string>;
 type Entry =
 	| { topic: "run_start"; instance: string; implementationCommit: string }
+	| { topic: "preview_submit"; id?: string; tool: string }
 	| { topic: "tool_start"; id: string; tool: string; args: unknown }
 	| { topic: "tool_end"; id: string; tool: string }
 	| { topic: "host"; event: Event }

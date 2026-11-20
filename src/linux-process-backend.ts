@@ -1329,36 +1329,59 @@ export class LinuxProcessReuseBackend {
 	) {
 		const captured = new Map<string, FileContentVersion>();
 		const denied = sensitivePaths(this.options.storeRoot, this.options.deniedPaths);
-		const candidates: { target: string; file: FileContentVersion; dependency: DynamicDependency }[] = [];
-		const seen = new Set<string>();
-		for (const input of observation.paths) {
-			if (input.role === "metadata" || input.lookupFailure || !pathContains(root, input.path)) continue;
+		const inputs = observation.paths.filter((input) => input.role !== "metadata" && !input.lookupFailure && pathContains(root, input.path));
+		const named = await mapFilesystem(inputs, async (input) => {
 			try {
 				const target = await view.realpath(input.path);
-				if (!pathContains(root, target) || denied.some((dir) => pathContains(dir, target)) || seen.has(target))
-					continue;
-				seen.add(target);
+				if (!pathContains(root, target) || denied.some((dir) => pathContains(dir, target))) return;
 				const stat = await view.stat(target, false);
-				const limit = Math.min(files.remainingBytes, speculativeConfig().filesystem.maxReadBytes);
-				if (!stat.isFile() || stat.size > BigInt(limit)) continue;
-				const file = (await files.borrow(target, stat, files.contents)) ??
-					(await captureFileContent(target, limit, files.contents, { stat, realPath: target, view }));
-				const dependency = { kind: "file", path: target, role: input.role, contentDigest: contentDigest(file.content) } as const;
-				// This file read owns its own snapshot. Crediting it to the process also requires continuity since launch.
-				files.remember(target, file);
-				candidates.push({ target, file, dependency });
-			} catch {
-				this.store.signal.throwIfAborted();
+				if (stat.isFile() && stat.size <= BigInt(speculativeConfig().filesystem.maxReadBytes))
+					return { target, stat, role: input.role as DependencyRole };
+			} catch { this.store.signal.throwIfAborted(); }
+		}, this.store.signal);
+		const seen = new Set<string>();
+		const unique = named.filter((item): item is NonNullable<typeof item> => {
+			if (!item || seen.has(item.target)) return false;
+			seen.add(item.target);
+			return true;
+		});
+		const candidates: { target: string; file: FileContentVersion; dependency: DynamicDependency }[] = [];
+		for (let i = 0; i < unique.length;) {
+			const batch: typeof unique = [];
+			let budget = files.remainingBytes;
+			while (i < unique.length && batch.length < speculativeConfig().filesystem.concurrency) {
+				const item = unique[i]!;
+				if (item.stat.size > BigInt(files.remainingBytes)) { i++; continue; }
+				if (item.stat.size > BigInt(budget)) break;
+				budget -= Number(item.stat.size);
+				batch.push(item);
+				i++;
+			}
+			const values = await mapFilesystem(batch, async ({ target, stat, role }) => {
+				try {
+					const file = (await files.borrow(target, stat, files.contents)) ??
+						(await captureFileContent(target, Number(stat.size), files.contents, { stat, realPath: target, view }));
+					const dependency = { kind: "file", path: target, role, contentDigest: contentDigest(file.content) } as const;
+					return { target, file, dependency };
+				} catch { this.store.signal.throwIfAborted(); }
+			}, this.store.signal);
+			for (const item of values) if (item) {
+				files.remember(item.target, item.file);
+				candidates.push(item);
 			}
 		}
-		if (candidates.length) {
-			if (proof.seal(candidates.map((item) => item.dependency), (name) => name)()) {
-				for (const { target, file } of candidates) captured.set(target, file);
-			} else if (candidates.length > 1) {
-				for (const { target, file, dependency } of candidates)
-					if (proof.seal([dependency], (name) => name)()) captured.set(target, file);
+		// Isolate changes without repeating every pathname walk for a single racing file.
+		const admit = (group: typeof candidates) => {
+			if (!group.length) return;
+			if (proof.seal(group.map((item) => item.dependency), (name) => name)()) {
+				for (const { target, file } of group) captured.set(target, file);
+			} else if (group.length > 1) {
+				const middle = Math.ceil(group.length / 2);
+				admit(group.slice(0, middle));
+				admit(group.slice(middle));
 			}
-		}
+		};
+		admit(candidates);
 		await this.publishFileInputs(files);
 		return captured;
 	}
@@ -3400,6 +3423,25 @@ async function captureDependencies(
 	const dependencies = new Map<string, DynamicDependency | undefined>();
 	const taints = new Set<ProvenanceTaint>([...observations, ...runs].flatMap((part) => part.taints));
 	const incompleteReasons = new Set(observations.flatMap((part) => part.incompleteReasons));
+	const coverage = session.workspace.processCoverage;
+	const cover = (target: string, listed: boolean) => {
+		if (!coverage) return;
+		const logical = session.projection.toLogical(target);
+		if (session.gitDirectory && pathContains(session.gitDirectory, logical)) return;
+		const name = relativeFilesystemPath(session.sourceRoot, logical);
+		if (name !== undefined && !coverage.covers(name, listed)) incompleteReasons.add("workspace_directory_not_materialized");
+	};
+	if (coverage) {
+		for (const observation of observations) {
+			for (const input of observation.paths) cover(input.path, "listed" in input && !!input.listed);
+			for (const lock of observation.locks ?? []) cover(lock.path, false);
+			if (observation.written?.length) coverage.observeWrite();
+		}
+		for (const run of runs)
+			for (const input of run.dependencies) cover(input.path, input.kind === "directory" && !!input.entriesDigest);
+		if (effects.effects.length || external.changes.length) coverage.observeWrite();
+		if (coverage.retry === "full") incompleteReasons.add("partial_workspace_write");
+	}
 	if (external.proof.kind === "incomplete") incompleteReasons.add(external.proof.reason);
 	let complete = observations.every((part) => part.complete);
 	if (!complete) taints.add("trace_incomplete");
@@ -3532,6 +3574,7 @@ async function captureDependencies(
 				continue;
 			}
 			let next = path.posix.join(current, segment);
+			if (coverage) cover(next, false);
 			// The repository is the workspace's own, mounted read-only (also when reached through the overlay): the host walk captures it.
 			const repository = session.projection.isWorkspacePhysical(next)
 				? session.projection.toLogical(next)
@@ -3639,7 +3682,7 @@ async function captureDependencies(
 		const parents = item.path.split("/").includes("..");
 		// Metadata already contains the returned ABI fields; only `..` needs a normalized-lookup comparison.
 		const walked =
-			item.role === "metadata" && !parents
+			item.role === "metadata" && !parents && !coverage
 				? {
 						path: path.posix.normalize(item.path),
 						links: [],
@@ -3659,6 +3702,7 @@ async function captureDependencies(
 			add(undefined, `pathname_walk:${item.path}`);
 			continue;
 		}
+		if (coverage) cover(walked.path, "listed" in item && !!item.listed);
 		for (const link of item.role === "metadata" ? [] : walked.links) add(link);
 		const observedPath = item.role === "metadata" ? path.resolve(item.path) : walked.path;
 		if (session.deniedPaths.some((denied) => pathContains(denied, observedPath))) {

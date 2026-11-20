@@ -284,7 +284,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions, implementati
 			}),
 		createHost: (id, options) => {
 			drafterBudget = options.drafterBudget;
-			return createSpeculativeActionHost(id, {
+			const host = createSpeculativeActionHost(id, {
 				...options,
 				onEvent: (event) => {
 					events.push(event);
@@ -292,6 +292,13 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions, implementati
 					options.onEvent?.(event);
 				},
 			});
+			return {
+				...host,
+				previewActorCall(input, signal) {
+					journal({ topic: "preview_submit", id: input.id, tool: input.tool });
+					return host.previewActorCall(input, signal);
+				},
+			};
 		},
 	});
 	const settingsManager = SettingsManager.inMemory({}, { projectTrusted: true });

@@ -64,14 +64,16 @@ async function installBootstrap(): Promise<string> {
 }
 let bootstrap: Promise<string | undefined> | undefined;
 export function compilerBootstrap() {
-	return bootstrap ??= installBootstrap().catch(() => undefined);
+	return bootstrap ??= installBootstrap().catch(() => {
+		bootstrap = undefined;
+		return undefined;
+	});
 }
 function compilerSearchPath(value: string | undefined, archive: string): string {
 	if (value?.split(path.delimiter).includes(archive)) return value;
 	return value === undefined ? archive : value + path.delimiter + archive;
 }
 type CompilerKey = { engine: string; executable: string; filename: string; optimize: number };
-type Compilation = { bytes: Buffer; computation: TimelineInterval };
 type CompilerWorker = {
 	readonly child: ReturnType<typeof spawn>;
 	readonly engine: string;
@@ -188,7 +190,7 @@ export class PythonImportStep implements TrustedSubcomputeStep {
 		}
 	}
 
-	private async withWorker(binary: string, engine: string, compile: (worker: CompilerWorker) => Promise<Compilation | undefined>) {
+	private async withWorker<T>(binary: string, engine: string, use: (worker: CompilerWorker) => Promise<T>) {
 		while (!this.closed) {
 			let slot = this.workers.get(binary);
 			if (!slot) {
@@ -213,7 +215,7 @@ export class PythonImportStep implements TrustedSubcomputeStep {
 			if (!slot.users++) slot.idle = Promise.withResolvers<void>();
 			try {
 				const worker = await slot.ready;
-				if (worker && worker.engine === engine && !this.closed) return await compile(worker);
+				if (worker && worker.engine === engine && !this.closed) return await use(worker);
 			} finally {
 				if (!--slot.users) slot.idle.resolve();
 			}
@@ -221,15 +223,26 @@ export class PythonImportStep implements TrustedSubcomputeStep {
 		}
 	}
 
-	async build({ key, input, signal, maxResultBytes }: TrustedStepBuild): Promise<Buffer | undefined> {
+	private async compiler(key: unknown) {
 		const request = key as Partial<CompilerKey> | null;
 		if (!request || typeof request.engine !== "string" || !/^[a-f0-9]{64}$/.test(request.engine) ||
 			typeof request.executable !== "string" || !path.isAbsolute(request.executable) || request.executable.includes("\0") ||
 			typeof request.filename !== "string" || !path.isAbsolute(request.filename) || request.filename.includes("\0") ||
 			typeof request.optimize !== "number" || !Number.isInteger(request.optimize) || request.optimize < 0 || request.optimize > 2) return;
 		const binary = await realpath(request.executable).catch(() => undefined);
-		if (!binary) return;
-		const result = await TimelineInterval.outside(() => this.withWorker(binary, request.engine!, async (worker) => {
+		if (binary) return { binary, engine: request.engine, filename: request.filename, optimize: request.optimize };
+	}
+
+	async acceptShared(key: unknown, signal: AbortSignal) {
+		signal.throwIfAborted();
+		const request = await this.compiler(key);
+		return !!request && !!await this.withWorker(request.binary, request.engine, async () => true);
+	}
+
+	async build({ key, input, signal, maxResultBytes }: TrustedStepBuild): Promise<Buffer | undefined> {
+		const request = await this.compiler(key);
+		if (!request) return;
+		const result = await TimelineInterval.outside(() => this.withWorker(request.binary, request.engine, async (worker) => {
 			const bytes = await input();
 			if (bytes.length > 2 * 1024 * 1024) return;
 			const compiled = worker.queue.then(async () => {

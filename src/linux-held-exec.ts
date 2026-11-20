@@ -119,7 +119,7 @@ export async function executionDomainCollector(binary: string) {
 						throw new Error("execution record owner is unavailable");
 					descriptor = Number(request(11, id, Buffer.from(`${broker}\0`)).readBigUInt64LE(16));
 					let offset = 0;
-					return () => {
+					return function* () {
 						if (phase === "closed" || descriptor === undefined)
 							throw new Error("execution record owner is closed");
 						const fence = request(12, id);
@@ -131,11 +131,13 @@ export async function executionDomainCollector(binary: string) {
 							!isSafeCount(length, offset, capacities.domainTraceBytes)
 						)
 							throw new Error("execution records are incomplete");
-						const bytes = Buffer.allocUnsafe(length - offset);
-						if (readSync(descriptor, bytes, 0, bytes.length, offset) !== bytes.length)
-							throw new Error("execution records changed while reading");
-						offset = length;
-						return bytes;
+						while (offset < length) {
+							const bytes = Buffer.allocUnsafe(Math.min(length - offset, 64 * 1024));
+							if (readSync(descriptor, bytes, 0, bytes.length, offset) !== bytes.length)
+								throw new Error("execution records changed while reading");
+							offset += bytes.length;
+							yield bytes;
+						}
 					};
 				},
 				launch: (command: readonly [string, ...string[]]): readonly [string, ...string[]] => [

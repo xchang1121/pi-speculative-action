@@ -1,7 +1,8 @@
-import { lstat, readFile } from "node:fs/promises";
+import { link, lstat, lutimes, mkdir, open, readFile, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { expect } from "vitest";
+import { expect, vi } from "vitest";
+import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 import { FILESYSTEM_OBSERVATION_FIELDS } from "../src/filesystem-evidence.ts";
 import { createCompletedProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { onExit } from "./async.ts";
@@ -137,6 +138,58 @@ processTest.for(
 		if (artifact) expect(await readFile(path.join(f.workspace, artifact))).toEqual(expectedArtifact);
 	},
 );
+
+processTest("an oversized checkout seals only directories demanded by the process and invalidates changed inputs", { timeout: 60_000 }, async ({ benchmark }) => {
+	const f = await benchmark("pi-large-workspace-", "in_memory", {},
+		path.join(os.homedir(), ".cache", "pi-speculative-action", "bash-qualification"));
+	for (const dir of ["unrelated", "src", "src/nested"]) await mkdir(path.join(f.workspace, dir));
+	const large = await open(path.join(f.workspace, "unrelated", "payload"), "wx");
+	try { await large.truncate(513 * 1024 * 1024); } finally { await large.close(); }
+	await f.write("src/nested/input", "original\n");
+	const alias = path.join(f.workspace, "alias");
+	await symlink("src/nested", alias);
+	await lutimes(alias, new Date(Date.now() + 60_000), new Date(0));
+	const command = "printf '%s\\n' src/nested/*; cat src/nested/input";
+	await f.tool.execute("oracle", { command });
+	await f.prepare();
+	const branch = await f.fork(command);
+	await using _release = onExit(async () => { await branch.dispose?.(); });
+	expect(textOutput(branch.output.result)).toBe("src/nested/input\noriginal\n");
+	expect((await branch.validate!()).status).toBe("valid");
+	const linked = await f.fork("printf '%s\\n' alias/*");
+	await using _linked = onExit(async () => { await linked.dispose?.(); });
+	expect(textOutput(linked.output.result)).toBe("alias/input\n");
+	expect((await linked.validate!()).status).toBe("valid");
+	await mkdir(path.join(f.workspace, "src", "nested", "unused"));
+	await link(path.join(f.workspace, "unrelated", "payload"), path.join(f.workspace, "src", "nested", "unused", "payload"));
+	const listing = await f.fork("printf '%s\\n' src/nested/*");
+	await using _listing = onExit(async () => { await listing.dispose?.(); });
+	expect(textOutput(listing.output.result)).toBe("src/nested/input\nsrc/nested/unused\n");
+	expect((await listing.validate!()).status).toBe("valid");
+	await f.write("src/nested/input", "modified\n");
+	expect((await branch.validate!()).status).toBe("stale");
+	await expect(f.fork("printf private > newly-created")).rejects.toThrow();
+	await expect(lstat(path.join(f.workspace, "newly-created"))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+processTest("one private retry covers recursive enumeration of a newly observed directory", { timeout: 60_000 }, async ({ benchmark }) => {
+	const f = await benchmark("pi-recursive-read-", "in_memory");
+	await mkdir(path.join(f.workspace, "tree", "one", "two", "three"), { recursive: true });
+	await f.write("tree/one/two/three/file", "hello");
+	const command = 'walk(){ local p; for p in "$1"/*; do if [ -d "$p" ]; then walk "$p"; else printf "%s\\n" "$p"; fi; done; }; walk tree';
+	await f.tool.execute("oracle", { command });
+	await f.prepare();
+	const capture = vi.spyOn(WorkspaceSandboxService.prototype, "capture");
+	try {
+		const branch = await f.fork(command);
+		await using _branch = onExit(async () => { await branch.dispose?.(); });
+		expect(textOutput(branch.output.result)).toBe("tree/one/two/three/file\n");
+		expect((await branch.validate!()).status).toBe("valid");
+		expect(capture).toHaveBeenCalledTimes(2);
+	} finally {
+		capture.mockRestore();
+	}
+});
 
 processTest.for([false, true])(
 	"adopts compiled work once and rejects changed source (%s)",

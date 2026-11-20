@@ -1,7 +1,7 @@
 import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fauxAssistantMessage, fauxToolCall, fauxText, type Context } from "@earendil-works/pi-ai";
-import { createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
+import { createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, test, vi } from "vitest";
 import { bindResourceOperation, createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
@@ -115,6 +115,26 @@ test("keeps Actor and speculative read evidence across intervening turns and rej
 	const changed = { path: "early.txt", offset: 2, limit: 1 };
 	expect(await f.execute("read", changed)).toEqual(await f.oracle("read", changed));
 });
+test.each(["edit", "write"] as const)("keeps the Actor's path spelling in stock %s receipts", async (tool) => {
+	const cwd = await directories.create();
+	const file = "state.txt";
+	const absolute = path.join(cwd, file);
+	await writeFile(absolute, "old");
+	const args = tool === "edit" ? { edits: [{ oldText: "old", newText: "new" }] } : { content: "new" };
+	const sandbox = new WorkspaceSandboxService();
+	const f = systemHost(cwd, [createEditTool(cwd), createWriteTool(cwd)], {
+		executionWorlds: [sandbox.createExecutionWorld(), resourceWorld()],
+	});
+	await using _close = onExit(f.dispose);
+	await f.start();
+	const run = await f.preview(tool, { path: file, ...args });
+	expect(await run?.completion).toMatchObject({ status: "completed" });
+	expect(await readFile(absolute, "utf8")).toBe("old");
+	const receipt = await f.execute(tool, { path: absolute, ...args });
+	expect(textOutput(receipt)).toContain(absolute);
+	expect(await readFile(absolute, "utf8")).toBe("new");
+});
+
 test("the Drafter reads its predecessor's private workspace before either Actor call", async () => {
 	const cwd = await directories.create();
 	const sandbox = new WorkspaceSandboxService();

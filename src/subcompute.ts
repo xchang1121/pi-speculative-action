@@ -40,6 +40,8 @@ export interface TrustedSubcomputeStep {
 	readonly implementation: string;
 	readonly enabled?: () => boolean;
 	readonly runtime?: () => Promise<TrustedStepRuntime | undefined>;
+	/** Opt in only when the key and verified input fully determine the result across this store's workspaces. */
+	readonly acceptShared?: (key: unknown, signal: AbortSignal) => boolean | Promise<boolean>;
 	build(request: TrustedStepBuild): unknown | Promise<unknown>;
 	dispose?(): void | Promise<void>;
 }
@@ -55,7 +57,7 @@ export interface TrustedStepBuild {
 	readonly maxResultBytes: number;
 }
 const unavailable = Symbol("step unavailable");
-type PreparedValue = { framePrefix: Buffer; size: number; computation: TimelineInterval; bytes: number; referenced: boolean };
+type PreparedValue = { workspace: string; framePrefix: Buffer; size: number; computation: TimelineInterval; bytes: number; referenced: boolean };
 type WireValue =
 	| {
 			readonly encoding: "json";
@@ -578,6 +580,7 @@ export class SubcomputeService {
 							if (await sha256DigestAsync(bytes) !== `sha256:${request.inputDigest}`) throw new Error("subcompute_input_digest_mismatch");
 							return bytes;
 						};
+						const verifiedInput = () => input ??= TimelineInterval.outside(receiveInput);
 						const maxResultBytes = Math.min(this.configuration.current.subcomputation.maxStepResultBytes, this.maxBytes(),
 							this.runtime().resourceCacheMaxBytes ?? Infinity, Math.floor((limit() - 160) * 3 / 4));
 						try {
@@ -585,10 +588,15 @@ export class SubcomputeService {
 								let produced = false;
 								const result = await this.sharedBuild(key, () => this.prepareBytes(key, signal, async () => {
 									produced = true;
-									const value = await step.build({ key: request.key, input: () => input ??= TimelineInterval.outside(receiveInput), signal, maxResultBytes });
+									const value = await step.build({ key: request.key, input: verifiedInput, signal, maxResultBytes });
 									if (value === undefined) throw unavailable;
+									if (step.acceptShared) await verifiedInput();
 									return value;
-								}, maxResultBytes), signal);
+								}, maxResultBytes, !!step.acceptShared), signal);
+								if (result.workspace !== this.inputManager.root) {
+									if (!await step.acceptShared?.(request.key, signal)) throw unavailable;
+									await verifiedInput();
+								}
 								if (active.state.kind === "closed") throw new Error("subcompute_context_closed");
 								if (result.size > maxResultBytes) {
 									releaseBusy();
@@ -652,9 +660,10 @@ export class SubcomputeService {
 		}
 	}
 	/** Inline inputs are completely identified by the host binding, exact key and verified content digest. */
-	private async prepareBytes(key: string, signal: AbortSignal, build: () => Promise<unknown>, limit: number): Promise<PreparedValue> {
+	private async prepareBytes(key: string, signal: AbortSignal, build: () => Promise<unknown>, limit: number, share: boolean): Promise<PreparedValue> {
 		const store = this.inputStorage.store;
-		const root = `content:${this.inputManager.root}`;
+		const workspace = this.inputManager.root;
+		const root = share ? "trusted:content" : `content:${workspace}`;
 		const binding = "host.content";
 		const hot = this.prepared.get(key);
 		if (hot) {
@@ -664,19 +673,19 @@ export class SubcomputeService {
 			if (this.prepared.has(key)) return hot;
 		}
 		const [record] = await store.findPreparedInputCandidates({ root, binding, prepKey: digestObject(key), limit: 1 }, signal);
-		const payload = record?.payload as { root?: string; preparations?: { binding: string; key: string }[]; data?: string; computation?: unknown } | undefined;
-		const encode = (value: unknown, receipt: unknown, id: string, maxSize = Infinity): PreparedValue => {
+		const payload = record?.payload as { root?: string; workspace?: string; preparations?: { binding: string; key: string }[]; data?: string; computation?: unknown } | undefined;
+		const encode = (value: unknown, receipt: unknown, id: string, origin: string, maxSize = Infinity): PreparedValue => {
 			const size = wireBytes(value, true);
 			if (size > maxSize) throw unavailable;
 			// Delivery adds the consumer's own state and receipt token to this immutable value.
 			const framePrefix = Buffer.from(`{"value":${JSON.stringify(encodeValue(value))},`);
 			return {
-				framePrefix, size, computation: TimelineInterval.restore(receipt) ?? TimelineInterval.unknownReuse(id),
+				workspace: origin, framePrefix, size, computation: TimelineInterval.restore(receipt) ?? TimelineInterval.unknownReuse(id),
 				referenced: false, bytes: framePrefix.length + key.length + Buffer.byteLength(JSON.stringify(receipt ?? null)),
 			};
 		};
 		let result: PreparedValue | undefined;
-		if (record && payload?.root === root && payload.preparations?.length === 1 &&
+		if (record && payload?.root === root && (!share || typeof payload.workspace === "string" && path.isAbsolute(payload.workspace)) && payload.preparations?.length === 1 &&
 			payload.preparations[0]?.binding === binding && payload.preparations[0].key === key) {
 			try {
 				let data: Buffer | undefined;
@@ -684,7 +693,7 @@ export class SubcomputeService {
 				else if (record.artifacts.length === 1 && payload.data === undefined)
 					data = await store.artifacts.get(record.artifacts[0]!, signal);
 				const owned = data && snapshotTrusted(deserialize(data));
-				if (owned) result = encode(owned.value, payload.computation, record.id);
+				if (owned) result = encode(owned.value, payload.computation, record.id, share ? payload.workspace! : workspace);
 			} catch (error) {
 				if (hasErrorCode(error, "ERR_PROVENANCE_SCHEMA")) throw error;
 				signal.throwIfAborted();
@@ -700,8 +709,8 @@ export class SubcomputeService {
 			if (!owned) throw unavailable;
 			const data = owned.data;
 			const receipt = TimelineInterval.serialize(computation);
-			result = encode(owned.value, receipt, key, limit);
-			const metadata = { root, preparations: [{ binding, key }], computation: this.configuration.current.subcomputation.persistTimelineIntervals
+			result = encode(owned.value, receipt, key, workspace, limit);
+			const metadata = { root, ...(share && { workspace }), preparations: [{ binding, key }], computation: this.configuration.current.subcomputation.persistTimelineIntervals
 				? receipt : undefined };
 			const envelope = { id: key, createdAt: Date.now(), artifacts: [], payload: { ...metadata, data: "" } };
 			if (Buffer.byteLength(JSON.stringify(envelope)) + 4 * Math.ceil(data.length / 3) <= this.configuration.current.storage.maxRecordBytes)

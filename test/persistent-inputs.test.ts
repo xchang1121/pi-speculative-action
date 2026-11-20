@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ArtifactReference } from "../src/content-chunks.ts";
-import { digestObject, type Sha256Digest } from "../src/primitives.ts";
+import { digestObject, filesystemPathKey, type Sha256Digest } from "../src/primitives.ts";
 import { captureFileContent, CONTENT_CHUNK_BYTES, ContentChunkPool, readContent } from "../src/content-chunks.ts";
 import { evaluateResourceQuery, ResourceObjectInputs } from "../src/agent-execution-world.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
@@ -181,6 +181,30 @@ test("a single verified CAS block supplies its file digest without a second read
 	}
 });
 
+test("an oversize workspace is rechecked without walking it and becomes eligible immediately after shrinking", async () => {
+	const f = await fixture();
+	const config = new SpeculativeConfiguration({ filesystem: { maxTreeBytes: 8 } });
+	const sandbox = config.run(() => new WorkspaceSandboxService(f.store));
+	const full = vi.spyOn(WorkspaceStructureCapture.prototype, "captureVersions");
+	const execute = vi.fn(async () => true);
+	try {
+		await mkdir(path.join(f.root, "nested"));
+		await writeFile(path.join(f.root, "a"), "12345");
+		await writeFile(path.join(f.root, "nested", "b"), "67890");
+		await expect(sandbox.withWorkspace(f.root, execute)).rejects.toThrow("exceeds configured limits");
+		const calls = full.mock.calls.length;
+		await expect(sandbox.withWorkspace(f.root, execute)).rejects.toThrow("exceeds configured limits");
+		expect(full).toHaveBeenCalledTimes(calls);
+		expect(execute).not.toHaveBeenCalled();
+		await writeFile(path.join(f.root, "nested", "b"), "6");
+		expect(await sandbox.withWorkspace(f.root, execute)).toBe(true);
+		expect(full.mock.calls.length).toBeGreaterThan(calls);
+	} finally {
+		await sandbox.dispose();
+		await f.close();
+	}
+});
+
 test("required workspace snapshots reject excess names and bytes before reading file bodies", async () => {
 	const f = await fixture();
 	const inputs = new ResourceObjectInputs(f.root, f.store, new AbortController().signal);
@@ -342,6 +366,27 @@ linux("stops persistent recovery after a consumed input and releases its lease",
 	}
 	expect(session.contents.closed).toBe(true);
 	expect(session.contents.openChunks).toBe(0);
+});
+
+test("file candidates honor the per-root history limit, including ancestor aliases", async () => {
+	const f = await fixture();
+	try {
+		const put = (root: string, entries: unknown[]) => f.store.putInputVersion({ root, entries, preparations: [] }, []);
+		const key = (name: string) => filesystemPathKey(path.join(f.root, name));
+		const file = [key("file"), { type: "file" }];
+		const oldest = await put(f.root, [file, [key("old"), { type: "file" }]]);
+		const alias = await put(f.root, [[key("tree"), { type: "alias" }]]);
+		const newest = await put(f.root, [file]);
+		await put("different-root", [file]);
+		const recent = await f.store.inputPathIndex(f.root, 2, new AbortController().signal);
+		expect([...recent(key("file"))]).toEqual([newest.id]);
+		expect([...recent(key("tree/leaf"))]).toEqual([alias.id]);
+		expect([...recent(key("old"))]).toEqual([]);
+		const all = await f.store.inputPathIndex(f.root, 3, new AbortController().signal);
+		expect([...all(key("file"))]).toEqual([newest.id, oldest.id]);
+	} finally {
+		await f.close();
+	}
 });
 
 linux("reads one path catalog and restores a shared closure once for concurrent queries", async () => {
@@ -588,8 +633,12 @@ linux("a failed file input batch rolls back every row and releases the captured 
 			return { ...token, release };
 		});
 		const put = f.store.putInputVersion.bind(f.store);
+		const overlap = Promise.withResolvers<void>();
+		let started = 0;
 		let inserted = 0;
 		vi.spyOn(f.store, "putInputVersion").mockImplementation(async (...args) => {
+			if (++started === 2) overlap.resolve();
+			await overlap.promise;
 			const record = await put(...args);
 			if (++inserted === 2) throw new Error("injected publication failure");
 			return record;
