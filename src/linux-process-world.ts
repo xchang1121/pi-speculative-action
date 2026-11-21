@@ -381,6 +381,7 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 					for (;;) {
 						await using inputs = !parent ? backend.fileInputs(sourceRoot, context.signal, context.inputs) : undefined;
 						const directories = preparation.kind === "observed" ? preparation.directories : undefined;
+						const adoptable = Boolean(operation) || backend.canAdoptProcess();
 						let session: LinuxProcessSession | undefined;
 						let launches = 0;
 						let exitCode: number | null | undefined;
@@ -389,7 +390,7 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 								workspaceSandbox.capture(
 									{
 										...workspaceOptions,
-										adoptable: Boolean(operation) || backend.canAdoptProcess(),
+										adoptable,
 										inputs,
 										cwd: sourceRoot,
 										driver: selected.driver,
@@ -399,6 +400,7 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 										execute: async (workspace) => {
 											session = await backend.open({
 												sourceRoot,
+												adoptable,
 												inputs,
 												workspace,
 												invocation,

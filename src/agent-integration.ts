@@ -536,6 +536,24 @@ function assembleAgentExecutionHost(
 			)
 		);
 	};
+	const canAdoptSpeculation = (tool: string, action?: ActionKey) => {
+		const invocation = action?.executionContext as ToolInvocation | undefined;
+		if (invocation?.authoritativeOnly && !invocation.operation) return false;
+		const definition = actionSemantics.definition(action ?? tool);
+		return Boolean(
+			definition &&
+				executionGateway.canAdoptSpeculation(
+					{
+						tool,
+						action,
+						backend: invocation?.operation?.binding.backend,
+						effect: definition.effect,
+						requirements: definition.requirements,
+					},
+					options.cwd,
+				),
+		);
+	};
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
 		const {
 			patternAware,
@@ -808,6 +826,7 @@ function assembleAgentExecutionHost(
 					resourceCacheMaxBytes: currentSettings.resourceCacheMaxBytes,
 				}),
 				effect: (key) => actionSemantics.effect(key),
+				adoptable: (call, key) => canAdoptSpeculation(call.tool, key),
 				key: async (call) => calls.get(call)?.binding.action,
 				route: async (_call, key, signal, parent) =>
 					resolveExecutionRoute(key.tool, signal, key, parent?.checkpoint),

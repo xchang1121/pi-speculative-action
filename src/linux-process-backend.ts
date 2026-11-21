@@ -1,20 +1,12 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import {
-	BorderedLoader,
-	createLocalBashOperations,
-	truncateToVisualLines,
-} from "@earendil-works/pi-coding-agent";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { on, once } from "node:events";
 import type { BigIntStats } from "node:fs";
-import { constants as fsConstants, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import {
-	access,
 	chmod,
 	copyFile,
-	link,
 	lstat,
 	mkdir,
 	mkdtemp,
@@ -24,16 +16,12 @@ import {
 	readlink,
 	realpath,
 	rm,
-	rmdir,
 	stat,
 	writeFile,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { finished } from "node:stream/promises";
-import { StringDecoder } from "node:string_decoder";
-import { fileURLToPath } from "node:url";
-import { stripVTControlCharacters } from "node:util";
 import { ResourceObjectInputs } from "./agent-execution-world.ts";
 import {
 	currentSpeculativeConfiguration,
@@ -43,12 +31,9 @@ import {
 import { controlledRuntimeEnvironment, controlledSubcomputeChannel, withSubcomputeScope } from "./subcompute.ts";
 import {
 	captureFileContent,
-	ContentChunkPool,
 	contentDigest,
 	publishContent,
-	restoreArtifactContent,
 	type FileContentVersion,
-	writeContent,
 } from "./content-chunks.ts";
 import type {
 	ExecutionResourceContext,
@@ -77,7 +62,6 @@ import {
 	mapFilesystem,
 	withFilesystemReadView,
 	sameFilesystemIdentity,
-	settledFilesystemStat,
 	sharedWalk,
 } from "./filesystem-evidence.ts";
 import type {
@@ -96,6 +80,30 @@ import {
 	resolveLinuxExecHelper,
 	writeProcessChannel,
 } from "./linux-held-exec.ts";
+import {
+	checkLinuxEnvironment,
+	inspectLinuxEnvironment,
+	installLinuxDependencies,
+	parseLinuxOsRelease,
+	type LinuxEnvironmentReport,
+} from "./linux-environment.ts";
+import {
+	captureContentAddressedDependency,
+	captureHostObjectDependency,
+	classifyObservedSpecialPath,
+	createSymlinkPrefixCollector,
+	directoryState,
+	hostRoot,
+	imageInterpreter,
+	loadOutputEvents,
+	mergeDynamicDependency,
+	privateBranch,
+	privateReplay,
+	replayFilesystemEffects,
+	sandboxPolicyArguments,
+	sensitivePaths,
+	type BufferedOutput,
+} from "./linux-process-effects.ts";
 import type {
 	ProcessExecutionRequest,
 	ProcessExecutor,
@@ -129,9 +137,7 @@ import type { ProcessExecutionBinding, ProcessHandoff, ProcessReusePlan } from "
 import {
 	captureAbsenceDependency,
 	captureDirectoryDependency,
-	captureFileDependency,
 	captureMetadataDependency,
-	captureSymlinkDependency,
 	observeProcessInputs,
 	ProcessHandoffOwnership,
 	ProcessHandoffRegistry,
@@ -143,7 +149,6 @@ import {
 	configureNativeFilesystem,
 	nativeFilesystem,
 	nativeProcessLibrary,
-	qualifyNativeStartup,
 	spawnControlled,
 } from "./process-startup.mjs";
 import type {
@@ -176,7 +181,6 @@ import { executionRecords, installedImageStart, observeExecution, traceTail, UTS
 import type { TimelineDependency } from "./task-timing.ts";
 import { TimelineInterval } from "./task-timing.ts";
 import type {
-	SandboxDirectoryState,
 	SandboxWorkspaceChange,
 	SandboxWorkspaceContext,
 	WorkspaceStructureSnapshot,
@@ -191,307 +195,27 @@ import {
 	captureWorkspaceStructureEntry,
 	ExecutionPathProjection,
 	projectFileMutation,
-	assertFileAliases,
-	createParentDirectories,
-	matchesSandboxBaseline,
-	readRegularState,
-	directoryEntriesDigest,
 	sandboxWorkspaceChanges,
 	snapshotDependency,
 	workspaceInputVersion,
 	WorkspaceSandboxService,
 	WorkspaceStructureCapture,
 } from "./workspace-sandbox.ts";
-export interface LinuxEnvironmentReport {
-	readonly text: string;
-	readonly summary: string;
-	readonly warnings: boolean;
-}
-/** os-release is data: never source it, expand variables, or evaluate command substitutions. */
-export function parseLinuxOsRelease(text: string): Readonly<Record<string, string>> {
-	const result: Record<string, string> = Object.create(null);
-	for (const line of text.split(/\r?\n/)) {
-		const match = /^([A-Z][A-Z0-9_]*)=(.*)$/.exec(line.trim());
-		if (!match) continue;
-		const [key, raw] = match;
-		let value = raw!;
-		if (value.startsWith('"') || value.startsWith("'")) {
-			const quote = value[0]!;
-			if (!value.endsWith(quote) || value.length < 2) continue;
-			value = value.slice(1, -1);
-			if (quote === '"') value = value.replace(/\\(["\\$`])/g, "$1");
-		} else if (/\s|["']/.test(value)) continue;
-		result[key!] = clean(value);
-	}
-	return result;
-}
-/** Inventory plus the runtime's own bounded admission/observer probes. Every temporary owner is closed. */
-export async function inspectLinuxEnvironment(root = process.cwd()): Promise<LinuxEnvironmentReport> {
-	if (process.platform !== "linux") {
-		const text = "Linux environment checks require Pi running inside Linux or WSL 2.";
-		return { text, summary: text, warnings: true };
-	}
-	const release = parseLinuxOsRelease(await readFile("/etc/os-release", "utf8").catch(() => ""));
-	const bin = path.join(os.homedir(), ".local", "bin");
-	const host = `${release.PRETTY_NAME ?? release.ID ?? "Linux"}; ${process.arch}; ${clean(os.release())}`;
-	const lines = ["Linux environment Doctor", `Host: ${host}`];
-	const issues: string[] = [];
-	const check = async <Value>(
-		label: string,
-		inspect: () => Promise<Value>,
-		describe: (value: Value) => string = String,
-	) => {
-		try {
-			const value = await inspect();
-			lines.push(`${label}: ${clean(describe(value))}`);
-			return value;
-		} catch (error) {
-			const detail = `${label}: ${clean(errorMessage(error))}`;
-			issues.push(detail);
-			lines.push(detail);
-			return undefined;
-		}
-	};
-	const program = async (
-		name: string,
-		alternates: readonly string[] = [],
-		fallbacks: readonly string[] = [],
-		explicit?: string,
-		version = false,
-	) => {
-		// Toolchain shims dispatch by argv[0]; retain the selected symlink when testing launchability.
-		const file = await resolveHostExecutable(explicit, name, fallbacks, alternates, version);
-		if (!(await stat(file)).isFile()) throw new Error("not a regular executable");
-		if (version) await query(file, ["--version"]);
-		return file;
-	};
-	lines.push("Build tools: launchability only; compilation/linking is verified by setup:linux.");
-	let compiler: string | undefined;
-	for (const [label, name, alternates, fallbacks] of [
-		["C compiler", "cc", ["gcc", "clang"], []],
-		["Clang BPF compiler", "clang", [], []],
-		["Git", "git", [], []],
-		["Cargo", "cargo", [], [path.join(os.homedir(), ".cargo/bin/cargo")]],
-		["Rust compiler", "rustc", [], [path.join(os.homedir(), ".cargo/bin/rustc")]],
-		["make", "make", [], []],
-		["tar", "tar", [], []],
-		["xz", "xz", [], []],
-	] as const) {
-		const file = await check(label, () => program(name, alternates, fallbacks, undefined, true));
-		if (name === "cc") compiler = file;
-	}
-	if (compiler)
-		for (const [library, header] of [
-			["libc.a", ""],
-			["libbpf.so", "bpf/libbpf.h"],
-			["libelf.so", "libelf.h"],
-			["libz.so", "zlib.h"],
-		])
-			await check(library!, async () => {
-				const file = (await query(compiler!, [`-print-file-name=${library}`])).trim();
-				if (!path.isAbsolute(file) || !(await stat(file)).isFile())
-					throw new Error("development library not located; install its development package");
-				if (header) await access(path.join("/usr/include", header), fsConstants.R_OK);
-				return `${file}; linking not tested here`;
-			});
-	await check("cgroup v2", () =>
-		access("/sys/fs/cgroup/cgroup.controllers", fsConstants.R_OK).then(() => "present"),
-	);
-	await check("Kernel BTF", () =>
-		access("/sys/kernel/btf/vmlinux", fsConstants.R_OK).then(
-			() => "present; hooks checked by the execution domain",
-		),
-	);
-	if (process.arch !== "x64")
-		await check("Process architecture", async () => {
-			throw new Error("x86-64 required");
-		});
-	lines.push("Installed components: locating an executable does not qualify its behavior.");
-	for (const [label, name, explicit, fallback] of [
-		["Sandlock", "pi-speculative-sandlock", process.env.PI_SPEC_SANDLOCK, "pi-speculative-sandlock"],
-		["Execution domain launcher", "pi-speculative-domain", undefined, "pi-speculative-domain"],
-	] as const)
-		await check(label, () => program(name, [], [path.join(bin, fallback)], explicit));
-	const helper = await check("Native helper", () => resolveLinuxExecHelper(process.env.PI_SPEC_HELD_EXEC));
-	if (helper) {
-		const collector = await check(
-			"Execution domain",
-			() => executionDomainCollector(helper),
-			() => "active; protocol and source fingerprint match",
-		);
-		if (collector)
-			await check("Workspace admission", async () => {
-				collector.check(root);
-				return "available; operation dependencies and effects remain checked at use";
-			});
-		else lines.push("Workspace admission: untested (execution domain unavailable)");
-		await check(
-			"Native startup observation",
-			() => qualifyNativeStartup(helper),
-			() => "qualified; process state and ownership remain checked at use",
-		);
-	}
-	lines.push("Optional OverlayFS: Git workspace fallback remains available.");
-	await check("fuse-overlayfs", () =>
-		program("fuse-overlayfs", [], [path.join(bin, "fuse-overlayfs")], undefined, true),
-	);
-	await check("FUSE mount helper", () => program("fusermount3", ["fusermount"], [], undefined, true));
-	await check("/dev/fuse", () =>
-		access("/dev/fuse", fsConstants.R_OK | fsConstants.W_OK).then(
-			() => "read/write access; mount qualification remains separate",
-		),
-	);
-	lines.push(
-		"WSL requires WSL 2 and a Linux-native checkout. Rebuild helpers after upgrading; start Pi through the foreground execution domain and keep the separately qualified observer.",
-		"Use Refresh and show capabilities for enabled provider qualification. Missing evidence declines reuse; ordinary tools still execute. No packages, persistent services or permissions were changed.",
-	);
-	return {
-		text: lines.join("\n"),
-		summary: `Host: ${host}\n${issues.length ? issues.join("\n") : "Prerequisite and admission checks passed; individual operations still require proof."}`,
-		warnings: issues.length > 0,
-	};
-}
-function query(file: string, args: readonly string[]): Promise<string> {
-	return execHostText(file, args, {
-		cwd: "/",
-		env: {
-			...process.env,
-			RUSTUP_AUTO_INSTALL: "0",
-			CARGO_NET_OFFLINE: "true",
-		},
-		timeout: speculativeConfig().processReuse.diagnosticTimeoutMs,
-		killSignal: "SIGKILL",
-		maxBuffer: speculativeConfig().filesystem.diagnosticBytes,
-	});
-}
-function sanitizeDiagnosticText(text: string): string {
-	return stripVTControlCharacters(text).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
-}
-function clean(text: string): string {
-	return sanitizeDiagnosticText(text).slice(0, speculativeConfig().processReuse.diagnosticCharacters);
-}
-function requireIdleLinuxContext(ctx: ExtensionContext, action: string, linuxMessage: string): boolean {
-	if (process.platform !== "linux") {
-		ctx.ui.notify(linuxMessage, "warning");
-		return false;
-	}
-	if (!ctx.isIdle()) {
-		ctx.ui.notify(`Wait for the current task to finish before ${action}.`, "warning");
-		return false;
-	}
-	return true;
-}
-function ensureStillIdle(ctx: ExtensionContext, message: string): boolean {
-	if (ctx.isIdle()) return true;
-	ctx.ui.notify(`The task is now running. ${message} after it finishes.`, "warning");
-	return false;
-}
-/** Show host prerequisites separately from the controller's authoritative runtime diagnostics. */
-export async function checkLinuxEnvironment(
-	ctx: ExtensionContext,
-	refresh: () => Promise<void>,
-): Promise<void> {
-	if (
-		!requireIdleLinuxContext(
-			ctx,
-			"checking the Linux environment",
-			"Linux environment checks require Pi running inside Linux or WSL 2. Open this menu there.",
-		)
-	)
-		return;
-	const report = await inspectLinuxEnvironment(ctx.cwd);
-	ctx.ui.notify(report.text, report.warnings ? "warning" : "info");
-	if (!ensureStillIdle(ctx, "Refresh execution diagnostics")) return;
-	await refresh();
-}
-/** The installer and its native sources ship in src for both TypeScript and dist entry points. */
-export async function installLinuxDependencies(
-	ctx: ExtensionContext,
-	refresh: () => Promise<void>,
-): Promise<void> {
-	if (
-		!requireIdleLinuxContext(
-			ctx,
-			"installing Linux dependencies",
-			"Linux dependencies must be installed from Pi running inside Linux or WSL 2. Open this menu there.",
-		)
-	)
-		return;
-	const report = await inspectLinuxEnvironment(ctx.cwd);
-	if (!ensureStillIdle(ctx, "Retry installation")) return;
-	if (
-		!(await ctx.ui.confirm(
-			"Install / update Linux dependencies?",
-			`${report.summary}\n\nDownload and build the packaged Sandlock and process helpers, plus optional fuse-overlayfs, in ~/.local/bin. ` +
-				"Requires Git, C/Rust toolchains, Clang, libbpf/libelf/zlib development files, make, tar and xz; FUSE needs fusermount and /dev/fuse. " +
-				"Missing prerequisites may leave individual components unavailable. System packages and permissions are not changed. Building may take several minutes.",
-		))
-	)
-		return;
-	if (!ensureStillIdle(ctx, "Retry installation")) return;
-	const script = fileURLToPath(new URL("../src/setup-linux-process-backend.mjs", import.meta.url));
-	const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
-	const result = await ctx.ui.custom<{
-		output: string;
-		failed: boolean;
-		cancelled: boolean;
-	}>((tui, theme, _keys, done) => {
-		const loader = new BorderedLoader(tui, theme, "Installing Linux dependencies…");
-		const lifetime = new AbortController();
-		const decoder = new StringDecoder("utf8");
-		const signal = AbortSignal.any([loader.signal, lifetime.signal]);
-		let output = "";
-		const append = (text: string) => {
-			output = (output + sanitizeDiagnosticText(text.replace(/\r/g, "\n"))).slice(-16384);
-			tui.requestRender();
-		};
-		loader.addChild({
-			render: (width) => truncateToVisualLines(output, 10, width).visualLines,
-			invalidate() {},
-		});
-		void createLocalBashOperations({ shellPath: "/bin/sh" })
-			.exec(`exec ${quote(process.execPath)} ${quote(script)}`, path.dirname(script), {
-				signal,
-				onData: (data) => append(decoder.write(data)),
-			})
-			.then(
-				({ exitCode }) => (exitCode === 0 ? undefined : `Installer exited with ${exitCode ?? "a signal"}.`),
-				errorMessage,
-			)
-			.then((failure) => {
-				append(decoder.end());
-				if (failure !== undefined) append(`\n${failure}\n`);
-				done({ output, failed: failure !== undefined, cancelled: signal.aborted });
-			});
-		return {
-			render: (width) => loader.render(width),
-			invalidate: () => loader.invalidate(),
-			handleInput: (data) => loader.handleInput(data),
-			dispose() {
-				lifetime.abort();
-				loader.dispose();
-			},
-		};
-	});
-	const partial = /\bunavailable\b/i.test(result.output);
-	const status = result.cancelled
-		? "Installation cancelled; completed components remain installed."
-		: result.failed
-			? "Linux dependency installation failed."
-			: partial
-				? "Installation finished with unavailable components."
-				: "Linux dependency installation finished.";
-	const detail = result.output.trim().split("\n").slice(-14).join("\n");
-	ctx.ui.notify(
-		`${status}\n${detail}\nInstaller output describes installation checks; runtime qualification is reported separately. Restart Pi to load updated helpers and recheck workspace drivers.`,
-		result.failed && !result.cancelled ? "error" : result.cancelled || partial ? "warning" : "info",
-	);
-	await refresh();
-}
+
+export {
+	checkLinuxEnvironment,
+	imageInterpreter,
+	inspectLinuxEnvironment,
+	installLinuxDependencies,
+	parseLinuxOsRelease,
+	privateReplay,
+	type LinuxEnvironmentReport,
+};
 // Certificates are meaningful only under the implementation that collected and authorized their proof.
 const OBSERVER_FINGERPRINT = digestObject(
 	[
 		"linux-process-backend",
+		"linux-process-effects",
 		"execution-observer",
 		"process-reuse",
 		"reuse-store",
@@ -568,13 +292,6 @@ export interface LinuxProcessSession {
 	readonly dispose?: () => Promise<void>;
 }
 type ReadyBackend = Awaited<ReturnType<LinuxProcessReuseBackend["probe"]>>;
-interface ExecMount {
-	readonly virtualPath: string;
-	readonly hostPath: string;
-}
-interface SandboxMount extends ExecMount {
-	readonly readOnly: boolean;
-}
 interface ProcessArguments extends ProcessLaunchOptions {
 	readonly argv0: string;
 	readonly args: readonly string[];
@@ -597,10 +314,6 @@ type BoundProcessInvocation = ProcessArguments & {
 	readonly producer?: ProcessProducerProof;
 };
 export type NativeProcessInvocation = BoundProcessInvocation;
-interface BufferedOutput {
-	readonly fd: 1 | 2;
-	readonly data: Buffer;
-}
 interface DispatcherResponse {
 	readonly held?: HeldExecDecision;
 	readonly kind: "hit" | "executed" | "bypass";
@@ -1428,6 +1141,7 @@ export class LinuxProcessReuseBackend {
 	}
 	async open(
 		input: Pick<ExecutionResourceContext, "onOperationAdopted" | "acceptOperationScope"> & {
+			readonly adoptable?: boolean;
 			readonly inputs?: ResourceObjectInputs;
 			readonly sourceRoot: string;
 			readonly workspace: SandboxWorkspaceContext;
@@ -1770,6 +1484,7 @@ export class LinuxProcessReuseBackend {
 			boundary,
 			// The workspace's own repository stays read-only instead of exposing the snapshot's repository.
 			...(gitDirectory ? { gitDirectory } : {}),
+			adoptable: input.adoptable !== false,
 			workspace: input.workspace,
 			inputs: input.inputs,
 			invocation,
@@ -1858,14 +1573,14 @@ export class LinuxProcessReuseBackend {
 		]);
 		// The exact confinement and tracer builds, not their versions: a patched fix changes what their certificates mean.
 		nativeProcessLibrary(dispatcher);
-		const [sandlockCheck, sandlockBuild, platformFingerprint] = await Promise.all([
+		const [sandlockCheck, sandlockBuild, platformFingerprint, collector] = await Promise.all([
 			execHostText(sandlock, ["check"]),
 			hashExecutableFile(sandlock),
 			this.resolvePlatformFingerprint(),
+			executionDomainCollector(dispatcher),
 		]);
 		if (!sandlockCheck.includes("Status:         OK"))
 			throw new Error("Sandlock kernel protections are unavailable");
-		const collector = await executionDomainCollector(dispatcher);
 		const mountProbe = await mkdtemp(path.join(os.tmpdir(), "pi-process-view-probe-"));
 		let executionContext: ProcessExecutionContext | undefined;
 		try {
@@ -2547,6 +2262,86 @@ export class LinuxProcessReuseBackend {
 								[own, ...(own.descendants ?? [])],
 								privateBefore,
 							);
+							const accepted = acceptedReplayTaints();
+							const earlyBlockingTaints = [
+								...new Set(
+									observed
+										.flatMap((part) => part.taints)
+										.filter((taint) => !accepted.includes(taint)),
+								),
+							];
+							if (
+								outlet &&
+								!session.adoptable &&
+								(!observation.complete || earlyBlockingTaints.length > 0)
+							) {
+								const coverage = session.workspace.processCoverage;
+								if (coverage) {
+									for (const part of observed) {
+										for (const input of part.paths) {
+											for (const candidate of [input.path, path.posix.normalize(input.path)]) {
+												const logical = session.projection.toLogical(candidate);
+												if (session.gitDirectory && pathContains(session.gitDirectory, logical)) continue;
+												const name = relativeFilesystemPath(session.sourceRoot, logical);
+												if (name !== undefined) coverage.covers(name, "listed" in input && !!input.listed);
+											}
+										}
+										for (const lock of part.locks ?? []) {
+											const logical = session.projection.toLogical(lock.path);
+											const name = relativeFilesystemPath(session.sourceRoot, logical);
+											if (name !== undefined) coverage.covers(name, false);
+										}
+										if (part.written?.length) coverage.observeWrite();
+									}
+									for (const run of sources.flatMap((child) => child.evidence ?? []))
+										for (const input of run.dependencies) {
+											const name = relativeFilesystemPath(session.sourceRoot, input.path);
+											if (name !== undefined)
+												coverage.covers(name, input.kind === "directory" && !!input.entriesDigest);
+										}
+									if (effects.effects.length || external.changes.length) coverage.observeWrite();
+								}
+								if (session.inputs) {
+									for (const input of observed.flatMap((part) => part.paths)) {
+										if (input.role === "metadata" || input.lookupFailure) continue;
+										const logical = session.projection.toLogical(path.posix.normalize(input.path));
+										if (
+											!pathContains(session.sourceRoot, logical) ||
+											(session.gitDirectory && pathContains(session.gitDirectory, logical))
+										)
+											continue;
+										const relative = relativeFilesystemPath(session.sourceRoot, logical);
+										const original = relative ? session.workspace.baselineFile?.(relative) : undefined;
+										const physical = session.projection.toPhysical(logical);
+										const snapshotRelative = physical && relativeFilesystemPath(before.root, physical);
+										const current =
+											original && snapshotRelative !== undefined
+												? await workspaceInputVersion(before, snapshotRelative)
+												: undefined;
+										if (
+											original &&
+											current &&
+											(original.content === current ||
+												contentDigest(original.content) === contentDigest(current))
+										) {
+											if (session.inputs.remember(logical, original) && original.shared)
+												TimelineInterval.use(original.computation);
+										}
+									}
+								}
+								const computation = TimelineInterval.current(work.startedAt, performance.now(), [
+									...(preparation ? [ownedDependency(preparation)] : []),
+									...(session.preparation ? [session.preparation] : []),
+									...session.computations.filter((input) => {
+										const pid = processDependencyPIDs.get(input);
+										return pid !== undefined && observation.pids?.includes(pid);
+									}),
+								]);
+								TimelineInterval.group(computation, session);
+								recordProcessDependency(session, ownedDependency(computation), domain?.pid);
+								if (!session.metrics.lastError && earlyBlockingTaints.length)
+									this.setError(session, `tainted:${earlyBlockingTaints.join(",")}`);
+							} else {
 							const evidence = await captureDependencies(
 								session,
 								before,
@@ -2690,6 +2485,7 @@ export class LinuxProcessReuseBackend {
 									if (reusable) session.preparedResults++;
 								}
 							}, true);
+							}
 						} catch (error) {
 							// The process already ran. Certificate failure must never cause dispatcher fallback/re-execution.
 							const detail = failureDetail(error);
@@ -3325,6 +3121,10 @@ async function sealSessionEvidence(
 		throw new Error(`top-level workspace effects are incomplete: ${effects.reason ?? "unknown"}`);
 	}
 	const committedChanges = sandboxWorkspaceChanges(session.sourceRoot, effects);
+	if (!session.adoptable) {
+		if (committedChanges.length || external.changes.length) session.workspace.processCoverage?.observeWrite();
+		return committedChanges;
+	}
 	try {
 		const writers = evidenceSources(sessionWriters(session));
 		const evidence = await captureDependencies(
@@ -3344,26 +3144,6 @@ async function sealSessionEvidence(
 		session.incompleteReasons.add(`top_seal:${errorMessage(error)}`);
 	}
 	return committedChanges;
-}
-/** binfmt_script's interpreter (the first word after `#!`) or a little-endian ELF64's PT_INTERP. */
-export async function imageInterpreter(file: string): Promise<string | undefined> {
-	await using handle = await open(file, "r").catch(() => undefined);
-	const head = Buffer.alloc(256);
-	const read = handle ? (await handle.read(head, 0, 256, 0)).bytesRead : 0;
-	if (head.subarray(0, 2).toString("latin1") === "#!")
-		return /^[ \t]*([^ \t\n\0]+)/.exec(head.subarray(2, read).toString("latin1"))?.[1];
-	if (read < 64 || head.readUInt32BE(0) !== 0x7f454c46 || head[4] !== 2 || head[5] !== 1) return undefined;
-	const offset = Number(head.readBigUInt64LE(32));
-	const size = head.readUInt16LE(54);
-	const count = Math.min(head.readUInt16LE(56), speculativeConfig().processReuse.interpreterProgramHeaders);
-	const table = Buffer.alloc(size * count);
-	await handle!.read(table, 0, table.length, offset);
-	for (let entry = 0; size >= 56 && entry < count; entry++) {
-		if (table.readUInt32LE(entry * size) !== 3) continue;
-		const name = Buffer.alloc(Math.min(Number(table.readBigUInt64LE(entry * size + 32)), 4096));
-		await handle!.read(name, 0, name.length, Number(table.readBigUInt64LE(entry * size + 8)));
-		return name.toString("latin1").split("\0")[0] || undefined;
-	}
 }
 async function captureDependencies(
 	session: ActiveSession,
@@ -3879,253 +3659,6 @@ async function captureDependencies(
 		incompleteReasons: [...incompleteReasons],
 	};
 }
-/** Also what memory allocators (jemalloc, glibc) read at startup to size their mappings. */
-async function replayFilesystemEffects(
-	owner: Pick<WorkspaceSandboxService, "commitDelta">,
-	store: ProvenanceCertificateStore,
-	artifacts: VerifiedArtifactClosure,
-	journal: readonly OrderedEffectEvent[],
-	projection: ExecutionPathProjection,
-	privateStorage?: string,
-) {
-	await using privateReads = privateStorage ? FilesystemReadView.ambient() : undefined;
-	const contents = new ContentChunkPool(store);
-	try {
-		const changes: SandboxWorkspaceChange[] = [];
-		const { workspaceRoot } = projection;
-		for (const event of journal) {
-			if (event.kind === "output") continue;
-			const target = projection.toPhysical(event.path);
-			const inside = !!target && pathContains(workspaceRoot, target);
-			if (
-				!target ||
-				target === path.resolve(workspaceRoot) ||
-				(!inside && pathContains(projection.sourceRoot, target))
-			) {
-				throw new Error(`replay effect escapes workspace: ${event.path}`);
-			}
-			const root = inside ? workspaceRoot : await hostRoot(target);
-			const address = {
-				root,
-				target,
-				resource: slash(path.relative(root, target)),
-			};
-			if (event.before.kind === "directory" || event.after.kind === "directory") {
-				if (
-					[event.before, event.after].some((state) => state.kind !== "absent" && state.kind !== "directory")
-				)
-					throw new Error(`unsupported replay type change: ${event.path}`);
-				changes.push({
-					...address,
-					kind: "directory",
-					...(event.before.kind === "directory" ? { before: directoryState(event.before) } : {}),
-					...(event.after.kind === "directory" ? { after: directoryState(event.after) } : {}),
-				});
-				continue;
-			}
-			changes.push({
-				...address,
-				...projectFileMutation(event, (name) => projection.toPhysical(name)!),
-				...(event.before.kind === "file"
-					? {
-							before: await restoreArtifactContent(contents, event.before.data, artifacts),
-							beforeMode: event.before.mode,
-						}
-					: {}),
-				...(event.after.kind === "file"
-					? {
-							after: await restoreArtifactContent(contents, event.after.data, artifacts),
-							afterMode: event.after.mode,
-							afterModified: event.after.modified,
-						}
-					: {}),
-			});
-		}
-		// Inside a speculative session, what lies outside the workspace belongs to its private branch until adoption.
-		const { private: external, workspace = [] } = Object.groupBy(changes, (change) =>
-			privateStorage && !pathContains(workspaceRoot, change.target) ? "private" : "workspace",
-		);
-		if (external) await privateReplay(owner, privateStorage!, external, privateReads!, contents, workspace);
-		else if (workspace.length)
-			await owner.commitDelta(
-				{ changes: workspace, output: { result: { content: [], details: {} }, isError: false } },
-				privateReads,
-			);
-	} finally {
-		await contents.dispose();
-	}
-}
-/** Apply changes in a session's private branch as its sandboxes would have: over the merged view's state, into its upper
- * directory, a removal of a host object as a whiteout its sandboxes read. */
-export async function privateReplay(
-	owner: Pick<WorkspaceSandboxService, "commitDelta">,
-	storage: string,
-	changes: readonly SandboxWorkspaceChange[],
-	view: FilesystemReadView,
-	contents?: ContentChunkPool,
-	workspace: readonly SandboxWorkspaceChange[] = [],
-) {
-	const { upper, log, deleted } = await privateBranch(storage);
-	const physical = (target: string) => path.join(upper, target);
-	const projected = [...workspace];
-	const seeds = new Map<string, NonNullable<Awaited<ReturnType<typeof readRegularState>>>>();
-	const whiteouts: string[] = [];
-	await mkdir(upper, { recursive: true });
-	for (const change of changes) {
-		const target = physical(change.target);
-		await assertNoSymlinkPath(upper, target);
-		const own = await lstat(target).catch(ignoreMissing);
-		const lower = !deleted(change.target);
-		const source = own ? target : lower ? change.target : undefined;
-		const address = { root: upper, target, resource: path.relative(upper, target) };
-		if (change.kind === "directory") {
-			const captured =
-				source && (await captureFilesystemEntry(source, "directory", view).catch(ignoreMissing));
-			const entry = captured ? captureWorkspaceStructureEntry(captured) : undefined;
-			if (entry && entry.kind !== "directory")
-				throw new Error(`private replay expected directory: ${change.target}`);
-			const state = entry && directoryState(entry);
-			let visible = state;
-			if (own && lower && state && captured) {
-				const inherited = (
-					await captureFilesystemEntry(change.target, "directory", view).catch(ignoreMissing)
-				)?.entries;
-				if (inherited?.length) {
-					const names = new Map(
-						inherited
-							.filter((item) => !deleted(path.join(change.target, item.name)))
-							.map((item) => [item.name, item]),
-					);
-					for (const item of captured.entries!) names.set(item.name, item);
-					visible = { ...state, entriesDigest: directoryEntriesDigest([...names.values()]) };
-				}
-			}
-			if (!matchesSandboxBaseline(change, visible))
-				throw new Error(`resource changed before replay: ${change.target}`);
-			const { before, after } = change;
-			const modeChange =
-				before && after && before.mode !== after.mode && before.entriesDigest === after.entriesDigest;
-			if (own || after)
-				projected.push({
-					...change,
-					...address,
-					before: own ? state : undefined,
-					operation: change.operation === "mkdir" || modeChange ? "copy_up" : change.operation,
-				});
-		} else {
-			const state = source
-				? await readRegularState(source, change.before?.byteLength, view, contents)
-				: undefined;
-			if (!matchesSandboxBaseline(change, state))
-				throw new Error(`resource changed before replay: ${change.target}`);
-			let aliases = change.aliases;
-			if (!own && state) {
-				const names = aliases ?? [change.target];
-				if (aliases) await assertFileAliases(change.root, change.target, aliases, state.identity, view);
-				const visible: string[] = [];
-				for (const name of names) {
-					const destination = physical(name);
-					if (name !== change.target && (deleted(name) || (await lstat(destination).catch(ignoreMissing))))
-						continue;
-					visible.push(name);
-					seeds.set(destination, state);
-				}
-				if (aliases) aliases = visible;
-			}
-			projected.push({ ...change, ...address, ...projectFileMutation({ ...change, aliases }, physical) });
-		}
-		if (!change.after && lower && (await lstat(change.target).catch(ignoreMissing)))
-			whiteouts.push(
-				change.target
-					.slice(1)
-					.replace(/[\\\n\r]/g, (char) => ({ "\n": "\\n", "\r": "\\r", "\\": "\\\\" })[char]!),
-			);
-	}
-	const seeded: string[] = [];
-	const parents: string[] = [];
-	let committed = false;
-	try {
-		const objects = new Map<string, string>();
-		for (const [target, state] of seeds) {
-			await assertNoSymlinkPath(upper, target);
-			await createParentDirectories(upper, target, view, parents);
-			const key = `${state.identity!.dev}:${state.identity!.ino}`;
-			const anchor = objects.get(key);
-			if (anchor) {
-				await link(anchor, target);
-				seeded.push(target);
-			} else {
-				await using handle = await open(target, "wx", state.mode);
-				seeded.push(target);
-				await writeContent(handle, state.content);
-				await handle.chmod(state.mode);
-				objects.set(key, target);
-			}
-		}
-		if (projected.length)
-			await owner.commitDelta(
-				{ changes: projected, output: { result: { content: [], details: {} }, isError: false } },
-				view,
-			);
-		committed = true;
-		if (whiteouts.length) await writeFile(log, whiteouts.join("\n") + "\n", { flag: "a" });
-	} catch (error) {
-		if (committed)
-			throw new EffectCommitFailure("poisoned", "private whiteouts could not be published", error);
-		if (!isPoisonedEffectCommit(error)) {
-			for (const target of seeded.reverse()) await rm(target, { force: true });
-			for (const target of parents.reverse()) await rmdir(target);
-		}
-		throw error;
-	}
-}
-function directoryState({ entriesDigest, mode, uid, gid }: SandboxDirectoryState) {
-	return { entriesDigest, mode, uid, gid };
-}
-/** Output events carry the target's own descriptor. */
-function loadOutputEvents(artifacts: VerifiedArtifactClosure, journal: readonly OrderedEffectEvent[]) {
-	return journal.flatMap((event) =>
-		event.kind === "output" ? [{ fd: event.fd, data: artifacts.read(event.data) }] : [],
-	);
-}
-function sandboxPolicyArguments(
-	cwd: string,
-	deniedPaths: readonly string[],
-	writablePaths: readonly string[],
-	mounts: readonly SandboxMount[],
-	execMounts: readonly ExecMount[],
-	privateWrites: string,
-) {
-	return [
-		"run",
-		"--chroot",
-		"/",
-		// A write the host user could make but the policy does not grant lands in a private branch here, as it would succeed natively.
-		"--workdir",
-		"/",
-		"--fs-storage",
-		privateWrites,
-		"--fs-branch",
-		"writes",
-		"--on-exit",
-		"keep",
-		"--on-error",
-		"keep",
-		...mounts.flatMap((mount) => ["--fs-mount", sandboxMountArgument(mount)]),
-		...execMounts.flatMap((mount) => ["--exec-mount", sandboxMountArgument(mount)]),
-		"--fs-read",
-		"/",
-		...writablePaths.flatMap((target) => ["--fs-write", target]),
-		...[...speculativeConfig().processReuse.stableDevices].flatMap((target) => ["--fs-write", target]),
-		...deniedPaths.flatMap((target) => ["--fs-deny", target]),
-		"--no-huge-pages",
-		"--no-coredump",
-		"--max-processes",
-		String(speculativeConfig().processReuse.maxProcesses),
-		"--cwd",
-		cwd,
-	];
-}
 /** What the brokered run a traced launcher `pid` started wrote, with its own descendants; a run never answers for itself. */
 function brokeredWrites(session: ActiveSession, pid: number, self?: SessionWriter) {
 	const writers = sessionWriters(session).filter((writer) => writer !== self && writer.pid === pid);
@@ -4247,34 +3780,6 @@ function captureSessionInterval(session: ActiveSession): Promise<WorkspaceTransa
 		})));
 }
 const privateUpper = (session: ActiveSession) => path.join(session.processRoot, "private", "writes", "upper");
-/** A session's private branch under `storage`: its upper directory, its whiteout log and the host paths that log hides. */
-async function privateBranch(storage: string) {
-	const upper = path.join(storage, "writes", "upper");
-	const log = path.join(storage, "writes", "deleted.log");
-	const deletions = ((await readFile(log, "utf8").catch(ignoreMissing)) ?? "")
-		.split("\n")
-		.filter(Boolean)
-		.map(
-			(line) =>
-				`/${line.replace(/\\(.)/g, (_, escaped: string) => (escaped === "n" ? "\n" : escaped === "r" ? "\r" : escaped))}`,
-		);
-	return {
-		upper,
-		log,
-		deleted: (target: string) =>
-			deletions.some((entry) => target === entry || target.startsWith(`${entry}/`)),
-	};
-}
-/** The nearest directory above `target` the host holds: where a change outside the workspace stages and commits. */
-async function hostRoot(target: string) {
-	for (let directory = path.dirname(target); ; directory = path.dirname(directory)) {
-		if (
-			(await lstat(directory).catch(() => undefined))?.isDirectory() ||
-			directory === path.dirname(directory)
-		)
-			return directory;
-	}
-}
 /** The execution domain owns each original input proof; working versions are checked separately at each boundary. */
 async function captureInputProof(directory: string) {
 	const fields = FILESYSTEM_METADATA_FIELDS;
@@ -4557,17 +4062,6 @@ async function privateInterference(
 		}
 	return false;
 }
-/** A filesystem mount names its access; an exec mount only its image. */
-function sandboxMountArgument(mount: SandboxMount | ExecMount) {
-	if (
-		!path.isAbsolute(mount.virtualPath) ||
-		!path.isAbsolute(mount.hostPath) ||
-		[mount.virtualPath, mount.hostPath].some((value) => value.includes(":"))
-	) {
-		throw new Error(`Sandlock mount cannot represent ${mount.virtualPath}:${mount.hostPath}`);
-	}
-	return `${mount.virtualPath}:${mount.hostPath}${"readOnly" in mount ? (mount.readOnly ? ":ro" : ":rw") : ""}`;
-}
 function speculativeProducerProof(ready: ReadyBackend, deniedPaths: readonly string[], policy = POLICY_ID) {
 	return Object.freeze({
 		observer: { provider: "execution_domain", fingerprint: ready.observerFingerprint },
@@ -4813,82 +4307,6 @@ async function topLevelProcessPrototype(
 		platformFingerprint,
 	});
 }
-async function captureHostObjectDependency(
-	physical: string,
-	logical: string,
-	role: DependencyRole,
-	listed: boolean,
-	info: BigIntStats | undefined,
-	view: FilesystemReadView,
-	options?: { signal?: AbortSignal; maxFileBytes?: number },
-): Promise<DynamicDependency | undefined> {
-	if (!info) return captureAbsenceDependency(physical, logical, false, [], undefined, view);
-	if (info.isDirectory())
-		return captureDirectoryDependency(physical, logical, options !== undefined || !listed, [], listed, undefined, view);
-	if (!info.isFile()) return undefined;
-	return (await captureFileDependency(physical, logical, role, { ...options, view, includeMetadata: true })).dependency;
-}
-async function captureContentAddressedDependency(
-	target: string,
-	role: DependencyRole | "metadata",
-	view: FilesystemReadView,
-	settings = speculativeConfig().processReuse,
-): Promise<DynamicDependency | undefined> {
-	if (role === "metadata" || !settings.contentAddressedPaths.some((root) => pathContains(root, target))) return;
-	const info = await view.stat(target, false).catch(ignoreMissing);
-	if (!info?.isFile() || !settledFilesystemStat(info, Date.now(), target)) return;
-	const fields = ["dev", "ino", "mode", "size", "mtimeNs", "ctimeNs"] as const;
-	return { kind: "metadata", path: slash(target), followSymlinks: false, fields, digest: filesystemObservationDigest(info, fields) };
-}
-function mergeDynamicDependency(
-	existing: DynamicDependency | undefined,
-	incoming: DynamicDependency,
-): DynamicDependency | "conflict" {
-	if (!existing) return incoming;
-	if (
-		existing.kind === "file" &&
-		incoming.kind === "file" &&
-		stableEqual({ ...existing, role: incoming.role }, incoming)
-	)
-		return existing.role !== "executable" && incoming.role === "executable" ? incoming : existing;
-	// A listing adds evidence to reaching the same directory; neither observation may replace conflicting evidence.
-	if (
-		existing.kind === incoming.kind &&
-		(incoming.kind === "directory" || incoming.kind === "absence") &&
-		Object.entries(incoming).every(
-			([key, value]) => !(key in existing) || stableEqual(Reflect.get(existing, key), value),
-		)
-	)
-		return { ...existing, ...incoming };
-	return stableEqual(existing, incoming) ? existing : "conflict";
-}
-function classifyObservedSpecialPath(
-	observedPath: string,
-	settings = speculativeConfig().processReuse,
-	includeStableDevices = true,
-): "ignored" | ProvenanceTaint | undefined {
-	if (
-		(includeStableDevices && settings.stableDevices.includes(observedPath)) ||
-		settings.kernelConfigurationPaths.some((root) => pathContains(root, observedPath))
-	)
-		return "ignored";
-	// A process reading its own state, or the host's CPU, sysctl, and cgroup limits, observes this one run like the clock or its pid.
-	if (observedPath === "/proc/mounts") return "confinement_observation";
-	if (/^\/proc\/(?:self|thread-self|\d+)(?:\/|$)/.test(observedPath))
-		return /\/(?:limits|mounts|mountinfo|mountstats)$/.test(observedPath)
-			? "confinement_observation"
-			: "pid_observation";
-	// Reopening an inherited descriptor reaches what that descriptor carries, like a jobserver pipe, not a host file.
-	if (/^\/dev\/fd\/\d+$/.test(observedPath)) return "descriptor_observation";
-	if (/^\/dev\/u?random$/.test(observedPath)) return "random";
-	if (
-		/^\/proc\/sys(?:\/|$)|^\/sys\/(?:devices\/system\/cpu|fs\/cgroup)(?:\/|$)|^\/proc\/(?:meminfo|version|version_signature|cpuinfo|stat|loadavg|uptime|filesystems)$/.test(
-			observedPath,
-		)
-	)
-		return "clock";
-	return undefined;
-}
 async function captureActorDependencies(
 	observation: ExecutionObservation,
 	deniedPaths: readonly string[],
@@ -4905,19 +4323,7 @@ async function captureActorDependencies(
 		if (merged === "conflict") throw new Error(`actor_dependency_conflict:${key}`);
 		dependencies.set(key, merged);
 	};
-	const prefixes = new Map<string, Promise<DynamicDependency | undefined>>();
-	const symlinkAt = (prefix: string) => {
-		let pending = prefixes.get(prefix);
-		if (!pending)
-			prefixes.set(
-				prefix,
-				(pending = view
-					.stat(prefix, false)
-					.catch(ignoreMissing)
-					.then((info) => (info?.isSymbolicLink() ? captureSymlinkDependency(prefix, prefix, view) : info && undefined))),
-			);
-		return pending;
-	};
+	const collectSymlinkPrefixes = createSymlinkPrefixCollector(view, deniedPaths);
 	const relevant: ExecutionObservation["paths"][number][] = [];
 	for (const input of observation.paths) {
 		signal?.throwIfAborted();
@@ -4940,20 +4346,8 @@ async function captureActorDependencies(
 		async (input) => {
 			signal?.throwIfAborted();
 			const observedPath = path.resolve(input.path);
-			const items: DynamicDependency[] = [];
+			const items = await collectSymlinkPrefixes(input.path);
 			let sharedComputation: TimelineInterval | undefined;
-			// Record every symlink in the observed pathname before following its final object.
-			let prefix = path.parse(input.path).root;
-			for (const segment of input.path.slice(prefix.length).split(path.sep).filter(Boolean)) {
-				prefix = path.join(prefix, segment);
-				const link = await symlinkAt(prefix);
-				if (link) {
-					const resolved = await view.realpath(prefix).catch(ignoreMissing);
-					if (resolved && deniedPaths.some((denied) => pathContains(denied, resolved)))
-						throw new Error(`actor_denied_input:${resolved}`);
-					items.push(link);
-				}
-			}
 			const contentAddressed = await captureContentAddressedDependency(observedPath, input.role, view, settings);
 			if (contentAddressed) {
 				items.push(contentAddressed);
@@ -5092,17 +4486,4 @@ export async function validateTransferredProcessEvidence(
 		},
 		metrics,
 	};
-}
-function sensitivePaths(storeRoot: string, additional: readonly string[] | undefined) {
-	const home = os.homedir();
-	const credentials = speculativeConfig().processReuse.sensitivePaths.map((name) =>
-		name.startsWith("~/") ? path.join(home, name.slice(2)) : path.resolve(name),
-	);
-	return Object.freeze([
-		...new Set(
-			[storeRoot, ...credentials, ...(additional ?? [])]
-				.filter(path.isAbsolute)
-				.map((value) => path.resolve(value)),
-		),
-	]);
 }

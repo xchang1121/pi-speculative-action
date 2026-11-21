@@ -685,3 +685,74 @@ test("aborts and bypasses an in-flight unadoptable exclusive branch immediately 
 		await session.close();
 	}
 });
+
+test("bypasses unadoptable route admission and non-observation input candidates without blocking the Actor", async () => {
+	const routing = Promise.withResolvers<void>();
+	const routeAborted = Promise.withResolvers<void>();
+	const reading = Promise.withResolvers<void>();
+	const finishRead = Promise.withResolvers<void>();
+	const unadoptable: SpeculativeExecutionRoute = {
+		...exclusive,
+		adoptable: () => false,
+	};
+	const session = new LocalExecutionSession<string>({
+		settings: () => ({ maxConcurrentActions: 4, resourceCacheMaxEntries: 16 }),
+		effect: (key) => PI_ACTION_SEMANTICS.effect(key),
+		adoptable: (call) => call.tool !== "bash",
+		key: async (call) =>
+			PI_ACTION_SEMANTICS.buildKey(call.tool, call.input, "/workspace", "memory", { fingerprint: "test" }),
+		route: async (call, _key, signal) => {
+			if (call.tool === "read") return shared;
+			routing.resolve();
+			await new Promise<void>((_, reject) => {
+				signal.addEventListener("abort", () => {
+					routeAborted.resolve();
+					reject(signal.reason ?? new Error("aborted"));
+				}, { once: true });
+			});
+			return unadoptable;
+		},
+		authorize: async () => ({ ok: true }),
+		capture: async () => undefined,
+		native: async (call) => `native:${call.tool}`,
+		fork: async (call) => {
+			if (call.tool === "read") {
+				reading.resolve();
+				await finishRead.promise;
+			}
+			return {
+				backend: "memory",
+				output: "cached",
+				resources: ["shared.txt"],
+				capturedBytes: 6,
+				executionMetrics: {},
+				compatibility: { status: "compatible", executionFingerprint: "test", backend: "memory" },
+				validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }),
+				commit: async () => "cached",
+				dispose() {},
+			};
+		},
+	});
+	try {
+		const preview = session.speculate({ tool: "bash", input: { command: "pytest" } });
+		await routing.promise;
+		expect(await session.execute({ tool: "bash", input: { command: "pytest" } })).toMatchObject({
+			output: "native:bash",
+			served: false,
+		});
+		await routeAborted.promise;
+		expect(await preview.completion).toMatchObject({ status: "cancelled" });
+
+		const inflightRead = session.speculate({ tool: "read", input: { path: "shared.txt" } });
+		await reading.promise;
+		expect(await session.execute({ tool: "write", input: { path: "shared.txt", content: "updated" } })).toMatchObject({
+			output: "native:write",
+			served: false,
+		});
+		finishRead.resolve();
+		await inflightRead.completion;
+	} finally {
+		finishRead.resolve();
+		await session.close();
+	}
+});

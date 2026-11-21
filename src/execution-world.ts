@@ -1138,6 +1138,36 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 			this.select("speculation", request, preparation, (_world, route) => route),
 		);
 	}
+	/** Synchronous upper bound on whether any enabled speculation world can produce an Actor-adoptable branch. */
+	canAdoptSpeculation(request: ExecutionWorldRequest, cwd = ""): boolean {
+		if (this.lifecycle.sealed) return false;
+		const boundRequest = {
+			...request,
+			requirements: normalizeEffectRequirements(request.requirements),
+		};
+		for (const scope of ["runtime", "fallback"] as const) {
+			for (const world of this.worldsByID.values()) {
+				if (
+					this.admission?.(world, "speculation") ||
+					world.scope !== scope ||
+					(request.backend !== undefined && request.backend !== world.id) ||
+					!this.speculationEnabled(world.id)
+				)
+					continue;
+				const operation = world.speculation;
+				if (!operation || !supportsTool(operation, request.action?.tool ?? request.tool)) continue;
+				if (
+					request.parentCheckpoint &&
+					(!operation.acceptsCheckpoint || !operation.acceptsCheckpoint(request.parentCheckpoint, cwd))
+				)
+					continue;
+				if (!effectCapabilitiesCover(operation.capabilities, boundRequest.requirements)) continue;
+				if (boundRequest.effect === "observation" && !request.parentCheckpoint) return true;
+				if (operation.adoptable?.(boundRequest) !== false) return true;
+			}
+		}
+		return false;
+	}
 	fork(route: SpeculativeExecutionRoute, context: Context): Promise<WorldBranch<Output>> {
 		const world = this.worldsByID.get(route.backend);
 		if (!world || world.scope !== route.scope || world.isolation !== route.isolation)

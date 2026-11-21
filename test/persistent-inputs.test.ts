@@ -884,3 +884,45 @@ linux(
 		}
 	},
 );
+
+linux("partitions large file input batches into bounded multi-file records and recovers surviving files after partial edits", async () => {
+	const f = await fixture();
+	try {
+		const signal = new AbortController().signal;
+		const targets: string[] = [];
+		{
+			await using files = new ResourceObjectInputs(f.root, f.store, signal);
+			for (let index = 0; index < 40; index++) {
+				const target = path.join(f.root, `file-${index}.txt`);
+				await writeFile(target, `content-${index}\n`);
+				await utimes(target, 915148800, 946684800);
+				targets.push(target);
+				files.remember(target, await captureFileContent(target, memoryBudget, files.contents));
+			}
+			expect(await files.publish()).toBe(40);
+		}
+		const stats = await f.store.stats();
+		expect(stats.inputVersions).toBeLessThanOrEqual(16);
+		expect(stats.inputVersions).toBeGreaterThan(0);
+
+		await writeFile(targets[0]!, "mutated-0\n");
+		await utimes(targets[0]!, 915148800, 946684900);
+
+		const session = new ResourceInputSession({ store: f.store, internalCache: true }, memoryBudget);
+		try {
+			const recovered: string[] = [];
+			const read = session.reader(path.parse(f.root).root, signal);
+			for (const target of [targets[0]!, targets[1]!, targets[39]!]) {
+				for await (const token of read(target)) {
+					const item = token.view?.snapshotInput(target);
+					if (item && "content" in item) recovered.push((await readContent(item.content)).toString());
+				}
+			}
+			expect(recovered).toEqual(["content-1\n", "content-39\n"]);
+		} finally {
+			await session.dispose();
+		}
+	} finally {
+		await f.close();
+	}
+});

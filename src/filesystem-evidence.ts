@@ -293,6 +293,19 @@ export class FilesystemReadView {
 		if (this.ambient) return (follow ? fs.stat : fs.lstat)(target, { bigint: true });
 		return this.observe(target, follow, (fd) => fstatSync(fd, { bigint: true }));
 	}
+	async statWithPath(
+		target: string,
+		follow = false,
+	): Promise<{
+		readonly stat: BigIntStats;
+		readonly resolvedPath?: string;
+	}> {
+		if (this.ambient) return { stat: await (follow ? fs.stat : fs.lstat)(target, { bigint: true }) };
+		return this.observe(target, follow, (fd, resolved) => ({
+			stat: fstatSync(fd, { bigint: true }),
+			resolvedPath: resolved.endsWith(" (deleted)") ? undefined : resolved,
+		}));
+	}
 	async realpath(target: string): Promise<string> {
 		if (this.ambient) return fs.realpath(target);
 		return this.observe(target, true, (_fd, resolved) => resolved);
@@ -945,14 +958,15 @@ export async function captureFilesystemEntry(
 	info: BigIntStats;
 	link: string | undefined;
 	entries: Awaited<ReturnType<typeof readFilesystemDirectory>> | undefined;
+	resolvedPath?: string;
 	computation: TimelineInterval;
 }> {
 	view ??= FilesystemReadView.ambient();
 	const startedAt = performance.now();
-	const before = await view.stat(target);
+	const { stat: before, resolvedPath } = await view.statWithPath(target);
 	if (read === "directory" && before.isDirectory()) {
 		const { info, entries, computation } = await captureFilesystemDirectory(target, { view, stat: before });
-		return { info, entries, link: undefined, computation };
+		return { info, entries, link: undefined, resolvedPath, computation };
 	}
 	const link = before.isSymbolicLink() ? await view.readlink(target) : undefined;
 	const info = link !== undefined || read !== undefined ? await view.stat(target) : before;
@@ -964,6 +978,7 @@ export async function captureFilesystemEntry(
 		info,
 		link,
 		entries: undefined,
+		resolvedPath: link === undefined ? resolvedPath : undefined,
 		computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())),
 	};
 }

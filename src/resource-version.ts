@@ -756,6 +756,10 @@ export class ResourceReadView {
 		return this.mode !== "capturing";
 	}
 	private pending?: Promise<void>;
+	private readonly queuedLoads: {
+		readonly dependency: ResourceDependency;
+		readonly settled: PromiseWithResolvers<void>;
+	}[] = [];
 	private readonly evaluation?: ResourceEvaluationContext;
 	private prepared?: {
 		readonly lifetime: RuntimeLifecycleLane;
@@ -767,7 +771,7 @@ export class ResourceReadView {
 		readonly dependency?: string;
 	};
 	private readonly maxBytes: number;
-	private readonly load?: (dependency: ResourceDependency) => Promise<void>;
+	private readonly load?: (dependencies: ReadonlyArray<ResourceDependency>) => Promise<void>;
 	private readonly observeObject?: (target: string, capture: StableFilesystemCapture) => void;
 	readonly contents?: ContentChunkPool;
 	private readonly contentOwners = new Set<ContentChunkPool>();
@@ -1716,25 +1720,44 @@ export class ResourceReadView {
 		};
 		entries.set(key, prepared.lifetime.own(retained));
 	}
+	private async drainLoads(): Promise<void> {
+		try {
+			while (this.queuedLoads.length) {
+				const batch = this.queuedLoads.splice(0);
+				if (this.failure || this.sealed) {
+					const error = this.failure ?? new Error("resource_snapshot_not_capturing");
+					for (const item of batch) item.settled.reject(error);
+					continue;
+				}
+				const needed = batch.filter(({ dependency: { path: target, scope } }) => {
+					const { entry } = this.entry(target, followsResource(scope));
+					return !resourceCovers(entry, scope);
+				});
+				try {
+					if (needed.length) await this.load!(needed.map((item) => item.dependency));
+					for (const item of batch) item.settled.resolve();
+				} catch (error) {
+					const failure = (this.failure ??= error instanceof Error ? error : new Error(String(error)));
+					for (const item of batch) item.settled.reject(failure);
+				}
+			}
+		} finally {
+			this.pending = undefined;
+		}
+	}
 	private async get(target: string, scope: ResourceDependency["scope"]): Promise<CapturedResource> {
 		this.assertComplete();
 		if (this.owner && this.boundary && !containsFilesystemPath(this.boundary.root, target))
 			this.unproven(target);
 		if (this.mode === "read_through" && this.owner && !this.owner.sealed) await this.owner.get(target, scope);
 		if (this.load && !this.sealed) {
-			const pending = (this.pending ?? Promise.resolve()).then(() => {
-				const { entry } = this.entry(target, followsResource(scope));
-				// Existing input evidence also owns the metadata derivable from those bytes or names.
-				if (resourceCovers(entry, scope)) return;
-				return this.load!({ path: target, scope });
-			});
-			this.pending = pending;
-			try {
-				await pending;
-			} catch (error) {
-				throw (this.failure ??= error instanceof Error ? error : new Error(String(error)));
-			} finally {
-				if (this.pending === pending) this.pending = undefined;
+			const { entry } = this.entry(target, followsResource(scope));
+			// Existing input evidence also owns the metadata derivable from those bytes or names.
+			if (!resourceCovers(entry, scope)) {
+				const settled = Promise.withResolvers<void>();
+				this.queuedLoads.push({ dependency: { path: target, scope }, settled });
+				this.pending ??= this.drainLoads();
+				await settled.promise;
 			}
 		}
 		let entry: CapturedResource | undefined;
@@ -2232,6 +2255,7 @@ export class ResourceVersionManager {
 		retainBytes: number,
 		signal?: AbortSignal,
 		preparation?: PreparationLookup,
+		target?: string,
 	): Promise<ResourceVersionToken | undefined> {
 		if (!this.open || !this.persistentInputs || this.snapshotExcludes.size)
 			throw new Error("persistent input owner changed");
@@ -2242,7 +2266,28 @@ export class ResourceVersionManager {
 			const selected = preparation && payload.preparations.find((item) =>
 				item.binding === preparation.binding && item.key === preparation.key);
 			if (preparation && !selected) return;
-			const keys = selected && new Set(selected.dependencies);
+			const targetKey =
+				!preparation && target !== undefined
+					? filesystemPathKey(path.resolve(this.root, target))
+					: undefined;
+			const targetEntry =
+				targetKey !== undefined
+					? payload.entries.find(
+							([name, entry]) =>
+								name === targetKey && entry.type === "file" && !!entry.content && !!entry.dependency,
+						)
+					: undefined;
+			if (targetKey !== undefined && !targetEntry) return;
+			const boundaryDependency = dependencyKey({ path: this.root, scope: "resolution" });
+			const keys = selected
+				? new Set(selected.dependencies)
+				: targetEntry
+					? new Set([
+							boundaryDependency,
+							targetEntry[1].dependency!,
+							...(targetEntry[1].metadata?.dependency ? [targetEntry[1].metadata.dependency] : []),
+						])
+					: undefined;
 			const required = keys ? payload.observations.filter((entry) => keys.has(dependencyKey(entry))) : payload.observations;
 			const proofBytes = required.reduce(
 				(sum, entry) => sum + observationBytes(dependencyKey(entry), entry),
@@ -2260,7 +2305,7 @@ export class ResourceVersionManager {
 					boundary: {
 						root: this.root,
 						physicalRoot: payload.physicalRoot,
-						dependency: dependencyKey({ path: this.root, scope: "resolution" }),
+						dependency: boundaryDependency,
 					},
 					contents,
 					memory: this.persistentInputs!.memory,
@@ -2273,12 +2318,12 @@ export class ResourceVersionManager {
 			const release = releaseOnce(() => this.releaseCapture(observations, view));
 			try {
 				const references = new Map<Sha256Digest, number>();
-				for (const [target, entry] of payload.entries) {
+				for (const [entryTarget, entry] of payload.entries) {
 					for (const reference of entry.content?.chunks ?? [])
 						if (reference) validateArtifact(reference, references);
-					if (selected) continue;
+					if (selected || (targetEntry && entryTarget !== targetEntry[0])) continue;
 					const content = entry.content && (await contents.restore(entry.content, undefined, signal));
-					view.capture(target, {
+					view.capture(entryTarget, {
 						...entry,
 						computation: entry.computation && TimelineInterval.restore(entry.computation),
 						...(content ? { content } : {}),
@@ -2291,7 +2336,11 @@ export class ResourceVersionManager {
 					record.artifacts.some((reference) => references.get(reference.digest) !== reference.size)
 				)
 					throw new Error("persistent input artifact closure mismatch");
-				await view.restorePreparations(selected ? [selected] : payload.preparations, store, signal);
+				await view.restorePreparations(
+					selected ? [selected] : targetEntry ? [] : payload.preparations,
+					store,
+					signal,
+				);
 				view.seal();
 				const token: ResourceVersionToken = {
 					root: this.root,
@@ -2503,7 +2552,7 @@ export class ResourceVersionManager {
 				retainBytes === undefined
 					? undefined
 					: new ResourceReadView(retainBytes, {
-							load: dependencies ? undefined : (dependency) => capture([dependency]),
+							load: dependencies ? undefined : capture,
 							boundary: { root: this.root, physicalRoot, dependency: boundaryKey },
 							observeObject: dependencies
 								? undefined
@@ -2886,19 +2935,31 @@ export class ResourceInputSession {
 		const manager = this.root(root);
 		const store = this.configuration.store;
 		const candidates = this.fileCandidates(root, signal);
-		const restored = new Map<Sha256Digest, Promise<ResourceVersionToken | undefined>>();
+		const restored = new Map<Sha256Digest, Promise<{ record?: StoredInputVersion; token?: ResourceVersionToken }>>();
+		const restoredTargets = new Map<string, Promise<ResourceVersionToken | undefined>>();
 		const session = this;
 		const restore = async (id: Sha256Digest) => {
 			const record = await store.getInputVersion(id, signal);
-			if (!record) return;
+			if (!record) return {};
 			try {
 				const token = await manager.restore(record, session.remainingBytes, signal);
+				if (token) retain(token);
+				return { record, token };
+			} catch {
+				signal.throwIfAborted();
+				store.signal.throwIfAborted();
+				// An invalid historical input leaves the current filesystem authoritative.
+				return { record };
+			}
+		};
+		const restoreTarget = async (record: StoredInputVersion, target: string) => {
+			try {
+				const token = await manager.restore(record, session.remainingBytes, signal, undefined, target);
 				if (token) retain(token);
 				return token;
 			} catch {
 				signal.throwIfAborted();
 				store.signal.throwIfAborted();
-				// An invalid historical input leaves the current filesystem authoritative.
 			}
 		};
 		return async function* (target?: string, preparation?: PreparationLookup) {
@@ -2919,7 +2980,23 @@ export class ResourceInputSession {
 					});
 					restored.set(id, pending);
 				}
-				const token = await pending;
+				const full = await pending;
+				if (full.token) {
+					yield full.token;
+					continue;
+				}
+				const entries = (full.record?.payload as { entries?: unknown[] } | null)?.entries;
+				if (!full.record || !Array.isArray(entries) || entries.length <= 1) continue;
+				const targetKey = `${id}\0${filesystemPathKey(path.resolve(manager.root, target))}`;
+				let single = restoredTargets.get(targetKey);
+				if (!single) {
+					single = restoreTarget(full.record, target).catch((error) => {
+						if (restoredTargets.get(targetKey) === single) restoredTargets.delete(targetKey);
+						throw error;
+					});
+					restoredTargets.set(targetKey, single);
+				}
+				const token = await single;
 				if (token) yield token;
 			}
 		};
@@ -3321,14 +3398,15 @@ async function fingerprintDependencies(
 				filesRead: 0,
 			};
 		}
-		const { info, link } = captured;
+		const { info, link, resolvedPath } = captured;
+		const pinnedPath = !info.isSymbolicLink() ? resolvedPath : undefined;
 		const realTarget = info.isSymbolicLink()
 			? path.join(
 					parentReal ?? (await fingerprintIO(() => filesystem!.realpath(path.dirname(target)))),
 					path.basename(target),
 				)
 			: parentReal === undefined
-				? await fingerprintIO(() => filesystem!.realpath(target))
+				? (pinnedPath ?? (await fingerprintIO(() => filesystem!.realpath(target))))
 				: path.join(parentReal, path.basename(target));
 		// An entry name joined to a walked directory stays where the directory was proven to be.
 		if (parentReal === undefined) assertInside(realRoot, realTarget);
@@ -3408,7 +3486,10 @@ async function fingerprintDependencies(
 			(scope === "entries" && !descend) ||
 			(["names", "entries", "tree_entries"].includes(scope) && !info.isDirectory())
 		) {
-			const after = parentReal === undefined ? await fingerprintIO(() => filesystem!.stat(target)) : info;
+			const after =
+				parentReal !== undefined || pinnedPath !== undefined
+					? info
+					: await fingerprintIO(() => filesystem!.stat(target));
 			if (!sameFilesystemIdentity(info, after)) throw new Error(`resource_file_changed:${target}`);
 			const size = ["stat", "entry"].includes(scope) ? Number(after.size) : undefined;
 			const computation = supplied && "computation" in supplied ? supplied.computation : captured.computation;

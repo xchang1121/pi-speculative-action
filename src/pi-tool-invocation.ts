@@ -348,16 +348,20 @@ async function walkSearchInputs(
 		});
 		return content.toString("utf8");
 	};
-	const rules = async (directory: string): Promise<Rule[]> => {
+	const rules = async (directory: string, dirEntries?: ReadonlySet<string>): Promise<Rule[]> => {
 		const cached = layers.get(directory);
 		if (cached) return cached;
 		const parent = path.dirname(directory);
 		let inherited = directory === parent || (!grep && directory === cwd) ? [] : await rules(parent);
 		let exclude = path.join(directory, ".git/info/exclude");
+		let hasGit = false;
 		if (grep) {
 			const git = path.join(directory, ".git");
-			const hasGit = await view.exists!(git);
-			if (hasGit || (engine!.jj && (await view.exists!(path.join(directory, ".jj"))))) {
+			hasGit = dirEntries ? dirEntries.has(".git") : Boolean(await view.exists!(git));
+			const hasJj =
+				engine!.jj &&
+				(dirEntries ? dirEntries.has(".jj") : Boolean(await view.exists!(path.join(directory, ".jj"))));
+			if (hasGit || hasJj) {
 				repositories.add(directory);
 				inherited = inherited.filter((rule) => rule.rank > 1);
 				if (hasGit && !(await view.stat!(git, "type", false)).isDirectory()) {
@@ -373,7 +377,9 @@ async function walkSearchInputs(
 		const names = grep ? [exclude, ".gitignore", ".ignore", ".rgignore"] : [".gitignore"];
 		const local: Rule[] = [];
 		for (const [rank, name] of names.entries()) {
+			if (grep && rank === 0 && !hasGit) continue;
 			if (grep && rank < 2 && !repositories.has(directory)) continue;
+			if (dirEntries && (!grep || rank > 0) && !dirEntries.has(name)) continue;
 			const content = await text(path.resolve(directory, name));
 			if (content !== undefined) {
 				const matcher = ignore({ ignorecase: false }).add(content);
@@ -426,13 +432,20 @@ async function walkSearchInputs(
 				!spellings.some((name) => matcher.match(name.replace(/\/$/u, ""), true))
 			)
 				return true;
-			await rules(file);
 			const names = await view.readdir!(file);
+			await rules(file, process.platform === "linux" ? new Set(names) : undefined);
 			// Every listed child requires an entry observation, including ones later excluded by a rule.
 			if ((entries += names.length) > entryLimit) return false;
-			for (const name of names) {
+			const children = names.map((name) => {
 				assert.ok(path.basename(name) === name && name !== "." && name !== "..", "invalid directory entry");
-				if (!await walk(path.join(file, name))) return false;
+				return path.join(file, name);
+			});
+			if (children.length > 1)
+				await Promise.all(
+					children.map((child) => Promise.resolve(view.stat!(child, "entry", false)).catch(() => undefined)),
+				);
+			for (const child of children) {
+				if (!await walk(child)) return false;
 			}
 		} else if (grep ? root || !matcher || negative || matches : matches) {
 			if (grep)
@@ -762,11 +775,34 @@ async function runCapturedGrep(
 			const scope = new SharedAbortScope();
 			const release = inputs.map((item) => scope.acquire(item.signal));
 			try {
-				for (const [index, item] of inputs.entries()) {
+				const stats = await Promise.allSettled(
+					inputs.map((item) =>
+						item.source
+							? Promise.resolve(item.inputs.stat!(item.source, "type"))
+							: Promise.resolve({ size: 0 }),
+					),
+				);
+				const sizes = inputs.map((item, index) => {
 					scope.signal.throwIfAborted();
-					const content = item.source ? await readSearchInput(item.inputs, item.source, charge) : Buffer.alloc(0);
-					await fs.writeFile(path.join(root, String(index)), content);
-				}
+					const settled = stats[index]!;
+					if (settled.status === "rejected") throw settled.reason;
+					if (!item.source) return 0;
+					const { size } = settled.value;
+					if (!isSafeCount(size)) throw new Error("search input size unavailable");
+					charge(item.source, size);
+					return size;
+				});
+				const contents = await Promise.allSettled(
+					inputs.map(async (item, index) => {
+						scope.signal.throwIfAborted();
+						const content = item.source
+							? await item.inputs.readFile(item.source, sizes[index]! + 1)
+							: Buffer.alloc(0);
+						if (item.source) assert.equal(content.length, sizes[index]!, "search input size changed");
+						await fs.writeFile(path.join(root, String(index)), content);
+					}),
+				);
+				for (const settled of contents) if (settled.status === "rejected") throw settled.reason;
 				const args = ["--", query.pattern, root];
 				if (query.ignoreCase) args.unshift("--ignore-case");
 				if (query.literal) args.unshift("--fixed-strings");

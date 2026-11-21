@@ -302,26 +302,50 @@ export class ResourceObjectInputs {
 		return withFilesystemReadView(undefined, async () => {
 			const owned: ResourceVersionToken[] = [];
 			try {
-				const validated = await mapFilesystem([...this.captured], async (entry) => {
+				const entries = [...this.captured];
+				const maxPartitions = 16;
+				const groups: (typeof entries)[] = [];
+				if (entries.length <= maxPartitions) {
+					for (const entry of entries) groups.push([entry]);
+				} else {
+					const chunkSize = Math.ceil(entries.length / maxPartitions);
+					for (let index = 0; index < entries.length; index += chunkSize)
+						groups.push(entries.slice(index, index + chunkSize));
+				}
+				const captureValid = async (
+					group: typeof entries,
+				): Promise<{ readonly token: ResourceVersionToken; readonly count: number }[]> => {
+					if (!group.length) return [];
 					try {
 						const token = await this.session.capture(
-							undefined, this.root, PI_ACTION_SEMANTICS, this.session.maxBytes, new Map([entry]),
+							undefined,
+							this.root,
+							PI_ACTION_SEMANTICS,
+							this.session.maxBytes,
+							new Map(group),
 						);
 						owned.push(token);
 						token.view?.seal();
-						if (!(await validateResourceVersion([token], true)).expired) return token;
+						if (!(await validateResourceVersion([token], true)).expired)
+							return [{ token, count: group.length }];
 					} catch {
 						this.signal.throwIfAborted();
 					}
-				}, this.signal);
-				const tokens = validated.filter((token) => token !== undefined);
-				if (!tokens.length) return 0;
+					if (group.length === 1) return [];
+					const middle = Math.ceil(group.length / 2);
+					return [
+						...(await captureValid(group.slice(0, middle))),
+						...(await captureValid(group.slice(middle))),
+					];
+				};
+				const validated = (await mapFilesystem(groups, captureValid, this.signal)).flat();
+				if (!validated.length) return 0;
 				return await this.session.configuration.store.withPublication(async () => {
-					await mapFilesystem(tokens, async (token) => {
+					await mapFilesystem(validated, async ({ token }) => {
 						if (!await this.session.publish(token, this.signal)) throw new Error("file input publication failed");
 					}, this.signal);
 					this.signal.throwIfAborted();
-					return tokens.length;
+					return validated.reduce((sum, { count }) => sum + count, 0);
 				});
 			} finally {
 				await Promise.all(owned.map((token) => token.release()));
@@ -355,6 +379,7 @@ export async function evaluateResourceQuery<Output>(
 	acceptObservation?: (observation: ResourceObservation) => boolean,
 ) {
 	signal.throwIfAborted();
+	return withFilesystemReadView(undefined, async () => {
 	const borrowed: ResourceVersionToken[] = [];
 	const recover = session?.reader(root, signal, (token) => { borrowed.push(token); });
 	const capture = () =>
@@ -526,6 +551,7 @@ export async function evaluateResourceQuery<Output>(
 			await Promise.allSettled([...borrowed, ...retained, captured, initial].map(releaseResourceVersion));
 		});
 	}
+	});
 }
 /** Committed poststates enter the same read view and exact validation as captured inputs. */
 export async function createCommittedResourceInputs(

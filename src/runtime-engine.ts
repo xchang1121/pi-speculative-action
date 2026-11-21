@@ -365,6 +365,7 @@ export interface LocalExecutionHooks<Output> {
 		"maxConcurrentActions" | "resourceCacheMaxEntries" | "resourceCacheMaxBytes" | "reuseEnabled"
 	>;
 	effect?(key: ActionKey): ActionEffect | undefined;
+	adoptable?(call: ExecutionCall, key: ActionKey): boolean;
 	key(call: ExecutionCall, actor: boolean): Promise<ActionKey | undefined>;
 	route(
 		call: ExecutionCall,
@@ -432,7 +433,13 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 	private readonly handles = new Map<string, Handle<Output>>();
 	private readonly captures = new Set<object>();
 	private readonly capturing = new Map<string, Promise<void>>();
-	private readonly admitting = new Map<string, Set<Promise<void>>>();
+	private readonly admitting = new Map<
+		string,
+		Set<{
+			readonly promise: Promise<void>;
+			readonly abortUnadoptable?: () => void;
+		}>
+	>();
 	private readonly running = new Set<Entry<Output>>();
 	private sequence = 0;
 	private readonly hooks: LocalExecutionHooks<Output>;
@@ -728,12 +735,14 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 		exhausted?: Set<string>,
 	) {
 		if (!this.limits().maxEntries) return;
+		const effect = this.hooks.effect?.(key) ?? key.semantics?.effect;
 		for (const { entry, match } of this.pool.lookup(key, actor)) {
 			if (signal.aborted) return;
 			let base = entry.parent;
 			if (!parent) while (base?.adopted) base = base.parent;
 			if (entry.adopted && entry.route.reuse === "exclusive_branch") continue;
 			if (base !== parent || (parent && match.kind === "inputs")) continue;
+			if (match.kind === "inputs" && effect !== undefined && effect !== "observation") continue;
 			const rebuild = match.kind === "inputs" && candidateBranch(entry)?.reconstructionScope === "current_action" &&
 				!entry.resultViews?.has(key.key);
 			if (rebuild && exhausted?.has(entry.route.fingerprint)) continue;
@@ -859,12 +868,18 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 		const signal = AbortSignal.any([controller.signal, this.controller.signal]);
 		const admission = Promise.withResolvers<void>();
 		let waitingKey: string | undefined;
+		let admissionRecord:
+			| {
+					readonly promise: Promise<void>;
+					readonly abortUnadoptable?: () => void;
+			  }
+			| undefined;
 		let pinned: Entry<Output> | undefined;
 		const admitted = () => {
 			admission.resolve();
-			if (waitingKey === undefined) return;
+			if (waitingKey === undefined || !admissionRecord) return;
 			const waiters = this.admitting.get(waitingKey);
-			waiters?.delete(admission.promise);
+			waiters?.delete(admissionRecord);
 			if (!waiters?.size) this.admitting.delete(waitingKey);
 			waitingKey = undefined;
 		};
@@ -892,8 +907,14 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 						const opening = this.capturing.get(key.key);
 						if (opening) await waitForCompletion(opening, signal);
 						waitingKey = key.key;
+						admissionRecord = {
+							promise: admission.promise,
+							...(this.hooks.adoptable?.(call, key) === false
+								? { abortUnadoptable: () => controller.abort() }
+								: {}),
+						};
 						const waiting = this.admitting.get(key.key) ?? new Set();
-						waiting.add(admission.promise);
+						waiting.add(admissionRecord);
 						this.admitting.set(key.key, waiting);
 					}
 					const seen = new Set(this.pool.lookup(key, false).map(({ entry }) => entry));
@@ -994,7 +1015,11 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 				const selected = await this.select(call, key, signal, true, undefined, undefined, exhausted);
 				if (selected) return selected;
 				const opening = this.capturing.get(key.key);
-				const admissions = [...(this.admitting.get(key.key) ?? [])];
+				const admissions: Promise<void>[] = [];
+				for (const item of [...(this.admitting.get(key.key) ?? [])]) {
+					if (item.abortUnadoptable) item.abortUnadoptable();
+					else admissions.push(item.promise);
+				}
 				if (opening) admissions.push(opening);
 				if (admissions.length) {
 					await waitForCompletion(Promise.all(admissions), signal);
