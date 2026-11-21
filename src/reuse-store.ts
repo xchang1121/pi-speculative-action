@@ -502,6 +502,8 @@ export class ProvenanceCertificateStore {
 	private readonly publication = new AsyncLocalStorage<{
 		database: DatabaseSync;
 		touched: Set<string>;
+		verifiedPaths: Set<string>;
+		statements: Map<string, ReturnType<DatabaseSync["prepare"]>>;
 		active: boolean;
 	}>();
 	private control?: DatabaseSync;
@@ -517,7 +519,11 @@ export class ProvenanceCertificateStore {
 		this.reservedRoot = options.reservedRoot === true;
 		this.artifacts = new ArtifactCAS(path.join(this.root, "cas"), (target, bytes) =>
 			this.exclusive(
-				() => publishImmutable(target, bytes, this.reservedRoot ? this.root : undefined),
+				async () => {
+					const created = await publishImmutable(target, bytes, this.reservedRoot ? this.root : undefined);
+					this.publication.getStore()?.verifiedPaths.add(target);
+					return created;
+				},
 				[this.objectKey(target)],
 			),
 		);
@@ -624,9 +630,9 @@ export class ProvenanceCertificateStore {
 			const input = record.payload as { root: string; preparations: readonly { binding: string; key: string }[] };
 			if (typeof input?.root !== "string" || !Array.isArray(input.preparations))
 				throw new Error("invalid persistent input scope");
-			database.prepare("INSERT OR REPLACE INTO input_versions(id, root, value) VALUES (?, ?, ?)")
+			this.statement(database, "INSERT OR REPLACE INTO input_versions(id, root, value) VALUES (?, ?, ?)")
 				.run(id, input.root, encoded);
-			const index = database.prepare("INSERT OR IGNORE INTO input_preparations VALUES (?, ?, ?, ?, ?)");
+			const index = this.statement(database, "INSERT OR IGNORE INTO input_preparations VALUES (?, ?, ?, ?, ?)");
 			for (const { binding, key } of input.preparations) {
 				if (typeof binding !== "string" || typeof key !== "string") throw new Error("invalid preparation key");
 				index.run(input.root, binding, digestObject(key), id, record.createdAt);
@@ -982,6 +988,16 @@ export class ProvenanceCertificateStore {
 	private objectKey(target: string): string {
 		return path.relative(this.root, target).split(path.sep).join("/");
 	}
+	private statement(database: DatabaseSync, sql: string) {
+		const active = this.publication.getStore();
+		if (!active || active.database !== database) return database.prepare(sql);
+		let prepared = active.statements.get(sql);
+		if (!prepared) {
+			prepared = database.prepare(sql);
+			active.statements.set(sql, prepared);
+		}
+		return prepared;
+	}
 	/** A persistent root adopts existing versions under the same metadata transaction. */
 	private publishRoot<T>(
 		key: string,
@@ -993,9 +1009,22 @@ export class ProvenanceCertificateStore {
 				const result = await publish(database);
 				if (references.length) {
 					await this.artifacts.materialize(references);
-					const closure = await this.loadArtifacts(references);
-					if (!closure) throw new Error("persistent root artifacts are unavailable");
-					await closure.dispose();
+					const verified = this.publication.getStore()?.verifiedPaths;
+					const unverified = verified
+						? references.filter((reference) => !verified.has(this.artifacts.artifactPath(reference.digest)))
+						: references;
+					if (unverified.length) {
+						const closure = await this.read((signal) =>
+							this.artifacts.load(unverified, signal, undefined, {
+								maxStoredBytes: this.limits.maxBytes,
+								maxOpenChunks: 0,
+							}),
+						);
+						if (!closure) throw new Error("persistent root artifacts are unavailable");
+						await closure.dispose();
+						for (const reference of unverified)
+							verified?.add(this.artifacts.artifactPath(reference.digest));
+					}
 				}
 				return result;
 			},
@@ -1118,12 +1147,19 @@ export class ProvenanceCertificateStore {
 				database.exec("BEGIN IMMEDIATE");
 				admitted = true;
 			}, admission);
-			const publication = { database, touched: new Set(touched), active: true };
+			const publication = {
+				database,
+				touched: new Set(touched),
+				verifiedPaths: new Set<string>(),
+				statements: new Map<string, ReturnType<DatabaseSync["prepare"]>>(),
+				active: true,
+			};
 			// Cancellation ends at admission. Finish owned filesystem work before releasing the transaction.
 			try {
 				const value = await this.publication.run(publication, () => operation(database));
 				const version = changeRevision(database) + 1;
-				const update = database.prepare(
+				const update = this.statement(
+					database,
 					"INSERT INTO changes VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET revision=excluded.revision",
 				);
 				for (const key of ["", ...publication.touched]) update.run(key, version);

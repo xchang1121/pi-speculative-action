@@ -704,7 +704,30 @@ test("shared host results require the consuming workspace to authorize the bindi
 			});
 			expect(build).toHaveBeenCalledTimes(1);
 			expect(second.drainMetrics()[step.namespace]).toMatchObject({ hits: 1, misses: 0 });
+			const secondHit = await trustedCompute(consumer, to, step.namespace, null, bytes);
+			expect(secondHit).toMatchObject({ state: "hit", value: { value: { target: "library" } } });
 		} finally { consumer.close(); }
+		const thirdRoot = await directories.create();
+		const deniedAccept = vi.fn(() => false);
+		const deniedBuild = vi.fn(parseJsonConfig.build);
+		const deniedStep = { ...parseJsonConfig, namespace: "json.denied", build: deniedBuild, acceptShared: deniedAccept };
+		const deniedService = new SubcomputeService(thirdRoot, store, () => 65536, [deniedStep]);
+		try {
+			const env = await deniedService.environment();
+			const peer = client(env);
+			try {
+				peer.send({
+					op: "compute",
+					context: env.PI_SUBCOMPUTE_CONTEXT,
+					namespace: deniedStep.namespace,
+					key: null,
+					inputDigest: createHash("sha256").update(bytes).digest("hex"),
+				});
+				expect(await peer.read()).toEqual({ state: "unavailable" });
+				expect(deniedAccept).toHaveBeenCalledOnce();
+				expect(deniedBuild).not.toHaveBeenCalled();
+			} finally { peer.close(); }
+		} finally { await deniedService.dispose(); }
 	} finally {
 		await Promise.all([first.dispose(), second.dispose()]);
 		await store.dispose();

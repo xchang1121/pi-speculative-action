@@ -627,6 +627,7 @@ type PreparationLookup = { readonly binding?: string; readonly key: string };
 type ResourceInputLookup = (
 	target?: string,
 	preparation?: PreparationLookup,
+	cold?: boolean,
 ) => Iterable<ResourceInputSource> | AsyncIterable<ResourceInputSource>;
 type PreparedSharingState =
 	| { readonly kind: "building"; requiresProofs: boolean; readonly waiters: Set<() => void> }
@@ -1772,7 +1773,11 @@ export class ResourceReadView {
 		}
 		// The local alias proof owns this translation; the source owns the resolved resource.
 		for (const query of resolved === filesystemPathKey(target) ? [target] : [resolved, target])
-			for await (const source of evaluation?.lookup?.(query) ?? []) {
+			for await (const source of evaluation?.lookup?.(
+				query,
+				undefined,
+				scope === "content" || !evaluation.missing,
+			) ?? []) {
 				if (source.view.entries === this.entries || !source.view.retained) continue;
 				try {
 					source.view.assertComplete(true);

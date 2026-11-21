@@ -517,6 +517,10 @@ const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf-creation-mode";
 const processDependencyPIDs = new WeakMap<TimelineDependency, number>();
 /** Native inputs consumed by this exact one-shot execution; they still prohibit any later replay. */
 const acceptedReplayTaints = () => speculativeConfig().processReuse.replayAcceptedTaints;
+const canReplayObservedProcess = () => {
+	const accepted = acceptedReplayTaints();
+	return accepted.includes("clock") && accepted.includes("random");
+};
 export interface LinuxProcessBackendOptions {
 	readonly storeRoot: string;
 	readonly store?: ProvenanceStoreOptions;
@@ -708,6 +712,9 @@ interface NativeObservation {
 export class LinuxProcessReuseBackend {
 	readonly configuration = currentSpeculativeConfiguration();
 	private readonly observations = new AsyncLocalStorage<NativeObservation>();
+	canAdoptProcess(): boolean {
+		return canReplayObservedProcess();
+	}
 	/** Keep actual completed launches and acknowledged adoptions in their enclosing native call's order. */
 	async observeBindings<Value>(
 		scope: ExecutionScope,
@@ -1136,116 +1143,144 @@ export class LinuxProcessReuseBackend {
 		try {
 			assertInvocationMatches(invocation, request);
 			const ready = await this.resolveReady();
+			const canAdopt = canReplayObservedProcess();
+			const learning = !!this.observations.getStore()?.learn;
 			const projection = new ExecutionPathProjection({
 				sourceRoot: options.sourceRoot,
 				workspaceRoot: options.sourceRoot,
 			});
-			const prototype = await this.topLevelPrototype(invocation, request, projection);
+			const prototype = canAdopt
+				? await this.topLevelPrototype(invocation, request, projection)
+				: undefined;
 			// Watch from before execution; post-exit hashes alone cannot establish what the process read.
 			proof = executionDomainProof(ready.collector, options.sourceRoot);
 			if (proof.reason) throw new Error(proof.reason);
 			recording = ready.collector.open();
 			await using trace = traceTail(executionRecords(recording.trace()), request.cwd);
 			const command = recording.launch([invocation.shell, ...shellArguments(invocation, request.command)]);
-			const boundary = await this.heldBoundary();
 			const began = performance.now();
 			let outputEndpoints: readonly [string, string] | undefined;
-			const native = this.nativeObservation(options.sourceRoot, this.observations.getStore()?.scope, request.signal);
-			const dispatcherExecutable = await realpath(ready.dispatcher).catch(() => ready.dispatcher);
-			const shellExecutable = await realpath(invocation.shell).catch(() => invocation.shell);
-			let rootPid: number | undefined;
-			let rootShellContinued = false;
 			const replayed = new Set<number>();
-			// The installed child, its exit and all evidence come from this one execution domain.
-			const record: ActorImageRecorder = async (pid, child, image, installed, clock) => {
-				if (pid === rootPid && image.executable === shellExecutable) return;
-				try {
-					const events = (await trace.read()).journal(pid);
-					const endpoints = image.context.outputEndpoints;
-					if (!events || !endpoints.every((name) => name === "/dev/null" || /^(socket|pipe):\[\d+\]$/.test(name)))
-						return;
-					const start = installedImageStart(events, installed);
-					const terminal = events.at(-1);
-					if (
-						start < 0 ||
-						terminal?.name !== "terminated" ||
-						terminal.result === undefined ||
-						(terminal.result & 127) !== 0 ||
-						events.slice(0, start).some((event) => event.name === "terminated")
-					) return;
-					let observed = await observeExecution(trace, image.executable, image.cwd, {
-						execution: { pid, start },
-						captureOutput: true,
-						outputEndpoints: endpoints,
-						outputFlags: image.outputFlags ?? [0, 0],
-						platformFingerprint: child.platformFingerprint,
-						controlledSocket: channel?.socket,
-						guardFilesystemSemanticsWithin: [options.sourceRoot],
-					});
-					if (observed.pids?.some((member) => replayed.has(member))) return;
-					if (channel) observed = await channel.observe(observed);
-					await this.publishActorProcess(
-						child, observed, { kind: "code", code: terminal.result >> 8 },
-						new TimelineInterval(clock.startedAt, clock.completedAt), proof!, request.signal, channel,
-					);
-				} catch (error) {
-					this.setError(undefined, `actor_child:${errorMessage(error)}`);
-				}
-			};
-			output = await boundary.trace(
-				{
-					...native,
-					descriptors: true,
-					decide: async (held) => {
-						rootPid ??= held.pid;
-						if (held.pid === rootPid && !rootShellContinued) {
-							const exe = await readlink(`/proc/${held.pid}/exe`).catch(() => undefined);
-							if (exe === dispatcherExecutable) return { kind: "continue" };
-							if (exe === shellExecutable) {
-								rootShellContinued = true;
-								return { kind: "continue" };
+			const mayIntercept =
+				canAdopt ||
+				learning ||
+				this.hasReusableWork ||
+				(await this.store.mayHaveCertificates(undefined, request.signal));
+			if (mayIntercept) {
+				const boundary = await this.heldBoundary();
+				const native = this.nativeObservation(options.sourceRoot, this.observations.getStore()?.scope, request.signal);
+				const dispatcherExecutable = await realpath(ready.dispatcher).catch(() => ready.dispatcher);
+				const shellExecutable = await realpath(invocation.shell).catch(() => invocation.shell);
+				let rootPid: number | undefined;
+				let rootShellContinued = false;
+				// The installed child, its exit and all evidence come from this one execution domain.
+				const record: ActorImageRecorder | undefined = canAdopt
+					? async (pid, child, image, installed, clock) => {
+							if (pid === rootPid && image.executable === shellExecutable) return;
+							try {
+								const events = (await trace.read()).journal(pid);
+								const endpoints = image.context.outputEndpoints;
+								if (!events || !endpoints.every((name) => name === "/dev/null" || /^(socket|pipe):\[\d+\]$/.test(name)))
+									return;
+								const start = installedImageStart(events, installed);
+								const terminal = events.at(-1);
+								if (
+									start < 0 ||
+									terminal?.name !== "terminated" ||
+									terminal.result === undefined ||
+									(terminal.result & 127) !== 0 ||
+									events.slice(0, start).some((event) => event.name === "terminated")
+								) return;
+								let observed = await observeExecution(trace, image.executable, image.cwd, {
+									execution: { pid, start },
+									captureOutput: true,
+									outputEndpoints: endpoints,
+									outputFlags: image.outputFlags ?? [0, 0],
+									platformFingerprint: child.platformFingerprint,
+									controlledSocket: channel?.socket,
+									guardFilesystemSemanticsWithin: [options.sourceRoot],
+								});
+								if (observed.pids?.some((member) => replayed.has(member))) return;
+								if (channel) observed = await channel.observe(observed);
+								await this.publishActorProcess(
+									child, observed, { kind: "code", code: terminal.result >> 8 },
+									new TimelineInterval(clock.startedAt, clock.completedAt), proof!, request.signal, channel,
+								);
+							} catch (error) {
+								this.setError(undefined, `actor_child:${errorMessage(error)}`);
 							}
 						}
-						const decision = await this.decideHeldExec(held, held.scope, record, channel?.identity);
-						if (decision.kind !== "replay") return decision;
-						return {
-							...decision,
-							adopted: () => {
-								replayed.add(held.pid);
-								return decision.adopted?.();
-							},
-						};
+					: undefined;
+				output = await boundary.trace(
+					{
+						...native,
+						descriptors: true,
+						decide: async (held) => {
+							rootPid ??= held.pid;
+							if (held.pid === rootPid && !rootShellContinued) {
+								const exe = await readlink(`/proc/${held.pid}/exe`).catch(() => undefined);
+								if (exe === dispatcherExecutable) return { kind: "continue" };
+								if (exe === shellExecutable) {
+									rootShellContinued = true;
+									return { kind: "continue" };
+								}
+							}
+							const decision = await this.decideHeldExec(held, held.scope, record, channel?.identity);
+							if (decision.kind !== "replay") return decision;
+							return {
+								...decision,
+								adopted: () => {
+									replayed.add(held.pid);
+									return decision.adopted?.();
+								},
+							};
+						},
 					},
-				},
-				() => {
+					() => {
+						started = true;
+						return runSpawn([ready.dispatcher, "--output-channel=3", ...command], {
+							...request,
+							held: true,
+							streamBeyondCaptureLimit: true,
+							onOutputEndpoints: (endpoints) => {
+								outputEndpoints = endpoints;
+							},
+							...(invocation.commandTransport === "stdin" ? { stdin: Buffer.from(request.command) } : {}),
+						});
+					},
+				);
+			} else {
+				output = await LinuxHeldExecBoundary.command(() => {
 					started = true;
 					return runSpawn([ready.dispatcher, "--output-channel=3", ...command], {
 						...request,
-						held: true,
+						held: false,
 						streamBeyondCaptureLimit: true,
 						onOutputEndpoints: (endpoints) => {
 							outputEndpoints = endpoints;
 						},
 						...(invocation.commandTransport === "stdin" ? { stdin: Buffer.from(request.command) } : {}),
 					});
-				},
-			);
+				});
+			}
 			const ended = performance.now();
+			const platformFingerprint =
+				prototype?.platformFingerprint ?? (await this.resolvePlatformFingerprint());
 			let observation = await observeExecution(trace, invocation.shell, request.cwd, {
-				platformFingerprint: prototype.platformFingerprint,
-				captureOutput: true,
+				platformFingerprint,
+				...(canAdopt ? { captureOutput: true as const } : {}),
 				outputEndpoints,
 				controlledSocket: channel?.socket,
 				guardFilesystemSemanticsWithin: [options.sourceRoot],
 			});
-			observation = verifyProcessOutput(observation, output.output);
+			if (canAdopt) observation = verifyProcessOutput(observation, output.output);
 			if (channel) observation = await channel.observe(observation);
 			await using files = this.fileInputs(
 				options.sourceRoot, request.signal ?? this.store.signal, this.observations.getStore()?.inputs,
 			);
-			const workspaceFiles = files && await withFilesystemReadView(undefined, (view) =>
-				this.captureActorFiles(observation, options.sourceRoot, files, proof!, view));
-			if (output.captureComplete !== false && !observation.pids?.some((pid) => replayed.has(pid)))
+			const workspaceFiles =
+				files && await this.captureActorFiles(observation, options.sourceRoot, files, proof!, canAdopt);
+			if (canAdopt && prototype && output.captureComplete !== false && !observation.pids?.some((pid) => replayed.has(pid)))
 				await this.publishActorProcess(prototype, observation, exitOutcome(output),
 					new TimelineInterval(began, ended), proof, request.signal, channel, workspaceFiles, true);
 		} catch (error) {
@@ -1325,65 +1360,61 @@ export class LinuxProcessReuseBackend {
 		root: string,
 		files: ResourceObjectInputs,
 		proof: ReturnType<typeof executionDomainProof>,
-		view: FilesystemReadView,
+		sealDependencies = true,
 	) {
 		const captured = new Map<string, FileContentVersion>();
 		const denied = sensitivePaths(this.options.storeRoot, this.options.deniedPaths);
 		const inputs = observation.paths.filter((input) => input.role !== "metadata" && !input.lookupFailure && pathContains(root, input.path));
-		const named = await mapFilesystem(inputs, async (input) => {
-			try {
-				const target = await view.realpath(input.path);
-				if (!pathContains(root, target) || denied.some((dir) => pathContains(dir, target))) return;
-				const stat = await view.stat(target, false);
-				if (stat.isFile() && stat.size <= BigInt(speculativeConfig().filesystem.maxReadBytes))
-					return { target, stat, role: input.role as DependencyRole };
-			} catch { this.store.signal.throwIfAborted(); }
-		}, this.store.signal);
-		const seen = new Set<string>();
-		const unique = named.filter((item): item is NonNullable<typeof item> => {
-			if (!item || seen.has(item.target)) return false;
-			seen.add(item.target);
-			return true;
-		});
-		const candidates: { target: string; file: FileContentVersion; dependency: DynamicDependency }[] = [];
-		for (let i = 0; i < unique.length;) {
-			const batch: typeof unique = [];
-			let budget = files.remainingBytes;
-			while (i < unique.length && batch.length < speculativeConfig().filesystem.concurrency) {
-				const item = unique[i]!;
-				if (item.stat.size > BigInt(files.remainingBytes)) { i++; continue; }
-				if (item.stat.size > BigInt(budget)) break;
-				budget -= Number(item.stat.size);
-				batch.push(item);
-				i++;
-			}
-			const values = await mapFilesystem(batch, async ({ target, stat, role }) => {
+		if (!inputs.length) return captured;
+		return withFilesystemReadView(undefined, async (view) => {
+			const named = await mapFilesystem(inputs, async (input) => {
 				try {
-					const file = (await files.borrow(target, stat, files.contents)) ??
-						(await captureFileContent(target, Number(stat.size), files.contents, { stat, realPath: target, view }));
+					const target = await view.realpath(input.path);
+					if (!pathContains(root, target) || denied.some((dir) => pathContains(dir, target))) return;
+					const stat = await view.stat(target, false);
+					if (stat.isFile() && stat.size <= BigInt(speculativeConfig().filesystem.maxReadBytes))
+						return { target, stat, role: input.role as DependencyRole };
+				} catch { this.store.signal.throwIfAborted(); }
+			}, this.store.signal);
+			const seen = new Set<string>();
+			const unique = named.filter((item): item is NonNullable<typeof item> => {
+				if (!item || seen.has(item.target)) return false;
+				seen.add(item.target);
+				return true;
+			});
+			let budget = files.remainingBytes;
+			const values = await mapFilesystem(unique, async ({ target, stat, role }) => {
+				try {
+					let file = await files.borrow(target, stat, files.contents);
+					if (!file) {
+						const bytes = Number(stat.size);
+						if (bytes > budget) return;
+						budget -= bytes;
+						file = await captureFileContent(target, bytes, files.contents, { stat, realPath: target, view });
+					}
 					const dependency = { kind: "file", path: target, role, contentDigest: contentDigest(file.content) } as const;
 					return { target, file, dependency };
 				} catch { this.store.signal.throwIfAborted(); }
 			}, this.store.signal);
-			for (const item of values) if (item) {
-				files.remember(item.target, item.file);
-				candidates.push(item);
+			const candidates = values.filter((item): item is NonNullable<typeof item> => item !== undefined);
+			for (const { target, file } of candidates) files.remember(target, file);
+			if (sealDependencies) {
+				// Isolate changes without repeating every pathname walk for a single racing file.
+				const admit = (group: typeof candidates) => {
+					if (!group.length) return;
+					if (proof.seal(group.map((item) => item.dependency), (name) => name)()) {
+						for (const { target, file } of group) captured.set(target, file);
+					} else if (group.length > 1) {
+						const middle = Math.ceil(group.length / 2);
+						admit(group.slice(0, middle));
+						admit(group.slice(middle));
+					}
+				};
+				admit(candidates);
 			}
-		}
-		// Isolate changes without repeating every pathname walk for a single racing file.
-		const admit = (group: typeof candidates) => {
-			if (!group.length) return;
-			if (proof.seal(group.map((item) => item.dependency), (name) => name)()) {
-				for (const { target, file } of group) captured.set(target, file);
-			} else if (group.length > 1) {
-				const middle = Math.ceil(group.length / 2);
-				admit(group.slice(0, middle));
-				admit(group.slice(middle));
-			}
-		};
-		admit(candidates);
-		await this.publishFileInputs(files);
-		return captured;
+			await this.publishFileInputs(files);
+			return captured;
+		});
 	}
 	private async publishFileInputs(files: ResourceObjectInputs, session?: ActiveSession) {
 		this.add(session, "fileInputHits", files.hits);
@@ -1535,7 +1566,7 @@ export class LinuxProcessReuseBackend {
 						if (external.proof.kind === "incomplete")
 							throw new Error(`unrepresentable writes outside the workspace: ${external.proof.reason}`);
 						const changes = [...(await sealSessionEvidence(session, external)), ...external.changes];
-						await validate();
+						if (canReplayObservedProcess()) await validate();
 						return changes;
 					} finally {
 						if (session.inputs) await this.publishFileInputs(session.inputs, session);
@@ -3440,7 +3471,7 @@ async function captureDependencies(
 		for (const run of runs)
 			for (const input of run.dependencies) cover(input.path, input.kind === "directory" && !!input.entriesDigest);
 		if (effects.effects.length || external.changes.length) coverage.observeWrite();
-		if (coverage.retry === "full") incompleteReasons.add("partial_workspace_write");
+		if (coverage.plan()?.kind === "full") incompleteReasons.add("partial_workspace_write");
 	}
 	if (external.proof.kind === "incomplete") incompleteReasons.add(external.proof.reason);
 	let complete = observations.every((part) => part.complete);
@@ -4842,13 +4873,16 @@ function classifyObservedSpecialPath(
 	)
 		return "ignored";
 	// A process reading its own state, or the host's CPU, sysctl, and cgroup limits, observes this one run like the clock or its pid.
+	if (observedPath === "/proc/mounts") return "confinement_observation";
 	if (/^\/proc\/(?:self|thread-self|\d+)(?:\/|$)/.test(observedPath))
-		return observedPath.endsWith("/limits") ? "confinement_observation" : "pid_observation";
+		return /\/(?:limits|mounts|mountinfo|mountstats)$/.test(observedPath)
+			? "confinement_observation"
+			: "pid_observation";
 	// Reopening an inherited descriptor reaches what that descriptor carries, like a jobserver pipe, not a host file.
 	if (/^\/dev\/fd\/\d+$/.test(observedPath)) return "descriptor_observation";
 	if (/^\/dev\/u?random$/.test(observedPath)) return "random";
 	if (
-		/^\/proc\/sys(?:\/|$)|^\/sys\/(?:devices\/system\/cpu|fs\/cgroup)(?:\/|$)|^\/proc\/(?:meminfo|version|version_signature|cpuinfo|stat|loadavg|uptime)$/.test(
+		/^\/proc\/sys(?:\/|$)|^\/sys\/(?:devices\/system\/cpu|fs\/cgroup)(?:\/|$)|^\/proc\/(?:meminfo|version|version_signature|cpuinfo|stat|loadavg|uptime|filesystems)$/.test(
 			observedPath,
 		)
 	)

@@ -112,6 +112,8 @@ const syscallNames: Readonly<Record<number, string>> = Object.fromEntries(
 132 utime mknod
 135 personality
 137 statfs fstatfs
+143 sched_getparam
+145 sched_getscheduler
 155 pivot_root
 157 prctl
 160 setrlimit chroot
@@ -225,7 +227,7 @@ type BinaryRecord = {
 	incomplete?: string;
 	pending?: boolean;
 	notified?: boolean;
-	response?: Buffer;
+	response?: { readonly valid: boolean; readonly expected?: number };
 	returned?: boolean;
 	virtual?: string;
 	descriptorPath?: string;
@@ -276,7 +278,7 @@ function* executionFrames(chunks: Iterable<Buffer>, maxBody: number) {
 			yield bytes.subarray(start, end);
 			start = end;
 		}
-		carry = start === bytes.length ? undefined : bytes.subarray(start);
+		carry = start === bytes.length ? undefined : Buffer.from(bytes.subarray(start));
 	}
 	if (carry) throw new Error("truncated execution record");
 }
@@ -295,16 +297,12 @@ export function executionRecords(read: () => Iterable<Buffer>, privateUpper?: st
 	let domain: bigint | undefined;
 	const complete = (id: bigint, record: BinaryRecord) => {
 		if (!record.returned || (record.notified && !record.response)) return;
-		if (record.response) {
-			const flags = record.response.readUInt32LE(20);
-			const error = record.response.readInt32LE(16);
-			if (
-				flags > 1 ||
-				error > 0 ||
-				(!(flags & 1) && record.result !== (error || Number(record.response.readBigInt64LE(8))))
-			)
-				record.incomplete = "native_metadata_response_changed";
-		}
+		if (
+			record.response &&
+			(!record.response.valid ||
+				(record.response.expected !== undefined && record.result !== record.response.expected))
+		)
+			record.incomplete = "native_metadata_response_changed";
 		record.pending = false;
 		calls.delete(id);
 	};
@@ -496,7 +494,7 @@ export function executionRecords(read: () => Iterable<Buffer>, privateUpper?: st
 							const end = body.indexOf(0, 2);
 							record.socket = pathname(body.subarray(2, end < 0 ? size : end));
 						}
-					} else if (kind === 21) (record.output ??= []).push(body);
+					} else if (kind === 21) (record.output ??= []).push(Buffer.from(body));
 					else if (kind === 25 && !size && isExec(record.name))
 						record.incomplete = "exec_projection_unproven";
 					else if (
@@ -512,7 +510,14 @@ export function executionRecords(read: () => Iterable<Buffer>, privateUpper?: st
 						if (kind === 1) record.virtual = value;
 						else record.descriptorPath = value;
 					} else if (kind === 4 && size === 24 && !record.response) {
-						record.response = body;
+						const flags = body.readUInt32LE(20);
+						const responseError = body.readInt32LE(16);
+						record.response =
+							flags > 1 || responseError > 0
+								? { valid: false }
+								: flags & 1
+									? { valid: true }
+									: { valid: true, expected: responseError || Number(body.readBigInt64LE(8)) };
 						complete(id, record);
 					} else if (kind === 5 || kind === 9) {
 						if (kind === 5) record.incomplete = "native_metadata_rejected";
@@ -1127,10 +1132,12 @@ export async function observeExecution(
 		)
 			unsupported(name);
 		// The same live memory, load and CPU counters are exposed through procfs and sysfs.
-		if (name === "sysinfo" || name === "getrusage" || name === "sched_getaffinity") taints.add("clock");
-		if (name === "sched_getaffinity" && args[0] !== 0n) {
+		const schedRead =
+			name === "sched_getaffinity" || name === "sched_getparam" || name === "sched_getscheduler";
+		if (name === "sysinfo" || name === "getrusage" || schedRead) taints.add("clock");
+		if (schedRead && args[0] !== 0n) {
 			taints.add("pid_observation");
-			if (!selected.has(Number(args[0]))) taints.add("ipc");
+			if (!selected.has(Number(BigInt.asIntN(32, args[0]!)))) taints.add("ipc");
 		}
 		if (
 			name === "fadvise64" &&

@@ -643,3 +643,45 @@ test("a five-method session drives all call generators and streaming preview, in
 	}
 	expect(session.close).toHaveBeenCalledOnce();
 });
+
+test("aborts and bypasses an in-flight unadoptable exclusive branch immediately when the Actor arrives", async () => {
+	const started = Promise.withResolvers<void>();
+	const aborted = Promise.withResolvers<void>();
+	const rejections: string[] = [];
+	const unadoptable: SpeculativeExecutionRoute = {
+		...exclusive,
+		adoptable: () => false,
+	};
+	const call: ExecutionCall = { tool: "write", input: { path: "out.txt", content: "x" } };
+	const session = new LocalExecutionSession<string>({
+		settings: () => ({ maxConcurrentActions: 2, resourceCacheMaxEntries: 8 }),
+		key: async (c) => PI_ACTION_SEMANTICS.buildKey(c.tool, c.input, "/workspace", "memory", { fingerprint: "test" }),
+		route: async () => unadoptable,
+		authorize: async () => ({ ok: true }),
+		capture: async () => undefined,
+		native: async () => "native-actor",
+		rejection: (_call, rejection) => {
+			rejections.push(rejection.cause.code);
+		},
+		fork: async (_call, _key, _route, _runID, signal) => {
+			started.resolve();
+			await new Promise<void>((_, reject) => {
+				signal.addEventListener("abort", () => {
+					aborted.resolve();
+					reject(signal.reason ?? new Error("aborted"));
+				}, { once: true });
+			});
+			throw new Error("unreachable");
+		},
+	});
+	try {
+		const run = session.speculate(call);
+		await started.promise;
+		expect(await session.execute(call)).toMatchObject({ output: "native-actor", served: false });
+		await aborted.promise;
+		expect(await run.completion).toMatchObject({ status: "rejected", reason: "candidate_failed" });
+		expect(rejections).toEqual(["process_taints_unaccepted"]);
+	} finally {
+		await session.close();
+	}
+});

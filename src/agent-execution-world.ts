@@ -299,32 +299,34 @@ export class ResourceObjectInputs {
 	}
 	async publish() {
 		if (!this.captured.size) return 0;
-		const owned: ResourceVersionToken[] = [];
-		try {
-			const validated = await mapFilesystem([...this.captured], async (entry) => {
-				try {
-					const token = await this.session.capture(
-						undefined, this.root, PI_ACTION_SEMANTICS, this.session.maxBytes, new Map([entry]),
-					);
-					owned.push(token);
-					token.view?.seal();
-					if (!(await validateResourceVersion([token], true)).expired) return token;
-				} catch {
-					this.signal.throwIfAborted();
-				}
-			}, this.signal);
-			const tokens = validated.filter((token) => token !== undefined);
-			if (!tokens.length) return 0;
-			return await this.session.configuration.store.withPublication(async () => {
-				await mapFilesystem(tokens, async (token) => {
-					if (!await this.session.publish(token, this.signal)) throw new Error("file input publication failed");
+		return withFilesystemReadView(undefined, async () => {
+			const owned: ResourceVersionToken[] = [];
+			try {
+				const validated = await mapFilesystem([...this.captured], async (entry) => {
+					try {
+						const token = await this.session.capture(
+							undefined, this.root, PI_ACTION_SEMANTICS, this.session.maxBytes, new Map([entry]),
+						);
+						owned.push(token);
+						token.view?.seal();
+						if (!(await validateResourceVersion([token], true)).expired) return token;
+					} catch {
+						this.signal.throwIfAborted();
+					}
 				}, this.signal);
-				this.signal.throwIfAborted();
-				return tokens.length;
-			});
-		} finally {
-			await Promise.all(owned.map((token) => token.release()));
-		}
+				const tokens = validated.filter((token) => token !== undefined);
+				if (!tokens.length) return 0;
+				return await this.session.configuration.store.withPublication(async () => {
+					await mapFilesystem(tokens, async (token) => {
+						if (!await this.session.publish(token, this.signal)) throw new Error("file input publication failed");
+					}, this.signal);
+					this.signal.throwIfAborted();
+					return tokens.length;
+				});
+			} finally {
+				await Promise.all(owned.map((token) => token.release()));
+			}
+		});
 	}
 	[Symbol.asyncDispose]() {
 		this.captured.clear();
@@ -413,7 +415,7 @@ export async function evaluateResourceQuery<Output>(
 						execute,
 						(dependencies, commit) => observeOwner(versions, dependencies, commit),
 						root,
-						async function* (target, preparation) {
+						async function* (target, preparation, cold = true) {
 							const owners = [
 								versions,
 								...[...(lookup?.(target) ?? [])].map((source) => resourceVersions.get(source)?.() ?? []),
@@ -428,6 +430,7 @@ export async function evaluateResourceQuery<Output>(
 													? [observe(token, dependencies, commit)]
 													: observeOwner(tokens, undefined, commit),
 										};
+							if (!cold && !preparation) return;
 							for await (const token of recover?.(target, preparation) ?? [])
 								if (token.view)
 									yield {

@@ -558,6 +558,8 @@ static __always_inline int pure_syscall(unsigned long nr) {
   case __NR_getgroups:
   case __NR_umask:
   case __NR_sched_yield:
+  case __NR_sched_get_priority_max:
+  case __NR_sched_get_priority_min:
     return 1;
   default:
     return 0;
@@ -683,6 +685,8 @@ static __always_inline unsigned call_layout(unsigned long nr) {
   case __NR_uname:
   case __NR_sysinfo:
   case __NR_getrusage:
+  case __NR_sched_getparam:
+  case __NR_sched_getscheduler:
   case __NR_sched_getaffinity:
   case __NR_prlimit64:
   case __NR_getrlimit:

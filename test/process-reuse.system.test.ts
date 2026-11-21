@@ -450,3 +450,18 @@ test("a whole handoff waits for all child claims and only retries recoverable co
 	partial.claimChild()!(true);
 	await expect(partial.commit(apply)).rejects.toThrow("partially consumed");
 });
+
+test("models sched_getparam and sched_getscheduler taints without unsupported_syscall", async () => {
+	for (const [nr, targetPid, expected] of [
+		[143, 0, ["clock", "random"]],
+		[145, 999, ["clock", "ipc", "pid_observation", "random"]],
+	] as const) {
+		const { tail, begin, finish, image, exit } = executionTrace();
+		image("/usr/bin/python3");
+		finish(begin(nr, 0, [targetPid, 0, 0, 0, 0, 0], []), 0);
+		exit();
+		const observed = await observeExecution(tail, "/usr/bin/python3", "/work");
+		expect(observed.taints).not.toContain("unsupported_syscall");
+		expect(observed.taints).toEqual([...expected]);
+	}
+});

@@ -451,17 +451,47 @@ async function walkSearchInputs(
 	return { kind: "selected", files };
 }
 
+const findSelectionBinding = createSerializablePreparationBinding(
+	{ platform: process.platform, namespace: "pi.find-file-selection" },
+	(value) =>
+		isRecord(value) &&
+		(value.kind === "entry_limit" ||
+			(value.kind === "selected" && Array.isArray(value.files) && value.files.every(isSearchPath))),
+);
+
 async function runCapturedFind(
 	view: ToolFilesystemOperations,
 	cwd: string,
 	args: unknown,
 	signal: AbortSignal,
 ): Promise<ToolSettlement> {
+	const limits = speculativeConfig().search;
 	const { execute } = createFindToolDefinition(cwd, {
 		operations: {
 			exists: view.exists!,
 			glob: async (pattern, target, { limit }) => {
-				const result = await walkSearchInputs(view, cwd, target, pattern, signal);
+				const select = (inputs: ToolFilesystemOperations, active: AbortSignal) =>
+					walkSearchInputs(inputs, cwd, target, pattern, active);
+				const result = view.prepare
+					? await view.prepare(
+							findSelectionBinding,
+							JSON.stringify([
+								cwd,
+								target,
+								pattern,
+								limits.maxEntries,
+								limits.maxInputBytes,
+								limits.braceExpandMax,
+							]),
+							async (inputs, active) => {
+								const value = await select(inputs, active);
+								return { value, bytes: serialize(value).byteLength, dispose: () => {} };
+							},
+							async (value) => value,
+							target,
+							signal,
+						)
+					: await select(view, signal);
 				if (result.kind === "entry_limit") throw resourceBudgetError("search entry budget");
 				return result.files.slice(0, limit);
 			},

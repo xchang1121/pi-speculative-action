@@ -618,6 +618,8 @@ export interface SpeculativeExecutionRoute {
 	readonly fingerprint: string;
 	/** Backend-authenticated parent state this route can materialize; never a result-freshness proof. */
 	readonly acceptsCheckpoint?: (checkpoint: WorldCheckpoint) => boolean;
+	/** Live policy check for whether an exclusive branch on this route can be adopted by the Actor. */
+	readonly adoptable?: () => boolean;
 }
 export function sameSpeculativeExecutionRoute(
 	left: SpeculativeExecutionRoute,
@@ -940,6 +942,8 @@ export interface ExecutionWorldOperation {
 export interface ExecutionWorldSpeculation<Context, Output> extends ExecutionWorldOperation {
 	/** Explicit ancestry interoperability across routes; implementations must authenticate the checkpoint and workspace. */
 	readonly acceptsCheckpoint?: (checkpoint: WorldCheckpoint, cwd: string) => boolean;
+	/** Whether an exclusive branch produced for this request can pass Actor adoption under current policy. */
+	readonly adoptable?: (request: ExecutionWorldRequest) => boolean;
 	readonly execute: (context: Context) => Promise<WorldBranch<Output>>;
 }
 export interface ExecutionWorldObservation<Context, Output> extends ExecutionWorldOperation {
@@ -1307,6 +1311,18 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 						Object.defineProperty(route, "acceptsCheckpoint", {
 							value: (checkpoint: WorldCheckpoint) =>
 								lifetime.deref()?.sealed === false && owner.deref()?.(checkpoint, cwd) === true,
+						});
+					}
+					const adoptable = kind === "speculation" && world.speculation?.adoptable;
+					if (adoptable) {
+						const owner = new WeakRef(adoptable);
+						const lifetime = new WeakRef(this.lifecycle);
+						const boundRequest = {
+							...request,
+							requirements: normalizeEffectRequirements(request.requirements),
+						};
+						Object.defineProperty(route, "adoptable", {
+							value: () => lifetime.deref()?.sealed === false && owner.deref()?.(boundRequest) !== false,
 						});
 					}
 					Object.freeze(route);

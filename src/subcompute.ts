@@ -57,7 +57,14 @@ export interface TrustedStepBuild {
 	readonly maxResultBytes: number;
 }
 const unavailable = Symbol("step unavailable");
-type PreparedValue = { workspace: string; framePrefix: Buffer; size: number; computation: TimelineInterval; bytes: number; referenced: boolean };
+type PreparedValue = {
+	verifiedWorkspaces: Set<string>;
+	framePrefix: Buffer;
+	size: number;
+	computation: TimelineInterval;
+	bytes: number;
+	referenced: boolean;
+};
 type WireValue =
 	| {
 			readonly encoding: "json";
@@ -587,15 +594,17 @@ export class SubcomputeService {
 							await active.run(async () => {
 								let produced = false;
 								const result = await this.sharedBuild(key, () => this.prepareBytes(key, signal, async () => {
+									if (step.acceptShared && !await step.acceptShared(request.key, signal)) throw unavailable;
 									produced = true;
 									const value = await step.build({ key: request.key, input: verifiedInput, signal, maxResultBytes });
 									if (value === undefined) throw unavailable;
 									if (step.acceptShared) await verifiedInput();
 									return value;
 								}, maxResultBytes, !!step.acceptShared), signal);
-								if (result.workspace !== this.inputManager.root) {
+								if (!result.verifiedWorkspaces.has(this.inputManager.root)) {
 									if (!await step.acceptShared?.(request.key, signal)) throw unavailable;
 									await verifiedInput();
+									result.verifiedWorkspaces.add(this.inputManager.root);
 								}
 								if (active.state.kind === "closed") throw new Error("subcompute_context_closed");
 								if (result.size > maxResultBytes) {
@@ -680,8 +689,12 @@ export class SubcomputeService {
 			// Delivery adds the consumer's own state and receipt token to this immutable value.
 			const framePrefix = Buffer.from(`{"value":${JSON.stringify(encodeValue(value))},`);
 			return {
-				workspace: origin, framePrefix, size, computation: TimelineInterval.restore(receipt) ?? TimelineInterval.unknownReuse(id),
-				referenced: false, bytes: framePrefix.length + key.length + Buffer.byteLength(JSON.stringify(receipt ?? null)),
+				verifiedWorkspaces: new Set([origin]),
+				framePrefix,
+				size,
+				computation: TimelineInterval.restore(receipt) ?? TimelineInterval.unknownReuse(id),
+				referenced: false,
+				bytes: framePrefix.length + key.length + Buffer.byteLength(JSON.stringify(receipt ?? null)),
 			};
 		};
 		let result: PreparedValue | undefined;
@@ -764,12 +777,11 @@ export class SubcomputeService {
 			signal.throwIfAborted();
 		}
 		const pending = evaluate();
-		this.building.set(key, pending);
-		try {
-			return await pending;
-		} finally {
-			this.building.delete(key);
-		}
+		const tracked = pending.finally(() => {
+			if (this.building.get(key) === tracked) this.building.delete(key);
+		});
+		this.building.set(key, tracked);
+		return await tracked;
 	}
 	dispose(): Promise<void> {
 		return this.lifetime.close(async () => {

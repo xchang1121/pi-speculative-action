@@ -364,7 +364,7 @@ export class ExecutionPathProjection {
 	}
 }
 type DirectoryDepth = "entries" | "subtree" | "bounded";
-export type WorkspaceDirectoryReads = Map<string, DirectoryDepth>;
+export type WorkspaceDirectoryReads = ReadonlyMap<string, DirectoryDepth>;
 export interface WorkspaceStructureCaptureOptions {
 	readonly maxFiles?: number;
 	readonly exclude?: readonly string[];
@@ -484,11 +484,15 @@ export async function captureWorkspaceStructure(
 ): Promise<WorkspaceStructureSnapshot> {
 	return new WorkspaceStructureCapture(root, options).capture();
 }
+export type WorkspaceRetryPlan =
+	| { readonly kind: "unrecoverable" }
+	| { readonly kind: "full" }
+	| { readonly kind: "directories"; readonly directories: WorkspaceDirectoryReads };
 export class UnprovenWorkspaceRead extends Error {
-	readonly retry?: "full" | "directories";
-	constructor(message: string, retry?: "full" | "directories") {
+	readonly plan: WorkspaceRetryPlan;
+	constructor(message: string, plan: WorkspaceRetryPlan = { kind: "unrecoverable" }) {
 		super(message);
-		this.retry = retry;
+		this.plan = plan;
 	}
 }
 
@@ -1182,6 +1186,8 @@ export interface WorkspaceExecutionSnapshot extends SandboxExecutionDelta {
 export type WorkspaceSandboxDriver = "auto" | "git" | "overlayfs" | "in_memory";
 export interface WorkspaceSandboxOptions extends LinuxOverlayfsOptions {
 	readonly inputs?: ResourceObjectInputs;
+	/** Whether the captured branch can pass Actor adoption under current policy. */
+	readonly adoptable?: boolean;
 	/** Kept for existing callers; immutable snapshots no longer invoke Git. */
 	readonly gitBinary?: string;
 	/** Auto uses an immutable CAS snapshot unless a trace-guarded runtime explicitly qualifies a COW driver. */
@@ -1201,7 +1207,7 @@ export interface SandboxWorkspaceContext {
 	readonly processCoverage?: {
 		readonly covers: (relative: string, listed: boolean) => boolean;
 		readonly observeWrite: () => void;
-		readonly retry: "full" | "directories" | undefined;
+		readonly plan: () => Exclude<WorkspaceRetryPlan, { readonly kind: "unrecoverable" }> | undefined;
 	};
 	/** Native metadata for pinned snapshot objects; shared by every process in this private workspace. */
 	readonly metadataImage?: string;
@@ -1230,6 +1236,7 @@ export interface SandboxWorkspaceObservation {
 	readonly baselineFrontier: Map<string, RegularFileState | undefined>;
 	readonly sourceDevice: bigint;
 	readonly initialStructure: WorkspaceStructureSnapshot;
+	readonly liveLower?: boolean;
 	readonly metadata?: Awaited<ReturnType<typeof preserveSnapshotMetadata>>;
 	readonly modes?: ReadonlyMap<string, number>;
 	readonly liveBase?: WorkspaceStructureSnapshot;
@@ -2205,11 +2212,16 @@ export class WorkspaceSandboxService {
 					);
 					if (workspace.processCoverage) {
 						if (changes.some((change) => !change.validationOnly)) workspace.processCoverage.observeWrite();
-						const result = await options.validate?.();
-						if (workspace.processCoverage.retry)
-							throw new UnprovenWorkspaceRead("workspace observation requires another private capture", workspace.processCoverage.retry);
-						if (result?.status !== "valid")
-							throw new UnprovenWorkspaceRead(result?.cause?.detail ?? result?.cause?.code ?? "private execution is unproven");
+						const plan = workspace.processCoverage.plan();
+						if (plan)
+							throw new UnprovenWorkspaceRead("workspace observation requires another private capture", plan);
+						if (options.adoptable !== false) {
+							const result = await options.validate?.();
+							if (result?.status !== "valid")
+								throw new UnprovenWorkspaceRead(
+									result?.cause?.detail ?? result?.cause?.code ?? "private execution is unproven",
+								);
+						}
 					}
 					return (capturedSnapshot = {
 						output: captured.output,
@@ -2676,7 +2688,7 @@ export class WorkspaceSandboxService {
 						await workspace?.transactions.dispose();
 					} finally {
 						try {
-							await Promise.all(pins.map((handle) => handle.close()));
+							await mapFilesystem(pins, (handle) => handle.close());
 						} finally {
 							await overlay?.close();
 						}
@@ -2691,26 +2703,27 @@ export class WorkspaceSandboxService {
 		try {
 			const contents = await this.createContentPool();
 			releaseContents = contents?.retain();
+			const nextDirectories = processDirectories && new Map(processDirectories);
 			const capture = () => new WorkspaceStructureCapture(sourceRoot, {
-				directories: processDirectories,
+				directories: nextDirectories,
 				content: { pool: contents, maxBytes: configured.maxTreeBytes, maxFileBytes: configured.maxTreeBytes, required: true },
 			}).captureVersions(undefined, options.inputs);
 			const captured = await capture().catch((error: unknown) => {
-				if (processDirectories && (error instanceof WorkspaceSizeLimit || isMissing(error) ||
+				if (nextDirectories && (error instanceof WorkspaceSizeLimit || isMissing(error) ||
 					hasErrorCode(error, "EACCES") || hasErrorCode(error, "EPERM"))) {
 					// An enumerated subtree can exceed the private image budget. Its exact listings still fit independently.
-					const subtrees = [...processDirectories].filter(([, depth]) => depth === "subtree");
+					const subtrees = [...nextDirectories].filter(([, depth]) => depth === "subtree");
 					if (subtrees.length) {
-						for (const [name] of subtrees) processDirectories.set(name, "bounded");
+						for (const [name] of subtrees) nextDirectories.set(name, "bounded");
 						return capture();
 					}
 				}
-				if (!processDirectories && error instanceof WorkspaceSizeLimit && error.paths.length)
+				if (!nextDirectories && error instanceof WorkspaceSizeLimit && error.paths.length)
 					this.oversize = { root: sourceRoot, witness: error };
 				throw error;
 			});
-			if (!processDirectories && this.oversize === prior) this.oversize = undefined;
-			if ((!processDirectories && !captured.snapshot.complete) || [...captured.files.values()].some((file) => !file))
+			if (!nextDirectories && this.oversize === prior) this.oversize = undefined;
+			if ((!nextDirectories && !captured.snapshot.complete) || [...captured.files.values()].some((file) => !file))
 				throw new Error("workspace snapshot exceeds configured limits");
 			const original = new Map([...captured.entries].map(([name, entry]) => [name, entry.captured.info]));
 			await mkdir(processRoot);
@@ -2758,6 +2771,7 @@ export class WorkspaceSandboxService {
 				baselineFrontier: new Map(),
 				metadata,
 				initialStructure,
+				liveLower: !!live,
 				...(overlay
 					? {
 							overlay: {
@@ -2771,7 +2785,7 @@ export class WorkspaceSandboxService {
 				hints: sourceChanges(),
 			};
 			workspace = createWorkspaceObservation(data, sourceChanges, contents);
-			let retry: "full" | "directories" | undefined;
+			let state: { kind: "covered" | "directories" | "full" } = { kind: "covered" };
 			const covers = (relative: string, listed: boolean) => {
 				// Only complete directory listings can establish a child name or its absence.
 				const parents = workspaceAncestors(listed ? relative : path.dirname(relative)).reverse();
@@ -2781,16 +2795,26 @@ export class WorkspaceSandboxService {
 				});
 				if (first < 0) return true;
 				for (const name of parents.slice(first)) {
-					if (processDirectories!.size >= configured.maxTreeEntries) { retry = "full"; break; }
-					if (!processDirectories!.has(name)) processDirectories!.set(name, "entries");
+					if (nextDirectories!.size >= configured.maxTreeEntries) { state = { kind: "full" }; break; }
+					if (!nextDirectories!.has(name)) nextDirectories!.set(name, "entries");
 				}
-				if (listed && retry !== "full" && !parents.some((name) => processDirectories!.get(name) === "bounded"))
-					processDirectories!.set(parents[first]!, "subtree");
-				retry ??= "directories";
+				if (listed && state.kind !== "full" && !parents.some((name) => nextDirectories!.get(name) === "bounded"))
+					nextDirectories!.set(parents[first]!, "subtree");
+				if (state.kind === "covered") state = { kind: "directories" };
 				return false;
 			};
-			const processCoverage = processDirectories && !captured.snapshot.complete ? {
-				covers, observeWrite: () => { retry = "full"; }, get retry() { return retry; },
+			const processCoverage = nextDirectories && !captured.snapshot.complete ? {
+				covers,
+				observeWrite: () => {
+					if (options.adoptable !== false) state = { kind: "full" };
+				},
+				plan: () => {
+					if (state.kind === "covered") return undefined;
+					const changed = [...nextDirectories].some(([name, depth]) => processDirectories!.get(name) !== depth);
+					return state.kind === "full" || !changed
+						? ({ kind: "full" } as const)
+						: ({ kind: "directories", directories: new Map(nextDirectories) } as const);
+				},
 			} : undefined;
 			return { ...workspace, dispose, pinObject, processCoverage };
 		} catch (error) {
@@ -3009,8 +3033,17 @@ async function preserveSnapshotMetadata(
 				: 0;
 	};
 	// Check each parent before populating its children: a stale checkout may contain a symlink in its place.
+	const resourceDepth = (resource: string) => (resource ? slash(resource).split("/").length : 0);
+	const directoryLevels = new Map<number, string[]>();
 	for (const resource of names)
 		if (original.get(resource)!.isDirectory()) {
+			const depth = resourceDepth(resource);
+			const group = directoryLevels.get(depth);
+			if (group) group.push(resource);
+			else directoryLevels.set(depth, [resource]);
+		}
+	for (const [, level] of [...directoryLevels].sort(([a], [b]) => a - b))
+		await mapFilesystem(level, async (resource) => {
 			const target = path.join(sandboxRoot, resource);
 			const current = await lstat(target).catch((error) => {
 				if (isMissing(error)) return undefined;
@@ -3018,44 +3051,64 @@ async function preserveSnapshotMetadata(
 			});
 			if (!current) await mkdir(target);
 			else if (!current.isDirectory()) throw new Error(`snapshot directory type changed: ${resource}`);
-		}
+		});
 	const translated: [string, BigIntStats][] = [];
-	const rows: [BigIntStats, BigIntStats, number][] = [];
 	const objects = new Map<string, string>();
-	// Set parent modes last so a read-only directory cannot prevent its own snapshot from being populated.
-	for (const resource of names.reverse()) {
-		const source = original.get(resource)!;
-		const target = path.join(sandboxRoot, resource);
-		const current = await lstat(target, { bigint: true }).catch((error) => {
+	const reversed = [...names].reverse();
+	const currentStats = await mapFilesystem(reversed, (resource) =>
+		lstat(path.join(sandboxRoot, resource), { bigint: true }).catch((error) => {
 			if (isMissing(error)) return undefined;
 			throw error;
-		});
+		}),
+	);
+	const nonDirectories: [string, BigIntStats][] = [];
+	const directoryModes = new Map<number, [string, BigIntStats][]>();
+	for (const [index, resource] of reversed.entries()) {
+		const current = currentStats[index];
 		if (!current) continue; // A warmup can predate this name; exact input validation still decides adoption.
 		if (objects.has(`${current.dev}:${current.ino}`)) continue;
+		const source = original.get(resource)!;
 		if ((source.mode & 61440n) !== (current.mode & 61440n))
 			throw new Error(`snapshot object type changed: ${resource}`);
 		if (source.uid !== current.uid || source.gid !== current.gid)
 			throw new Error(`snapshot object ownership differs: ${resource}`);
+		objects.set(`${current.dev}:${current.ino}`, `${source.dev}:${source.ino}`);
+		const target = path.join(sandboxRoot, resource);
+		translated.push([target, source]);
+		if (source.isDirectory()) {
+			const depth = resourceDepth(resource);
+			const group = directoryModes.get(depth);
+			if (group) group.push([target, source]);
+			else directoryModes.set(depth, [[target, source]]);
+		} else nonDirectories.push([target, source]);
+	}
+	const applyMetadata = async ([target, source]: [string, BigIntStats]) => {
 		if (!source.isSymbolicLink()) await chmod(target, Number(source.mode & 4095n));
 		if (process.platform === "linux" || !source.isSymbolicLink())
 			await (source.isSymbolicLink() ? lutimes : utimes)(target, source.atime, source.mtime);
-		objects.set(`${current.dev}:${current.ino}`, `${source.dev}:${source.ino}`);
-		translated.push([target, source]);
-	}
+	};
+	await mapFilesystem(nonDirectories, applyMetadata);
+	// Set parent modes last so a read-only directory cannot prevent its own snapshot from being populated.
+	for (const [, level] of [...directoryModes].sort(([a], [b]) => b - a))
+		await mapFilesystem(level, applyMetadata);
 	await restoreModifiedTimes(translated.map(([target, source]) => [target, String(source.mtimeNs)]));
-	for (const [target, source] of translated) {
-		if (!native && (!pin || !source.isFile())) continue;
-		const physical = await pin!(target);
-		if (native) {
+	const pinnedGroups = await mapFilesystem(
+		translated.filter(([, source]) => native || Boolean(pin && source.isFile())),
+		async ([target, source]): Promise<[BigIntStats, BigIntStats, number][]> => {
+			const physical = await pin!(target);
+			if (!native) return [];
 			const relative = path.relative(sandboxRoot, target);
 			const policy = atimePolicy(path.join(sourceRoot, relative), source.isDirectory());
-			rows.push([physical, source, policy]);
+			const entries: [BigIntStats, BigIntStats, number][] = [[physical, source, policy]];
 			if (mergedRoot) {
 				const merged = await pin!(path.join(mergedRoot, relative));
-				if (merged.dev !== physical.dev || merged.ino !== physical.ino) rows.push([merged, source, policy]);
+				if (merged.dev !== physical.dev || merged.ino !== physical.ino)
+					entries.push([merged, source, policy]);
 			}
-		}
-	}
+			return entries;
+		},
+	);
+	const rows = pinnedGroups.flat();
 	const image = native ? path.join(processRoot, "metadata.json") : undefined;
 	if (image) {
 		rows.push([
@@ -3111,7 +3164,7 @@ async function createWorkspaceTransactionDriver(
 		snapshot: workspace.initialStructure,
 		files: new Map(),
 	};
-	let fenced = false;
+	let fenced = versions.snapshot.complete && !workspace.liveLower;
 	const active = new Set<Capture>();
 	const lock = new RuntimeLifecycleLane();
 	let poisonReason = versions.snapshot.complete ? undefined : "workspace_structure_limit";
@@ -4001,36 +4054,53 @@ async function withCommitLocks<T>(
 /** Materialize the same immutable content records used by reads and transaction deltas. */
 async function materializeWorkspaceTree(tree: WorkspaceContentSnapshot, root: string): Promise<void> {
 	await mkdir(root);
+	const directories = new Map<number, string[]>();
 	const objects = new Map<string, string>();
+	const primaryFiles: { target: string; mode: number; content: FileContentVersion["content"] }[] = [];
+	const linkedFiles: { source: string; target: string }[] = [];
+	const symlinks: { relative: string; linkTarget: string; target: string }[] = [];
 	for (const [relative, entry] of [...tree.snapshot.entries].sort(([a], [b]) => a.length - b.length)) {
 		if (!relative) continue;
 		const target = path.resolve(root, relative);
 		if (!containsFilesystemPath(root, target)) throw new Error("snapshot entry escapes workspace");
 		if (entry.kind === "directory") {
-			await mkdir(target, { recursive: true });
+			const depth = slash(relative).split("/").length;
+			const group = directories.get(depth);
+			if (group) group.push(target);
+			else directories.set(depth, [target]);
 		} else if (entry.kind === "file") {
 			const captured = tree.files.get(relative);
 			if (!captured) throw new Error(`snapshot file unavailable: ${relative}`);
 			if (entry.links > 1 && entry.aliases?.length !== entry.links)
 				throw new Error("workspace hardlink namespace is not closed");
 			const existing = entry.object && objects.get(entry.object);
-			if (existing) await link(existing, target);
+			if (existing) linkedFiles.push({ source: existing, target });
 			else {
-				await using handle = await open(target, "wx", entry.mode);
-				await writeContent(handle, captured.content);
+				primaryFiles.push({ target, mode: entry.mode, content: captured.content });
 				if (entry.object) objects.set(entry.object, target);
 			}
 		} else if (entry.kind === "symlink") {
 			const resolved = path.resolve(path.dirname(path.join(tree.snapshot.root, relative)), entry.target);
 			if (path.isAbsolute(entry.target) || !containsFilesystemPath(tree.snapshot.root, resolved))
 				throw new Error("snapshot symlink escapes workspace");
-			const destination = await realpath(path.join(tree.snapshot.root, relative)).catch((error) => {
-				if (isMissing(error)) return resolved;
-				throw error;
-			});
-			if (!containsFilesystemPath(tree.snapshot.root, destination))
-				throw new Error("snapshot symlink escapes workspace");
-			await symlink(entry.target, target);
+			symlinks.push({ relative, linkTarget: entry.target, target });
 		} else throw new Error(`unsupported snapshot entry: ${relative}`);
 	}
+	for (const [, level] of [...directories].sort(([a], [b]) => a - b))
+		await mapFilesystem(level, (target) => mkdir(target, { recursive: true }));
+	await mapFilesystem(primaryFiles, async ({ target, mode, content }) => {
+		await using handle = await open(target, "wx", mode);
+		await writeContent(handle, content);
+	});
+	await mapFilesystem(linkedFiles, ({ source, target }) => link(source, target));
+	await mapFilesystem(symlinks, async ({ relative, linkTarget, target }) => {
+		const resolved = path.resolve(path.dirname(path.join(tree.snapshot.root, relative)), linkTarget);
+		const destination = await realpath(path.join(tree.snapshot.root, relative)).catch((error) => {
+			if (isMissing(error)) return resolved;
+			throw error;
+		});
+		if (!containsFilesystemPath(tree.snapshot.root, destination))
+			throw new Error("snapshot symlink escapes workspace");
+		await symlink(linkTarget, target);
+	});
 }

@@ -224,3 +224,63 @@ test("a limited grep consumes only the matching prefix and agrees with native or
 		await profile.dispose();
 	}
 });
+
+test("find reuses prepared selection across limit changes and invalidates on directory updates", async () => {
+	const cwd = await directories.create();
+	await mkdir(path.join(cwd, "pkg"));
+	for (const file of ["pkg/a.py", "pkg/b.py", "pkg/c.py"]) await writeFile(path.join(cwd, file), "x = 1\n");
+	const profile = await createClosedSearchProfile(cwd);
+	const find = profile.invocations.get("find")!;
+	const sources: object[] = [];
+	const versions: ResourceVersionToken[] = [];
+	const search = async (limit: number) => {
+		const signal = AbortSignal.timeout(10000);
+		const request = { callID: `find-${limit}`, args: { pattern: "**/*.py", limit }, signal };
+		let walks = 0;
+		const issued = performance.now();
+		const run = await TimelineInterval.measure(() =>
+			evaluateResourceQuery(
+				undefined,
+				{ signal, inputs: () => sources, onInputSource: (source) => sources.push(source) },
+				path.parse(cwd).root,
+				(view) =>
+					find.filesystem!(
+						{
+							...view,
+							prepare: (binding, key, build, use, hint, active) =>
+								view.prepare!(
+									binding,
+									key,
+									(inputs, s) => {
+										if (hint === cwd) walks++;
+										return build(inputs, s);
+									},
+									use,
+									hint,
+									active,
+								),
+						},
+						request,
+					),
+				PI_ACTION_SEMANTICS,
+				8 * 1024 * 1024,
+				true,
+				"output",
+			),
+		);
+		versions.push(...run.output!.versions);
+		expect(run.output!.output).toEqual(await find.authoritative!(request));
+		return { walks, timing: new TaskTimeline(0).recordTool(run.computation, issued) };
+	};
+	try {
+		expect((await search(1)).walks).toBe(1);
+		const reused = await search(2);
+		expect(reused.walks).toBe(0);
+		expect(reused.timing.hiddenComputeMs).toBeGreaterThan(0);
+		await writeFile(path.join(cwd, "pkg", "d.py"), "x = 2\n");
+		expect((await search(3)).walks).toBe(1);
+	} finally {
+		for (const token of versions) await token.release();
+		await profile.dispose();
+	}
+});

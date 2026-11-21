@@ -752,6 +752,15 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 					continue;
 				}
 				if (actor) {
+					if (entry.route.reuse === "exclusive_branch" && entry.route.adoptable?.() === false) {
+						if (this.running.has(entry)) entry.work.controller.abort();
+						this.hooks.rejection?.(call, {
+							candidateID: entry.id,
+							match,
+							cause: cause("freshness", "process_taints_unaccepted"),
+						});
+						continue;
+					}
 					lease = entry.work.acquire(this.nextID());
 					if (!lease) continue;
 				}

@@ -303,6 +303,7 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 				tools: options.completedOnly ? options.tools : undefined,
 				capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
 				acceptsCheckpoint: (checkpoint, cwd) => workspaceSandbox.acceptsCheckpoint(checkpoint, cwd),
+				adoptable: (request) => Boolean(request.action && operationFor(request.action)) || backend.canAdoptProcess(),
 				fingerprint: async (request) => {
 					backendChecked = true;
 					const { action } = request;
@@ -380,7 +381,6 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 					for (;;) {
 						await using inputs = !parent ? backend.fileInputs(sourceRoot, context.signal, context.inputs) : undefined;
 						const directories = preparation.kind === "observed" ? preparation.directories : undefined;
-						const initialDirectories = directories?.size;
 						let session: LinuxProcessSession | undefined;
 						let launches = 0;
 						let exitCode: number | null | undefined;
@@ -389,6 +389,7 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 								workspaceSandbox.capture(
 									{
 										...workspaceOptions,
+										adoptable: Boolean(operation) || backend.canAdoptProcess(),
 										inputs,
 										cwd: sourceRoot,
 										driver: selected.driver,
@@ -396,7 +397,6 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 										validate: () => session!.validate(),
 										afterCapture: () => session!.seal([]),
 										execute: async (workspace) => {
-											if (!workspace.processCoverage) preparation = { kind: "full" };
 											session = await backend.open({
 												sourceRoot,
 												inputs,
@@ -475,10 +475,17 @@ export function createLinuxProcessExecutionWorld(options: LinuxProcessExecutionW
 						} catch (error) {
 							await session?.dispose?.();
 							context.signal.throwIfAborted();
-							if (preparation.kind === "full" || isPoisonedEffectCommit(error)) throw error;
-							if (!(error instanceof UnprovenWorkspaceRead) || !error.retry) throw error;
-							const retry = error.retry;
-							if (retry === "full" || preparation.directories.size === initialDirectories) preparation = { kind: "full" };
+							if (
+								preparation.kind === "full" ||
+								isPoisonedEffectCommit(error) ||
+								!(error instanceof UnprovenWorkspaceRead) ||
+								error.plan.kind === "unrecoverable"
+							)
+								throw error;
+							preparation =
+								error.plan.kind === "directories"
+									? { kind: "observed", directories: error.plan.directories }
+									: { kind: "full" };
 						}
 					}
 				},
