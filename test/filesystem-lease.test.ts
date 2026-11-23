@@ -274,3 +274,18 @@ test("the legacy git driver selects the same immutable snapshot without a Git ex
 		await service.dispose();
 	}
 });
+
+test("closes every acquired sandbox lease even when concurrency is 1 and the first close fails", async () => {
+	const fsEvidence = await import("../src/filesystem-evidence.ts");
+	let closed = 0;
+	const configuration = new SpeculativeConfiguration({ filesystem: { concurrency: 1 } });
+	await expect(
+		configuration.run(() =>
+			fsEvidence.settleFilesystem([0, 1, 2, 3, 4, 5, 6], async (index) => {
+				closed++;
+				if (index === 0) throw new Error("first lease close failed");
+			}),
+		),
+	).rejects.toThrow("first lease close failed");
+	expect(closed).toBe(7);
+});

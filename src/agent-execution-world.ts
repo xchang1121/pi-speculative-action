@@ -379,23 +379,35 @@ export async function evaluateResourceQuery<Output>(
 	acceptObservation?: (observation: ResourceObservation) => boolean,
 ) {
 	signal.throwIfAborted();
-	return withFilesystemReadView(undefined, async () => {
-	const borrowed: ResourceVersionToken[] = [];
-	const recover = session?.reader(root, signal, (token) => { borrowed.push(token); });
-	const capture = () =>
-		session
-			? session.capture(undefined, root, semantics, maxBytes)
-			: captureResourceVersion(undefined, root, semantics, maxBytes);
-	const initial = inputs ? undefined : await capture();
-	initial?.view?.seal();
-	const versions = inputs ?? [initial!];
-	const version = versions[0]!;
-	const view = version.view!;
-	const retained: ResourceVersionToken[] = [];
-	let missing: Promise<ResourceVersionToken> | undefined;
-	let captured: ResourceVersionToken | undefined;
 	let sealed: ResourceVersionToken[] | undefined;
 	const inputSource = publish && Object.freeze({});
+	const discardSealed = async () => {
+		await TimelineInterval.outside(async () => {
+			if (inputSource) resourceVersions.delete(inputSource);
+			const tokens = sealed ? [...sealed] : [];
+			sealed = undefined;
+			await Promise.allSettled(tokens.map(releaseResourceVersion));
+		});
+	};
+	const result = await withFilesystemReadView(
+		undefined,
+		async (fsView) => {
+			const borrowed: ResourceVersionToken[] = [];
+			const recover = session?.reader(root, signal, (token) => {
+				borrowed.push(token);
+			});
+			const capture = () =>
+				session
+					? session.capture(undefined, root, semantics, maxBytes)
+					: captureResourceVersion(undefined, root, semantics, maxBytes);
+			const initial = inputs ? undefined : await capture();
+			initial?.view?.seal();
+			const versions = inputs ?? [initial!];
+			const version = versions[0]!;
+			const view = version.view!;
+			const retained: ResourceVersionToken[] = [];
+			let missing: Promise<ResourceVersionToken> | undefined;
+			let captured: ResourceVersionToken | undefined;
 	// Keep the initiating view first: it owns the query's root resolution, even when another source answers first.
 	const proofs = new Map<ResourceVersionToken, Map<string, ResourceObservation>>([[version, new Map()]]);
 	const observe = (
@@ -440,7 +452,7 @@ export async function evaluateResourceQuery<Output>(
 						execute,
 						(dependencies, commit) => observeOwner(versions, dependencies, commit),
 						root,
-						async function* (target, preparation, cold = true) {
+						async function* (target, preparation, cold: boolean | "content" = true) {
 							const owners = [
 								versions,
 								...[...(lookup?.(target) ?? [])].map((source) => resourceVersions.get(source)?.() ?? []),
@@ -456,7 +468,7 @@ export async function evaluateResourceQuery<Output>(
 													: observeOwner(tokens, undefined, commit),
 										};
 							if (!cold && !preparation) return;
-							for await (const token of recover?.(target, preparation) ?? [])
+							for await (const token of recover?.(target, preparation, cold === "content") ?? [])
 								if (token.view)
 									yield {
 										view: token.view.readOnly(),
@@ -529,11 +541,18 @@ export async function evaluateResourceQuery<Output>(
 											observations,
 										})),
 									);
-								if (!transfer || transfer(owned)) {
+								if (!completed) {
+									await fsView.verify();
+									if (transfer!(owned)) {
+										captured = undefined;
+										retained.length = 0;
+										sealed = owned;
+									}
+								} else {
 									captured = undefined;
 									retained.length = 0;
+									sealed = owned;
 								}
-								sealed = owned;
 							} else if (transfer) sealed = []; // Successful consumption does not require future cache retention.
 							if (completed && transfer && validation !== "prepared") signal.throwIfAborted();
 						} catch (error) {
@@ -551,7 +570,13 @@ export async function evaluateResourceQuery<Output>(
 			await Promise.allSettled([...borrowed, ...retained, captured, initial].map(releaseResourceVersion));
 		});
 	}
-	});
+		},
+		discardSealed,
+	);
+	if (result?.versions.length && transfer && !transfer(result.versions)) {
+		await discardSealed();
+	}
+	return result;
 }
 /** Committed poststates enter the same read view and exact validation as captured inputs. */
 export async function createCommittedResourceInputs(
@@ -898,10 +923,7 @@ export function bindResourceOperation(
 						),
 					);
 				try {
-					const run = () => (session ? session.run(evaluate) : evaluate());
-					const result = await (completeObservation === "single_query"
-						? withFilesystemReadView(undefined, run)
-						: run());
+					const result = await (session ? session.run(evaluate) : evaluate());
 					if (!result?.versions.length) unproven();
 					return result;
 				} finally {

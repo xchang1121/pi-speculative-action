@@ -473,6 +473,11 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 		entry.handles.clear();
 		void this.lifetime.release(candidateBranch(entry));
 	}
+	private hasParentUsers(entry: Entry<Output>) {
+		return (
+			entry.pins > 1 || [...entry.handles].some((id) => (this.handles.get(id)?.parentUsers ?? 0) > 0)
+		);
+	}
 	private trim() {
 		for (const entry of this.pool.trim(
 			this.limits(),
@@ -762,7 +767,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 				}
 				if (actor) {
 					if (entry.route.reuse === "exclusive_branch" && entry.route.adoptable?.() === false) {
-						if (this.running.has(entry)) entry.work.controller.abort();
+						if (this.running.has(entry) && !this.hasParentUsers(entry)) entry.work.controller.abort();
 						this.hooks.rejection?.(call, {
 							candidateID: entry.id,
 							match,
@@ -910,7 +915,11 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 						admissionRecord = {
 							promise: admission.promise,
 							...(this.hooks.adoptable?.(call, key) === false
-								? { abortUnadoptable: () => controller.abort() }
+								? {
+										abortUnadoptable: () => {
+											if (!handle.parentUsers) controller.abort();
+										},
+									}
 								: {}),
 						};
 						const waiting = this.admitting.get(key.key) ?? new Set();

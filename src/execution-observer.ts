@@ -60,6 +60,11 @@ export interface ExecutionObservationOptions {
 	readonly controlledSocket?: string;
 	readonly dispatcherSocket?: string;
 	readonly platformFingerprint?: string;
+	readonly scheduling?: {
+		readonly policy: number;
+		readonly priority: number;
+		readonly resetOnFork?: "unprobed";
+	};
 	/** A native exec boundary in this trace; the original execution owns all records. */
 	readonly execution?: {
 		readonly pid: number;
@@ -1138,6 +1143,25 @@ export async function observeExecution(
 		if (schedRead && args[0] !== 0n) {
 			taints.add("pid_observation");
 			if (!selected.has(Number(BigInt.asIntN(32, args[0]!)))) taints.add("ipc");
+		}
+		if ((name === "sched_getscheduler" || name === "sched_getparam") && ok) {
+			const target = args[0] === 0n ? pid : Number(BigInt.asIntN(32, args[0]!));
+			const sched = options.scheduling;
+			const resetChild = Boolean(sched && target !== root.pid && sched.policy & 0x40000000);
+			const expectedPolicy = sched ? (resetChild ? 0 : sched.policy) : undefined;
+			const expectedPriority = sched ? (resetChild ? 0 : sched.priority) : undefined;
+			const schedProven =
+				sched !== undefined &&
+				selected.has(target) &&
+				(sched.policy & ~0x40000000) !== 6 &&
+				!(sched.resetOnFork === "unprobed" && target !== root.pid);
+			if (
+				!schedProven ||
+				(name === "sched_getscheduler"
+					? result !== expectedPolicy
+					: record.lock === undefined || record.lock < 0 || record.lock !== expectedPriority)
+			)
+				unsupported(name);
 		}
 		if (
 			name === "fadvise64" &&

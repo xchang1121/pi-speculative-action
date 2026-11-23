@@ -79,6 +79,7 @@ import {
 	pinFilesystemObject,
 	readFilesystemDirectory,
 	sameFilesystemIdentity,
+	settleFilesystem,
 	sharedWalk,
 	FILESYSTEM_METADATA_FIELDS as SNAPSHOT_METADATA_FIELDS,
 	withFilesystemReadView,
@@ -2688,7 +2689,7 @@ export class WorkspaceSandboxService {
 						await workspace?.transactions.dispose();
 					} finally {
 						try {
-							await mapFilesystem(pins, (handle) => handle.close());
+							await settleFilesystem(pins, (handle) => handle.close());
 						} finally {
 							await overlay?.close();
 						}

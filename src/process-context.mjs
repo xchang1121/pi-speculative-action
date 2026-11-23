@@ -3,6 +3,7 @@
 import { closeSync, openSync, readFileSync } from "node:fs";
 import { readFile, readlink, stat } from "node:fs/promises";
 import { speculativeConfig } from "./config-schema.ts";
+import { ensureNativeFilesystem, nativeFilesystem } from "./process-startup.mjs";
 /** @typedef {import("./provenance-certificate.js").InheritedFileDescriptor["type"]} DescriptorType */
 /** @type {ReadonlyMap<bigint, DescriptorType>} */
 const descriptorTypes = new Map([
@@ -11,7 +12,12 @@ const descriptorTypes = new Map([
 	[0o020000n, "device"],
 ]);
 /** @typedef {{
+ * readonly policy: number, readonly priority: number, readonly nice: number,
+ * readonly cpus: string, readonly memoryNodes: string, readonly resetOnFork?: "unprobed"
+ * }} ProcessSchedulingContext */
+/** @typedef {{
  * readonly key: string, readonly launchKey: string, readonly umask: number,
+ * readonly scheduling: ProcessSchedulingContext,
  * readonly descriptorTypes: readonly [DescriptorType, DescriptorType, DescriptorType],
  * readonly outputEndpoints: readonly [string, string]
  * }} ProcessExecutionContext */
@@ -47,11 +53,12 @@ export async function captureProcessContext(pid, inheritedDescriptors) {
 		);
 	/** @type {[string, string]} */
 	const outputEndpoints = ["", ""];
-	const [status, limits, processStat, shell, descriptors] = await Promise.all([
+	const [status, limits, processStat, shell, native, descriptors] = await Promise.all([
 		readFile(`${root}/status`, "utf8"),
 		readFile(`${root}/limits`, "utf8"),
 		readFile(`${root}/stat`, "utf8"),
 		stat("/bin/sh", { bigint: true }),
+		nativeFilesystem ? Promise.resolve(nativeFilesystem) : ensureNativeFilesystem().catch(() => undefined),
 		Promise.all([0, 1, 2].map(async (fd) => {
 			if (fd === 0 && !inheritedDescriptors.some((name) => Number(name) === 0))
 				return { fd, type: /** @type {DescriptorType} */ ("closed"), flags: 0, alias: "closed:0" };
@@ -85,6 +92,7 @@ export async function captureProcessContext(pid, inheritedDescriptors) {
 	if (uid.length !== 4 || gid.length !== 4) throw new Error("held process credentials are incomplete");
 	if (!groups.includes(gid[1])) groups.push(gid[1]);
 	groups.sort((left, right) => left - right);
+	const scheduling = parseProcessScheduling(pid, status, processStat, native);
 	const semantic = {
 		executionDomain: "ptrace",
 		// Core's hard cap is confinement; observing it is guarded by the trace.
@@ -107,22 +115,147 @@ export async function captureProcessContext(pid, inheritedDescriptors) {
 		},
 		systemMetadata: fields(shell),
 		signals: { blocked: field("SigBlk"), ignored: field("SigIgn") },
-		scheduling: {
-			nice: Number(
-				processStat
-					.slice(processStat.lastIndexOf(") ") + 2)
-					.trim()
-					.split(/\s+/)[16],
-			),
-			cpus: field("Cpus_allowed_list"),
-			memoryNodes: field("Mems_allowed_list"),
-		},
+		scheduling,
 		descriptors,
 	};
 	return {
 		...contextKeys(semantic),
+		scheduling,
 		umask: Number.parseInt(field("Umask"), 8),
 		outputEndpoints,
+	};
+}
+/**
+ * @param {number} pid
+ * @param {string} status
+ * @param {string} processStat
+ * @param {typeof nativeFilesystem} native
+ * @returns {ProcessSchedulingContext}
+ */
+function parseProcessScheduling(pid, status, processStat, native) {
+	/** @param {string} name */
+	const field = (name) => {
+		const value = new RegExp(`^${name}:\\s*(.*)$`, "m").exec(status)?.[1];
+		if (value === undefined) throw new Error(`held process status lacks ${name}`);
+		return value.trim();
+	};
+	const statFields = processStat.slice(processStat.lastIndexOf(") ") + 2).trim().split(/\s+/);
+	const nice = Number(statFields[16]);
+	const statPriority = Number(statFields[37]);
+	const statPolicy = Number(statFields[38]);
+	if (
+		!Number.isSafeInteger(nice) ||
+		!Number.isSafeInteger(statPriority) ||
+		statPriority < 0 ||
+		!Number.isSafeInteger(statPolicy) ||
+		statPolicy < 0
+	) {
+		throw new Error("held process scheduling metadata is invalid");
+	}
+	let policy = statPolicy;
+	let priority = statPriority;
+	let probed = false;
+	if (native) {
+		schedProbeBuffer.writeInt32LE(pid, 0);
+		try {
+			if (native(-17, schedProbeBuffer) === 0) {
+				policy = schedProbeBuffer.readInt32LE(0);
+				priority = schedProbeBuffer.readInt32LE(4);
+				probed = true;
+			}
+		} catch {
+			// Fall back to procfs scheduling fields when the native helper lacks the probe.
+		}
+	}
+	if ((policy & ~0x40000000) === 6) {
+		throw new Error("held process has unmodeled deadline scheduler");
+	}
+	return {
+		policy,
+		priority,
+		nice,
+		cpus: field("Cpus_allowed_list"),
+		memoryNodes: field("Mems_allowed_list"),
+		...(probed ? {} : { resetOnFork: /** @type {const} */ ("unprobed") }),
+	};
+}
+const schedProbeBuffer = Buffer.alloc(2064);
+/**
+ * Format an active CPU affinity mask into canonical list notation matching procfs Cpus_allowed_list.
+ * @param {Buffer} mask
+ * @returns {string}
+ */
+function formatCpuList(mask) {
+	/** @type {string[]} */
+	const ranges = [];
+	let rangeStart = -1;
+	const totalBits = mask.length * 8;
+	for (let bit = 0; bit <= totalBits; bit++) {
+		const set = bit < totalBits && (mask[bit >> 3] & (1 << (bit & 7))) !== 0;
+		if (set && rangeStart < 0) rangeStart = bit;
+		else if (!set && rangeStart >= 0) {
+			ranges.push(rangeStart === bit - 1 ? `${rangeStart}` : `${rangeStart}-${bit - 1}`);
+			rangeStart = -1;
+		}
+	}
+	return ranges.join(",");
+}
+/** @type {string | undefined} */
+let selfMemoryNodes;
+/**
+ * @param {number} pid
+ * @returns {Promise<ProcessSchedulingContext>}
+ */
+export async function captureProcessScheduling(pid) {
+	const native = nativeFilesystem ?? (await ensureNativeFilesystem().catch(() => undefined));
+	if (native) {
+		schedProbeBuffer.writeInt32LE(pid === process.pid ? 0 : pid, 0);
+		try {
+			if (native(-17, schedProbeBuffer) === 0) {
+				const policy = schedProbeBuffer.readInt32LE(0);
+				if ((policy & ~0x40000000) === 6) {
+					throw new Error("held process has unmodeled deadline scheduler");
+				}
+				const memoryNodes =
+					pid === process.pid
+						? (selfMemoryNodes ??=
+								/^Mems_allowed_list:\s*(.*)$/m
+									.exec(readFileSync("/proc/self/status", "utf8"))?.[1]
+									?.trim() ?? "")
+						: /^Mems_allowed_list:\s*(.*)$/m
+								.exec(await readFile(`/proc/${pid}/status`, "utf8"))?.[1]
+								?.trim() ?? "";
+				const maskLen = schedProbeBuffer.readInt32LE(12);
+				return {
+					policy,
+					priority: schedProbeBuffer.readInt32LE(4),
+					nice: schedProbeBuffer.readInt32LE(8),
+					cpus: formatCpuList(schedProbeBuffer.subarray(16, 16 + maskLen)),
+					memoryNodes,
+				};
+			}
+		} catch (error) {
+			if (error instanceof Error && error.message.includes("deadline scheduler")) throw error;
+		}
+	}
+	const root = `/proc/${pid}`;
+	const [status, processStat] = await Promise.all([
+		readFile(`${root}/status`, "utf8"),
+		readFile(`${root}/stat`, "utf8"),
+	]);
+	return parseProcessScheduling(pid, status, processStat, native);
+}
+/**
+ * @param {ProcessSchedulingContext} scheduling
+ * @returns {ProcessSchedulingContext}
+ */
+export function forkedProcessScheduling(scheduling) {
+	if (!(scheduling.policy & 0x40000000)) return scheduling;
+	return {
+		...scheduling,
+		policy: 0,
+		priority: 0,
+		nice: Math.max(0, scheduling.nice),
 	};
 }
 /** Status flags a launcher sets again on a target's routed outputs (its parent's own, like make's O_APPEND); the rest pin the stream. */
@@ -161,10 +294,11 @@ export function processLaunchOptions(context, endpoints) {
 		)[1],
 	};
 }
-/** The launch's identity after restoring its streams and stack limit. @param {ProcessExecutionContext} context @param {ProcessLaunchOptions} launch */
+/** The launch's identity after restoring its streams and stack limit. @param {ProcessExecutionContext} context @param {ProcessLaunchOptions} launch @param {ProcessSchedulingContext} [scheduling] */
 export function routedProcessIdentity(
 	context,
 	{ outputRoute: route, closeStdin, outputPipes, outputFlags, stackLimit },
+	scheduling,
 ) {
 	const semantic = JSON.parse(context.key);
 	if (
@@ -215,13 +349,16 @@ export function routedProcessIdentity(
 		semantic.rlimits.find(
 			/** @param {string[]} limit */ /** @param {string[]} limit */ (limit) => limit[0] === "Max stack size",
 		)[1] = stackLimit;
+	const effectiveScheduling = scheduling ?? semantic.scheduling;
 	return {
 		...contextKeys({
 			...semantic,
 			executionDomain: "ptrace",
 			signals,
+			scheduling: effectiveScheduling,
 			descriptors,
 		}),
+		scheduling: effectiveScheduling,
 		umask: context.umask,
 	};
 }

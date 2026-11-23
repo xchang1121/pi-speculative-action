@@ -87,11 +87,12 @@ function executionTrace() {
 		paths.forEach((path, index) => frame(17 + index, key, Buffer.from(path + "\0"), pid));
 		return key;
 	};
-	const finish = (key: number, result: number, pid = 101, inode = 0, mode = 0) => {
+	const finish = (key: number, result: number, pid = 101, inode = 0, mode = 0, lock = 0) => {
 		const data = Buffer.alloc(64);
 		data.writeBigInt64LE(BigInt(result));
 		data.writeBigUInt64LE(BigInt(inode), 8);
 		data.writeUInt16LE(mode, 20);
+		data.writeInt32LE(lock, 56);
 		frame(20, key, data, pid);
 	};
 	const image = (name: string, pid = 101) => {
@@ -451,17 +452,20 @@ test("a whole handoff waits for all child claims and only retries recoverable co
 	await expect(partial.commit(apply)).rejects.toThrow("partially consumed");
 });
 
-test("models sched_getparam and sched_getscheduler taints without unsupported_syscall", async () => {
-	for (const [nr, targetPid, expected] of [
-		[143, 0, ["clock", "random"]],
-		[145, 999, ["clock", "ipc", "pid_observation", "random"]],
+test("verifies sched_getparam and sched_getscheduler against proven scheduling context", async () => {
+	for (const [nr, targetPid, result, lock, scheduling, expected] of [
+		[143, 0, 0, 0, { policy: 0, priority: 0 }, ["clock", "random"]],
+		[145, 0, 3, -1, { policy: 3, priority: 0 }, ["clock", "random"]],
+		[145, 0, 3, -1, { policy: 0, priority: 0 }, ["clock", "random", "unsupported_syscall"]],
+		[143, 0, 0, -1, { policy: 0, priority: 0 }, ["clock", "random", "unsupported_syscall"]],
+		[145, 0, 0, -1, undefined, ["clock", "random", "unsupported_syscall"]],
+		[145, 999, -3, -1, { policy: 0, priority: 0 }, ["clock", "ipc", "pid_observation", "random"]],
 	] as const) {
 		const { tail, begin, finish, image, exit } = executionTrace();
 		image("/usr/bin/python3");
-		finish(begin(nr, 0, [targetPid, 0, 0, 0, 0, 0], []), 0);
+		finish(begin(nr, 0, [targetPid, 0, 0, 0, 0, 0], []), result, undefined, undefined, undefined, lock);
 		exit();
-		const observed = await observeExecution(tail, "/usr/bin/python3", "/work");
-		expect(observed.taints).not.toContain("unsupported_syscall");
+		const observed = await observeExecution(tail, "/usr/bin/python3", "/work", { scheduling });
 		expect(observed.taints).toEqual([...expected]);
 	}
 });

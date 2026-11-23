@@ -348,19 +348,26 @@ async function walkSearchInputs(
 		});
 		return content.toString("utf8");
 	};
-	const rules = async (directory: string, dirEntries?: ReadonlySet<string>): Promise<Rule[]> => {
+	const rules = async (
+		directory: string,
+		dirEntries?: ReadonlySet<string>,
+		lowerEntries?: ReadonlySet<string>,
+	): Promise<Rule[]> => {
 		const cached = layers.get(directory);
 		if (cached) return cached;
 		const parent = path.dirname(directory);
 		let inherited = directory === parent || (!grep && directory === cwd) ? [] : await rules(parent);
 		let exclude = path.join(directory, ".git/info/exclude");
 		let hasGit = false;
+		const mayContain = (name: string) => !lowerEntries || lowerEntries.has(name);
 		if (grep) {
 			const git = path.join(directory, ".git");
-			hasGit = dirEntries ? dirEntries.has(".git") : Boolean(await view.exists!(git));
+			hasGit = Boolean(dirEntries?.has(".git") || (mayContain(".git") && (await view.exists!(git))));
 			const hasJj =
 				engine!.jj &&
-				(dirEntries ? dirEntries.has(".jj") : Boolean(await view.exists!(path.join(directory, ".jj"))));
+				Boolean(
+					dirEntries?.has(".jj") || (mayContain(".jj") && (await view.exists!(path.join(directory, ".jj")))),
+				);
 			if (hasGit || hasJj) {
 				repositories.add(directory);
 				inherited = inherited.filter((rule) => rule.rank > 1);
@@ -379,7 +386,7 @@ async function walkSearchInputs(
 		for (const [rank, name] of names.entries()) {
 			if (grep && rank === 0 && !hasGit) continue;
 			if (grep && rank < 2 && !repositories.has(directory)) continue;
-			if (dirEntries && (!grep || rank > 0) && !dirEntries.has(name)) continue;
+			if ((!grep || rank > 0) && !dirEntries?.has(name) && !mayContain(name)) continue;
 			const content = await text(path.resolve(directory, name));
 			if (content !== undefined) {
 				const matcher = ignore({ ignorecase: false }).add(content);
@@ -433,7 +440,11 @@ async function walkSearchInputs(
 			)
 				return true;
 			const names = await view.readdir!(file);
-			await rules(file, process.platform === "linux" ? new Set(names) : undefined);
+			await rules(
+				file,
+				process.platform === "linux" ? new Set(names) : undefined,
+				new Set(names.map((entry) => entry.toLowerCase())),
+			);
 			// Every listed child requires an entry observation, including ones later excluded by a rule.
 			if ((entries += names.length) > entryLimit) return false;
 			const children = names.map((name) => {

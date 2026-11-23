@@ -32,6 +32,7 @@
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -273,6 +274,172 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
       if (length != sizeof(struct utsname))
         return NULL;
       value = uname(bytes);
+    } else if (operation == -17) {
+      int32_t pid_arg;
+      if (length != 2064)
+        return NULL;
+      memcpy(&pid_arg, bytes, sizeof(pid_arg));
+      pid_t target = (pid_t)le32toh((uint32_t)pid_arg);
+      struct sched_param param = {0};
+      int policy = (int)syscall(SYS_sched_getscheduler, target);
+      errno = 0;
+      int nice_val = getpriority(PRIO_PROCESS, (id_t)target);
+      int nice_err = errno;
+      unsigned char mask[2048] = {0};
+      long mask_len = syscall(SYS_sched_getaffinity, target, sizeof(mask), mask);
+      if (policy < 0 || nice_err || mask_len <= 0 || mask_len > (long)sizeof(mask) ||
+          syscall(SYS_sched_getparam, target, &param) < 0)
+        value = -1;
+      else {
+        int32_t header[4] = {
+            (int32_t)htole32((uint32_t)policy),
+            (int32_t)htole32((uint32_t)param.sched_priority),
+            (int32_t)htole32((uint32_t)nice_val),
+            (int32_t)htole32((uint32_t)mask_len),
+        };
+        memcpy(bytes, header, sizeof(header));
+        memcpy((unsigned char *)bytes + sizeof(header), mask, (size_t)mask_len);
+        value = 0;
+      }
+    } else if (operation == -18) {
+      uint32_t header[4];
+      if (length < 4300)
+        return NULL;
+      memcpy(header, bytes, sizeof(header));
+      int32_t root_fd = (int32_t)le32toh(header[0]);
+      uint32_t open_flags = le32toh(header[1]);
+      uint32_t need_stat = le32toh(header[2]);
+      uint32_t path_len = le32toh(header[3]);
+      char *path_ptr = (char *)bytes + 112;
+      if (!path_len || 112 + (size_t)path_len + 1 > length || path_ptr[path_len] != '\0' ||
+          memchr(path_ptr, '\0', path_len))
+        return NULL;
+      if (open_flags & ~(O_PATH | O_NOFOLLOW | O_CLOEXEC)) {
+        errno = EINVAL;
+        value = -1;
+      } else {
+        struct open_how how = {.flags = open_flags | O_CLOEXEC,
+                               .resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS};
+        int fd = (int)syscall(SYS_openat2, root_fd, path_ptr, &how, sizeof(how));
+        if (fd < 0)
+          value = -1;
+        else {
+          char proc_fd[64];
+          snprintf(proc_fd, sizeof(proc_fd), "/proc/self/fd/%d", fd);
+          ssize_t rlen = readlink(proc_fd, path_ptr, length - 112);
+          int err = 0;
+          struct statx stx;
+          if (rlen < 0)
+            err = errno ? errno : EIO;
+          else if ((size_t)rlen >= length - 112)
+            err = ENAMETOOLONG;
+          else if (need_stat) {
+            memset(&stx, 0, sizeof(stx));
+            if (statx(fd, "", AT_EMPTY_PATH | AT_STATX_SYNC_AS_STAT,
+                      STATX_BASIC_STATS | STATX_BTIME, &stx) < 0)
+              err = errno ? errno : EIO;
+          }
+          close(fd);
+          if (err) {
+            errno = err;
+            value = -1;
+          } else {
+            if (need_stat) {
+              uint64_t ufields[10] = {
+                  htole64((uint64_t)makedev(stx.stx_dev_major, stx.stx_dev_minor)),
+                  htole64((uint64_t)stx.stx_ino),
+                  htole64((uint64_t)stx.stx_mode),
+                  htole64((uint64_t)stx.stx_nlink),
+                  htole64((uint64_t)stx.stx_uid),
+                  htole64((uint64_t)stx.stx_gid),
+                  htole64((uint64_t)makedev(stx.stx_rdev_major, stx.stx_rdev_minor)),
+                  htole64((uint64_t)stx.stx_size),
+                  htole64((uint64_t)stx.stx_blksize),
+                  htole64((uint64_t)stx.stx_blocks),
+              };
+              int64_t atime_ns =
+                  (int64_t)stx.stx_atime.tv_sec * 1000000000LL + (int64_t)stx.stx_atime.tv_nsec;
+              int64_t mtime_ns =
+                  (int64_t)stx.stx_mtime.tv_sec * 1000000000LL + (int64_t)stx.stx_mtime.tv_nsec;
+              int64_t ctime_ns =
+                  (int64_t)stx.stx_ctime.tv_sec * 1000000000LL + (int64_t)stx.stx_ctime.tv_nsec;
+              int64_t btime_ns = (stx.stx_mask & STATX_BTIME)
+                                     ? ((int64_t)stx.stx_btime.tv_sec * 1000000000LL +
+                                        (int64_t)stx.stx_btime.tv_nsec)
+                                     : 0LL;
+              uint64_t sfields[4] = {
+                  htole64((uint64_t)atime_ns),
+                  htole64((uint64_t)mtime_ns),
+                  htole64((uint64_t)ctime_ns),
+                  htole64((uint64_t)btime_ns),
+              };
+              memcpy(bytes, ufields, sizeof(ufields));
+              memcpy((unsigned char *)bytes + sizeof(ufields), sfields, sizeof(sfields));
+            }
+            value = (int32_t)rlen;
+          }
+        }
+      }
+    } else if (operation == -19) {
+      uint32_t header[2];
+      if (length < 8192)
+        return NULL;
+      memcpy(header, bytes, sizeof(header));
+      int32_t root_fd = (int32_t)le32toh(header[0]);
+      uint32_t path_len = le32toh(header[1]);
+      char *path_ptr = (char *)bytes + 112;
+      if (!path_len || 112 + (size_t)path_len + 1 > length || path_ptr[path_len] != '\0' ||
+          memchr(path_ptr, '\0', path_len))
+        return NULL;
+      struct open_how how = {.flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+                             .resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS};
+      int fd = (int)syscall(SYS_openat2, root_fd, path_ptr, &how, sizeof(how));
+      if (fd < 0)
+        value = -1;
+      else {
+        char proc_fd[64];
+        snprintf(proc_fd, sizeof(proc_fd), "/proc/self/fd/%d", fd);
+        ssize_t rlen = readlink(proc_fd, path_ptr, length - 112);
+        if (rlen < 0 || (size_t)rlen >= length - 512) {
+          int err = rlen < 0 ? (errno ? errno : EIO) : ENAMETOOLONG;
+          close(fd);
+          errno = err;
+          value = -1;
+        } else {
+          size_t start = (112 + (size_t)rlen + 7) & ~(size_t)7;
+          size_t used = start;
+          int err = 0;
+          int complete = 0;
+          while (length - used >= 280) {
+            long n = syscall(SYS_getdents64, fd, (unsigned char *)bytes + used, length - used);
+            if (n < 0) {
+              if (errno != EINVAL)
+                err = errno ? errno : EIO;
+              break;
+            }
+            if (n == 0) {
+              complete = 1;
+              break;
+            }
+            used += (size_t)n;
+          }
+          close(fd);
+          if (err) {
+            errno = err;
+            value = -1;
+          } else if (complete) {
+            uint32_t out_header[3] = {
+                htole32((uint32_t)rlen),
+                htole32((uint32_t)start),
+                htole32((uint32_t)(used - start)),
+            };
+            memcpy(bytes, out_header, sizeof(out_header));
+            value = 1;
+          } else {
+            value = 0;
+          }
+        }
+      }
     } else if (operation == -15) {
       if (length <= sizeof(struct pi_domain_packet) ||
           strnlen((char *)bytes + sizeof(struct pi_domain_packet),

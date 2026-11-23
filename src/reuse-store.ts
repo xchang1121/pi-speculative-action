@@ -512,6 +512,17 @@ export class ProvenanceCertificateStore {
 		readonly dev: bigint;
 		readonly ino: bigint;
 	};
+	private readonly inputEntrySummaries = new Map<
+		Sha256Digest,
+		readonly (readonly [name: string, kind: string, hasContent: boolean])[]
+	>();
+	private readonly lastInputCatalogs = new Map<
+		string,
+		{
+			readonly idsKey: string;
+			readonly lookup: (target: string, contentOnly?: boolean) => Set<Sha256Digest>;
+		}
+	>();
 	constructor(root: string, options: ProvenanceStoreOptions = {}) {
 		this.options = options;
 		this.root = path.resolve(root);
@@ -637,6 +648,7 @@ export class ProvenanceCertificateStore {
 				if (typeof binding !== "string" || typeof key !== "string") throw new Error("invalid preparation key");
 				index.run(input.root, binding, digestObject(key), id, record.createdAt);
 			}
+			this.rememberInputEntrySummary(id, record.payload);
 			return record;
 		});
 	}
@@ -672,36 +684,90 @@ export class ProvenanceCertificateStore {
 			signal,
 		);
 	}
+	private rememberInputEntrySummary(id: Sha256Digest, payload: unknown): readonly (readonly [string, string, boolean])[] {
+		const rawEntries = (payload as { entries?: unknown } | null)?.entries;
+		const summary: (readonly [string, string, boolean])[] = [];
+		if (Array.isArray(rawEntries)) {
+			for (const item of rawEntries) {
+				if (!Array.isArray(item) || typeof item[0] !== "string") continue;
+				const meta = item[1] as { type?: unknown; content?: unknown } | null | undefined;
+				const kind = typeof meta?.type === "string" ? meta.type : "";
+				const hasContent = meta !== null && typeof meta === "object" && meta.content !== undefined && meta.content !== null;
+				summary.push([item[0], kind, hasContent]);
+			}
+		}
+		this.inputEntrySummaries.delete(id);
+		this.inputEntrySummaries.set(id, summary);
+		const maxCached = this.configuration.current.filesystem.maxHistoryEntries;
+		while (this.inputEntrySummaries.size > maxCached) {
+			const oldest = this.inputEntrySummaries.keys().next().value;
+			if (!oldest) break;
+			this.inputEntrySummaries.delete(oldest);
+		}
+		return summary;
+	}
 	/** One read snapshot supplies path hints for a whole resource query, including existing stores. */
 	async inputPathIndex(root: string, limit: number, signal: AbortSignal) {
 		if (!isSafeCount(limit, 1, this.configuration.current.filesystem.maxHistoryEntries))
 			throw new Error("invalid input discovery limit");
-		const rows = await this.query(
-			`SELECT i.id, e.value ->> '$[0]' AS name, e.value ->> '$[1].type' AS kind
-			FROM input_versions AS i
-			CROSS JOIN json_each(CASE WHEN json_valid(i.value) THEN i.value END, '$.payload.entries') AS e
-			WHERE e.type = 'array' AND i.rowid IN (
-				SELECT rowid FROM input_versions WHERE root = ? ORDER BY rowid DESC LIMIT ?
-			) ORDER BY i.rowid DESC`,
-			[root, limit], signal,
+		const idRows = await this.query(
+			"SELECT id FROM input_versions WHERE root = ? ORDER BY rowid DESC LIMIT ?",
+			[root, limit],
+			signal,
 		);
-		const paths = new Map<string, Sha256Digest[]>();
-		for (const { id, name, kind } of rows) {
-			if (!isSha256Digest(id) || typeof name !== "string") continue;
-			const key = kind === "alias" ? `tree:${name}` : name;
-			const ids = paths.get(key);
-			if (ids) ids.push(id);
-			else paths.set(key, [id]);
+		const ids: Sha256Digest[] = [];
+		for (const { id } of idRows) {
+			if (isSha256Digest(id)) ids.push(id);
 		}
-		return (target: string) => {
-			const ids = new Set(paths.get(target));
+		const idsKey = ids.join(",");
+		const cacheKey = `${root}\0${limit}`;
+		const cached = this.lastInputCatalogs.get(cacheKey);
+		if (cached && cached.idsKey === idsKey) return cached.lookup;
+		for (const id of ids) {
+			if (this.inputEntrySummaries.has(id)) continue;
+			const value = (await this.query("SELECT value FROM input_versions WHERE id = ?", [id], signal))[0]?.value;
+			if (typeof value !== "string") continue;
+			try {
+				const decoded = JSON.parse(value) as { payload?: unknown } | null;
+				this.rememberInputEntrySummary(id, decoded?.payload);
+			} catch {
+				this.inputEntrySummaries.set(id, []);
+			}
+		}
+		const paths = new Map<string, Sha256Digest[]>();
+		const contentPaths = new Map<string, Sha256Digest[]>();
+		for (const id of ids) {
+			const summary = this.inputEntrySummaries.get(id);
+			if (!summary) continue;
+			for (const [name, kind, hasContent] of summary) {
+				const key = kind === "alias" ? `tree:${name}` : name;
+				const list = paths.get(key);
+				if (list) list.push(id);
+				else paths.set(key, [id]);
+				if (kind !== "alias" && hasContent) {
+					const clist = contentPaths.get(name);
+					if (clist) clist.push(id);
+					else contentPaths.set(name, [id]);
+				}
+			}
+		}
+		const lookup = (target: string, contentOnly = false) => {
+			const out = new Set((contentOnly ? contentPaths : paths).get(target));
 			for (let current = target; ; ) {
-				for (const id of paths.get(`tree:${current}`) ?? []) ids.add(id);
+				for (const id of paths.get(`tree:${current}`) ?? []) out.add(id);
 				const parent = filesystemPathKey(path.dirname(current));
-				if (current === parent) return ids;
+				if (current === parent) return out;
 				current = parent;
 			}
 		};
+		this.lastInputCatalogs.delete(cacheKey);
+		this.lastInputCatalogs.set(cacheKey, { idsKey, lookup });
+		while (this.lastInputCatalogs.size > 32) {
+			const oldest = this.lastInputCatalogs.keys().next().value;
+			if (!oldest) break;
+			this.lastInputCatalogs.delete(oldest);
+		}
+		return lookup;
 	}
 	async findByWeakKey(
 		weakKey: Sha256Digest,
@@ -1006,6 +1072,18 @@ export class ProvenanceCertificateStore {
 	): Promise<T> {
 		return this.exclusive(
 			async (database) => {
+				if (references.length) {
+					const sizes = new Map<Sha256Digest, number>();
+					for (const reference of references) validateArtifact(reference, sizes);
+					let totalBytes = 0;
+					for (const size of sizes.values()) {
+						totalBytes += size;
+						if (totalBytes > this.limits.maxBytes)
+							throw Object.assign(new Error("artifact stored-byte budget exceeded"), {
+								code: "ERR_ARTIFACT_LEASE_BUDGET",
+							});
+					}
+				}
 				const result = await publish(database);
 				if (references.length) {
 					await this.artifacts.materialize(references);

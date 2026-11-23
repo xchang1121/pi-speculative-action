@@ -61,17 +61,140 @@ export type FilesystemObservationField = (typeof FILESYSTEM_OBSERVATION_FIELDS)[
 export type FilesystemObservationEvidence = {
 	readonly [Field in FilesystemObservationField]: bigint;
 };
-const FILESYSTEM_TYPES = [
-	["file", "isFile", 8],
-	["directory", "isDirectory", 4],
-	["symlink", "isSymbolicLink", 10],
-	["socket", "isSocket", 12],
-	["fifo", "isFIFO", 1],
-	["char", "isCharacterDevice", 2],
-	["block", "isBlockDevice", 6],
-] as const;
 export function filesystemEntryType(entry: FilesystemTypeEvidence): string {
-	return FILESYSTEM_TYPES.find(([, check]) => entry[check]())?.[0] ?? "other";
+	if (entry.isFile()) return "file";
+	if (entry.isDirectory()) return "directory";
+	if (entry.isSymbolicLink()) return "symlink";
+	if (entry.isSocket()) return "socket";
+	if (entry.isFIFO()) return "fifo";
+	if (entry.isCharacterDevice()) return "char";
+	if (entry.isBlockDevice()) return "block";
+	return "other";
+}
+class DirectoryTypeEntry implements FilesystemTypeEvidence {
+	readonly name: string;
+	readonly kind: number;
+	constructor(name: string, kind: number) {
+		this.name = name;
+		this.kind = kind;
+	}
+	isFile(): boolean {
+		return this.kind === 8;
+	}
+	isDirectory(): boolean {
+		return this.kind === 4;
+	}
+	isSymbolicLink(): boolean {
+		return this.kind === 10;
+	}
+	isSocket(): boolean {
+		return this.kind === 12;
+	}
+	isFIFO(): boolean {
+		return this.kind === 1;
+	}
+	isCharacterDevice(): boolean {
+		return this.kind === 2;
+	}
+	isBlockDevice(): boolean {
+		return this.kind === 6;
+	}
+}
+const nsToMs = (ns: bigint): bigint => (ns >= 0n ? ns / 1_000_000n : (ns - 999_999n) / 1_000_000n);
+const nsToDate = (ns: bigint): Date => new Date(Number(ns) / 1_000_000);
+class NativeBigIntStats implements BigIntStats {
+	readonly dev: bigint;
+	readonly ino: bigint;
+	readonly mode: bigint;
+	readonly nlink: bigint;
+	readonly uid: bigint;
+	readonly gid: bigint;
+	readonly rdev: bigint;
+	readonly size: bigint;
+	readonly blksize: bigint;
+	readonly blocks: bigint;
+	readonly atimeNs: bigint;
+	readonly mtimeNs: bigint;
+	readonly ctimeNs: bigint;
+	readonly birthtimeNs: bigint;
+	constructor(u64: BigUint64Array, i64: BigInt64Array) {
+		this.dev = u64[0]!;
+		this.ino = u64[1]!;
+		this.mode = u64[2]!;
+		this.nlink = u64[3]!;
+		this.uid = u64[4]!;
+		this.gid = u64[5]!;
+		this.rdev = u64[6]!;
+		this.size = u64[7]!;
+		this.blksize = u64[8]!;
+		this.blocks = u64[9]!;
+		this.atimeNs = i64[0]!;
+		this.mtimeNs = i64[1]!;
+		this.ctimeNs = i64[2]!;
+		this.birthtimeNs = i64[3]!;
+	}
+	get atimeMs(): bigint {
+		return nsToMs(this.atimeNs);
+	}
+	get mtimeMs(): bigint {
+		return nsToMs(this.mtimeNs);
+	}
+	get ctimeMs(): bigint {
+		return nsToMs(this.ctimeNs);
+	}
+	get birthtimeMs(): bigint {
+		return nsToMs(this.birthtimeNs);
+	}
+	get atime(): Date {
+		return nsToDate(this.atimeNs);
+	}
+	get mtime(): Date {
+		return nsToDate(this.mtimeNs);
+	}
+	get ctime(): Date {
+		return nsToDate(this.ctimeNs);
+	}
+	get birthtime(): Date {
+		return nsToDate(this.birthtimeNs);
+	}
+	isFile(): boolean {
+		return (this.mode & 0o170000n) === 0o100000n;
+	}
+	isDirectory(): boolean {
+		return (this.mode & 0o170000n) === 0o040000n;
+	}
+	isSymbolicLink(): boolean {
+		return (this.mode & 0o170000n) === 0o120000n;
+	}
+	isBlockDevice(): boolean {
+		return (this.mode & 0o170000n) === 0o060000n;
+	}
+	isCharacterDevice(): boolean {
+		return (this.mode & 0o170000n) === 0o020000n;
+	}
+	isFIFO(): boolean {
+		return (this.mode & 0o170000n) === 0o010000n;
+	}
+	isSocket(): boolean {
+		return (this.mode & 0o170000n) === 0o140000n;
+	}
+}
+const NATIVE_IO_BYTES = 65536;
+const nativeIoBuffer = Buffer.alloc(NATIVE_IO_BYTES);
+const nativeStatU64 = new BigUint64Array(nativeIoBuffer.buffer, nativeIoBuffer.byteOffset, 10);
+const nativeStatI64 = new BigInt64Array(nativeIoBuffer.buffer, nativeIoBuffer.byteOffset + 80, 4);
+function compareUtf8Names(left: string, right: string): number {
+	const limit = Math.min(left.length, right.length);
+	for (let index = 0; index < limit; index++) {
+		const a = left.charCodeAt(index);
+		const b = right.charCodeAt(index);
+		if (a !== b) {
+			return a < 0xd800 && b < 0xd800
+				? a - b
+				: Buffer.compare(Buffer.from(left), Buffer.from(right));
+		}
+	}
+	return left.length - right.length;
 }
 export function filesystemModeType(mode: number | bigint) {
 	switch (Number(mode) & 0o170000) {
@@ -284,6 +407,32 @@ export class FilesystemReadView {
 		});
 		return value;
 	}
+	private fastStatOrPath(
+		target: string,
+		follow: boolean,
+		needStat: boolean,
+	): { readonly stat?: BigIntStats; readonly resolved: string } | undefined {
+		if (typeof this.descriptor !== "number" || !this.reader)
+			throw new Error("read-only filesystem view is closed or unavailable");
+		const absolute = path.isAbsolute(target) ? target : `${process.cwd()}/${target}`;
+		if (absolute.includes("\0")) throw new Error("invalid filesystem pathname");
+		const pathBytes = Buffer.byteLength(absolute);
+		if (112 + pathBytes + 1 > NATIVE_IO_BYTES - 512) return undefined;
+		this.observed.add(absolute);
+		const flags = 0x200000 | (follow ? 0 : constants.O_NOFOLLOW);
+		nativeIoBuffer.writeInt32LE(this.descriptor, 0);
+		nativeIoBuffer.writeUInt32LE(flags, 4);
+		nativeIoBuffer.writeUInt32LE(needStat ? 1 : 0, 8);
+		nativeIoBuffer.writeUInt32LE(pathBytes, 12);
+		nativeIoBuffer.write(absolute, 112, pathBytes, "utf8");
+		nativeIoBuffer[112 + pathBytes] = 0;
+		const rlen = this.reader(-18, nativeIoBuffer);
+		if (!Number.isInteger(rlen)) throw new Error("native filesystem stat unavailable");
+		if (rlen < 0) throw filesystemReadError(`filesystem open failed: ${target} (flags=${flags})`, rlen);
+		const resolved = nativeIoBuffer.toString("utf8", 112, 112 + rlen);
+		this.observed.add(resolved);
+		return needStat ? { stat: new NativeBigIntStats(nativeStatU64, nativeStatI64), resolved } : { resolved };
+	}
 	async pin(target: string, follow = false): Promise<FilesystemObjectHandle> {
 		if (this.ambient) return fs.open(target, 0x200000 | (follow ? 0 : constants.O_NOFOLLOW));
 		const descriptor = this.open(target, 0x200000 | (follow ? 0 : constants.O_NOFOLLOW));
@@ -291,6 +440,8 @@ export class FilesystemReadView {
 	}
 	async stat(target: string, follow = false): Promise<BigIntStats> {
 		if (this.ambient) return (follow ? fs.stat : fs.lstat)(target, { bigint: true });
+		const fast = this.fastStatOrPath(target, follow, true);
+		if (fast) return fast.stat!;
 		return this.observe(target, follow, (fd) => fstatSync(fd, { bigint: true }));
 	}
 	async statWithPath(
@@ -301,6 +452,12 @@ export class FilesystemReadView {
 		readonly resolvedPath?: string;
 	}> {
 		if (this.ambient) return { stat: await (follow ? fs.stat : fs.lstat)(target, { bigint: true }) };
+		const fast = this.fastStatOrPath(target, follow, true);
+		if (fast)
+			return {
+				stat: fast.stat!,
+				resolvedPath: fast.resolved.endsWith(" (deleted)") ? undefined : fast.resolved,
+			};
 		return this.observe(target, follow, (fd, resolved) => ({
 			stat: fstatSync(fd, { bigint: true }),
 			resolvedPath: resolved.endsWith(" (deleted)") ? undefined : resolved,
@@ -308,6 +465,8 @@ export class FilesystemReadView {
 	}
 	async realpath(target: string): Promise<string> {
 		if (this.ambient) return fs.realpath(target);
+		const fast = this.fastStatOrPath(target, true, false);
+		if (fast) return fast.resolved;
 		return this.observe(target, true, (_fd, resolved) => resolved);
 	}
 	async readlink(target: string): Promise<string> {
@@ -336,6 +495,68 @@ export class FilesystemReadView {
 			}
 			throw new Error("filesystem symlink target is too large");
 		});
+	}
+	scanDirectoryEntries(target: string): DirectoryTypeEntry[] {
+		if (this.ambient) {
+			let fd: number;
+			try {
+				fd = openSync(target, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOATIME);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+				fd = openSync(target, constants.O_RDONLY | constants.O_DIRECTORY);
+			}
+			try {
+				const entries: DirectoryTypeEntry[] = [];
+				for (;;) {
+					const count = nativeFilesystem!(fd, nativeIoBuffer);
+					if (!Number.isInteger(count) || count > nativeIoBuffer.length) throw new Error("invalid_directory_read");
+					if (count < 0) throw filesystemReadError("directory read failed", count);
+					if (!count) break;
+					entries.push(...directoryImage(nativeIoBuffer.subarray(0, count), undefined, false));
+				}
+				return entries;
+			} finally {
+				closeSync(fd);
+			}
+		}
+		if (typeof this.descriptor !== "number" || !this.reader)
+			throw new Error("read-only filesystem view is closed or unavailable");
+		const absolute = path.isAbsolute(target) ? target : `${process.cwd()}/${target}`;
+		if (absolute.includes("\0")) throw new Error("invalid filesystem pathname");
+		const pathBytes = Buffer.byteLength(absolute);
+		if (112 + pathBytes + 1 <= NATIVE_IO_BYTES - 512) {
+			this.observed.add(absolute);
+			nativeIoBuffer.writeInt32LE(this.descriptor, 0);
+			nativeIoBuffer.writeUInt32LE(pathBytes, 4);
+			nativeIoBuffer.write(absolute, 112, pathBytes, "utf8");
+			nativeIoBuffer[112 + pathBytes] = 0;
+			const status = this.reader(-19, nativeIoBuffer);
+			if (!Number.isInteger(status)) throw new Error("native directory scan unavailable");
+			if (status < 0)
+				throw filesystemReadError(
+					`filesystem open failed: ${target} (flags=${constants.O_RDONLY | constants.O_DIRECTORY})`,
+					status,
+				);
+			if (status === 1) {
+				const rlen = nativeIoBuffer.readUInt32LE(0);
+				const start = nativeIoBuffer.readUInt32LE(4);
+				const used = nativeIoBuffer.readUInt32LE(8);
+				this.observed.add(nativeIoBuffer.toString("utf8", 112, 112 + rlen));
+				return directoryImage(nativeIoBuffer.subarray(start, start + used), undefined, false);
+			}
+		}
+		const entries: DirectoryTypeEntry[] = [];
+		this.open(target, constants.O_RDONLY | constants.O_DIRECTORY, (fd) => {
+			for (;;) {
+				const count = this.reader!(fd, nativeIoBuffer);
+				if (!Number.isInteger(count) || count > nativeIoBuffer.length) throw new Error("invalid_directory_read");
+				if (count < 0) throw filesystemReadError("directory read failed", count);
+				if (!count) break;
+				entries.push(...directoryImage(nativeIoBuffer.subarray(0, count), undefined, false));
+			}
+			return 0;
+		});
+		return entries;
 	}
 	async readDirectory(target: string): Promise<FileHandle> {
 		if (this.ambient)
@@ -523,6 +744,32 @@ export async function mapFilesystem<Input, Output>(
 		throw error;
 	}
 	return output;
+}
+/** Bound independent teardown work, attempting every item before reporting the first failure. */
+export async function settleFilesystem<Input>(
+	values: ReadonlyArray<Input>,
+	run: (value: Input) => Promise<unknown>,
+): Promise<void> {
+	let cursor = 0;
+	let failure: unknown;
+	await Promise.all(
+		Array.from(
+			{
+				length: Math.min(speculativeConfig().filesystem.concurrency, values.length),
+			},
+			async () => {
+				while (cursor < values.length) {
+					const index = cursor++;
+					try {
+						await run(values[index]);
+					} catch (error) {
+						failure ??= error;
+					}
+				}
+			},
+		),
+	);
+	if (failure !== undefined) throw failure;
 }
 export type StableFilesystemCapture = {
 	readonly computation?: TimelineInterval;
@@ -712,10 +959,9 @@ function directoryImage(
 	cursor?: {
 		cookie: bigint;
 	},
+	sort = true,
 ) {
-	const entries: (FilesystemTypeEvidence & {
-		readonly name: string;
-	})[] = [];
+	const entries: DirectoryTypeEntry[] = [];
 	for (let offset = 0; offset < content.length;) {
 		if (content.length - offset < 24) throw new Error("invalid_directory_image");
 		const length = content.readUInt16LE(offset + 16);
@@ -725,7 +971,7 @@ function directoryImage(
 			throw new Error("invalid_directory_image");
 		const name = content.subarray(offset + 19, zero);
 		const decoded = name.toString("utf8");
-		if (decoded.includes("/") || !Buffer.from(decoded).equals(name))
+		if (decoded.includes("/") || (decoded.includes("\ufffd") && !Buffer.from(decoded).equals(name)))
 			throw new Error("unrepresentable_directory_name");
 		if (cursor) {
 			const cookie = content.readBigInt64LE(offset + 8);
@@ -733,15 +979,11 @@ function directoryImage(
 			cursor.cookie = cookie;
 			content.fill(0, zero + 1, end);
 		}
-		const type = content[offset + 18];
-		if (decoded !== "." && decoded !== "..")
-			entries.push({
-				name: decoded,
-				...Object.fromEntries(FILESYSTEM_TYPES.map(([, check, code]) => [check, () => code === type])),
-			} as (typeof entries)[number]);
+		const type = content[offset + 18]!;
+		if (decoded !== "." && decoded !== "..") entries.push(new DirectoryTypeEntry(decoded, type));
 		offset = end;
 	}
-	return entries.sort((a, b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
+	return sort ? entries.sort((a, b) => compareUtf8Names(a.name, b.name)) : entries;
 }
 /** Observe a directory through an independent OFD without advancing owned input access times. */
 export async function readFilesystemDirectory(
@@ -754,38 +996,23 @@ export async function readFilesystemDirectory(
 > {
 	if (!nativeFilesystem) return fs.readdir(target, { withFileTypes: true });
 	view ??= FilesystemReadView.ambient();
-	const handle = await view.readDirectory(target);
-	try {
-		const entries: ReturnType<typeof directoryImage> = [];
-		for await (const content of readDirectoryChunks(handle))
-			entries.push(
-				...(await mapFilesystem(directoryImage(content), async (entry) =>
-					filesystemEntryType(entry) === "other"
-						? Object.assign(await view.stat(path.join(target, entry.name)), {
-								name: entry.name,
-							})
-						: entry,
-				)),
-			);
-		return entries.sort((a, b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
-	} finally {
-		await handle.close();
+	const raw = view.scanDirectoryEntries(target);
+	let hasUnknown = false;
+	for (let i = 0; i < raw.length; i++) {
+		if (raw[i]!.kind === 0) {
+			hasUnknown = true;
+			break;
+		}
 	}
-}
-/** The yielded buffer is borrowed until the next read; callers retain only admitted bytes. */
-async function* readDirectoryChunks(handle: FileHandle, maxBytes = Infinity, signal?: AbortSignal) {
-	const buffer = Buffer.allocUnsafe(speculativeConfig().filesystem.directoryReadBytes);
-	let used = 0;
-	for (;;) {
-		signal?.throwIfAborted();
-		const count = nativeFilesystem!(handle.fd, buffer);
-		if (!Number.isInteger(count) || count > buffer.length) throw new Error("invalid_directory_read");
-		if (count < 0) throw filesystemReadError("directory read failed", count);
-		if (!count) return;
-		used += count;
-		if (used > maxBytes) throw new Error("directory image exceeds capture budget");
-		yield buffer.subarray(0, count);
-	}
+	if (!hasUnknown) return raw.sort((a, b) => compareUtf8Names(a.name, b.name));
+	const resolved = await mapFilesystem(raw, async (entry) =>
+		entry.kind === 0
+			? Object.assign(await view.stat(path.join(target, entry.name)), {
+					name: entry.name,
+				})
+			: entry,
+	);
+	return resolved.sort((a, b) => compareUtf8Names(a.name, b.name));
 }
 /** Open an independent reader on one regular inode without changing owned inputs' access times. */
 export async function openFilesystemFile(

@@ -46,6 +46,7 @@ import {
 	mapFilesystem,
 	openFilesystemReadView,
 	readFilesystemDirectory,
+	rememberCapture,
 	resolveFilesystemDestination,
 	sameFilesystemIdentity,
 	type StableFilesystemCapture,
@@ -461,7 +462,12 @@ const preparationMetadataBytes = (
 	resource: string | undefined,
 	dependencies: Iterable<string>,
 ) => serialize([key, resource, [...dependencies]]).byteLength;
+const parsedResourcePayloads = new WeakMap<object, Map<string, PersistentResourcePayload>>();
 function parsePersistentResourcePayload(value: unknown, root: string): PersistentResourcePayload {
+	if (value && typeof value === "object") {
+		const cached = parsedResourcePayloads.get(value)?.get(root);
+		if (cached) return cached;
+	}
 	const payload = value as PersistentResourcePayload;
 	const invalid = () => {
 		throw new Error("invalid persistent input closure");
@@ -615,19 +621,28 @@ function parsePersistentResourcePayload(value: unknown, root: string): Persisten
 		if (identities.has(identity)) return invalid();
 		identities.add(identity);
 	}
-	return {
+	const parsed: PersistentResourcePayload = {
 		root,
 		physicalRoot: payload.physicalRoot,
 		observations: payload.observations,
 		entries,
 		preparations,
 	};
+	if (value && typeof value === "object") {
+		let byRoot = parsedResourcePayloads.get(value);
+		if (!byRoot) {
+			byRoot = new Map();
+			parsedResourcePayloads.set(value, byRoot);
+		}
+		byRoot.set(root, parsed);
+	}
+	return parsed;
 }
 type PreparationLookup = { readonly binding?: string; readonly key: string };
 type ResourceInputLookup = (
 	target?: string,
 	preparation?: PreparationLookup,
-	cold?: boolean,
+	cold?: boolean | "content",
 ) => Iterable<ResourceInputSource> | AsyncIterable<ResourceInputSource>;
 type PreparedSharingState =
 	| { readonly kind: "building"; requiresProofs: boolean; readonly waiters: Set<() => void> }
@@ -1799,7 +1814,7 @@ export class ResourceReadView {
 			for await (const source of evaluation?.lookup?.(
 				query,
 				undefined,
-				scope === "content" || !evaluation.missing,
+				scope === "content" ? "content" : !evaluation.missing,
 			) ?? []) {
 				if (source.view.entries === this.entries || !source.view.retained) continue;
 				try {
@@ -2883,7 +2898,7 @@ export class ResourceInputSession {
 		const manager = this.root(root);
 		const store = this.configuration.store;
 		let catalog: ReturnType<typeof store.inputPathIndex> | undefined;
-		return async (target: string) => {
+		return async (target: string, contentOnly = false) => {
 			if (!catalog) {
 				const limit = Math.min(store.limits.maxCertificates, speculativeConfig().filesystem.maxHistoryEntries);
 				const pending = manager
@@ -2896,7 +2911,7 @@ export class ResourceInputSession {
 				catalog = pending;
 			}
 			const lookup = await catalog;
-			return lookup(filesystemPathKey(path.resolve(manager.root, target)));
+			return lookup(filesystemPathKey(path.resolve(manager.root, target)), contentOnly);
 		};
 	}
 	/** A native reader verifies its own live file digest. It only needs that file's immutable blocks and receipt. */
@@ -2915,7 +2930,7 @@ export class ResourceInputSession {
 		let last: { id: Sha256Digest; files: ReturnType<typeof load> } | undefined;
 		return async function* (target: string) {
 			const name = filesystemPathKey(target);
-			for (const id of await candidates(name)) {
+			for (const id of await candidates(name, true)) {
 				signal.throwIfAborted();
 				if (last?.id !== id) last = { id, files: load(id) };
 				const attempt = last;
@@ -2935,11 +2950,24 @@ export class ResourceInputSession {
 		const manager = this.root(root);
 		const store = this.configuration.store;
 		const candidates = this.fileCandidates(root, signal);
+		const records = new Map<Sha256Digest, Promise<StoredInputVersion | undefined>>();
 		const restored = new Map<Sha256Digest, Promise<{ record?: StoredInputVersion; token?: ResourceVersionToken }>>();
 		const restoredTargets = new Map<string, Promise<ResourceVersionToken | undefined>>();
+		const singleRestoresPerRecord = new Map<Sha256Digest, number>();
 		const session = this;
+		const loadRecord = (id: Sha256Digest) => {
+			let pending = records.get(id);
+			if (!pending) {
+				pending = store.getInputVersion(id, signal).catch((error) => {
+					if (records.get(id) === pending) records.delete(id);
+					throw error;
+				});
+				records.set(id, pending);
+			}
+			return pending;
+		};
 		const restore = async (id: Sha256Digest) => {
-			const record = await store.getInputVersion(id, signal);
+			const record = await loadRecord(id);
 			if (!record) return {};
 			try {
 				const token = await manager.restore(record, session.remainingBytes, signal);
@@ -2962,7 +2990,20 @@ export class ResourceInputSession {
 				store.signal.throwIfAborted();
 			}
 		};
-		return async function* (target?: string, preparation?: PreparationLookup) {
+		const runSingleTarget = (id: Sha256Digest, record: StoredInputVersion, resolvedTarget: string, target: string) => {
+			const targetKey = `${id}\0${resolvedTarget}`;
+			let single = restoredTargets.get(targetKey);
+			if (!single) {
+				singleRestoresPerRecord.set(id, (singleRestoresPerRecord.get(id) ?? 0) + 1);
+				single = restoreTarget(record, target).catch((error) => {
+					if (restoredTargets.get(targetKey) === single) restoredTargets.delete(targetKey);
+					throw error;
+				});
+				restoredTargets.set(targetKey, single);
+			}
+			return single;
+		};
+		return async function* (target?: string, preparation?: PreparationLookup, contentOnly = false) {
 			if (target === undefined || preparation || session.persistence.inputs) {
 				for await (const { token } of manager.recover(() => session.remainingBytes, { signal, target, preparation })) {
 					retain(token);
@@ -2970,8 +3011,40 @@ export class ResourceInputSession {
 				}
 				return;
 			}
-			for (const id of await candidates(target)) {
+			const resolvedTarget = filesystemPathKey(path.resolve(manager.root, target));
+			const contentDep = dependencyKey({ path: resolvedTarget, scope: "content" });
+			for (const id of await candidates(target, contentOnly)) {
 				signal.throwIfAborted();
+				const existingFull = restored.get(id);
+				if (existingFull) {
+					const full = await existingFull;
+					if (full.token) {
+						yield full.token;
+						continue;
+					}
+				}
+				const record = await loadRecord(id);
+				if (!record) continue;
+				const entries = (record.payload as { entries?: unknown[] } | null)?.entries;
+				const canSliceTarget =
+					Array.isArray(entries) &&
+					entries.length > 1 &&
+					entries.some(
+						(item) =>
+							Array.isArray(item) &&
+							item[0] === resolvedTarget &&
+							Boolean(item[1]) &&
+							typeof item[1] === "object" &&
+							(item[1] as { type?: unknown }).type === "file" &&
+							Boolean((item[1] as { content?: unknown }).content) &&
+							(item[1] as { dependency?: unknown }).dependency === contentDep &&
+							!(item[1] as { metadata?: { dependency?: unknown } }).metadata?.dependency,
+					);
+				if (canSliceTarget && (existingFull !== undefined || (singleRestoresPerRecord.get(id) ?? 0) < 2)) {
+					const token = await runSingleTarget(id, record, resolvedTarget, target);
+					if (token) yield token;
+					continue;
+				}
 				let pending = restored.get(id);
 				if (!pending) {
 					pending = restore(id).catch((error) => {
@@ -2985,18 +3058,8 @@ export class ResourceInputSession {
 					yield full.token;
 					continue;
 				}
-				const entries = (full.record?.payload as { entries?: unknown[] } | null)?.entries;
 				if (!full.record || !Array.isArray(entries) || entries.length <= 1) continue;
-				const targetKey = `${id}\0${filesystemPathKey(path.resolve(manager.root, target))}`;
-				let single = restoredTargets.get(targetKey);
-				if (!single) {
-					single = restoreTarget(full.record, target).catch((error) => {
-						if (restoredTargets.get(targetKey) === single) restoredTargets.delete(targetKey);
-						throw error;
-					});
-					restoredTargets.set(targetKey, single);
-				}
-				const token = await single;
+				const token = await runSingleTarget(id, full.record, resolvedTarget, target);
 				if (token) yield token;
 			}
 		};
@@ -3535,6 +3598,7 @@ async function fingerprintDependencies(
 				const bytes = provided && (provided instanceof ChunkedContent ? provided : Buffer.from(provided));
 				// Supplied bytes own data, never a host observation window; adoption validates them exactly.
 				// A file unchanged since an earlier read of it, by the racy-git rule, needs no read unless its bytes are retained.
+				const takenAtMs = Date.now();
 				const streamed =
 					chunked &&
 					(await chunked.capture((onChunk) =>
@@ -3542,11 +3606,13 @@ async function fingerprintDependencies(
 							captureStableFile(target, chunked.limits.maxLogicalBytes, false, {
 								stat: info,
 								realPath: realTarget,
+								digest: false,
 								view: filesystem,
 								onChunk,
 							}),
 						),
 					));
+				if (streamed) rememberCapture(streamed.capture, takenAtMs);
 				const content: StableFilesystemCapture = streamed
 					? streamed.capture
 					: bytes

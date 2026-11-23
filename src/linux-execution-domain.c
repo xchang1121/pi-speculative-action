@@ -1110,6 +1110,13 @@ int metadata_return(struct bpf_raw_tracepoint_args *context) {
           }
         }
       }
+      if (number == __NR_sched_getparam) {
+        __s32 priority;
+        if (bpf_probe_read_user(&priority, sizeof(priority), (void *)call->arguments[1]))
+          event->error = -14;
+        else
+          done.lock = priority;
+      }
       if (number == __NR_fcntl && ((call->arguments[1] >= 5 && call->arguments[1] <= 7) ||
                                   (call->arguments[1] >= 36 && call->arguments[1] <= 38))) {
         short type;

@@ -926,3 +926,26 @@ linux("partitions large file input batches into bounded multi-file records and r
 		await f.close();
 	}
 });
+
+test("rejects batch publications whose unique artifact closure exceeds the stored-byte budget", async () => {
+	const f = await fixture();
+	f.store.configure({ maxBytes: 4096 });
+	try {
+		await f.store.withPublication(async () => {
+			const first = await f.store.artifacts.put(Buffer.alloc(3072, 1));
+			const second = await f.store.artifacts.put(Buffer.alloc(3072, 2));
+			const singleA = await f.store.putInputVersion({ root: f.root, preparations: [], kind: "single-a" }, [first]);
+			const singleB = await f.store.putInputVersion({ root: f.root, preparations: [], kind: "single-b" }, [second]);
+			await expect(
+				f.store.putInputVersion({ root: f.root, preparations: [], kind: "oversize" }, [first, second]),
+			).rejects.toThrow("artifact stored-byte budget exceeded");
+			for (const record of [singleA, singleB]) {
+				const loaded = await f.store.loadArtifacts(record.artifacts);
+				expect(loaded?.bytes).toBe(3072);
+				await loaded?.dispose();
+			}
+		});
+	} finally {
+		await f.close();
+	}
+});

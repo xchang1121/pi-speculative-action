@@ -686,6 +686,59 @@ test("aborts and bypasses an in-flight unadoptable exclusive branch immediately 
 	}
 });
 
+test("preserves an unadoptable exclusive parent branch when an after successor still depends on it", async () => {
+	const parentStarted = Promise.withResolvers<void>();
+	const finishParent = Promise.withResolvers<void>();
+	const unadoptable: SpeculativeExecutionRoute = {
+		...exclusive,
+		adoptable: () => false,
+	};
+	const session = new LocalExecutionSession<string>({
+		settings: () => ({ maxConcurrentActions: 4, resourceCacheMaxEntries: 16 }),
+		effect: (key) => PI_ACTION_SEMANTICS.effect(key),
+		adoptable: (call) => call.tool !== "bash",
+		key: async (call) =>
+			PI_ACTION_SEMANTICS.buildKey(call.tool, call.input, "/workspace", "memory", { fingerprint: "test" }),
+		route: async (call) => (call.tool === "bash" ? unadoptable : exclusive),
+		authorize: async () => ({ ok: true }),
+		capture: async () => undefined,
+		native: async () => "native-actor",
+		fork: async (call) => {
+			if (call.tool === "bash") {
+				parentStarted.resolve();
+				await finishParent.promise;
+			}
+			return {
+				backend: "memory",
+				output: `spec:${call.tool}`,
+				resources: ["out.txt"],
+				capturedBytes: 4,
+				checkpoint: { id: call.tool, backend: "memory", lineage: call.tool, depth: 1 },
+				executionMetrics: {},
+				compatibility: { status: "compatible", executionFingerprint: "test", backend: "memory" },
+				validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }),
+				commit: async () => `spec:${call.tool}`,
+				dispose() {},
+			};
+		},
+	});
+	try {
+		const parent = session.speculate({ tool: "bash", input: { command: "gen" } });
+		const child = session.speculate({ tool: "write", input: { path: "out.txt", content: "next" } }, { after: parent.runID });
+		await parentStarted.promise;
+		expect(await session.execute({ tool: "bash", input: { command: "gen" } })).toMatchObject({
+			output: "native-actor",
+			served: false,
+		});
+		finishParent.resolve();
+		expect(await parent.completion).toMatchObject({ status: "completed", output: "spec:bash" });
+		expect(await child.completion).toMatchObject({ status: "completed", output: "spec:write" });
+	} finally {
+		finishParent.resolve();
+		await session.close();
+	}
+});
+
 test("bypasses unadoptable route admission and non-observation input candidates without blocking the Actor", async () => {
 	const routing = Promise.withResolvers<void>();
 	const routeAborted = Promise.withResolvers<void>();

@@ -58,7 +58,8 @@ export interface TrustedStepBuild {
 }
 const unavailable = Symbol("step unavailable");
 type PreparedValue = {
-	verifiedWorkspaces: Set<string>;
+	originWorkspace: string;
+	verifiedScopes: WeakSet<SubcomputeScope>;
 	framePrefix: Buffer;
 	size: number;
 	computation: TimelineInterval;
@@ -601,10 +602,12 @@ export class SubcomputeService {
 									if (step.acceptShared) await verifiedInput();
 									return value;
 								}, maxResultBytes, !!step.acceptShared), signal);
-								if (!result.verifiedWorkspaces.has(this.inputManager.root)) {
+								if (result.originWorkspace !== this.inputManager.root) {
 									if (!await step.acceptShared?.(request.key, signal)) throw unavailable;
-									await verifiedInput();
-									result.verifiedWorkspaces.add(this.inputManager.root);
+									if (!result.verifiedScopes.has(active)) {
+										await verifiedInput();
+										result.verifiedScopes.add(active);
+									}
 								}
 								if (active.state.kind === "closed") throw new Error("subcompute_context_closed");
 								if (result.size > maxResultBytes) {
@@ -689,7 +692,8 @@ export class SubcomputeService {
 			// Delivery adds the consumer's own state and receipt token to this immutable value.
 			const framePrefix = Buffer.from(`{"value":${JSON.stringify(encodeValue(value))},`);
 			return {
-				verifiedWorkspaces: new Set([origin]),
+				originWorkspace: origin,
+				verifiedScopes: new WeakSet(),
 				framePrefix,
 				size,
 				computation: TimelineInterval.restore(receipt) ?? TimelineInterval.unknownReuse(id),

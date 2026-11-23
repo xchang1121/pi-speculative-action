@@ -263,3 +263,58 @@ linux(
 		}
 	},
 );
+
+linux("matches native BigIntStats fields and reads both compact and multi-chunk directories in UTF-8 byte order", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "pi-fast-fs-"));
+	try {
+		const file = path.join(root, "sample.txt");
+		const link = path.join(root, "sample.link");
+		const bigDir = path.join(root, "many");
+		await writeFile(file, "payload\n");
+		await fs.symlink("sample.txt", link);
+		await fs.mkdir(bigDir);
+		const expectedNames: string[] = [];
+		for (let i = 0; i < 1800; i++) {
+			const name = `entry_${String(i).padStart(4, "0")}_${"x".repeat(28)}.txt`;
+			expectedNames.push(name);
+			await writeFile(path.join(bigDir, name), "");
+		}
+		expectedNames.push("\u{1F600}", "\uE000");
+		await writeFile(path.join(bigDir, "\u{1F600}"), "");
+		await writeFile(path.join(bigDir, "\uE000"), "");
+		expectedNames.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+
+		await using view = await filesystemEvidence.openFilesystemReadView();
+		for (const [target, follow] of [
+			[file, false],
+			[link, false],
+			[link, true],
+			[bigDir, false],
+			["/dev/null", false],
+		] as const) {
+			const actual = await view.stat(target, follow);
+			const reference = await (follow ? fs.stat : fs.lstat)(target, { bigint: true });
+			for (const field of filesystemEvidence.FILESYSTEM_METADATA_FIELDS) {
+				expect(actual[field], `${target}:${field}`).toBe(reference[field]);
+			}
+			expect(actual.mtimeMs).toBe(reference.mtimeMs);
+			expect(actual.isFile()).toBe(reference.isFile());
+			expect(actual.isDirectory()).toBe(reference.isDirectory());
+			expect(actual.isSymbolicLink()).toBe(reference.isSymbolicLink());
+			expect(actual.isCharacterDevice()).toBe(reference.isCharacterDevice());
+		}
+		expect(await view.realpath(link)).toBe(await fs.realpath(link));
+
+		const compact = await filesystemEvidence.readFilesystemDirectory(root, view);
+		expect(compact.map((entry) => [entry.name, filesystemEvidence.filesystemEntryType(entry)])).toEqual([
+			["many", "directory"],
+			["sample.link", "symlink"],
+			["sample.txt", "file"],
+		]);
+		const large = await filesystemEvidence.readFilesystemDirectory(bigDir, view);
+		expect(large.map((entry) => entry.name)).toEqual(expectedNames);
+		await view.verify();
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});

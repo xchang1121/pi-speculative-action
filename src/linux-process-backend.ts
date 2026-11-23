@@ -125,10 +125,16 @@ import {
 	slash,
 	stableEqual,
 } from "./primitives.ts";
-import type { ProcessExecutionContext, ProcessLaunchOptions } from "./process-context.mjs";
+import type {
+	ProcessExecutionContext,
+	ProcessLaunchOptions,
+	ProcessSchedulingContext,
+} from "./process-context.mjs";
 import {
 	byteStreamContextKey,
 	captureProcessContext,
+	captureProcessScheduling,
+	forkedProcessScheduling,
 	processLaunchOptions,
 	routedProcessIdentity,
 	validProcessContext,
@@ -230,6 +236,7 @@ const OBSERVER_FINGERPRINT = digestObject(
 			),
 		)
 		.concat(
+			sha256Digest(readFileSync(new URL("./process-context.mjs", import.meta.url))),
 			["c", "h"].map((extension) =>
 				sha256Digest(readFileSync(new URL(`../src/linux-execution-domain.${extension}`, import.meta.url))),
 			),
@@ -360,6 +367,7 @@ interface DomainExecution {
 	readonly pid: number;
 	readonly trace: TraceTail;
 	readonly endpoints: readonly [string, string];
+	readonly scheduling: ProcessSchedulingContext;
 	readonly resume: () => void;
 	readonly exit: Promise<number>;
 }
@@ -529,6 +537,7 @@ export class LinuxProcessReuseBackend {
 		request: ProcessExecutionRequest,
 		projection: ExecutionPathProjection,
 		environment = definedProcessEnvironment(request.environment),
+		scheduling?: ProcessSchedulingContext,
 	) {
 		return topLevelProcessPrototype(
 			invocation,
@@ -536,6 +545,7 @@ export class LinuxProcessReuseBackend {
 			environment,
 			projection,
 			await this.resolvePlatformFingerprint(),
+			scheduling ?? forkedProcessScheduling(await captureProcessScheduling(process.pid)),
 		);
 	}
 	private async appendOutputJournal(journal: OrderedEffectEvent[], events: readonly BufferedOutput[]) {
@@ -862,8 +872,11 @@ export class LinuxProcessReuseBackend {
 				sourceRoot: options.sourceRoot,
 				workspaceRoot: options.sourceRoot,
 			});
+			const scheduling = canAdopt
+				? forkedProcessScheduling(await captureProcessScheduling(process.pid))
+				: undefined;
 			const prototype = canAdopt
-				? await this.topLevelPrototype(invocation, request, projection)
+				? await this.topLevelPrototype(invocation, request, projection, undefined, scheduling)
 				: undefined;
 			// Watch from before execution; post-exit hashes alone cannot establish what the process read.
 			proof = executionDomainProof(ready.collector, options.sourceRoot);
@@ -910,6 +923,7 @@ export class LinuxProcessReuseBackend {
 									outputEndpoints: endpoints,
 									outputFlags: image.outputFlags ?? [0, 0],
 									platformFingerprint: child.platformFingerprint,
+									scheduling: image.context.scheduling,
 									controlledSocket: channel?.socket,
 									guardFilesystemSemanticsWithin: [options.sourceRoot],
 								});
@@ -981,6 +995,7 @@ export class LinuxProcessReuseBackend {
 				prototype?.platformFingerprint ?? (await this.resolvePlatformFingerprint());
 			let observation = await observeExecution(trace, invocation.shell, request.cwd, {
 				platformFingerprint,
+				scheduling,
 				...(canAdopt ? { captureOutput: true as const } : {}),
 				outputEndpoints,
 				controlledSocket: channel?.socket,
@@ -991,10 +1006,25 @@ export class LinuxProcessReuseBackend {
 			await using files = this.fileInputs(
 				options.sourceRoot, request.signal ?? this.store.signal, this.observations.getStore()?.inputs,
 			);
+			const willAttemptPublish =
+				canAdopt &&
+				Boolean(prototype) &&
+				output.captureComplete !== false &&
+				!observation.pids?.some((pid) => replayed.has(pid));
+			const canPublishProcess =
+				willAttemptPublish &&
+				speculativeConfig().processReuse.persistCompletedCertificates &&
+				observation.complete &&
+				!observation.incompleteReasons.length &&
+				!observation.written?.length &&
+				!observation.external?.length &&
+				!observation.locks?.length &&
+				!observation.metadataChanges?.length &&
+				observation.taints.every((taint) => acceptedReplayTaints().includes(taint));
 			const workspaceFiles =
-				files && await this.captureActorFiles(observation, options.sourceRoot, files, proof!, canAdopt);
-			if (canAdopt && prototype && output.captureComplete !== false && !observation.pids?.some((pid) => replayed.has(pid)))
-				await this.publishActorProcess(prototype, observation, exitOutcome(output),
+				files && await this.captureActorFiles(observation, options.sourceRoot, files, proof!, canPublishProcess);
+			if (willAttemptPublish)
+				await this.publishActorProcess(prototype!, observation, exitOutcome(output),
 					new TimelineInterval(began, ended), proof, request.signal, channel, workspaceFiles, true);
 		} catch (error) {
 			this.setError(undefined, `actor_observation:${errorMessage(error)}`);
@@ -1307,7 +1337,7 @@ export class LinuxProcessReuseBackend {
 							const environment = definedProcessEnvironment(request.environment);
 							const { output: prototype, computation: preparation } = await TimelineInterval.outside(() =>
 								TimelineInterval.measure(() =>
-									this.topLevelPrototype(invocation, request, session.projection, environment),
+									this.topLevelPrototype(invocation, request, session.projection, environment, session.scheduling),
 								),
 							);
 							this.add(session, "wholeCommandRequests");
@@ -1472,6 +1502,7 @@ export class LinuxProcessReuseBackend {
 			domain.close();
 			throw error;
 		}
+		const scheduling = forkedProcessScheduling(await captureProcessScheduling(process.pid));
 		const session = {
 			token,
 			processRoot,
@@ -1482,6 +1513,7 @@ export class LinuxProcessReuseBackend {
 			producer,
 			nestedProducer,
 			boundary,
+			scheduling,
 			// The workspace's own repository stays read-only instead of exposing the snapshot's repository.
 			...(gitDirectory ? { gitDirectory } : {}),
 			adoptable: input.adoptable !== false,
@@ -1732,7 +1764,7 @@ export class LinuxProcessReuseBackend {
 			this.add(session, "requests");
 			const requestID = session.metrics.requests;
 			const ready = await this.resolveReady();
-			const eligibility = eligibleRequest(session, context, cwd, args, ready.executionContext);
+			const eligibility = eligibleRequest(session, context, cwd, args, ready.executionContext, session.scheduling);
 			if (typeof eligibility === "string") {
 				this.setError(session, `process_bypass:${eligibility}`, "bypasses");
 				return native;
@@ -1746,6 +1778,7 @@ export class LinuxProcessReuseBackend {
 				pid: held.pid,
 				trace: traceTail(source, session.projection.toLogical(cwd), { execution: { pid: held.pid, start } }),
 				endpoints: context.outputEndpoints,
+				scheduling: context.scheduling,
 				resume: resumed.resolve,
 				exit: exited.promise,
 			};
@@ -1803,7 +1836,15 @@ export class LinuxProcessReuseBackend {
 				const captured = "prototype" in options
 					? { output: options.prototype, computation: options.preparation }
 					: await TimelineInterval.outside(() =>
-							TimelineInterval.measure(() => this.prototype(session.projection, request, executable, channel?.identity)),
+							TimelineInterval.measure(() =>
+								this.prototype(
+									session.projection,
+									request,
+									executable,
+									channel?.identity,
+									domain?.scheduling ?? session.scheduling,
+								),
+							),
 						);
 				const { computation: preparation, output: observedPrototype } = captured;
 				const weakKey = processWeakKey(observedPrototype);
@@ -2088,6 +2129,7 @@ export class LinuxProcessReuseBackend {
 								? Promise.resolve(completedObservation)
 								: observeExecution(tail, image, logicalCwd, {
 										platformFingerprint: observedPrototype.platformFingerprint,
+										scheduling: domain ? domain.scheduling : session.scheduling,
 										controlledSocket: channel?.socket,
 										launchPath,
 										brokeredWrites: (pid) => brokeredWrites(session, pid, writer),
@@ -2976,17 +3018,19 @@ export class LinuxProcessReuseBackend {
 		request: ProcessArguments,
 		executable: string,
 		stepIdentity = controlledSubcomputeChannel(request.environment)?.identity,
+		scheduling?: ProcessSchedulingContext,
 	): Promise<ExecPrototype> {
-		const [digest, ready] = await Promise.all([
+		const [digest, ready, effectiveScheduling] = await Promise.all([
 			hashExecutableFile(request.imageSource ?? executable),
 			this.resolveReady(),
+			scheduling ? Promise.resolve(scheduling) : captureProcessScheduling(process.pid).then(forkedProcessScheduling),
 		]);
 		return bufferedProcessPrototype(
 			{
 				...request,
 				executable,
 				argv: [request.argv0, ...request.args],
-				context: routedProcessIdentity(ready.executionContext, request),
+				context: routedProcessIdentity(ready.executionContext, request, effectiveScheduling),
 			},
 			projection,
 			digest,
@@ -4226,6 +4270,7 @@ function eligibleRequest(
 	cwd: string,
 	args: readonly string[],
 	expectedContext: ProcessExecutionContext,
+	scheduling: ProcessSchedulingContext,
 ) {
 	if (!validProcessContext(context)) return "process_context_unsupported";
 	if (!pathContains(session.workspace.sandboxRoot, cwd)) return "cwd_outside_workspace";
@@ -4246,7 +4291,7 @@ function eligibleRequest(
 		) ?? session.outputs.topLevel;
 	const launch = processLaunchOptions(context, endpoints);
 	if (!launch) return "output_endpoint_mismatch";
-	const routed = routedProcessIdentity(expectedContext, launch);
+	const routed = routedProcessIdentity(expectedContext, launch, scheduling);
 	if (context.launchKey !== routed.launchKey) return "launch_key_mismatch";
 	if (context.umask !== routed.umask) return "umask_mismatch";
 	return launch;
@@ -4262,6 +4307,7 @@ async function topLevelProcessPrototype(
 	environment: Readonly<Record<string, string>>,
 	projection: ExecutionPathProjection,
 	platformFingerprint: Sha256Digest,
+	scheduling: ProcessSchedulingContext,
 ) {
 	return createExecPrototype({
 		executablePath: invocation.shell,
@@ -4281,6 +4327,7 @@ async function topLevelProcessPrototype(
 				groups: process.getgroups?.(),
 			},
 			scheduler: {
+				...scheduling,
 				cpuCount: os.availableParallelism(),
 				timeout: request.timeout ?? null,
 			},

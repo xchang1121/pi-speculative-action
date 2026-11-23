@@ -707,6 +707,22 @@ test("shared host results require the consuming workspace to authorize the bindi
 			const secondHit = await trustedCompute(consumer, to, step.namespace, null, bytes);
 			expect(secondHit).toMatchObject({ state: "hit", value: { value: { target: "library" } } });
 		} finally { consumer.close(); }
+		const nextSession = await second.environment();
+		const nextPeer = client(nextSession);
+		try {
+			allowed = false;
+			nextPeer.send({ ...packet, context: nextSession.PI_SUBCOMPUTE_CONTEXT });
+			expect(await nextPeer.read()).toEqual({ state: "unavailable" });
+			allowed = true;
+			nextPeer.send({ ...packet, context: nextSession.PI_SUBCOMPUTE_CONTEXT });
+			const prompt = await nextPeer.read();
+			expect(prompt.state).toBe("input");
+			nextPeer.send({ op: "input", token: prompt.token, value: { encoding: "base64", value: bytes.toString("base64") } });
+			const verified = await nextPeer.read();
+			expect(verified).toMatchObject({ state: "hit", value: { value: { target: "library" } } });
+			nextPeer.send({ op: "consumed", token: verified.token });
+			expect(await nextPeer.read()).toEqual({ state: "ready" });
+		} finally { nextPeer.close(); }
 		const thirdRoot = await directories.create();
 		const deniedAccept = vi.fn(() => false);
 		const deniedBuild = vi.fn(parseJsonConfig.build);
