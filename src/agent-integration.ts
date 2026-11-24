@@ -528,7 +528,7 @@ function assembleAgentExecutionHost(
 					tool,
 					action,
 					parentCheckpoint,
-					backend: (action?.executionContext as ToolInvocation | undefined)?.operation?.binding.backend,
+					backend: invocation?.operation?.binding.backend,
 					effect: definition.effect,
 					requirements: definition.requirements,
 				},
@@ -703,7 +703,8 @@ function assembleAgentExecutionHost(
 	};
 	type PredictionState =
 		| { readonly kind: "running"; readonly settled: Promise<void> }
-		| { readonly kind: "completed"; readonly producerRunID: string };
+		| { readonly kind: "completed"; readonly producerRunID: string }
+		| { readonly kind: "terminated" };
 	const calls = new WeakMap<ExecutionCall, CallRecord>();
 	const measured = <T>(call: ExecutionCall, execute: () => T) =>
 		service ? service.withMetrics(calls.get(call)!.steps ??= new Map(), execute) : execute();
@@ -827,6 +828,7 @@ function assembleAgentExecutionHost(
 				}),
 				effect: (key) => actionSemantics.effect(key),
 				adoptable: (call, key) => canAdoptSpeculation(call.tool, key),
+				cacheable: (_call, key) => !(key.executionContext as ToolInvocation | undefined)?.operation,
 				key: async (call) => calls.get(call)?.binding.action,
 				route: async (_call, key, signal, parent) =>
 					resolveExecutionRoute(key.tool, signal, key, parent?.checkpoint),
@@ -1031,31 +1033,44 @@ function assembleAgentExecutionHost(
 	const refresh = async () => {
 		currentSettings = await resolveSettings();
 	};
-	const turnPreviewIds = new WeakMap<GeneratorTurn, Set<string>>();
-	const releases = new PendingTasks();
-	const releasedRuns = new Map<string, Promise<void>>();
-	const deferredRetireIds = new Set<string>();
-	const releaseRun = (id: string): Promise<void> => {
-		deferredRetireIds.delete(id);
-		const prior = releasedRuns.get(id);
-		if (prior) return prior;
-		let task: Promise<void>;
+	const unreleased = new Set<string>();
+	const retryPending = new Set<string>();
+	const inFlight = new Map<string, Promise<boolean>>();
+	const turnHandles = new WeakMap<GeneratorTurn, Set<string>>();
+	const ownForTurn = (turn: GeneratorTurn, id: string) => {
+		let ids = turnHandles.get(turn);
+		if (!ids) turnHandles.set(turn, (ids = new Set()));
+		ids.add(id);
+	};
+	const releaseRun = (id: string): Promise<boolean> => {
+		if (!unreleased.has(id)) return Promise.resolve(true);
+		const active = inFlight.get(id);
+		if (active) return active;
+		retryPending.delete(id);
+		const settle = (ok: boolean) => {
+			inFlight.delete(id);
+			if (ok) unreleased.delete(id);
+			else if (unreleased.has(id)) retryPending.add(id);
+			return ok;
+		};
 		try {
-			const result = session.release(id);
-			task =
-				result && typeof result.then === "function"
-					? releases.track(result.then(() => undefined, () => undefined))
-					: Promise.resolve();
+			const out = session.release(id);
+			if (!out || typeof out.then !== "function") return Promise.resolve(settle(true));
+			const task = out.then(() => settle(true), () => settle(false));
+			inFlight.set(id, task);
+			return task;
 		} catch {
-			task = Promise.resolve();
+			return Promise.resolve(settle(false));
 		}
-		releasedRuns.set(id, task);
-		return task;
 	};
 	const turnSession: ExecutionSession<ToolSettlement> = {
-		speculate: (call, opts) => session.speculate(call, opts),
+		speculate: (call, opts) => {
+			const run = session.speculate(call, opts);
+			unreleased.add(run.runID);
+			return run;
+		},
 		execute: (call, opts) => session.execute(call, opts),
-		release: (id) => releaseRun(id),
+		release: (id) => releaseRun(id).then(() => undefined),
 		flush: () => session.flush(),
 		close: () => session.close(),
 	};
@@ -1064,23 +1079,25 @@ function assembleAgentExecutionHost(
 		p: NonNullable<ReturnType<typeof predictions.get>>,
 		settlement: PredictionSettlement,
 		served: boolean,
+		retiringTurn?: GeneratorTurn,
 	) => {
 		predictions.delete(id);
-		const retireWhenDone = () => {
-			if (closed || p.state.kind === "completed") {
-				void releaseRun(id);
-				return;
+		const ownerTurn = retiringTurn ?? turns.get(p.turnID);
+		const retire = () => {
+			if (closed || !unreleased.has(id)) return;
+			if (p.state.kind !== "running") {
+				if (ownerTurn) ownForTurn(ownerTurn, id);
+				else void releaseRun(id);
+			} else {
+				const done = () => {
+					if (!closed) void releaseRun(id);
+				};
+				void p.run.completion.then(done, done);
 			}
-			deferredRetireIds.add(id);
-			const done = () => {
-				if (deferredRetireIds.delete(id)) void releaseRun(id);
-			};
-			void p.run.completion.then(done, done);
 		};
-		const ownerTurn = turns.get(p.turnID);
 		if (ownerTurn && !ownerTurn.signal.aborted)
-			ownerTurn.signal.addEventListener("abort", retireWhenDone, { once: true });
-		else retireWhenDone();
+			ownerTurn.signal.addEventListener("abort", retire, { once: true });
+		else retire();
 		p.prediction.onFeedback?.(settlement, served);
 		const info = { sessionID, turnID: p.turnID, tool: p.prediction.tool, action: p.key, settlement };
 		void subscriptions.publish("prediction_settled", info);
@@ -1136,11 +1153,8 @@ function assembleAgentExecutionHost(
 					after,
 					signal: preview && opts.signal ? opts.signal : external,
 				}));
-				if (preview) {
-					let ids = turnPreviewIds.get(turn);
-					if (!ids) turnPreviewIds.set(turn, (ids = new Set()));
-					ids.add(run.runID);
-				}
+				unreleased.add(run.runID);
+				if (preview) ownForTurn(turn, run.runID);
 				if (!preview) {
 					const identity = {
 						id: run.runID,
@@ -1162,13 +1176,16 @@ function assembleAgentExecutionHost(
 							settled: run.completion.then((completion) => {
 								if (completion.status === "completed")
 									p.state = { kind: "completed", producerRunID: completion.producerRunID ?? run.runID };
-								else if (predictions.has(run.runID))
-									settlePrediction(
-										run.runID,
-										p,
-										{ prediction: identity, observation: "unobserved", cause: cause("admission", completion.reason) },
-										false,
-									);
+								else {
+									p.state = { kind: "terminated" };
+									if (predictions.has(run.runID))
+										settlePrediction(
+											run.runID,
+											p,
+											{ prediction: identity, observation: "unobserved", cause: cause("admission", completion.reason) },
+											false,
+										);
+								}
 							}),
 						},
 					};
@@ -1302,11 +1319,8 @@ function assembleAgentExecutionHost(
 								calls.set(call, { tool, turnID, binding: { action: op }, rejections: [] });
 								if (closed) return;
 								const run = measured(call, () => local.speculate(call));
-								deferredRetireIds.add(run.runID);
-								void run.completion.then(
-									() => releaseRun(run.runID),
-									() => releaseRun(run.runID),
-								);
+								unreleased.add(run.runID);
+								void run.completion.then(() => releaseRun(run.runID), () => releaseRun(run.runID));
 							})(),
 						)
 						.catch(() => {});
@@ -1320,8 +1334,6 @@ function assembleAgentExecutionHost(
 		if (turn) {
 			controllers.get(turn)?.abort();
 			turns.delete(turnID);
-			for (const previewID of turnPreviewIds.get(turn) ?? []) void releaseRun(previewID);
-			turnPreviewIds.delete(turn);
 			const actor = lastActor.get(turnID);
 			for (const [id, p] of predictions)
 				if (terminal || p.lastDecision <= decision) {
@@ -1341,9 +1353,22 @@ function assembleAgentExecutionHost(
 									cause: cause("control", "turn_finished"),
 								},
 						false,
+						turn,
 					);
 				}
 			lastActor.delete(turnID);
+			const own = turnHandles.get(turn);
+			turnHandles.delete(turn);
+			if (!closed) {
+				for (const id of new Set([...(own ?? []), ...retryPending])) {
+					const active = own?.has(id) ? inFlight.get(id) : undefined;
+					if (active)
+						void active.then((ok) => {
+							if (!ok && !closed) void releaseRun(id);
+						});
+					else if (!inFlight.has(id)) void releaseRun(id);
+				}
+			}
 			await subscriptions.publish("turn_finished", { ...turn, terminal });
 		}
 		await Promise.all(executionWorlds.filter(inClosure).map((w) => w.finishTurn?.(turnID)));
@@ -1380,13 +1405,7 @@ function assembleAgentExecutionHost(
 			const signature = stableValueHash([input.tool, input.args]);
 			const prior = issued.get(input.id);
 			if (prior?.input === signature) return prior.run;
-			if (prior)
-				void releases.track(
-					prior.run.then(
-						(run) => (run ? releaseRun(run.runID) : undefined),
-						() => undefined,
-					),
-				);
+			if (prior) void prior.run.then((run) => (run ? releaseRun(run.runID) : undefined), () => undefined);
 			const run = submit();
 			issued.set(input.id, { input: signature, run });
 			return run;
@@ -1476,7 +1495,6 @@ function assembleAgentExecutionHost(
 					) {
 						// Reserve this observation while the equivalent root handle confirms its physical producer.
 						predictions.delete(id);
-						deferredRetireIds.add(id);
 						void pending.track(p.state.settled.then(credit));
 					} else credit();
 				}
@@ -1553,13 +1571,11 @@ function assembleAgentExecutionHost(
 			closed = true;
 			try {
 				for (const id of [...turns.keys()]) await finishTurn(id);
-				for (const id of predictions.keys()) void releaseRun(id);
-				for (const id of [...deferredRetireIds]) void releaseRun(id);
-				deferredRetireIds.clear();
 				await maintenance;
-				await releases.drain();
+				await Promise.all([...unreleased].map((id) => releaseRun(id)));
+				await Promise.all(inFlight.values());
 				await session.close();
-				await releases.drain();
+				await Promise.all(inFlight.values());
 				await workspaceCursor?.release();
 				await pending.drain();
 				await subscriptions.publish("session_closed", { sessionID, terminal: true });

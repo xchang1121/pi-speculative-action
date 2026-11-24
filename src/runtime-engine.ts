@@ -379,6 +379,7 @@ export interface LocalExecutionHooks<Output> {
 	>;
 	effect?(key: ActionKey): ActionEffect | undefined;
 	adoptable?(call: ExecutionCall, key: ActionKey): boolean;
+	cacheable?(call: ExecutionCall, key: ActionKey): boolean;
 	key(call: ExecutionCall, actor: boolean): Promise<ActionKey | undefined>;
 	route(
 		call: ExecutionCall,
@@ -480,12 +481,29 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 		entry.disposed = true;
 		return this.lifetime.release(candidateBranch(entry));
 	}
+	private effectiveParent(entry: Entry<Output>) {
+		let base = entry.parent;
+		while (base?.phase === "adopted") base = base.parent;
+		return base;
+	}
+	private isCacheRetained(entry: Entry<Output>) {
+		for (let cur: Entry<Output> | undefined = entry; cur; cur = this.effectiveParent(cur))
+			if (!this.pool.isCached(cur)) return false;
+		return true;
+	}
+	private dropFromPool(entry: Entry<Output>) {
+		for (const key of entry.resultViews?.keys() ?? []) this.setView(entry, key);
+		this.pool.delete(entry);
+		if (entry.phase !== "adopted") {
+			for (const child of this.pool.cached())
+				if (!this.isCacheRetained(child)) this.evictFromPool(child);
+		}
+	}
 	private remove(entry: Entry<Output>) {
 		if (entry.phase === "removed") return;
 		this.running.delete(entry);
 		entry.phase = "removed";
-		this.pool.delete(entry);
-		for (const key of entry.resultViews?.keys() ?? []) this.setView(entry, key);
+		this.dropFromPool(entry);
 		for (const id of entry.handles) {
 			const handle = this.handles.get(id);
 			handle?.detach?.();
@@ -500,13 +518,12 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 			if (this.running.has(entry)) entry.work.controller.abort();
 			return;
 		}
-		if (entry.phase === "settled" && (entry.route.reuse === "exclusive_branch" || !this.pool.isCached(entry))) {
+		if (entry.phase === "settled" && !this.isCacheRetained(entry)) {
 			this.remove(entry);
 		}
 	}
 	private evictFromPool(entry: Entry<Output>) {
-		for (const key of entry.resultViews?.keys() ?? []) this.setView(entry, key);
-		this.pool.delete(entry);
+		this.dropFromPool(entry);
 		this.releaseUnreferenced(entry);
 	}
 	private hasParentUsers(entry: Entry<Output>) {
@@ -666,7 +683,12 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 		this.running.delete(entry);
 		entry.phase = "settled";
 		entry.work.succeed(branch, execution, execution.completedAt - execution.startedAt);
-		if (limits.maxEntries <= 0 || entry.estimatedBytes > limits.maxBytes) {
+		if (
+			limits.maxEntries <= 0 ||
+			entry.estimatedBytes > limits.maxBytes ||
+			(entry.key && this.hooks.cacheable?.(entry.call, entry.key) === false) ||
+			(entry.route.reuse === "exclusive_branch" && entry.route.adoptable?.() === false)
+		) {
 			this.evictFromPool(entry);
 			return;
 		}
@@ -778,8 +800,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 		const effect = this.hooks.effect?.(key) ?? key.semantics?.effect;
 		for (const { entry, match } of this.pool.lookup(key, actor)) {
 			if (signal.aborted) return;
-			let base = entry.parent;
-			if (!parent) while (base?.phase === "adopted") base = base.parent;
+			const base = parent ? entry.parent : this.effectiveParent(entry);
 			if (entry.phase === "adopted" && entry.route.reuse === "exclusive_branch") continue;
 			if (base !== parent || (parent && match.kind === "inputs")) continue;
 			if (match.kind === "inputs" && effect !== undefined && effect !== "observation") continue;
@@ -809,6 +830,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 				if (actor) {
 					if (entry.route.reuse === "exclusive_branch" && entry.route.adoptable?.() === false) {
 						if (entry.phase === "running" && !this.hasParentUsers(entry)) entry.work.controller.abort();
+						else if (entry.phase === "settled") this.evictFromPool(entry);
 						this.hooks.rejection?.(call, {
 							candidateID: entry.id,
 							match,
@@ -827,6 +849,8 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 				if (!view.ok) {
 					if (rebuild && view.cause.code === "input_budget_exhausted")
 						exhausted?.add(view.snapshotScoped ? entry : entry.route.fingerprint);
+					if (actor && match.kind === "exact" && entry.route.reuse === "exclusive_branch")
+						this.evictFromPool(entry);
 					this.hooks.rejection?.(call, { candidateID: entry.id, match, cause: view.cause });
 					continue;
 				}
@@ -838,6 +862,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 						const committed = await execution.output.commit();
 						if (match.kind === "exact") output = committed;
 					} catch (error) {
+						if (entry.route.reuse === "exclusive_branch") this.evictFromPool(entry);
 						if (isPoisonedEffectCommit(effectCommitFailure(error, "poisoned"))) throw error;
 						continue;
 					}
@@ -845,8 +870,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 				if (actor && entry.route.reuse === "exclusive_branch") {
 					lease!.adopt();
 					entry.phase = "adopted";
-					for (const viewKey of entry.resultViews?.keys() ?? []) this.setView(entry, viewKey);
-					this.pool.delete(entry);
+					this.dropFromPool(entry);
 					this.recheckWrites(key, execution.output);
 					await this.keepInputs(entry, execution.output, execution.toolExecution, true);
 				} else {

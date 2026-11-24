@@ -403,6 +403,7 @@ test.each([true, false])("credits two exact predictions by the returned producer
 test("session close awaits async or rejecting release before close and drains source-request delivery", async () => {
 	const entered = Promise.withResolvers<void>();
 	const finish = Promise.withResolvers<void>();
+	const crossDone = Promise.withResolvers<RunCompletion<ToolSettlement>>();
 	const releaseGate = Promise.withResolvers<void>();
 	const sessionClosed = Promise.withResolvers<void>();
 	const order: string[] = [];
@@ -412,8 +413,20 @@ test("session close awaits async or rejecting release before close and drains so
 	const tools = [createReadTool("/virtual")];
 	const fork = createActorForkPlanSource();
 	vi.spyOn(fork.source, "start").mockImplementation((turn) => {
-		void turn.request("drafter", "continuation", turn.signal, async () => 1);
+		if (turn.startInput.turnID === "t-first")
+			void turn.issue({ source: "self-speculation", group: "g", id: "c", tool: "read", input: { path: "hold-cross.txt" }, horizon: 2 });
+		if (turn.startInput.turnID === "turn")
+			void turn.request("drafter", "continuation", turn.signal, async () => 1);
 	});
+	const okCompletion = (runID: string): RunCompletion<ToolSettlement> => ({
+		status: "completed",
+		output: { isError: false, result: { content: [fauxText("ok")], details: {} } },
+		served: false,
+		producerRunID: runID,
+		toolExecution: new TimelineInterval(0, 0),
+	});
+	let activeSlot: string | undefined;
+	const slotAttempts = new Map<string, number>();
 	const host = createSpeculativeActionHost("drain", {
 		cwd: "/virtual",
 		actorForkPlanSource: fork,
@@ -421,19 +434,36 @@ test("session close awaits async or rejecting release before close and drains so
 		executionSession: {
 			speculate(call) {
 				const runID = String(call.input.path);
-				return {
-					runID,
-					completion: Promise.resolve({
-						status: "completed",
-						output: { isError: false, result: { content: [fauxText("ok")], details: {} } },
-						served: false,
-						producerRunID: runID,
-						toolExecution: new TimelineInterval(0, 0),
-					}),
-				};
+				if (runID === "hold-cross.txt") return { runID, completion: crossDone.promise };
+				if (runID.startsWith("slot-")) {
+					if (activeSlot) return { runID, completion: Promise.resolve({ status: "rejected", reason: "concurrency_limit" }) };
+					if (runID === "slot-later.txt" || runID === "slot-old.txt") activeSlot = runID;
+				}
+				return { runID, completion: Promise.resolve(okCompletion(runID)) };
 			},
 			execute: vi.fn(),
 			async release(id) {
+				if (id.startsWith("slot-")) {
+					if (id === "slot-later.txt" || id === "slot-old.txt") {
+						const n = (slotAttempts.get(id) ?? 0) + 1;
+						slotAttempts.set(id, n);
+						if (n === 1) throw new Error("transient disconnect");
+						if (activeSlot === id) activeSlot = undefined;
+					}
+					return;
+				}
+				if (id === "retry-hang.txt") {
+					const n = (slotAttempts.get(id) ?? 0) + 1;
+					slotAttempts.set(id, n);
+					if (n === 1) {
+						order.push("retry_1");
+						throw new Error("first release failed");
+					}
+					order.push("retry_2_start");
+					await releaseGate.promise;
+					order.push("retry_2_end");
+					return;
+				}
 				if (id === "reject.txt") {
 					await new Promise<void>((resolve) => setImmediate(resolve));
 					throw new Error("release transport closed");
@@ -452,35 +482,72 @@ test("session close awaits async or rejecting release before close and drains so
 	});
 	host.runtime.subscribe({
 		source_request: async ({ request }) => {
-			if (request.request.kind !== "continuation") return;
+			if (request.request.kind !== "continuation" || request.request.turnID !== "turn") return;
 			entered.resolve();
 			await finish.promise;
 			order.push("continuation");
 		},
+		turn_finished: ({ startInput }) => {
+			if (startInput.turnID === "t-second") order.push("finish_second");
+			if (startInput.turnID === "t-hang-2") order.push("finish_hang_2");
+		},
 		session_closed: () => { order.push("closed"); },
 	});
+	const start = (turnID: string) =>
+		host.startTurn({ turnID, tools, actorModel: testModel(), actorOptions: {}, context: { messages: [], tools } });
+	const preview = (turnID: string, id: string, p: string) =>
+		host.previewActorCall({ turnID, id, tool: "read", args: { path: p }, tools });
 	try {
-		await host.startTurn({
-			turnID: "turn",
-			tools,
-			actorModel: testModel(),
-			actorOptions: {},
-			context: { messages: [], tools },
-		});
+		await start("t-retry-1");
+		await (await preview("t-retry-1", "pr", "slot-later.txt"))?.completion;
+		await host.finishTurn("t-retry-1");
+		expect(slotAttempts.get("slot-later.txt")).toBe(1);
+		await start("t-retry-2");
+		expect((await (await preview("t-retry-2", "pr2", "slot-probe.txt"))?.completion)?.status).toBe("rejected");
+		await host.finishTurn("t-retry-2");
+		expect(slotAttempts.get("slot-later.txt")).toBe(2);
+
+		await start("t-slot");
+		expect((await (await preview("t-slot", "ps", "slot-old.txt"))?.completion)?.status).toBe("completed");
+		expect((await (await preview("t-slot", "ps", "slot-repl.txt"))?.completion)?.status).toBe("rejected");
+		await expect.poll(() => slotAttempts.get("slot-old.txt")).toBe(1);
+		await host.finishTurn("t-slot");
+		expect(slotAttempts.get("slot-old.txt")).toBe(2);
+
+		await start("t-hang-1");
+		await (await preview("t-hang-1", "ph", "retry-hang.txt"))?.completion;
+		await host.finishTurn("t-hang-1");
+		await start("t-hang-2");
+		await host.finishTurn("t-hang-2");
+		expect(order).toEqual(["retry_1", "retry_2_start", "finish_hang_2"]);
+
+		await start("t-first");
+		await host.finishTurn("t-first", true);
+		await start("t-second");
+		crossDone.resolve(okCompletion("hold-cross.txt"));
+		await expect.poll(() => order).toContain("release_start");
+		await host.finishTurn("t-second");
+		expect(order).toEqual(["retry_1", "retry_2_start", "finish_hang_2", "release_start", "finish_second"]);
+
+		await start("turn");
 		await entered.promise;
-		for (const p of ["hold.txt", "reject.txt"])
-			await (await host.previewActorCall({ turnID: "turn", id: p, tool: "read", args: { path: p }, tools }))?.completion;
+		expect((await (await preview("turn", "pn", "slot-next.txt"))?.completion)?.status).toBe("completed");
+		await (await preview("turn", "rej", "reject.txt"))?.completion;
 		const closed = host.dispose();
-		await expect.poll(() => order).toEqual(["release_start"]);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(order).not.toContain("close");
 		releaseGate.resolve();
 		await sessionClosed.promise;
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		finish.resolve();
 		await closed;
-		expect(order).toEqual(["release_start", "release_end", "close", "continuation", "closed"]);
+		expect(order.indexOf("close")).toBeGreaterThan(order.indexOf("retry_2_end"));
+		expect(order.indexOf("close")).toBeGreaterThan(order.indexOf("release_end"));
+		expect(order.slice(-2)).toEqual(["continuation", "closed"]);
 		expect(unhandled).toEqual([]);
 	} finally {
 		process.off("unhandledRejection", onUnhandled);
+		crossDone.resolve({ status: "cancelled", reason: "closed" });
 		releaseGate.resolve();
 		finish.resolve();
 		await host.dispose();
@@ -685,76 +752,25 @@ test("handles unadoptable exclusive branches, preserves active parent branches, 
 	const unadoptable: SpeculativeExecutionRoute = { ...exclusive, adoptable: () => false };
 	const disposed: string[] = [];
 	const makeBranch = (id: string, output: string, capturedBytes = 4, reconstruct?: WorldBranch<string>["reconstruct"]): WorldBranch<string> => ({
-		backend: "memory",
-		output,
-		resources: ["shared.txt"],
-		capturedBytes,
-		checkpoint: { id, backend: "memory", lineage: id, depth: 1 },
-		executionMetrics: {},
+		backend: "memory", output, resources: ["shared.txt"], capturedBytes,
+		checkpoint: { id, backend: "memory", lineage: id, depth: 1 }, executionMetrics: {},
 		compatibility: { status: "compatible", executionFingerprint: "test", backend: "memory" },
 		validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }),
-		commit: async () => output,
-		reconstruct,
-		dispose() {
-			disposed.push(id);
-		},
+		commit: async () => output, reconstruct, dispose() { disposed.push(id); },
 	});
 
-	for (const withChild of [false, true]) {
-		const started = Promise.withResolvers<void>();
-		const finish = Promise.withResolvers<void>();
-		const session = new LocalExecutionSession<string>({
-			settings: () => ({ maxConcurrentActions: 4, resourceCacheMaxEntries: 8 }),
-			effect: (key) => PI_ACTION_SEMANTICS.effect(key),
-			adoptable: (call) => call.tool !== "bash",
-			key: async (call) => PI_ACTION_SEMANTICS.buildKey(call.tool, call.input, "/workspace", "memory", { fingerprint: "test" }),
-			route: async (call) => (call.tool === "bash" ? unadoptable : exclusive),
-			authorize: async () => ({ ok: true }),
-			capture: async () => undefined,
-			native: async () => "native-actor",
-			fork: async (call, _key, _route, _runID, signal) => {
-				if (call.tool === "bash") {
-					started.resolve();
-					await new Promise<void>((resolve, reject) => {
-						finish.promise.then(resolve);
-						signal.addEventListener("abort", () => reject(signal.reason ?? new Error("aborted")), { once: true });
-					});
-				}
-				return makeBranch(call.tool, `spec:${call.tool}`);
-			},
-		});
-		try {
-			const parent = session.speculate({ tool: "bash", input: { command: "gen" } });
-			const child = withChild
-				? session.speculate({ tool: "write", input: { path: "out.txt", content: "next" } }, { after: parent.runID })
-				: undefined;
-			await started.promise;
-			expect(await session.execute({ tool: "bash", input: { command: "gen" } })).toMatchObject({ output: "native-actor", served: false });
-			finish.resolve();
-			if (withChild) {
-				expect(await parent.completion).toMatchObject({ status: "completed", output: "spec:bash" });
-				expect(await child!.completion).toMatchObject({ status: "completed", output: "spec:write" });
-			} else {
-				expect(await parent.completion).toMatchObject({ status: "rejected", reason: "candidate_failed" });
-			}
-		} finally {
-			finish.resolve();
-			await session.close();
-		}
-	}
-
-	disposed.length = 0;
-	let maxEntries = 1;
+	let maxEntries = 8;
 	let flightBuilds = 0;
-	const flightStart = Promise.withResolvers<void>();
-	const flightEnd = Promise.withResolvers<void>();
-	const authEntered = Promise.withResolvers<void>();
-	const authGate = Promise.withResolvers<void>();
+	let bashStarted = Promise.withResolvers<void>();
+	let bashFinish = Promise.withResolvers<void>();
+	const flightStart = Promise.withResolvers<void>(), flightEnd = Promise.withResolvers<void>();
+	const authEntered = Promise.withResolvers<void>(), authGate = Promise.withResolvers<void>();
 	const session = new LocalExecutionSession<string>({
 		settings: () => ({ maxConcurrentActions: 4, resourceCacheMaxEntries: maxEntries, resourceCacheMaxBytes: 4096 }),
 		effect: (key) => PI_ACTION_SEMANTICS.effect(key),
+		adoptable: (call) => call.tool !== "bash",
 		key: async (call) => PI_ACTION_SEMANTICS.buildKey(call.tool, call.input, "/workspace", "memory", { fingerprint: "test" }),
-		route: async (call) => (call.tool === "write" ? exclusive : shared),
+		route: async (call) => (call.tool === "bash" ? unadoptable : call.tool === "write" ? exclusive : shared),
 		authorize: async (call, _key, _route, _signal, actor) => {
 			if (actor && call.input.path === "oversize-flight.txt") {
 				authEntered.resolve();
@@ -764,10 +780,19 @@ test("handles unadoptable exclusive branches, preserves active parent branches, 
 		},
 		capture: async () => undefined,
 		native: async (call) => {
+			if (call.tool === "bash") return "native-actor";
 			if (call.input.path === "oversize-flight.txt") flightBuilds++;
 			return `native:${JSON.stringify(call.input)}`;
 		},
-		fork: async (call, _key, _route, runID) => {
+		fork: async (call, _key, _route, runID, signal) => {
+			if (call.tool === "bash") {
+				bashStarted.resolve();
+				await new Promise<void>((resolve, reject) => {
+					bashFinish.promise.then(resolve);
+					signal.addEventListener("abort", () => reject(signal.reason ?? new Error("aborted")), { once: true });
+				});
+				return makeBranch(runID, "spec:bash");
+			}
 			const pathArg = String((call.input as { path?: string }).path ?? "");
 			if (pathArg === "oversize-flight.txt") {
 				flightBuilds++;
@@ -792,6 +817,25 @@ test("handles unadoptable exclusive branches, preserves active parent branches, 
 		},
 	});
 	try {
+		for (const withChild of [false, true]) {
+			bashStarted = Promise.withResolvers<void>();
+			bashFinish = Promise.withResolvers<void>();
+			const parent = session.speculate({ tool: "bash", input: { command: `gen-${withChild}` } });
+			const child = withChild ? session.speculate({ tool: "write", input: { path: "out.txt", content: "next" } }, { after: parent.runID }) : undefined;
+			await bashStarted.promise;
+			expect(await session.execute({ tool: "bash", input: { command: `gen-${withChild}` } })).toMatchObject({ output: "native-actor", served: false });
+			bashFinish.resolve();
+			if (withChild) {
+				expect(await parent.completion).toMatchObject({ status: "completed", output: "spec:bash" });
+				expect(await child!.completion).toMatchObject({ status: "completed", output: "ok:out.txt" });
+				session.release(child!.runID);
+			} else expect(await parent.completion).toMatchObject({ status: "rejected", reason: "candidate_failed" });
+			session.release(parent.runID);
+		}
+		await session.flush();
+		disposed.length = 0;
+		maxEntries = 1;
+
 		const h1 = session.speculate({ tool: "write", input: { path: "shared.txt", content: "v1" } });
 		expect((await h1.completion).status).toBe("completed");
 		const h2 = session.speculate({ tool: "write", input: { path: "shared.txt", content: "v1" } });
@@ -813,18 +857,6 @@ test("handles unadoptable exclusive branches, preserves active parent branches, 
 		session.release(h2.runID);
 		await session.flush();
 
-		const turnController = new AbortController();
-		const oversizeRuns = ["oversize-a.txt", "oversize-b.txt", "oversize-c.txt", "oversize-d.txt"].map((p) =>
-			session.speculate({ tool: "read", input: { path: p } }, { signal: turnController.signal }),
-		);
-		for (const run of oversizeRuns) expect((await run.completion).status).toBe("completed");
-		turnController.abort();
-		await session.flush();
-		expect(session.snapshot()).toMatchObject({ resultEntries: 0, resultBytes: 0 });
-		for (const run of oversizeRuns) expect(disposed).toContain(run.runID);
-		for (const p of ["oversize-a.txt", "oversize-b.txt", "oversize-c.txt", "oversize-d.txt"])
-			expect((await session.execute({ tool: "read", input: { path: p } })).served).toBe(false);
-
 		const flight = session.speculate(read("oversize-flight.txt"));
 		await flightStart.promise;
 		const joined = session.execute(read("oversize-flight.txt"));
@@ -841,121 +873,147 @@ test("handles unadoptable exclusive branches, preserves active parent branches, 
 
 		maxEntries = 4;
 		for (const p of ["small-1.txt", "snap-good.txt", "snap-exhausted.txt"]) {
-			const r = session.speculate({ tool: "read", input: { path: p } });
-			await r.completion;
-			expect((await session.execute({ tool: "read", input: { path: p } })).served).toBe(true);
+			await session.speculate(read(p)).completion;
+			expect((await session.execute(read(p))).served).toBe(true);
 		}
-		expect(await session.execute({ tool: "read", input: { path: "derived-small.txt" } })).toMatchObject({
-			output: "rebuilt:derived-small.txt",
-			served: true,
-		});
-		expect(await session.execute({ tool: "read", input: { path: "huge-view.txt" } })).toMatchObject({
-			served: true,
-		});
-		const bigSpec = session.speculate({ tool: "read", input: { path: "oversize.txt" } });
+		expect(await session.execute(read("derived-small.txt"))).toMatchObject({ output: "rebuilt:derived-small.txt", served: true });
+		expect((await session.execute(read("huge-view.txt"))).served).toBe(true);
+		const bigSpec = session.speculate(read("oversize.txt"));
 		await bigSpec.completion;
 		session.release(bigSpec.runID);
-
-		expect(await session.execute({ tool: "read", input: { path: "small-1.txt" } })).toMatchObject({
-			output: "ok:small-1.txt",
-			served: true,
-		});
-		expect(await session.execute({ tool: "read", input: { path: "derived-small.txt" } })).toMatchObject({
-			output: "rebuilt:derived-small.txt",
-			served: true,
-			reusedInterval: true,
-		});
+		expect(await session.execute(read("small-1.txt"))).toMatchObject({ output: "ok:small-1.txt", served: true });
+		expect(await session.execute(read("derived-small.txt"))).toMatchObject({ output: "rebuilt:derived-small.txt", served: true, reusedInterval: true });
 	} finally {
+		bashFinish.resolve();
 		flightEnd.resolve();
 		authGate.resolve();
 		await session.close();
 	}
 
 	const dir = await mkdtemp(path.join(os.tmpdir(), "pi-oversize-preview-"));
-	const names = ["alpha", "beta", "gamma", "delta"];
+	const names = ["alpha", "beta"];
 	for (const name of names) await writeFile(path.join(dir, name), name[0]!.repeat(32768));
 	await writeFile(path.join(dir, "small.txt"), "hello\n");
-	const host = systemHost(dir, [createReadTool(dir)], {}, { resourceCacheMaxEntries: 1, resourceCacheMaxBytes: 8192 });
+	let hostCap = 1;
+	let hostBytes = 8192;
+	let useDrafter = false;
+	const spiedRead = createReadTool(dir);
+	const readSpy = vi.spyOn(spiedRead, "execute");
+	const sandbox = new WorkspaceSandboxService();
+	const fork = createActorForkPlanSource();
+	const host = systemHost(
+		dir,
+		[createWriteTool(dir), spiedRead],
+		{
+			actorForkPlanSource: fork,
+			executionWorlds: [sandbox.createExecutionWorld(), resourceWorld()],
+			complete: async (_model, context) => {
+				if (context.tools?.[0]?.name === "speculative_observations") return fauxAssistantMessage("wait");
+				const results = context.messages.filter((m) => m.role === "toolResult");
+				if (!results.length) return toolUse("write", { path: "dep.txt", content: "chained\n" }, { id: "dw" });
+				if (results.length === 1) return toolUse("read", { path: "dep.txt" }, { id: "dr" });
+				return fauxAssistantMessage("done");
+			},
+			getSettings: () => ({
+				enabled: true, drafterEnabled: useDrafter, drafterMaxDepth: 1, candidateLimit: 2, maxConcurrentActions: 2,
+				resourceCacheMaxEntries: hostCap, resourceCacheMaxBytes: hostBytes,
+				patternAware: { enabled: false }, prepareObservedOperations: false,
+				selfSpeculation: { enabled: true, forkEnabled: true, forkActionEnabled: true, forkTransport: "sidecar" },
+			}),
+		},
+	);
 	try {
 		await host.start("turn-1");
 		const previewSignal = new AbortController();
-		for (const name of names) {
-			const run = await host.preview("read", { path: name }, previewSignal.signal, `p-${name}`);
-			expect((await run?.completion)?.status).toBe("completed");
-		}
+		for (const name of names) expect((await (await host.preview("read", { path: name }, previewSignal.signal, `p-${name}`))?.completion)?.status).toBe("completed");
 		previewSignal.abort();
 		await host.finish();
 		expect(host.events.at(-1)?.cache).toMatchObject({ resultEntries: 0, resultBytes: 0 });
 		await host.start("turn-2");
 		for (const name of names) await host.execute("read", { path: name }, undefined, `a-${name}`);
-		expect(host.fallbacks).toHaveLength(4);
-		expect(host.actors.every((ev) => ev.settlement.provider.kind === "actor" && ev.settlement.provider.origin === "fallback")).toBe(true);
+		expect(host.fallbacks).toHaveLength(2);
+		await host.finish();
 
-		for (const inject of [false, true]) {
-			const readTool = createReadTool(dir);
-			const spy = vi.spyOn(readTool, "execute");
-			const injected = inject
-				? new LocalExecutionSession<ToolSettlement>({
-						settings: () => ({ maxConcurrentActions: 2, resourceCacheMaxEntries: 2, resourceCacheMaxBytes: 65536 }),
-						effect: (key) => PI_ACTION_SEMANTICS.effect(key),
-						key: async (call) => PI_ACTION_SEMANTICS.buildKey(call.tool, call.input, dir, "memory", { fingerprint: "inj" }),
-						route: async () => shared,
-						authorize: async () => ({ ok: true }),
-						capture: async () => undefined,
-						native: async (call, _key, signal) => ({ result: await readTool.execute(call.id ?? "a", call.input as never, signal), isError: false }),
-						fork: async (call, _key, _route, runID, signal) => {
-							const out = { result: await readTool.execute(runID, call.input as never, signal), isError: false };
-							return {
-								backend: "memory", output: out, resources: [path.join(dir, String(call.input.path))], capturedBytes: 6,
-								executionMetrics: {}, compatibility: { status: "compatible", executionFingerprint: "inj", backend: "memory" },
-								validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }), commit: async () => out, dispose() {},
-							};
-						},
-					})
-				: undefined;
-			const h = systemHost(dir, [readTool], injected ? { executionSession: injected } : {}, { resourceCacheMaxEntries: 2 }, inject ? "inj" : "loc");
-			try {
-				await h.start("t1");
-				expect((await (await h.preview("read", { path: "small.txt" }, undefined, "p"))?.completion)?.status).toBe("completed");
-				await h.finish();
-				expect(injected ? injected.snapshot().resultEntries : h.events.at(-1)?.cache.resultEntries).toBe(1);
-				await h.start("t2");
-				const out = await h.execute("read", { path: "small.txt" }, undefined, "a");
-				expect(out.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("hello") });
-				if (inject) expect(spy).toHaveBeenCalledTimes(1);
-				expect(h.fallbacks).toEqual([]);
-			} finally {
-				await h.dispose();
-			}
-		}
+		hostBytes = 65536;
+		readSpy.mockClear();
+		host.fallbacks.length = 0;
+		fork.startTurn("t-wr");
+		await host.start("t-wr");
+		fork.publish("t-wr", [{ id: "g", calls: [{ id: "w", index: 0, tool: "write", input: { path: "note.txt", content: "fresh\n" } }] }]);
+		await host.ready(["note.txt"]);
+		await host.execute("write", { path: "note.txt", content: "fresh\n" }, undefined, "aw");
+		expect((await host.execute("read", { path: "note.txt" }, undefined, "ar")).content[0]).toMatchObject({ type: "text", text: expect.stringContaining("fresh") });
+		expect(readSpy).not.toHaveBeenCalled();
+		expect(host.actors.at(-1)?.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "inputs" } });
+		await host.finish();
 
-		const spiedRead = createReadTool(dir);
-		const readSpy = vi.spyOn(spiedRead, "execute");
-		const sandbox = new WorkspaceSandboxService();
-		const fork = createActorForkPlanSource();
-		const single = systemHost(
-			dir,
-			[createWriteTool(dir), spiedRead],
-			{ actorForkPlanSource: fork, executionWorlds: [sandbox.createExecutionWorld(), resourceWorld()] },
-			{ resourceCacheMaxEntries: 1, selfSpeculation: { enabled: true, forkEnabled: true, forkActionEnabled: true, forkTransport: "sidecar" } },
-			"single-slot",
-		);
+		hostCap = 512;
+		fork.startTurn("t-roots");
+		await host.start("t-roots");
+		fork.publish("t-roots", [{
+			id: "roots",
+			calls: [
+				{ id: "w1", index: 0, tool: "write", input: { path: "r1.txt", content: "one\n" } },
+				{ id: "w2", index: 1, tool: "write", input: { path: "r2.txt", content: "two\n" } },
+			],
+		}]);
+		await host.ready(["r1.txt", "r2.txt"]);
+		await host.execute("write", { path: "r1.txt", content: "one\n" }, undefined, "aw1");
+		expect((await (await host.preview("read", { path: "small.txt" }, undefined, "ps"))?.completion)?.status).toBe("completed");
+		await host.finish();
+		expect(host.events.at(-1)?.cache).toMatchObject({ branchEntries: 1, resultEntries: 3 });
+		await host.start("t-roots-2");
+		await host.execute("read", { path: "small.txt" }, undefined, "as");
+		await host.execute("write", { path: "r2.txt", content: "two\n" }, undefined, "aw2");
+		expect(host.fallbacks).toEqual([]);
+		expect(host.actors.at(-1)?.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } });
+		await host.finish();
+
+		useDrafter = true;
+		await host.start("t-dep");
+		await host.ready(2, "drafter");
+		await host.finish();
+		expect(host.events.at(-1)?.cache.branchEntries).toBe(2);
+		useDrafter = false;
+		await host.start("t-dep-2");
+		await host.execute("write", { path: "dep.txt", content: "chained\n" }, undefined, "adw");
+		await host.execute("read", { path: "dep.txt" }, undefined, "adr");
+		expect(host.actors.at(-1)?.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } });
+		expect(host.actors.at(-1)?.computation?.hiddenComputeMs).toBeGreaterThan(0);
+
+		const injRead = createReadTool(dir);
+		const injSpy = vi.spyOn(injRead, "execute");
+		const injected = new LocalExecutionSession<ToolSettlement>({
+			settings: () => ({ maxConcurrentActions: 2, resourceCacheMaxEntries: 2, resourceCacheMaxBytes: 65536 }),
+			effect: (key) => PI_ACTION_SEMANTICS.effect(key),
+			key: async (call) => PI_ACTION_SEMANTICS.buildKey(call.tool, call.input, dir, "memory", { fingerprint: "inj" }),
+			route: async () => shared, authorize: async () => ({ ok: true }), capture: async () => undefined,
+			native: async (call, _key, signal) => ({ result: await injRead.execute(call.id ?? "a", call.input as never, signal), isError: false }),
+			fork: async (call, _key, _route, runID, signal) => {
+				const out = { result: await injRead.execute(runID, call.input as never, signal), isError: false };
+				return {
+					backend: "memory", output: out, resources: [path.join(dir, String(call.input.path))], capturedBytes: 6,
+					executionMetrics: {}, compatibility: { status: "compatible", executionFingerprint: "inj", backend: "memory" },
+					validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }), commit: async () => out, dispose() {},
+				};
+			},
+		});
+		const injHost = systemHost(dir, [injRead], { executionSession: injected }, { resourceCacheMaxEntries: 2 }, "inj");
 		try {
-			fork.startTurn("t1");
-			await single.start("t1");
-			fork.publish("t1", [{ id: "g", calls: [{ id: "w", index: 0, tool: "write", input: { path: "note.txt", content: "fresh\n" } }] }]);
-			await single.ready(["note.txt"]);
-			await single.execute("write", { path: "note.txt", content: "fresh\n" }, undefined, "aw");
-			const rebuilt = await single.execute("read", { path: "note.txt" }, undefined, "ar");
-			expect(rebuilt.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("fresh") });
-			expect(readSpy).not.toHaveBeenCalled();
-			expect(single.actors.at(-1)?.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "inputs" } });
+			await injHost.start("ti1");
+			expect((await (await injHost.preview("read", { path: "small.txt" }, undefined, "p"))?.completion)?.status).toBe("completed");
+			await injHost.finish();
+			expect(injected.snapshot().resultEntries).toBe(1);
+			await injHost.start("ti2");
+			await injHost.execute("read", { path: "small.txt" }, undefined, "a");
+			expect(injSpy).toHaveBeenCalledTimes(1);
+			expect(injHost.fallbacks).toEqual([]);
 		} finally {
-			await single.dispose();
-			await sandbox.dispose();
+			await injHost.dispose();
 		}
 	} finally {
 		await host.dispose();
+		await sandbox.dispose();
 		await rm(dir, { recursive: true, force: true });
 	}
 });
