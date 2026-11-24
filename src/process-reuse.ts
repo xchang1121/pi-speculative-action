@@ -44,7 +44,7 @@ import {
 } from "./provenance-certificate.ts";
 import type { ArtifactSource, VerifiedArtifactClosure } from "./reuse-store.ts";
 import { ProvenanceCertificateStore } from "./reuse-store.ts";
-import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
+import { LeaseScope, RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
 import { TimelineInterval } from "./task-timing.ts";
 import { directoryEntriesDigest } from "./workspace-sandbox.ts";
 export interface ProvenanceValidationContext {
@@ -961,46 +961,39 @@ export class ProcessHandoffRegistry<Invocation = never> {
 					// Preserve live producer attribution without waiting for unfinished work ahead of history.
 					historyChecked ||= !candidate;
 					if (candidate) considered.set(completed!, candidate.id);
+					await using attempt = new LeaseScope();
+					const claim = completed ? this.claim(completed) : undefined;
+					if (completed && !claim) continue;
+					attempt.defer(claim);
 					const plan = candidate
 						? await request.lookup([candidate], undefined, new Map([[candidate.id, result!.artifacts]]))
 						: await request.lookup(undefined, new Set(considered.values()));
 					if (!plan) continue;
-					let unused = plan.artifacts;
-					try {
-						if (this.lifetime.sealed || request.signal?.aborted) break;
-						if (
-							candidate &&
-							(!completed ||
-								candidate !== plan.certificate ||
-								completed.state !== state ||
-								!this.executions.has(completed))
-						)
-							continue;
-						const claim = completed && this.claim(completed);
-						if (completed && !claim) continue;
-						const hit: ProcessHandoffAcquisition<Plan> = {
-							kind: "hit",
-							plan,
-							joined: waits.length > 0,
-							...(completed
-								? {
-										producer: completed,
-										waiting: waits.filter((wait) => wait.handoff === completed).map((wait) => wait.interval),
-									}
-								: {}),
-							settle: () => {
-								try {
-									claim?.();
-								} finally {
-									void this.lifetime.release(plan.artifacts);
+					attempt.defer(() => plan.artifacts?.dispose());
+					if (this.lifetime.sealed || request.signal?.aborted) break;
+					if (
+						candidate &&
+						(!completed ||
+							candidate !== plan.certificate ||
+							completed.state !== state ||
+							!this.executions.has(completed))
+					)
+						continue;
+					const owned = attempt.move();
+					return {
+						kind: "hit",
+						plan,
+						joined: waits.length > 0,
+						...(completed
+							? {
+									producer: completed,
+									waiting: waits.filter((wait) => wait.handoff === completed).map((wait) => wait.interval),
 								}
-							},
-						};
-						unused = undefined;
-						return hit;
-					} finally {
-						if (unused) await unused.dispose();
-					}
+							: {}),
+						settle: () => {
+							void this.lifetime.track(owned.dispose().catch(() => undefined));
+						},
+					};
 				}
 				if (producer)
 					return {

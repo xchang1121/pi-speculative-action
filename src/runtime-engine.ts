@@ -72,6 +72,9 @@ class CandidateStore<Entry extends CandidateStoreEntry> {
 	has(entry: Entry) {
 		return !!this.record(entry);
 	}
+	isCached(entry: Entry) {
+		return Boolean(this.record(entry)?.segment);
+	}
 	values() {
 		return [...this.entries.values()].map(({ entry }) => entry);
 	}
@@ -267,6 +270,7 @@ type ResultView<Output> =
 	| {
 			readonly ok: false;
 			readonly cause: ResolutionCause;
+			readonly snapshotScoped?: true;
 	  };
 type RetainedResultView<Output> = Omit<
 	Extract<
@@ -281,6 +285,8 @@ type RetainedResultView<Output> = Omit<
 	readonly execution: TimelineInterval;
 };
 
+type EntryPhase = "running" | "settled" | "adopted" | "removed";
+
 interface Entry<Output> extends CandidateStoreEntry {
 	call: ExecutionCall;
 	route: SpeculativeExecutionRoute;
@@ -288,8 +294,8 @@ interface Entry<Output> extends CandidateStoreEntry {
 	parent?: Entry<Output>;
 	handles: Set<string>;
 	pins: number;
-	adopted: boolean;
-	retained: boolean;
+	phase: EntryPhase;
+	disposed?: boolean;
 	inputSource?: object;
 	estimatedBytes: number;
 	resultViews?: Map<string, RetainedResultView<Output>>;
@@ -343,11 +349,18 @@ async function resolveResultView<Output>(
 		rebuilt = undefined;
 		return result;
 	} catch (error) {
+		const snapshotScoped =
+			(error !== null && typeof error === "object" && "snapshotScoped" in error && error.snapshotScoped === true) ||
+			hasErrorCode(error, "ERR_ARTIFACT_LEASE_BUDGET");
+		const budgetExhausted = snapshotScoped || hasErrorCode(error, "ERR_RESOURCE_BUDGET");
 		return {
 			ok: false,
-			cause: cause("reconstruction", hasErrorCode(error, "ERR_RESOURCE_BUDGET") ||
-				hasErrorCode(error, "ERR_ARTIFACT_LEASE_BUDGET") ? "input_budget_exhausted" : "reconstruction_failed",
-				errorDetail(error)),
+			...(snapshotScoped ? { snapshotScoped: true as const } : {}),
+			cause: cause(
+				"reconstruction",
+				budgetExhausted ? "input_budget_exhausted" : "reconstruction_failed",
+				errorDetail(error),
+			),
 		};
 	} finally {
 		if (rebuilt?.dispose)
@@ -462,7 +475,15 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 	private nextID() {
 		return "run-" + ++this.sequence;
 	}
+	private disposeBranch(entry: Entry<Output>) {
+		if (entry.disposed) return Promise.resolve();
+		entry.disposed = true;
+		return this.lifetime.release(candidateBranch(entry));
+	}
 	private remove(entry: Entry<Output>) {
+		if (entry.phase === "removed") return;
+		this.running.delete(entry);
+		entry.phase = "removed";
 		this.pool.delete(entry);
 		for (const key of entry.resultViews?.keys() ?? []) this.setView(entry, key);
 		for (const id of entry.handles) {
@@ -471,7 +492,22 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 			this.handles.delete(id);
 		}
 		entry.handles.clear();
-		void this.lifetime.release(candidateBranch(entry));
+		void this.disposeBranch(entry);
+	}
+	private releaseUnreferenced(entry: Entry<Output>) {
+		if (entry.pins || entry.handles.size || this.hasParentUsers(entry)) return;
+		if (entry.phase === "running") {
+			if (this.running.has(entry)) entry.work.controller.abort();
+			return;
+		}
+		if (entry.phase === "settled" && (entry.route.reuse === "exclusive_branch" || !this.pool.isCached(entry))) {
+			this.remove(entry);
+		}
+	}
+	private evictFromPool(entry: Entry<Output>) {
+		for (const key of entry.resultViews?.keys() ?? []) this.setView(entry, key);
+		this.pool.delete(entry);
+		this.releaseUnreferenced(entry);
 	}
 	private hasParentUsers(entry: Entry<Output>) {
 		return (
@@ -481,23 +517,9 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 	private trim() {
 		for (const entry of this.pool.trim(
 			this.limits(),
-			(entry) =>
-				!entry.pins &&
-				!this.running.has(entry) &&
-				![...entry.handles].some((id) => this.handles.get(id)?.parentUsers),
+			(entry) => !entry.pins && entry.phase !== "running",
 		))
-			this.remove(entry);
-	}
-	private trimHandles() {
-		const capacity = this.limits().maxEntries + this.running.size;
-		if (this.handles.size <= capacity) return;
-		for (const handle of this.handles.values()) {
-			if (!handle.settled || handle.parentUsers) continue;
-			if (handle.entry && !handle.released) handle.entry.retained = true;
-			this.handles.delete(handle.id);
-			handle.entry?.handles.delete(handle.id);
-			if (this.handles.size <= capacity) break;
-		}
+			this.evictFromPool(entry);
 	}
 	private releaseView(resource?: ViewResource) {
 		if (resource && --resource.references === 0) void this.lifetime.release(resource);
@@ -514,16 +536,20 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 	private retainView(entry: Entry<Output>, key: ActionKey, view: Extract<ResultView<Output>, { ok: true }>) {
 		if (!view.execution || view.reused) return;
 		const limits = this.limits();
+		if (!limits.maxEntries) return;
 		const output = cloneSharedData(view.output);
 		const bytes = estimateValueBytes(output) + Buffer.byteLength(key.key) + finiteValue(view.capturedBytes);
+		let existingViewsBytes = 0;
+		for (const item of entry.resultViews?.values() ?? []) existingViewsBytes += item.bytes;
+		const baseBytes = entry.estimatedBytes - existingViewsBytes;
+		if (baseBytes + bytes > limits.maxBytes) return;
 		this.setView(entry, key.key);
 		while (
 			entry.resultViews?.size &&
 			(entry.resultViews.size >= limits.maxEntries || entry.estimatedBytes + bytes > limits.maxBytes)
 		)
 			this.setView(entry, entry.resultViews.keys().next().value!);
-		if (limits.maxEntries && entry.estimatedBytes + bytes <= limits.maxBytes)
-			this.setView(entry, key.key, { ...view, execution: view.execution, output, bytes });
+		this.setView(entry, key.key, { ...view, execution: view.execution, output, bytes });
 	}
 	private borrow(exclude?: Entry<Output>) {
 		const leases = new Set<Entry<Output>>();
@@ -544,7 +570,10 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 				yield* session.captures;
 			},
 			release: () => {
-				for (const entry of leases) entry.pins--;
+				for (const entry of leases) {
+					entry.pins--;
+					this.releaseUnreferenced(entry);
+				}
 				leases.clear();
 				this.trim();
 			},
@@ -628,14 +657,21 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 			handles: new Set(),
 			pins: 0,
 			estimatedBytes: 0,
-			adopted: false,
-			retained: false,
+			phase: "running",
 		};
 	}
 	private retain(entry: Entry<Output>, branch: WorldBranch<Output>, execution: TimelineInterval) {
+		const limits = this.limits();
 		entry.estimatedBytes = estimateValueBytes(branch.output) + inputIndexBytes(branch) + branch.capturedBytes;
+		this.running.delete(entry);
+		entry.phase = "settled";
 		entry.work.succeed(branch, execution, execution.completedAt - execution.startedAt);
+		if (limits.maxEntries <= 0 || entry.estimatedBytes > limits.maxBytes) {
+			this.evictFromPool(entry);
+			return;
+		}
 		this.pool.settle(entry, branch, entry.route.reuse === "shared_result");
+		this.trim();
 	}
 	private async keepInputs(
 		entry: Entry<Output>,
@@ -656,7 +692,6 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 			reuse: "shared_result",
 		});
 		owner.work.start(timing.startedAt);
-		owner.retained = true;
 		this.retain(owner, inputs, timing);
 	}
 	private recheckWrites(key: ActionKey, branch?: WorldBranch<Output>) {
@@ -737,26 +772,32 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 		actor: boolean,
 		parent?: Entry<Output>,
 		handle?: Handle<Output>,
-		exhausted?: Set<string>,
+		exhausted?: Set<Entry<Output> | string>,
 	) {
 		if (!this.limits().maxEntries) return;
 		const effect = this.hooks.effect?.(key) ?? key.semantics?.effect;
 		for (const { entry, match } of this.pool.lookup(key, actor)) {
 			if (signal.aborted) return;
 			let base = entry.parent;
-			if (!parent) while (base?.adopted) base = base.parent;
-			if (entry.adopted && entry.route.reuse === "exclusive_branch") continue;
+			if (!parent) while (base?.phase === "adopted") base = base.parent;
+			if (entry.phase === "adopted" && entry.route.reuse === "exclusive_branch") continue;
 			if (base !== parent || (parent && match.kind === "inputs")) continue;
 			if (match.kind === "inputs" && effect !== undefined && effect !== "observation") continue;
 			const rebuild = match.kind === "inputs" && candidateBranch(entry)?.reconstructionScope === "current_action" &&
 				!entry.resultViews?.has(key.key);
-			if (rebuild && exhausted?.has(entry.route.fingerprint)) continue;
+			if (rebuild && (exhausted?.has(entry) || exhausted?.has(entry.route.fingerprint))) continue;
 			entry.pins++;
 			let lease: ReturnType<typeof entry.work.acquire>;
 			let resultView: Extract<ResultView<Output>, { ok: true }> | undefined;
 			try {
 				const authorization = await this.hooks.authorize(call, key, entry.route, signal, true);
-				if (signal.aborted || !authorization.ok || !this.pool.has(entry)) {
+				if (
+					signal.aborted ||
+					!authorization.ok ||
+					!this.limits().maxEntries ||
+					entry.phase === "removed" ||
+					(entry.phase === "adopted" && entry.route.reuse === "exclusive_branch")
+				) {
 					if (!authorization.ok)
 						this.hooks.rejection?.(call, {
 							candidateID: entry.id,
@@ -767,7 +808,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 				}
 				if (actor) {
 					if (entry.route.reuse === "exclusive_branch" && entry.route.adoptable?.() === false) {
-						if (this.running.has(entry) && !this.hasParentUsers(entry)) entry.work.controller.abort();
+						if (entry.phase === "running" && !this.hasParentUsers(entry)) entry.work.controller.abort();
 						this.hooks.rejection?.(call, {
 							candidateID: entry.id,
 							match,
@@ -784,7 +825,8 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 				const execution = waiting.value;
 				const view = await this.view(entry, call, key, match, signal);
 				if (!view.ok) {
-					if (rebuild && view.cause.code === "input_budget_exhausted") exhausted?.add(entry.route.fingerprint);
+					if (rebuild && view.cause.code === "input_budget_exhausted")
+						exhausted?.add(view.snapshotScoped ? entry : entry.route.fingerprint);
 					this.hooks.rejection?.(call, { candidateID: entry.id, match, cause: view.cause });
 					continue;
 				}
@@ -802,20 +844,21 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 				}
 				if (actor && entry.route.reuse === "exclusive_branch") {
 					lease!.adopt();
-					entry.adopted = true;
+					entry.phase = "adopted";
+					for (const viewKey of entry.resultViews?.keys() ?? []) this.setView(entry, viewKey);
+					this.pool.delete(entry);
 					this.recheckWrites(key, execution.output);
 					await this.keepInputs(entry, execution.output, execution.toolExecution, true);
-					for (const key of entry.resultViews?.keys() ?? []) this.setView(entry, key);
-					this.pool.delete(entry);
 				} else {
-					if (actor) entry.retained = true;
 					if (handle) this.attach(handle, entry);
-					try {
-						this.retainView(entry, key, view);
-					} catch {
-						/* An opaque result cannot be retained. */
+					if (this.pool.isCached(entry)) {
+						try {
+							this.retainView(entry, key, view);
+						} catch {
+							/* An opaque result cannot be retained. */
+						}
+						this.pool.recordHit(entry, this.limits());
 					}
-					this.pool.recordHit(entry, this.limits());
 				}
 				if (actor) await this.hooks.observed?.(call, key, execution.output).catch(() => {});
 				return {
@@ -830,9 +873,9 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 				this.releaseView(resultView?.resource);
 				lease?.release();
 				entry.pins--;
-				if (!entry.pins && !entry.handles.size && this.running.has(entry)) entry.work.controller.abort();
-				if (entry.adopted && !this.pool.has(entry) && !entry.pins)
-					await this.lifetime.release(candidateBranch(entry));
+				if (entry.phase === "adopted" && !this.pool.has(entry) && !entry.pins)
+					await this.disposeBranch(entry);
+				else this.releaseUnreferenced(entry);
 				this.trim();
 			}
 		}
@@ -902,7 +945,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 						if (ready.status !== "completed" || ready.value.status !== "completed" || !parent.entry)
 							return { status: "rejected", reason: "parent_unavailable" };
 						base = parent.entry;
-						while (base && (base.route.reuse === "shared_result" || base.adopted)) base = base.parent;
+						while (base && (base.route.reuse === "shared_result" || base.phase === "adopted")) base = base.parent;
 						if (base) {
 							pinned = base;
 							pinned.pins++;
@@ -998,12 +1041,11 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 					};
 				} finally {
 					admitted();
-					if (pinned && --pinned.pins === 0 && pinned.adopted && !this.pool.has(pinned))
-						await this.lifetime.release(candidateBranch(pinned));
-					handle.detach?.();
+					if (pinned && --pinned.pins === 0 && pinned.phase === "adopted" && !this.pool.has(pinned))
+						await this.disposeBranch(pinned);
+					else if (pinned) this.releaseUnreferenced(pinned);
 					handle.settled = true;
-					this.trimHandles();
-					if (!handle.entry) this.release(id);
+					if (!handle.entry || handle.released) this.release(id);
 					if (parent && --parent.parentUsers === 0 && parent.released) this.release(parent.id);
 				}
 			})(),
@@ -1017,7 +1059,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 				: this.controller.signal;
 			signal.throwIfAborted();
 			const key = await this.hooks.key(call, true);
-			const exhausted = new Set<string>();
+			const exhausted = new Set<Entry<Output> | string>();
 			while (key && this.limits().maxEntries) {
 				signal.throwIfAborted();
 				const seen = new Set(this.pool.lookup(key, false).map(({ entry }) => entry));
@@ -1048,7 +1090,6 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 					capture = await this.hooks.capture(call, key, signal).catch(() => undefined);
 				if (key && capture && !capture.inputsOnly && capture.route.reuse === "shared_result") {
 					pending = this.makeEntry(call, key, capture.route, id);
-					pending.retained = true;
 					pending.work.start(started);
 					this.pool.insert(pending);
 				}
@@ -1082,7 +1123,6 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 								await this.lifetime.release(branch);
 							}
 						} else {
-							entry.retained = true;
 							entry.work.start(computation.startedAt);
 							this.retain(entry, branch, computation);
 						}
@@ -1115,10 +1155,7 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 		const entry = handle.entry;
 		if (!entry) return;
 		entry.handles.delete(id);
-		if (!entry.handles.size && !entry.pins) {
-			if (this.running.has(entry)) entry.work.controller.abort();
-			else if (!entry.retained && !entry.adopted) this.remove(entry);
-		}
+		this.releaseUnreferenced(entry);
 	}
 	snapshot(): SpeculativeCacheSnapshot {
 		const hot = this.pool.hotEntries();
@@ -1145,10 +1182,11 @@ export class LocalExecutionSession<Output> implements ExecutionSession<Output> {
 	}
 	close() {
 		this.controller.abort();
-		for (const handle of this.handles.values()) this.release(handle.id);
+		for (const handle of [...this.handles.values()]) this.release(handle.id);
 		for (const entry of this.running) entry.work.controller.abort();
 		return this.lifetime.close(async () => {
 			await this.lifetime.drain();
+			for (const handle of [...this.handles.values()]) if (handle.entry) this.remove(handle.entry);
 			for (const entry of this.pool.values()) this.remove(entry);
 			this.handles.clear();
 		});

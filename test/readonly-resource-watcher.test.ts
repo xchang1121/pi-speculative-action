@@ -313,6 +313,24 @@ linux("matches native BigIntStats fields and reads both compact and multi-chunk 
 		]);
 		const large = await filesystemEvidence.readFilesystemDirectory(bigDir, view);
 		expect(large.map((entry) => entry.name)).toEqual(expectedNames);
+
+		const runExecFile = promisify(execFile);
+		const nowMs = Date.now() + 60_000;
+		for (const [name, nsText, expectedSettled] of [
+			["future-y2400.txt", "13569465600123456789", false],
+			["boundary-999950.txt", "1893456000999999950", false],
+			["pre1970-subms.txt", "-500000", true],
+		] as const) {
+			const target = path.join(root, name);
+			await writeFile(target, "ts\n");
+			await runExecFile("python3", ["-c", "import os, sys; n = int(sys.argv[2]); os.utime(sys.argv[1], ns=(n, n))", target, nsText]);
+			const [actual, reference] = await Promise.all([view.stat(target, false), fs.lstat(target, { bigint: true })]);
+			expect([actual.mtimeNs, actual.mtimeMs, actual.mtime.getTime()]).toEqual([reference.mtimeNs, reference.mtimeMs, reference.mtime.getTime()]);
+			expect(filesystemEvidence.settledFilesystemStat(actual, nowMs, target)).toBe(expectedSettled);
+			expect(filesystemEvidence.settledFilesystemStat(actual, nowMs, target)).toBe(
+				filesystemEvidence.settledFilesystemStat(reference, nowMs, target),
+			);
+		}
 		await view.verify();
 	} finally {
 		await rm(root, { recursive: true, force: true });

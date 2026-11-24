@@ -1031,6 +1031,34 @@ function assembleAgentExecutionHost(
 	const refresh = async () => {
 		currentSettings = await resolveSettings();
 	};
+	const turnPreviewIds = new WeakMap<GeneratorTurn, Set<string>>();
+	const releases = new PendingTasks();
+	const releasedRuns = new Map<string, Promise<void>>();
+	const deferredRetireIds = new Set<string>();
+	const releaseRun = (id: string): Promise<void> => {
+		deferredRetireIds.delete(id);
+		const prior = releasedRuns.get(id);
+		if (prior) return prior;
+		let task: Promise<void>;
+		try {
+			const result = session.release(id);
+			task =
+				result && typeof result.then === "function"
+					? releases.track(result.then(() => undefined, () => undefined))
+					: Promise.resolve();
+		} catch {
+			task = Promise.resolve();
+		}
+		releasedRuns.set(id, task);
+		return task;
+	};
+	const turnSession: ExecutionSession<ToolSettlement> = {
+		speculate: (call, opts) => session.speculate(call, opts),
+		execute: (call, opts) => session.execute(call, opts),
+		release: (id) => releaseRun(id),
+		flush: () => session.flush(),
+		close: () => session.close(),
+	};
 	const settlePrediction = (
 		id: string,
 		p: NonNullable<ReturnType<typeof predictions.get>>,
@@ -1038,6 +1066,21 @@ function assembleAgentExecutionHost(
 		served: boolean,
 	) => {
 		predictions.delete(id);
+		const retireWhenDone = () => {
+			if (closed || p.state.kind === "completed") {
+				void releaseRun(id);
+				return;
+			}
+			deferredRetireIds.add(id);
+			const done = () => {
+				if (deferredRetireIds.delete(id)) void releaseRun(id);
+			};
+			void p.run.completion.then(done, done);
+		};
+		const ownerTurn = turns.get(p.turnID);
+		if (ownerTurn && !ownerTurn.signal.aborted)
+			ownerTurn.signal.addEventListener("abort", retireWhenDone, { once: true });
+		else retireWhenDone();
 		p.prediction.onFeedback?.(settlement, served);
 		const info = { sessionID, turnID: p.turnID, tool: p.prediction.tool, action: p.key, settlement };
 		void subscriptions.publish("prediction_settled", info);
@@ -1068,7 +1111,7 @@ function assembleAgentExecutionHost(
 			startInput,
 			data,
 			signal,
-			session,
+			session: turnSession,
 			settings,
 			async issue(prediction, opts = {}) {
 				const preview = prediction.source === "actor_preview";
@@ -1093,6 +1136,11 @@ function assembleAgentExecutionHost(
 					after,
 					signal: preview && opts.signal ? opts.signal : external,
 				}));
+				if (preview) {
+					let ids = turnPreviewIds.get(turn);
+					if (!ids) turnPreviewIds.set(turn, (ids = new Set()));
+					ids.add(run.runID);
+				}
 				if (!preview) {
 					const identity = {
 						id: run.runID,
@@ -1252,8 +1300,13 @@ function assembleAgentExecutionHost(
 								});
 								const call: ExecutionCall = { tool: tool.name, input: key.input };
 								calls.set(call, { tool, turnID, binding: { action: op }, rejections: [] });
+								if (closed) return;
 								const run = measured(call, () => local.speculate(call));
-								void run.completion.then(() => local.release(run.runID));
+								deferredRetireIds.add(run.runID);
+								void run.completion.then(
+									() => releaseRun(run.runID),
+									() => releaseRun(run.runID),
+								);
 							})(),
 						)
 						.catch(() => {});
@@ -1267,6 +1320,8 @@ function assembleAgentExecutionHost(
 		if (turn) {
 			controllers.get(turn)?.abort();
 			turns.delete(turnID);
+			for (const previewID of turnPreviewIds.get(turn) ?? []) void releaseRun(previewID);
+			turnPreviewIds.delete(turn);
 			const actor = lastActor.get(turnID);
 			for (const [id, p] of predictions)
 				if (terminal || p.lastDecision <= decision) {
@@ -1325,7 +1380,13 @@ function assembleAgentExecutionHost(
 			const signature = stableValueHash([input.tool, input.args]);
 			const prior = issued.get(input.id);
 			if (prior?.input === signature) return prior.run;
-			if (prior) void prior.run.then((run) => run && session.release(run.runID));
+			if (prior)
+				void releases.track(
+					prior.run.then(
+						(run) => (run ? releaseRun(run.runID) : undefined),
+						() => undefined,
+					),
+				);
 			const run = submit();
 			issued.set(input.id, { input: signature, run });
 			return run;
@@ -1415,6 +1476,7 @@ function assembleAgentExecutionHost(
 					) {
 						// Reserve this observation while the equivalent root handle confirms its physical producer.
 						predictions.delete(id);
+						deferredRetireIds.add(id);
 						void pending.track(p.state.settled.then(credit));
 					} else credit();
 				}
@@ -1490,9 +1552,14 @@ function assembleAgentExecutionHost(
 			if (closed) return;
 			closed = true;
 			try {
-				for (const id of turns.keys()) await finishTurn(id);
-				await session.close();
+				for (const id of [...turns.keys()]) await finishTurn(id);
+				for (const id of predictions.keys()) void releaseRun(id);
+				for (const id of [...deferredRetireIds]) void releaseRun(id);
+				deferredRetireIds.clear();
 				await maintenance;
+				await releases.drain();
+				await session.close();
+				await releases.drain();
 				await workspaceCursor?.release();
 				await pending.drain();
 				await subscriptions.publish("session_closed", { sessionID, terminal: true });

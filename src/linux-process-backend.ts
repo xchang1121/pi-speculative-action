@@ -180,7 +180,7 @@ import {
 } from "./provenance-certificate.ts";
 import type { ProvenanceStoreOptions, VerifiedArtifactClosure } from "./reuse-store.ts";
 import { ProvenanceCertificateStore } from "./reuse-store.ts";
-import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
+import { LeaseScope, RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
 import { cause, zeroValidationMetrics, type ResourceValidation } from "./settlement.ts";
 import type { ExecutionObservation, TracedWrite, TraceTail } from "./execution-observer.ts";
 import { executionRecords, installedImageStart, observeExecution, traceTail, UTSNAME_BYTES, writesWithin } from "./execution-observer.ts";
@@ -1182,27 +1182,40 @@ export class LinuxProcessReuseBackend {
 	): Promise<LinuxProcessSession> {
 		return this.withProducer(async (): Promise<LinuxProcessSession> => {
 			const { session, ready, readyAt, controller } = await this.allocateSession(input);
-			let executionState: "idle" | "tool" | "operation" = "idle";
+			type SessionPhase =
+				| { readonly kind: "idle" }
+				| { readonly kind: "active"; readonly boundary: "tool" | "operation"; dispatch?: Promise<void> }
+				| {
+						readonly kind: "sealing";
+						readonly dispatch?: Promise<void>;
+						readonly promise: Promise<readonly SandboxWorkspaceChange[]>;
+				  };
+			let phase: SessionPhase = { kind: "idle" };
 			this.producers++;
-			let dispatch: Promise<void> | undefined;
+			const setAdmission = (next: SessionAdmissionState) => {
+				const previous = session.sealing.admission;
+				if (previous.kind === "verified" && (next.kind !== "verified" || next.proof !== previous.proof))
+					previous.proof.close();
+				session.sealing.admission = next;
+			};
 			const execute = <Value>(
 				kind: "tool" | "operation",
 				operation: () => Promise<Value>,
 			): Promise<Value> => {
 				if (
 					session.lifecycle.sealed ||
-					session.sealing.promise ||
-					executionState === "operation" ||
-					(executionState !== "idle" && executionState !== kind)
+					phase.kind === "sealing" ||
+					(phase.kind === "active" && (phase.boundary === "operation" || phase.boundary !== kind))
 				)
 					return Promise.reject(new Error("process session execution boundary is already consumed"));
-				executionState = kind;
+				if (phase.kind === "idle") phase = { kind: "active", boundary: kind };
+				const activePhase = phase;
 				return session.lifecycle.admit(() =>
 					measureProcess(session, async () => {
 						session.signal?.throwIfAborted();
 						const dispatchStartedAt = performance.now();
 						// Bound operations can launch reusable children too; interception excludes their own image below.
-						await (dispatch ??= this.createProcessInterposition(session, ready).then(
+						await (activePhase.dispatch ??= this.createProcessInterposition(session, ready).then(
 							async (interposition) => {
 								session.signal?.throwIfAborted();
 								session.interposition = interposition;
@@ -1248,8 +1261,7 @@ export class LinuxProcessReuseBackend {
 				}
 				if (initial.kind === "verified") {
 					if (initial.valid()) return { ...initial.result, metrics: zeroValidationMetrics() };
-					initial.proof.close();
-					session.sealing.admission = { kind: "unverified" };
+					setAdmission({ kind: "unverified" });
 				}
 				const evidence = session.sealing.topLevelEvidence;
 				const paths =
@@ -1287,7 +1299,7 @@ export class LinuxProcessReuseBackend {
 						return admissionFailure("stale", "process_inputs_changed_during_admission", proof.reason, result.metrics);
 					// The session owns both this proof and the prepared result; its final commit
 					// rechecks continuity instead of repeating the same dependency reads.
-					session.sealing.admission = { kind: "verified", proof, valid, result };
+					setAdmission({ kind: "verified", proof, valid, result });
 					return result;
 				} finally {
 					const settled = currentAdmission();
@@ -1298,24 +1310,33 @@ export class LinuxProcessReuseBackend {
 				(validating ??= inspectAdmission().finally(() => {
 					validating = undefined;
 				}));
-			const seal = () =>
-				(session.sealing.promise ??= this.withProducer(async () => {
-					await session.lifecycle.drain();
-					try {
-						const external = await privateCommits(
-							session,
-							session.sealing.privateSince ?? 0,
-							sessionWriters(session),
-						);
-						if (external.proof.kind === "incomplete")
-							throw new Error(`unrepresentable writes outside the workspace: ${external.proof.reason}`);
-						const changes = [...(await sealSessionEvidence(session, external)), ...external.changes];
-						if (canReplayObservedProcess()) await validate();
-						return changes;
-					} finally {
-						if (session.inputs) await this.publishFileInputs(session.inputs, session);
-					}
-				}));
+			const seal = () => {
+				if (phase.kind !== "sealing") {
+					const dispatch = phase.kind === "active" ? phase.dispatch : undefined;
+					phase = {
+						kind: "sealing",
+						dispatch,
+						promise: this.withProducer(async () => {
+							await session.lifecycle.drain();
+							try {
+								const external = await privateCommits(
+									session,
+									session.sealing.privateSince ?? 0,
+									sessionWriters(session),
+								);
+								if (external.proof.kind === "incomplete")
+									throw new Error(`unrepresentable writes outside the workspace: ${external.proof.reason}`);
+								const changes = [...(await sealSessionEvidence(session, external)), ...external.changes];
+								if (canReplayObservedProcess()) await validate();
+								return changes;
+							} finally {
+								if (session.inputs) await this.publishFileInputs(session.inputs, session);
+							}
+						}),
+					};
+				}
+				return phase.promise;
+			};
 			const result: LinuxProcessSession = {
 				ownership: session.ownership,
 				computationDependencies: () => Object.freeze([...session.computations]),
@@ -1408,22 +1429,19 @@ export class LinuxProcessReuseBackend {
 					session.lifecycle.close(async () => {
 						controller.abort(new Error("Linux process session closed"));
 						try {
-							await dispatch?.catch(() => undefined);
+							const activeDispatch = phase.kind === "idle" ? undefined : phase.dispatch;
+							await activeDispatch?.catch(() => undefined);
 							await seal().catch(() => undefined);
 						} finally {
 							try {
-								session.releaseVersions?.();
-								session.privateStructure.clear();
-								session.workspaceDomain?.close();
-								session.domain.close();
+								await session.resources.dispose();
 							} finally {
 								this.producers--;
 							}
 						}
 					}),
 				dispose: async () => {
-					if (session.sealing.admission.kind === "verified") session.sealing.admission.proof.close();
-					session.sealing.admission = { kind: "disposed" };
+					setAdmission({ kind: "disposed" });
 					try {
 						await result.close();
 					} finally {
@@ -1462,7 +1480,13 @@ export class LinuxProcessReuseBackend {
 			"environment" in input.invocation ? undefined : this.boundInvocation(input.invocation, input.scope);
 		if (bound && bound.sourceRoot !== sourceRoot) throw new Error("bound process workspace changed");
 		const token = randomBytes(32).toString("hex");
+		const scheduling = forkedProcessScheduling(await captureProcessScheduling(process.pid));
 		const processRoot = await mkdtemp(path.join(input.workspace.processRoot, "session-"));
+		await using allocation = new LeaseScope();
+		let committed = false;
+		allocation.defer(() =>
+			committed ? undefined : rm(processRoot, { recursive: true, force: true }).catch(() => undefined),
+		);
 		const boundary = await this.heldBoundary();
 		const deniedPaths = sensitivePaths(this.options.storeRoot, this.options.deniedPaths).filter(
 			(target) =>
@@ -1476,33 +1500,42 @@ export class LinuxProcessReuseBackend {
 			(info) => (info.isDirectory() ? path.join(sourceRoot, ".git") : undefined),
 			() => undefined,
 		);
-		const domain = ready.collector.open();
+		const domain = allocation.adopt(ready.collector.open(), (item) => item.close());
 		const upper = path.join(processRoot, "private", "writes", "upper");
-		let workspaceDomain: typeof domain | undefined;
-		let metadata: ReturnType<typeof executionRecords>;
-		let releaseVersions: (() => void) | undefined;
-		try {
-			metadata = executionRecords(domain.trace(ready.sandlock), upper);
-			if (input.workspace.structure.retain) workspaceDomain = ready.collector.open();
-			await mkdir(upper, { recursive: true, mode: 0o700 });
-			if (input.workspace.metadataImage) {
-				// The COW root is bookkeeping storage. A process statting / observes the host root.
-				const rows = JSON.parse(await readFile(input.workspace.metadataImage, "utf8"));
-				const roots = await Promise.all([lstat(upper, { bigint: true }), lstat("/", { bigint: true })]);
-				rows.push([
-					...roots.map((info) => FILESYSTEM_METADATA_FIELDS.map((field) => String(info[field]))),
-					0,
-				]);
-				await writeFile(input.workspace.metadataImage, JSON.stringify(rows));
-			}
-			domain.watch([path.join(processRoot, "private")]);
-			if (workspaceDomain) releaseVersions = input.workspace.structure.retain!(workspaceDomain);
-		} catch (error) {
-			workspaceDomain?.close();
-			domain.close();
-			throw error;
+		const metadata = executionRecords(domain.trace(ready.sandlock), upper);
+		const workspaceDomain = input.workspace.structure.retain
+			? allocation.adopt(ready.collector.open(), (item) => item.close())
+			: undefined;
+		await mkdir(upper, { recursive: true, mode: 0o700 });
+		if (input.workspace.metadataImage) {
+			// The COW root is bookkeeping storage. A process statting / observes the host root.
+			const rows = JSON.parse(await readFile(input.workspace.metadataImage, "utf8"));
+			const roots = await Promise.all([lstat(upper, { bigint: true }), lstat("/", { bigint: true })]);
+			rows.push([
+				...roots.map((info) => FILESYSTEM_METADATA_FIELDS.map((field) => String(info[field]))),
+				0,
+			]);
+			await writeFile(input.workspace.metadataImage, JSON.stringify(rows));
 		}
-		const scheduling = forkedProcessScheduling(await captureProcessScheduling(process.pid));
+		domain.watch([path.join(processRoot, "private")]);
+		if (workspaceDomain) allocation.defer(input.workspace.structure.retain!(workspaceDomain));
+		const privateStructure = allocation.adopt(
+			new WorkspaceStructureCapture(
+				upper,
+				{
+					exclude: [],
+					content: {
+						pool: input.workspace.contents,
+						maxFileBytes: speculativeConfig().processReuse.privateFileBytes,
+						maxBytes: speculativeConfig().processReuse.privateTreeBytes,
+					},
+				},
+				domain,
+			),
+			(item) => item.clear(),
+		);
+		committed = true;
+		const resources = allocation.move();
 		const session = {
 			token,
 			processRoot,
@@ -1545,7 +1578,6 @@ export class LinuxProcessReuseBackend {
 				admission: { kind: "unverified" } as SessionAdmissionState,
 				transaction: undefined as Promise<WorkspaceTransactionCapture> | undefined,
 				capture: undefined as Promise<WorkspaceTransactionDelta> | undefined,
-				promise: undefined as Promise<readonly SandboxWorkspaceChange[]> | undefined,
 				topLevelEvidence: undefined as DynamicDependencyCertificate | undefined,
 				privateSince: undefined as number | undefined,
 			},
@@ -1556,19 +1588,8 @@ export class LinuxProcessReuseBackend {
 			domain,
 			metadata,
 			workspaceDomain,
-			releaseVersions,
-			privateStructure: new WorkspaceStructureCapture(
-				upper,
-				{
-					exclude: [],
-					content: {
-						pool: input.workspace.contents,
-						maxFileBytes: speculativeConfig().processReuse.privateFileBytes,
-						maxBytes: speculativeConfig().processReuse.privateTreeBytes,
-					},
-				},
-				domain,
-			),
+			resources,
+			privateStructure,
 		};
 		return { session, ready, readyAt, controller };
 	}
@@ -4173,20 +4194,24 @@ async function runSpawn(
 		options.onData?.(value);
 		if (!captureComplete) return;
 		capturedBytes += value.length;
-		if (capturedBytes > limits.maxCapturedOutputBytes || output.length >= limits.maxOutputEvents) {
+		const previous = output.at(-1);
+		const coalesce =
+			previous?.fd === fd && previous.data.byteLength + value.byteLength <= limits.outputChunkBytes;
+		if (
+			capturedBytes > limits.maxCapturedOutputBytes ||
+			(!coalesce && output.length >= limits.maxOutputEvents)
+		) {
 			captureComplete = false;
 			output.length = 0;
 			if (!options.streamBeyondCaptureLimit) terminate();
 			return;
 		}
-		const event = { fd, data: Buffer.from(value) } as const;
-		const previous = output.at(-1);
-		if (previous?.fd === fd && previous.data.byteLength + event.data.byteLength <= limits.outputChunkBytes) {
+		if (coalesce) {
 			output[output.length - 1] = {
 				fd,
-				data: Buffer.concat([previous.data, event.data]),
+				data: Buffer.concat([previous.data, value]),
 			};
-		} else output.push(event);
+		} else output.push({ fd, data: Buffer.from(value) });
 	};
 	const endpoints = options.onOutputEndpoints
 		? (async () => {

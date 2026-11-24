@@ -1073,6 +1073,7 @@ test("trusted steps degrade cleanly at serialization limits, accept internal sto
 					await input();
 					if (key === "exact-limit") return Buffer.alloc(maxResultBytes, 7);
 					if (key === "non-plain") return new Date(0);
+					if (key === "over-store-quota") return { blob: "x".repeat(512) };
 					return { ok: true };
 				},
 			},
@@ -1094,6 +1095,15 @@ test("trusted steps degrade cleanly at serialization limits, accept internal sto
 				expect(await trustedCompute(peer, env, "boundary.step", "ok", bytes)).toMatchObject({
 					state: "published",
 					value: { encoding: "json", value: { ok: true } },
+				});
+				store.configure({ maxBytes: 128 });
+				service.configuration.update({
+					...service.configuration.current,
+					storage: { ...service.configuration.current.storage, maxRecordBytes: 128, maxBytes: 128 },
+				});
+				expect(await trustedCompute(peer, env, "boundary.step", "over-store-quota", bytes)).toMatchObject({
+					state: "published",
+					value: { encoding: "json", value: { blob: "x".repeat(512) } },
 				});
 				await expect(channel.validate()).resolves.toBeUndefined();
 			} finally {

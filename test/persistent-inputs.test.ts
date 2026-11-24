@@ -368,22 +368,33 @@ linux("stops persistent recovery after a consumed input and releases its lease",
 	expect(session.contents.openChunks).toBe(0);
 });
 
-test("file candidates honor the per-root history limit, including ancestor aliases", async () => {
+test("file candidates filter by path and ancestor aliases before applying history limits across workspaces", async () => {
 	const f = await fixture();
 	try {
-		const put = (root: string, entries: unknown[]) => f.store.putInputVersion({ root, entries, preparations: [] }, []);
-		const key = (name: string) => filesystemPathKey(path.join(f.root, name));
-		const file = [key("file"), { type: "file" }];
-		const oldest = await put(f.root, [file, [key("old"), { type: "file" }]]);
-		const alias = await put(f.root, [[key("tree"), { type: "alias" }]]);
-		const newest = await put(f.root, [file]);
-		await put("different-root", [file]);
-		const recent = await f.store.inputPathIndex(f.root, 2, new AbortController().signal);
-		expect([...recent(key("file"))]).toEqual([newest.id]);
-		expect([...recent(key("tree/leaf"))]).toEqual([alias.id]);
-		expect([...recent(key("old"))]).toEqual([]);
-		const all = await f.store.inputPathIndex(f.root, 3, new AbortController().signal);
-		expect([...all(key("file"))]).toEqual([newest.id, oldest.id]);
+		const config = new SpeculativeConfiguration({ filesystem: { maxHistoryEntries: 2 } });
+		const store = config.run(() => new ProvenanceCertificateStore(f.cache, { orphanGraceMs: 0 }));
+		try {
+			const put = (root: string, entries: unknown[]) => store.putInputVersion({ root, entries, preparations: [] }, []);
+			const key = (name: string) => filesystemPathKey(path.join(f.root, name));
+			const file = [key("file"), { type: "file", content: { digest: "d1" } }];
+			const oldest = await put(f.root, [file, [key("old"), { type: "file", content: { digest: "d0" } }]]);
+			const alias = await put(f.root, [[key("tree"), { type: "alias" }]]);
+			const newest = await put(f.root, [file]);
+			await put(f.root, [[key("ws-b-1"), { type: "file", content: { digest: "b1" } }]]);
+			await put(f.root, [[key("ws-b-2"), { type: "file", content: { digest: "b2" } }]]);
+			await put("different-root", [file]);
+
+			const signal = new AbortController().signal;
+			const single = await store.inputPathIndex(f.root, 1, signal);
+			expect([...single(key("file"), true)]).toEqual([newest.id]);
+			expect([...single(key("tree/leaf"))]).toEqual([alias.id]);
+			expect([...single(key("old"), true)]).toEqual([oldest.id]);
+
+			const pair = await store.inputPathIndex(f.root, 2, signal);
+			expect([...pair(key("file"), true)]).toEqual([newest.id, oldest.id]);
+		} finally {
+			await store.dispose();
+		}
 	} finally {
 		await f.close();
 	}
@@ -944,8 +955,159 @@ test("rejects batch publications whose unique artifact closure exceeds the store
 				expect(loaded?.bytes).toBe(3072);
 				await loaded?.dispose();
 			}
+			await expect(
+				f.store.putInputVersion({ root: f.root, preparations: [] }, [{ digest: first.digest, size: 3071 }]),
+			).rejects.toThrow("artifact integrity check failed: length");
 		});
 	} finally {
 		await f.close();
+	}
+});
+
+test("isolates oversized file closures during batch input publication, preserves cross-workspace borrows, and releases cancelled publish leases", async () => {
+	const base = await mkdtemp(path.join(os.tmpdir(), "pi-batch-inputs-"));
+	const wsA = path.join(base, "ws-a");
+	const wsB = path.join(base, "ws-b");
+	await Promise.all([mkdir(wsA), mkdir(wsB)]);
+	const config = new SpeculativeConfiguration({
+		filesystem: { chunkBytes: 256, maxHistoryEntries: 2, timestampQuietByFilesystem: {} },
+		storage: { maxRecordBytes: 8192 },
+	});
+	const store = config.run(
+		() => new ProvenanceCertificateStore(path.join(base, "cache"), { maxCertificates: 2, orphanGraceMs: 60_000 }),
+	);
+	try {
+		const small = path.join(wsA, "small.txt");
+		const hugeName = path.join(wsA, `${"x".repeat(180)}-oversize.bin`);
+		await writeFile(small, "abc");
+		await writeFile(hugeName, Buffer.alloc(32 * 1024, 7));
+		await utimes(small, 915148800, 946684800);
+		await utimes(hugeName, 915148800, 946684800);
+
+		await config.run(async () => {
+			await using inputsA = new ResourceObjectInputs(wsA, store, AbortSignal.timeout(10000));
+			inputsA.remember(small, await captureFileContent(small, 8 * 1024 * 1024, inputsA.contents));
+			inputsA.remember(hugeName, await captureFileContent(hugeName, 8 * 1024 * 1024, inputsA.contents));
+			expect(await inputsA.publish()).toBe(1);
+
+			for (const name of ["b1.txt", "b2.txt"]) {
+				const other = path.join(wsB, name);
+				await writeFile(other, name);
+				await utimes(other, 915148800, 946684800);
+				await using inputsB = new ResourceObjectInputs(wsB, store, AbortSignal.timeout(10000));
+				inputsB.remember(other, await captureFileContent(other, memoryBudget, inputsB.contents));
+				expect(await inputsB.publish()).toBe(1);
+			}
+
+			const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 5000);
+			try {
+				await using checkA = new ResourceObjectInputs(wsA, store, AbortSignal.timeout(10000));
+				const borrowed = await checkA.borrow(small, await lstat(small, { bigint: true }), checkA.contents);
+				expect(borrowed && (await readContent(borrowed.content)).toString()).toBe("abc");
+			} finally {
+				clock.mockRestore();
+			}
+
+			const session = new ResourceInputSession({ store, internalCache: true }, memoryBudget);
+			try {
+				const fresh = path.join(wsA, "fresh.txt");
+				await writeFile(fresh, "fresh\n");
+				const seed = await evaluateResourceQuery(
+					undefined,
+					{ signal: AbortSignal.timeout(10000) },
+					wsA,
+					async (view) => (await view.readFile(small)).toString(),
+					PI_ACTION_SEMANTICS,
+					memoryBudget,
+					true,
+					"output",
+					undefined,
+					session,
+				);
+				const controller = new AbortController();
+				const origPublish = session.publish.bind(session);
+				vi.spyOn(session, "publish").mockImplementation(async (...args) => {
+					const ok = await origPublish(...args);
+					controller.abort(new Error("abort_after_publish"));
+					return ok;
+				});
+				const transfer = vi.fn(() => true);
+				await expect(
+					evaluateResourceQuery(
+						seed!.versions,
+						{ signal: controller.signal },
+						wsA,
+						async (view) => `${await view.readFile(small)}:${await view.readFile(fresh)}`,
+						PI_ACTION_SEMANTICS,
+						memoryBudget,
+						true,
+						"output",
+						transfer,
+						session,
+					),
+				).rejects.toThrow("abort_after_publish");
+				expect(transfer).not.toHaveBeenCalled();
+				await Promise.all(seed!.versions.map((v) => v.release()));
+			} finally {
+				await session.dispose();
+			}
+			expect(session.contents.openChunks).toBe(0);
+		});
+
+		const ws29 = path.join(base, "ws-29");
+		const cache29 = path.join(base, "cache-29");
+		await mkdir(ws29);
+		const config29 = new SpeculativeConfiguration({ filesystem: { timestampQuietByFilesystem: {} } });
+		let targetFile = "";
+		await config29.run(async () => {
+			const writerStore = new ProvenanceCertificateStore(cache29);
+			const manager = new ResourceVersionManager(path.parse(ws29).root, {
+				watch: false,
+				persistentInputs: { store: writerStore, internalCache: true },
+			});
+			try {
+				for (let i = 0; i < 29; i++) {
+					const file = path.join(ws29, `f-${String(i).padStart(2, "0")}.txt`);
+					if (i === 7) targetFile = file;
+					await writeFile(file, `payload-${i}`);
+					await utimes(file, 915148800, 946684800);
+					const tok = await manager.capture([{ path: file, scope: "content" }], memoryBudget);
+					try {
+						await manager.persist(tok);
+					} finally {
+						await tok.release();
+					}
+				}
+			} finally {
+				manager.close();
+				await writerStore.dispose();
+			}
+
+			const cold4k = new ProvenanceCertificateStore(cache29, { maxReadBytes: 4096 });
+			const preparedSql: string[] = [];
+			const origPrepare = DatabaseSync.prototype.prepare;
+			const prepareSpy = vi.spyOn(DatabaseSync.prototype, "prepare").mockImplementation(function (this: DatabaseSync, sql: string) {
+				preparedSql.push(sql);
+				return origPrepare.call(this, sql);
+			});
+			const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 5000);
+			try {
+				const idx = await cold4k.inputPathIndex(path.parse(ws29).root, 1, AbortSignal.timeout(10000));
+				const hits = [...idx(filesystemPathKey(targetFile), true)];
+				expect(hits).toHaveLength(1);
+				expect(await cold4k.getInputVersion(hits[0]!)).toBeDefined();
+				await using recover = new ResourceObjectInputs(ws29, cold4k, AbortSignal.timeout(10000));
+				const hit = await recover.borrow(targetFile, await lstat(targetFile, { bigint: true }), recover.contents);
+				expect(hit && (await readContent(hit.content)).toString()).toBe("payload-7");
+				expect(preparedSql.some((s) => s.includes("jsonb_each"))).toBe(false);
+			} finally {
+				clock.mockRestore();
+				prepareSpy.mockRestore();
+				await cold4k.dispose();
+			}
+		});
+	} finally {
+		await store.dispose();
+		await rm(base, { recursive: true, force: true });
 	}
 });

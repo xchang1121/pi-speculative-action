@@ -84,7 +84,7 @@ import {
 	FILESYSTEM_METADATA_FIELDS as SNAPSHOT_METADATA_FIELDS,
 	withFilesystemReadView,
 } from "./filesystem-evidence.ts";
-import type { LinuxOverlayfsMount, LinuxOverlayfsOptions } from "./linux-overlayfs.ts";
+import type { LinuxOverlayfsOptions } from "./linux-overlayfs.ts";
 import { LinuxOverlayfsCapabilityRegistry, mountLinuxOverlayfs } from "./linux-overlayfs.ts";
 import type { Sha256Digest } from "./primitives.ts";
 import {
@@ -112,7 +112,7 @@ import {
 	type ToolFilesystemOperations,
 } from "./resource-version.ts";
 import { ProvenanceCertificateStore } from "./reuse-store.ts";
-import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
+import { LeaseScope, RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import type { ResourceValidation } from "./settlement.ts";
 interface WorkspaceEntryChange {
 	readonly changeDigest: Sha256Digest;
@@ -2667,43 +2667,27 @@ export class WorkspaceSandboxService {
 		const prior = this.oversize;
 		if (!processDirectories && prior?.root === sourceRoot &&
 			await prior.witness.exceeds(sourceRoot, configured.maxTreeBytes, configured.excludes)) throw prior.witness;
-		const versions = new ResourceVersionManager(sourceRoot);
-		const cursor = await versions.observeChanges();
-		const root = await mkdtemp(path.join(os.tmpdir(), "pi-workspace-"));
-		const processRoot = path.join(root, "process");
-		const lowerRoot = path.join(root, "tree");
+		const leases = new LeaseScope();
 		const pins: Awaited<ReturnType<typeof pinFilesystemObject>>[] = [];
 		const pinObject = async (target: string) => {
 			const handle = await pinFilesystemObject(target);
 			pins.push(handle);
 			return handle.stat;
 		};
-		let releaseContents: (() => Promise<void>) | undefined;
-		let overlay: LinuxOverlayfsMount | undefined;
-		let workspace: WorkspaceObservation | undefined;
-		let disposal: Promise<void> | undefined;
 		const dispose = () =>
-			(disposal ??= (async () => {
-				try {
-					try {
-						await workspace?.transactions.dispose();
-					} finally {
-						try {
-							await settleFilesystem(pins, (handle) => handle.close());
-						} finally {
-							await overlay?.close();
-						}
-					}
-					await removeOwnedTree(root);
-				} finally {
-					await cursor.release();
-					versions.close();
-					await releaseContents?.();
-				}
-			})().catch((error) => { throw effectCommitFailure(error, "poisoned"); }));
+			leases.dispose().catch((error) => {
+				throw effectCommitFailure(error, "poisoned");
+			});
 		try {
+			const versions = leases.adopt(new ResourceVersionManager(sourceRoot), (item) => item.close());
+			const cursor = leases.adopt(await versions.observeChanges(), (item) => item.release());
+			const root = leases.adopt(await mkdtemp(path.join(os.tmpdir(), "pi-workspace-")), (dir) =>
+				removeOwnedTree(dir),
+			);
+			const processRoot = path.join(root, "process");
+			const lowerRoot = path.join(root, "tree");
 			const contents = await this.createContentPool();
-			releaseContents = contents?.retain();
+			leases.defer(contents?.retain());
 			const nextDirectories = processDirectories && new Map(processDirectories);
 			const capture = () => new WorkspaceStructureCapture(sourceRoot, {
 				directories: nextDirectories,
@@ -2731,15 +2715,20 @@ export class WorkspaceSandboxService {
 			const live = driver === "overlayfs" && options.liveLower;
 			if (!live) await materializeWorkspaceTree(captured, lowerRoot);
 			let sandboxRoot = lowerRoot;
-			if (driver === "overlayfs") {
-				overlay = await mountLinuxOverlayfs({
-					lowerRoot: live ? sourceRoot : lowerRoot,
-					privateRoot: root,
-					options,
-					capabilityRegistry: this.overlayfsCapabilities,
-				});
-				sandboxRoot = overlay.root;
-			}
+			const overlay =
+				driver === "overlayfs"
+					? leases.adopt(
+							await mountLinuxOverlayfs({
+								lowerRoot: live ? sourceRoot : lowerRoot,
+								privateRoot: root,
+								options,
+								capabilityRegistry: this.overlayfsCapabilities,
+							}),
+							(mount) => mount.close(),
+						)
+					: undefined;
+			if (overlay) sandboxRoot = overlay.root;
+			leases.defer(() => settleFilesystem(pins, (handle) => handle.close()));
 			const metadata = await preserveSnapshotMetadata(
 				sourceRoot,
 				live ? overlay!.upperRoot : sandboxRoot,
@@ -2785,7 +2774,9 @@ export class WorkspaceSandboxService {
 				sourceDevice: original.get("")!.dev,
 				hints: sourceChanges(),
 			};
-			workspace = createWorkspaceObservation(data, sourceChanges, contents);
+			const workspace = leases.adopt(createWorkspaceObservation(data, sourceChanges, contents), (obs) =>
+				obs.transactions.dispose(),
+			);
 			let state: { kind: "covered" | "directories" | "full" } = { kind: "covered" };
 			const covers = (relative: string, listed: boolean) => {
 				// Only complete directory listings can establish a child name or its absence.

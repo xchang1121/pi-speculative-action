@@ -310,8 +310,8 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
       uint32_t open_flags = le32toh(header[1]);
       uint32_t need_stat = le32toh(header[2]);
       uint32_t path_len = le32toh(header[3]);
-      char *path_ptr = (char *)bytes + 112;
-      if (!path_len || 112 + (size_t)path_len + 1 > length || path_ptr[path_len] != '\0' ||
+      char *path_ptr = (char *)bytes + 128;
+      if (!path_len || 128 + (size_t)path_len + 1 > length || path_ptr[path_len] != '\0' ||
           memchr(path_ptr, '\0', path_len))
         return NULL;
       if (open_flags & ~(O_PATH | O_NOFOLLOW | O_CLOEXEC)) {
@@ -326,12 +326,12 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
         else {
           char proc_fd[64];
           snprintf(proc_fd, sizeof(proc_fd), "/proc/self/fd/%d", fd);
-          ssize_t rlen = readlink(proc_fd, path_ptr, length - 112);
+          ssize_t rlen = readlink(proc_fd, path_ptr, length - 128);
           int err = 0;
           struct statx stx;
           if (rlen < 0)
             err = errno ? errno : EIO;
-          else if ((size_t)rlen >= length - 112)
+          else if ((size_t)rlen >= length - 128)
             err = ENAMETOOLONG;
           else if (need_stat) {
             memset(&stx, 0, sizeof(stx));
@@ -357,24 +357,25 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
                   htole64((uint64_t)stx.stx_blksize),
                   htole64((uint64_t)stx.stx_blocks),
               };
-              int64_t atime_ns =
-                  (int64_t)stx.stx_atime.tv_sec * 1000000000LL + (int64_t)stx.stx_atime.tv_nsec;
-              int64_t mtime_ns =
-                  (int64_t)stx.stx_mtime.tv_sec * 1000000000LL + (int64_t)stx.stx_mtime.tv_nsec;
-              int64_t ctime_ns =
-                  (int64_t)stx.stx_ctime.tv_sec * 1000000000LL + (int64_t)stx.stx_ctime.tv_nsec;
-              int64_t btime_ns = (stx.stx_mask & STATX_BTIME)
-                                     ? ((int64_t)stx.stx_btime.tv_sec * 1000000000LL +
-                                        (int64_t)stx.stx_btime.tv_nsec)
-                                     : 0LL;
-              uint64_t sfields[4] = {
-                  htole64((uint64_t)atime_ns),
-                  htole64((uint64_t)mtime_ns),
-                  htole64((uint64_t)ctime_ns),
-                  htole64((uint64_t)btime_ns),
+              int64_t btime_sec =
+                  (stx.stx_mask & STATX_BTIME) ? (int64_t)stx.stx_btime.tv_sec : 0LL;
+              uint32_t btime_nsec =
+                  (stx.stx_mask & STATX_BTIME) ? (uint32_t)stx.stx_btime.tv_nsec : 0U;
+              uint64_t sec_fields[4] = {
+                  htole64((uint64_t)(int64_t)stx.stx_atime.tv_sec),
+                  htole64((uint64_t)(int64_t)stx.stx_mtime.tv_sec),
+                  htole64((uint64_t)(int64_t)stx.stx_ctime.tv_sec),
+                  htole64((uint64_t)btime_sec),
+              };
+              uint32_t nsec_fields[4] = {
+                  htole32((uint32_t)stx.stx_atime.tv_nsec),
+                  htole32((uint32_t)stx.stx_mtime.tv_nsec),
+                  htole32((uint32_t)stx.stx_ctime.tv_nsec),
+                  htole32(btime_nsec),
               };
               memcpy(bytes, ufields, sizeof(ufields));
-              memcpy((unsigned char *)bytes + sizeof(ufields), sfields, sizeof(sfields));
+              memcpy((unsigned char *)bytes + 80, sec_fields, sizeof(sec_fields));
+              memcpy((unsigned char *)bytes + 112, nsec_fields, sizeof(nsec_fields));
             }
             value = (int32_t)rlen;
           }
@@ -387,8 +388,8 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
       memcpy(header, bytes, sizeof(header));
       int32_t root_fd = (int32_t)le32toh(header[0]);
       uint32_t path_len = le32toh(header[1]);
-      char *path_ptr = (char *)bytes + 112;
-      if (!path_len || 112 + (size_t)path_len + 1 > length || path_ptr[path_len] != '\0' ||
+      char *path_ptr = (char *)bytes + 128;
+      if (!path_len || 128 + (size_t)path_len + 1 > length || path_ptr[path_len] != '\0' ||
           memchr(path_ptr, '\0', path_len))
         return NULL;
       struct open_how how = {.flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC,
@@ -399,14 +400,14 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
       else {
         char proc_fd[64];
         snprintf(proc_fd, sizeof(proc_fd), "/proc/self/fd/%d", fd);
-        ssize_t rlen = readlink(proc_fd, path_ptr, length - 112);
+        ssize_t rlen = readlink(proc_fd, path_ptr, length - 128);
         if (rlen < 0 || (size_t)rlen >= length - 512) {
           int err = rlen < 0 ? (errno ? errno : EIO) : ENAMETOOLONG;
           close(fd);
           errno = err;
           value = -1;
         } else {
-          size_t start = (112 + (size_t)rlen + 7) & ~(size_t)7;
+          size_t start = (128 + (size_t)rlen + 7) & ~(size_t)7;
           size_t used = start;
           int err = 0;
           int complete = 0;

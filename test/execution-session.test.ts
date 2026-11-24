@@ -1,6 +1,9 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { expect, test, vi } from "vitest";
 import { fauxText, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { createReadTool } from "@earendil-works/pi-coding-agent";
+import { createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { LocalExecutionSession } from "../src/runtime-engine.ts";
 import type { ExecutionCall, ExecutionSession, RunCompletion } from "../src/execution-session.ts";
@@ -10,8 +13,9 @@ import { createActorForkPlanSource } from "../src/self-speculation.ts";
 import { PATTERN_AWARE_DEFAULTS, PatternAwareStore } from "../src/pattern-aware.ts";
 import { cause, zeroValidationMetrics } from "../src/settlement.ts";
 import { TimelineInterval } from "../src/task-timing.ts";
+import { resourceWorld, systemHost } from "./agent-system-fixture.ts";
+import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 import { testModel, toolUse } from "./model.ts";
-import path from "node:path";
 import { resourceBudgetError } from "../src/primitives.ts";
 
 const read = (name: string): ExecutionCall => ({ tool: "read", input: { path: name } });
@@ -396,11 +400,16 @@ test.each([true, false])("credits two exact predictions by the returned producer
 	}
 });
 
-test("session close drains source-request delivery from detached continuations", async () => {
+test("session close awaits async or rejecting release before close and drains source-request delivery", async () => {
 	const entered = Promise.withResolvers<void>();
 	const finish = Promise.withResolvers<void>();
+	const releaseGate = Promise.withResolvers<void>();
 	const sessionClosed = Promise.withResolvers<void>();
 	const order: string[] = [];
+	const unhandled: unknown[] = [];
+	const onUnhandled = (reason: unknown) => unhandled.push(reason);
+	process.on("unhandledRejection", onUnhandled);
+	const tools = [createReadTool("/virtual")];
 	const fork = createActorForkPlanSource();
 	vi.spyOn(fork.source, "start").mockImplementation((turn) => {
 		void turn.request("drafter", "continuation", turn.signal, async () => 1);
@@ -410,11 +419,32 @@ test("session close drains source-request delivery from detached continuations",
 		actorForkPlanSource: fork,
 		complete: vi.fn(),
 		executionSession: {
-			speculate: vi.fn(),
+			speculate(call) {
+				const runID = String(call.input.path);
+				return {
+					runID,
+					completion: Promise.resolve({
+						status: "completed",
+						output: { isError: false, result: { content: [fauxText("ok")], details: {} } },
+						served: false,
+						producerRunID: runID,
+						toolExecution: new TimelineInterval(0, 0),
+					}),
+				};
+			},
 			execute: vi.fn(),
-			release() {},
+			async release(id) {
+				if (id === "reject.txt") {
+					await new Promise<void>((resolve) => setImmediate(resolve));
+					throw new Error("release transport closed");
+				}
+				order.push("release_start");
+				await releaseGate.promise;
+				order.push("release_end");
+			},
 			async flush() {},
 			async close() {
+				order.push("close");
 				sessionClosed.resolve();
 			},
 		},
@@ -432,19 +462,26 @@ test("session close drains source-request delivery from detached continuations",
 	try {
 		await host.startTurn({
 			turnID: "turn",
-			tools: [],
+			tools,
 			actorModel: testModel(),
 			actorOptions: {},
-			context: { messages: [] },
+			context: { messages: [], tools },
 		});
 		await entered.promise;
+		for (const p of ["hold.txt", "reject.txt"])
+			await (await host.previewActorCall({ turnID: "turn", id: p, tool: "read", args: { path: p }, tools }))?.completion;
 		const closed = host.dispose();
+		await expect.poll(() => order).toEqual(["release_start"]);
+		releaseGate.resolve();
 		await sessionClosed.promise;
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		finish.resolve();
 		await closed;
-		expect(order).toEqual(["continuation", "closed"]);
+		expect(order).toEqual(["release_start", "release_end", "close", "continuation", "closed"]);
+		expect(unhandled).toEqual([]);
 	} finally {
+		process.off("unhandledRejection", onUnhandled);
+		releaseGate.resolve();
 		finish.resolve();
 		await host.dispose();
 	}
@@ -644,168 +681,281 @@ test("a five-method session drives all call generators and streaming preview, in
 	expect(session.close).toHaveBeenCalledOnce();
 });
 
-test("aborts and bypasses an in-flight unadoptable exclusive branch immediately when the Actor arrives", async () => {
-	const started = Promise.withResolvers<void>();
-	const aborted = Promise.withResolvers<void>();
-	const rejections: string[] = [];
-	const unadoptable: SpeculativeExecutionRoute = {
-		...exclusive,
-		adoptable: () => false,
-	};
-	const call: ExecutionCall = { tool: "write", input: { path: "out.txt", content: "x" } };
-	const session = new LocalExecutionSession<string>({
-		settings: () => ({ maxConcurrentActions: 2, resourceCacheMaxEntries: 8 }),
-		key: async (c) => PI_ACTION_SEMANTICS.buildKey(c.tool, c.input, "/workspace", "memory", { fingerprint: "test" }),
-		route: async () => unadoptable,
-		authorize: async () => ({ ok: true }),
-		capture: async () => undefined,
-		native: async () => "native-actor",
-		rejection: (_call, rejection) => {
-			rejections.push(rejection.cause.code);
+test("handles unadoptable exclusive branches, preserves active parent branches, and enforces coalesced-handle and cache-admission invariants", async () => {
+	const unadoptable: SpeculativeExecutionRoute = { ...exclusive, adoptable: () => false };
+	const disposed: string[] = [];
+	const makeBranch = (id: string, output: string, capturedBytes = 4, reconstruct?: WorldBranch<string>["reconstruct"]): WorldBranch<string> => ({
+		backend: "memory",
+		output,
+		resources: ["shared.txt"],
+		capturedBytes,
+		checkpoint: { id, backend: "memory", lineage: id, depth: 1 },
+		executionMetrics: {},
+		compatibility: { status: "compatible", executionFingerprint: "test", backend: "memory" },
+		validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }),
+		commit: async () => output,
+		reconstruct,
+		dispose() {
+			disposed.push(id);
 		},
-		fork: async (_call, _key, _route, _runID, signal) => {
-			started.resolve();
-			await new Promise<void>((_, reject) => {
-				signal.addEventListener("abort", () => {
-					aborted.resolve();
-					reject(signal.reason ?? new Error("aborted"));
-				}, { once: true });
-			});
-			throw new Error("unreachable");
+	});
+
+	for (const withChild of [false, true]) {
+		const started = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		const session = new LocalExecutionSession<string>({
+			settings: () => ({ maxConcurrentActions: 4, resourceCacheMaxEntries: 8 }),
+			effect: (key) => PI_ACTION_SEMANTICS.effect(key),
+			adoptable: (call) => call.tool !== "bash",
+			key: async (call) => PI_ACTION_SEMANTICS.buildKey(call.tool, call.input, "/workspace", "memory", { fingerprint: "test" }),
+			route: async (call) => (call.tool === "bash" ? unadoptable : exclusive),
+			authorize: async () => ({ ok: true }),
+			capture: async () => undefined,
+			native: async () => "native-actor",
+			fork: async (call, _key, _route, _runID, signal) => {
+				if (call.tool === "bash") {
+					started.resolve();
+					await new Promise<void>((resolve, reject) => {
+						finish.promise.then(resolve);
+						signal.addEventListener("abort", () => reject(signal.reason ?? new Error("aborted")), { once: true });
+					});
+				}
+				return makeBranch(call.tool, `spec:${call.tool}`);
+			},
+		});
+		try {
+			const parent = session.speculate({ tool: "bash", input: { command: "gen" } });
+			const child = withChild
+				? session.speculate({ tool: "write", input: { path: "out.txt", content: "next" } }, { after: parent.runID })
+				: undefined;
+			await started.promise;
+			expect(await session.execute({ tool: "bash", input: { command: "gen" } })).toMatchObject({ output: "native-actor", served: false });
+			finish.resolve();
+			if (withChild) {
+				expect(await parent.completion).toMatchObject({ status: "completed", output: "spec:bash" });
+				expect(await child!.completion).toMatchObject({ status: "completed", output: "spec:write" });
+			} else {
+				expect(await parent.completion).toMatchObject({ status: "rejected", reason: "candidate_failed" });
+			}
+		} finally {
+			finish.resolve();
+			await session.close();
+		}
+	}
+
+	disposed.length = 0;
+	let maxEntries = 1;
+	let flightBuilds = 0;
+	const flightStart = Promise.withResolvers<void>();
+	const flightEnd = Promise.withResolvers<void>();
+	const authEntered = Promise.withResolvers<void>();
+	const authGate = Promise.withResolvers<void>();
+	const session = new LocalExecutionSession<string>({
+		settings: () => ({ maxConcurrentActions: 4, resourceCacheMaxEntries: maxEntries, resourceCacheMaxBytes: 4096 }),
+		effect: (key) => PI_ACTION_SEMANTICS.effect(key),
+		key: async (call) => PI_ACTION_SEMANTICS.buildKey(call.tool, call.input, "/workspace", "memory", { fingerprint: "test" }),
+		route: async (call) => (call.tool === "write" ? exclusive : shared),
+		authorize: async (call, _key, _route, _signal, actor) => {
+			if (actor && call.input.path === "oversize-flight.txt") {
+				authEntered.resolve();
+				await authGate.promise;
+			}
+			return { ok: true };
+		},
+		capture: async () => undefined,
+		native: async (call) => {
+			if (call.input.path === "oversize-flight.txt") flightBuilds++;
+			return `native:${JSON.stringify(call.input)}`;
+		},
+		fork: async (call, _key, _route, runID) => {
+			const pathArg = String((call.input as { path?: string }).path ?? "");
+			if (pathArg === "oversize-flight.txt") {
+				flightBuilds++;
+				flightStart.resolve();
+				await flightEnd.promise;
+			}
+			if (pathArg.startsWith("oversize")) return makeBranch(runID, "x".repeat(32768), 32768);
+			if (pathArg.startsWith("snap-")) {
+				const exhaustedSnap = pathArg === "snap-exhausted.txt";
+				return {
+					...makeBranch(runID, `snap:${pathArg}`, 64, async (req) => {
+						const target = String((req.args as { path?: string }).path ?? "");
+						if (exhaustedSnap) throw resourceBudgetError("resource_snapshot_budget_exceeded", true);
+						if (target === "huge-view.txt") return { output: "v".repeat(32768), capturedBytes: 32768 };
+						return { output: `rebuilt:${target}`, capturedBytes: 32 };
+					}),
+					reconstructionScope: "current_action",
+					inputResources: [{ path: "/workspace", descendants: true }],
+				};
+			}
+			return makeBranch(runID, `ok:${pathArg}`, 128);
 		},
 	});
 	try {
-		const run = session.speculate(call);
-		await started.promise;
-		expect(await session.execute(call)).toMatchObject({ output: "native-actor", served: false });
-		await aborted.promise;
-		expect(await run.completion).toMatchObject({ status: "rejected", reason: "candidate_failed" });
-		expect(rejections).toEqual(["process_taints_unaccepted"]);
+		const h1 = session.speculate({ tool: "write", input: { path: "shared.txt", content: "v1" } });
+		expect((await h1.completion).status).toBe("completed");
+		const h2 = session.speculate({ tool: "write", input: { path: "shared.txt", content: "v1" } });
+		expect(await h2.completion).toMatchObject({ status: "completed", served: true });
+		const detour = session.speculate({ tool: "write", input: { path: "detour.txt", content: "v1" } });
+		expect((await detour.completion).status).toBe("completed");
+		expect(session.snapshot().branchEntries).toBe(1);
+		expect(disposed).not.toContain(detour.runID);
+		const fromDetour = session.speculate({ tool: "write", input: { path: "detour-2.txt", content: "v2" } }, { after: detour.runID });
+		expect(await fromDetour.completion).toMatchObject({ status: "completed", output: "ok:detour-2.txt" });
+		const childFromFirst = session.speculate({ tool: "write", input: { path: "shared.txt", content: "v2" } }, { after: h1.runID });
+		expect(await childFromFirst.completion).toMatchObject({ status: "completed", output: "ok:shared.txt" });
+		session.release(fromDetour.runID);
+		session.release(detour.runID);
+		await session.flush();
+		expect(disposed).toContain(detour.runID);
+		session.release(childFromFirst.runID);
+		session.release(h1.runID);
+		session.release(h2.runID);
+		await session.flush();
+
+		const turnController = new AbortController();
+		const oversizeRuns = ["oversize-a.txt", "oversize-b.txt", "oversize-c.txt", "oversize-d.txt"].map((p) =>
+			session.speculate({ tool: "read", input: { path: p } }, { signal: turnController.signal }),
+		);
+		for (const run of oversizeRuns) expect((await run.completion).status).toBe("completed");
+		turnController.abort();
+		await session.flush();
+		expect(session.snapshot()).toMatchObject({ resultEntries: 0, resultBytes: 0 });
+		for (const run of oversizeRuns) expect(disposed).toContain(run.runID);
+		for (const p of ["oversize-a.txt", "oversize-b.txt", "oversize-c.txt", "oversize-d.txt"])
+			expect((await session.execute({ tool: "read", input: { path: p } })).served).toBe(false);
+
+		const flight = session.speculate(read("oversize-flight.txt"));
+		await flightStart.promise;
+		const joined = session.execute(read("oversize-flight.txt"));
+		await authEntered.promise;
+		flightEnd.resolve();
+		expect((await flight.completion).status).toBe("completed");
+		session.release(flight.runID);
+		expect(session.snapshot()).toMatchObject({ resultEntries: 0, resultBytes: 0 });
+		authGate.resolve();
+		expect(await joined).toMatchObject({ output: "x".repeat(32768), served: true });
+		expect(flightBuilds).toBe(1);
+		expect((await session.execute(read("oversize-flight.txt"))).served).toBe(false);
+		expect(flightBuilds).toBe(2);
+
+		maxEntries = 4;
+		for (const p of ["small-1.txt", "snap-good.txt", "snap-exhausted.txt"]) {
+			const r = session.speculate({ tool: "read", input: { path: p } });
+			await r.completion;
+			expect((await session.execute({ tool: "read", input: { path: p } })).served).toBe(true);
+		}
+		expect(await session.execute({ tool: "read", input: { path: "derived-small.txt" } })).toMatchObject({
+			output: "rebuilt:derived-small.txt",
+			served: true,
+		});
+		expect(await session.execute({ tool: "read", input: { path: "huge-view.txt" } })).toMatchObject({
+			served: true,
+		});
+		const bigSpec = session.speculate({ tool: "read", input: { path: "oversize.txt" } });
+		await bigSpec.completion;
+		session.release(bigSpec.runID);
+
+		expect(await session.execute({ tool: "read", input: { path: "small-1.txt" } })).toMatchObject({
+			output: "ok:small-1.txt",
+			served: true,
+		});
+		expect(await session.execute({ tool: "read", input: { path: "derived-small.txt" } })).toMatchObject({
+			output: "rebuilt:derived-small.txt",
+			served: true,
+			reusedInterval: true,
+		});
 	} finally {
+		flightEnd.resolve();
+		authGate.resolve();
 		await session.close();
 	}
-});
 
-test("preserves an unadoptable exclusive parent branch when an after successor still depends on it", async () => {
-	const parentStarted = Promise.withResolvers<void>();
-	const finishParent = Promise.withResolvers<void>();
-	const unadoptable: SpeculativeExecutionRoute = {
-		...exclusive,
-		adoptable: () => false,
-	};
-	const session = new LocalExecutionSession<string>({
-		settings: () => ({ maxConcurrentActions: 4, resourceCacheMaxEntries: 16 }),
-		effect: (key) => PI_ACTION_SEMANTICS.effect(key),
-		adoptable: (call) => call.tool !== "bash",
-		key: async (call) =>
-			PI_ACTION_SEMANTICS.buildKey(call.tool, call.input, "/workspace", "memory", { fingerprint: "test" }),
-		route: async (call) => (call.tool === "bash" ? unadoptable : exclusive),
-		authorize: async () => ({ ok: true }),
-		capture: async () => undefined,
-		native: async () => "native-actor",
-		fork: async (call) => {
-			if (call.tool === "bash") {
-				parentStarted.resolve();
-				await finishParent.promise;
-			}
-			return {
-				backend: "memory",
-				output: `spec:${call.tool}`,
-				resources: ["out.txt"],
-				capturedBytes: 4,
-				checkpoint: { id: call.tool, backend: "memory", lineage: call.tool, depth: 1 },
-				executionMetrics: {},
-				compatibility: { status: "compatible", executionFingerprint: "test", backend: "memory" },
-				validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }),
-				commit: async () => `spec:${call.tool}`,
-				dispose() {},
-			};
-		},
-	});
+	const dir = await mkdtemp(path.join(os.tmpdir(), "pi-oversize-preview-"));
+	const names = ["alpha", "beta", "gamma", "delta"];
+	for (const name of names) await writeFile(path.join(dir, name), name[0]!.repeat(32768));
+	await writeFile(path.join(dir, "small.txt"), "hello\n");
+	const host = systemHost(dir, [createReadTool(dir)], {}, { resourceCacheMaxEntries: 1, resourceCacheMaxBytes: 8192 });
 	try {
-		const parent = session.speculate({ tool: "bash", input: { command: "gen" } });
-		const child = session.speculate({ tool: "write", input: { path: "out.txt", content: "next" } }, { after: parent.runID });
-		await parentStarted.promise;
-		expect(await session.execute({ tool: "bash", input: { command: "gen" } })).toMatchObject({
-			output: "native-actor",
-			served: false,
-		});
-		finishParent.resolve();
-		expect(await parent.completion).toMatchObject({ status: "completed", output: "spec:bash" });
-		expect(await child.completion).toMatchObject({ status: "completed", output: "spec:write" });
-	} finally {
-		finishParent.resolve();
-		await session.close();
-	}
-});
+		await host.start("turn-1");
+		const previewSignal = new AbortController();
+		for (const name of names) {
+			const run = await host.preview("read", { path: name }, previewSignal.signal, `p-${name}`);
+			expect((await run?.completion)?.status).toBe("completed");
+		}
+		previewSignal.abort();
+		await host.finish();
+		expect(host.events.at(-1)?.cache).toMatchObject({ resultEntries: 0, resultBytes: 0 });
+		await host.start("turn-2");
+		for (const name of names) await host.execute("read", { path: name }, undefined, `a-${name}`);
+		expect(host.fallbacks).toHaveLength(4);
+		expect(host.actors.every((ev) => ev.settlement.provider.kind === "actor" && ev.settlement.provider.origin === "fallback")).toBe(true);
 
-test("bypasses unadoptable route admission and non-observation input candidates without blocking the Actor", async () => {
-	const routing = Promise.withResolvers<void>();
-	const routeAborted = Promise.withResolvers<void>();
-	const reading = Promise.withResolvers<void>();
-	const finishRead = Promise.withResolvers<void>();
-	const unadoptable: SpeculativeExecutionRoute = {
-		...exclusive,
-		adoptable: () => false,
-	};
-	const session = new LocalExecutionSession<string>({
-		settings: () => ({ maxConcurrentActions: 4, resourceCacheMaxEntries: 16 }),
-		effect: (key) => PI_ACTION_SEMANTICS.effect(key),
-		adoptable: (call) => call.tool !== "bash",
-		key: async (call) =>
-			PI_ACTION_SEMANTICS.buildKey(call.tool, call.input, "/workspace", "memory", { fingerprint: "test" }),
-		route: async (call, _key, signal) => {
-			if (call.tool === "read") return shared;
-			routing.resolve();
-			await new Promise<void>((_, reject) => {
-				signal.addEventListener("abort", () => {
-					routeAborted.resolve();
-					reject(signal.reason ?? new Error("aborted"));
-				}, { once: true });
-			});
-			return unadoptable;
-		},
-		authorize: async () => ({ ok: true }),
-		capture: async () => undefined,
-		native: async (call) => `native:${call.tool}`,
-		fork: async (call) => {
-			if (call.tool === "read") {
-				reading.resolve();
-				await finishRead.promise;
+		for (const inject of [false, true]) {
+			const readTool = createReadTool(dir);
+			const spy = vi.spyOn(readTool, "execute");
+			const injected = inject
+				? new LocalExecutionSession<ToolSettlement>({
+						settings: () => ({ maxConcurrentActions: 2, resourceCacheMaxEntries: 2, resourceCacheMaxBytes: 65536 }),
+						effect: (key) => PI_ACTION_SEMANTICS.effect(key),
+						key: async (call) => PI_ACTION_SEMANTICS.buildKey(call.tool, call.input, dir, "memory", { fingerprint: "inj" }),
+						route: async () => shared,
+						authorize: async () => ({ ok: true }),
+						capture: async () => undefined,
+						native: async (call, _key, signal) => ({ result: await readTool.execute(call.id ?? "a", call.input as never, signal), isError: false }),
+						fork: async (call, _key, _route, runID, signal) => {
+							const out = { result: await readTool.execute(runID, call.input as never, signal), isError: false };
+							return {
+								backend: "memory", output: out, resources: [path.join(dir, String(call.input.path))], capturedBytes: 6,
+								executionMetrics: {}, compatibility: { status: "compatible", executionFingerprint: "inj", backend: "memory" },
+								validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }), commit: async () => out, dispose() {},
+							};
+						},
+					})
+				: undefined;
+			const h = systemHost(dir, [readTool], injected ? { executionSession: injected } : {}, { resourceCacheMaxEntries: 2 }, inject ? "inj" : "loc");
+			try {
+				await h.start("t1");
+				expect((await (await h.preview("read", { path: "small.txt" }, undefined, "p"))?.completion)?.status).toBe("completed");
+				await h.finish();
+				expect(injected ? injected.snapshot().resultEntries : h.events.at(-1)?.cache.resultEntries).toBe(1);
+				await h.start("t2");
+				const out = await h.execute("read", { path: "small.txt" }, undefined, "a");
+				expect(out.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("hello") });
+				if (inject) expect(spy).toHaveBeenCalledTimes(1);
+				expect(h.fallbacks).toEqual([]);
+			} finally {
+				await h.dispose();
 			}
-			return {
-				backend: "memory",
-				output: "cached",
-				resources: ["shared.txt"],
-				capturedBytes: 6,
-				executionMetrics: {},
-				compatibility: { status: "compatible", executionFingerprint: "test", backend: "memory" },
-				validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }),
-				commit: async () => "cached",
-				dispose() {},
-			};
-		},
-	});
-	try {
-		const preview = session.speculate({ tool: "bash", input: { command: "pytest" } });
-		await routing.promise;
-		expect(await session.execute({ tool: "bash", input: { command: "pytest" } })).toMatchObject({
-			output: "native:bash",
-			served: false,
-		});
-		await routeAborted.promise;
-		expect(await preview.completion).toMatchObject({ status: "cancelled" });
+		}
 
-		const inflightRead = session.speculate({ tool: "read", input: { path: "shared.txt" } });
-		await reading.promise;
-		expect(await session.execute({ tool: "write", input: { path: "shared.txt", content: "updated" } })).toMatchObject({
-			output: "native:write",
-			served: false,
-		});
-		finishRead.resolve();
-		await inflightRead.completion;
+		const spiedRead = createReadTool(dir);
+		const readSpy = vi.spyOn(spiedRead, "execute");
+		const sandbox = new WorkspaceSandboxService();
+		const fork = createActorForkPlanSource();
+		const single = systemHost(
+			dir,
+			[createWriteTool(dir), spiedRead],
+			{ actorForkPlanSource: fork, executionWorlds: [sandbox.createExecutionWorld(), resourceWorld()] },
+			{ resourceCacheMaxEntries: 1, selfSpeculation: { enabled: true, forkEnabled: true, forkActionEnabled: true, forkTransport: "sidecar" } },
+			"single-slot",
+		);
+		try {
+			fork.startTurn("t1");
+			await single.start("t1");
+			fork.publish("t1", [{ id: "g", calls: [{ id: "w", index: 0, tool: "write", input: { path: "note.txt", content: "fresh\n" } }] }]);
+			await single.ready(["note.txt"]);
+			await single.execute("write", { path: "note.txt", content: "fresh\n" }, undefined, "aw");
+			const rebuilt = await single.execute("read", { path: "note.txt" }, undefined, "ar");
+			expect(rebuilt.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("fresh") });
+			expect(readSpy).not.toHaveBeenCalled();
+			expect(single.actors.at(-1)?.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "inputs" } });
+		} finally {
+			await single.dispose();
+			await sandbox.dispose();
+		}
 	} finally {
-		finishRead.resolve();
-		await session.close();
+		await host.dispose();
+		await rm(dir, { recursive: true, force: true });
 	}
 });

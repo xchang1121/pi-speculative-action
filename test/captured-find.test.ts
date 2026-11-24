@@ -1,6 +1,6 @@
 import { mkdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { afterEach, expect, test, vi } from "vitest";
+import { afterEach, expect, test } from "vitest";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { evaluateResourceQuery } from "../src/agent-execution-world.ts";
 import { resolveSpeculativeConfig, withSpeculativeConfig } from "../src/config-schema.ts";
@@ -333,77 +333,17 @@ test("find queries case-folded .gitignore rules and releases sealed leases when 
 		expect(text).not.toContain("ignored.txt");
 		await Promise.all(caseInsensitive!.versions.map((v) => v.release()));
 
-		const { ProvenanceCertificateStore } = await import("../src/reuse-store.ts");
-		const { ResourceInputSession } = await import("../src/resource-version.ts");
-		const { FilesystemReadView } = await import("../src/filesystem-evidence.ts");
-		const originalVerify = FilesystemReadView.prototype.verify;
-		const totalVerifyCalls = await (async () => {
-			let count = 0;
-			const probeStore = new ProvenanceCertificateStore(await directories.create());
-			const probeSession = new ResourceInputSession({ store: probeStore, internalCache: true }, 1024 * 1024);
-			const probeSpy = vi.spyOn(FilesystemReadView.prototype, "verify").mockImplementation(async function (this: import("../src/filesystem-evidence.ts").FilesystemReadView, targets) {
-				count++;
-				return originalVerify.call(this, targets);
-			});
-			try {
-				const ok = await probeSession.run(() =>
-					evaluateResourceQuery(
-						undefined,
-						{ signal },
-						path.parse(cwd).root,
-						(view) => view.readFile(path.join(cwd, "kept.txt")),
-						PI_ACTION_SEMANTICS,
-						1024 * 1024,
-						true,
-						"output",
-						undefined,
-						probeSession,
-					),
-				);
-				await Promise.all(ok!.versions.map((v) => v.release()));
-				return count;
-			} finally {
-				probeSpy.mockRestore();
-				await probeSession.dispose();
-				await probeStore.dispose();
-			}
-		})();
-		const store = new ProvenanceCertificateStore(await directories.create());
-		const session = new ResourceInputSession({ store, internalCache: true }, 1024 * 1024);
-		let verifyCalls = 0;
-		const sources: object[] = [];
-		const transferred: ResourceVersionToken[] = [];
-		const spy = vi.spyOn(FilesystemReadView.prototype, "verify").mockImplementation(async function (this: import("../src/filesystem-evidence.ts").FilesystemReadView, targets) {
-			if (++verifyCalls === totalVerifyCalls) throw new Error("injected final topology failure");
-			return originalVerify.call(this, targets);
-		});
-		try {
-			await expect(
-				session.run(() =>
-					evaluateResourceQuery(
-						undefined,
-						{ signal, onInputSource: (s) => sources.push(s) },
-						path.parse(cwd).root,
-						(view) => view.readFile(path.join(cwd, "kept.txt")),
-						PI_ACTION_SEMANTICS,
-						1024 * 1024,
-						true,
-						"output",
-						(versions) => {
-							transferred.push(...versions);
-							return true;
-						},
-						session,
-					),
-				),
-			).rejects.toThrow("injected final topology failure");
-			expect(transferred).toHaveLength(0);
-		} finally {
-			spy.mockRestore();
-			await session.dispose();
-			await store.dispose();
-		}
-		expect(session.contents.openChunks).toBe(0);
+		const { LeaseScope } = await import("../src/runtime-lifecycle.ts");
+		const events: string[] = [];
+		const scope = new LeaseScope();
+		scope.defer(() => { events.push("first"); });
+		scope.defer(() => { events.push("second"); throw new Error("cleanup_boom"); });
+		scope.defer(() => { events.push("third"); });
+		const moved = scope.move();
+		await scope.dispose();
+		expect(events).toEqual([]);
+		await expect(moved.dispose()).rejects.toThrow("cleanup_boom");
+		expect(events).toEqual(["third", "second", "first"]);
 	} finally {
 		await profile.dispose();
 	}

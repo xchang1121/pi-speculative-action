@@ -15,8 +15,11 @@ export function errorDetail(error: unknown): string {
 export function hasErrorCode(error: unknown, code: string): boolean {
 	return Boolean(error && typeof error === "object" && "code" in error && error.code === code);
 }
-export function resourceBudgetError(detail: string) {
-	return Object.assign(new Error(detail), { code: "ERR_RESOURCE_BUDGET" });
+export function resourceBudgetError(detail: string, snapshotScoped = false) {
+	return Object.assign(new Error(detail), {
+		code: "ERR_RESOURCE_BUDGET",
+		...(snapshotScoped ? { snapshotScoped: true as const } : {}),
+	});
 }
 export function isMissing(error: unknown): boolean {
 	return hasErrorCode(error, "ENOENT");

@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
+import fs from "node:fs";
 import { once } from "node:events";
 import { lutimes, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -14,7 +15,10 @@ import { executionRecords, observeExecution, traceTail } from "../src/execution-
 import { createBashTool, createReadTool } from "@earendil-works/pi-coding-agent";
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import { expect, test, vi } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
+import * as processContext from "../src/process-context.mjs";
+
+afterEach(() => vi.restoreAllMocks());
 import {
 	createControlledBashOperations,
 	resolveSpeculativeConfig,
@@ -791,6 +795,101 @@ test.skipIf(process.platform !== "linux").for([false, true])(
 		} finally {
 			await host.dispose();
 			await rm(root, { recursive: true, force: true });
+		}
+	},
+);
+
+test.skipIf(process.platform !== "linux")(
+	"samples mutable self memory nodes, isolates concurrent child scheduling probes, and matches kernel SCHED_BATCH reset-on-fork inheritance",
+	async () => {
+		const realReadFileSync = fs.readFileSync.bind(fs);
+		let simulatedMems = "0";
+		vi.spyOn(fs, "readFileSync").mockImplementation(((target: unknown, ...rest: unknown[]) => {
+			if (target === "/proc/self/status" || target === `/proc/${process.pid}/status`) {
+				return String(realReadFileSync(target as string, "utf8")).replace(
+					/^Mems_allowed_list:\s*.*$/m,
+					`Mems_allowed_list:\t${simulatedMems}`,
+				);
+			}
+			return (realReadFileSync as (...args: unknown[]) => unknown)(target, ...rest);
+		}) as typeof fs.readFileSync);
+
+		const firstSelf = await processContext.captureProcessScheduling(process.pid);
+		simulatedMems = "1";
+		const secondSelf = await processContext.captureProcessScheduling(process.pid);
+		expect(firstSelf.memoryNodes).toBe("0");
+		expect(secondSelf.memoryNodes).toBe("1");
+		vi.restoreAllMocks();
+
+		const baseNice = (await processContext.captureProcessScheduling(process.pid)).nice;
+		const spawnNiced = async (delta: number) => {
+			const child = spawn(
+				"python3",
+				["-c", `import os, sys, time; os.nice(${delta}); sys.stdout.write("ready\\n"); sys.stdout.flush(); time.sleep(10)`],
+				{ stdio: ["ignore", "pipe", "ignore"] },
+			);
+			await once(child.stdout, "data");
+			return child;
+		};
+		const childA = await spawnNiced(2);
+		const childB = await spawnNiced(9);
+		try {
+			const [serialA, serialB] = [
+				await processContext.captureProcessScheduling(childA.pid!),
+				await processContext.captureProcessScheduling(childB.pid!),
+			];
+			const [concurrentA, concurrentB] = await Promise.all([
+				processContext.captureProcessScheduling(childA.pid!),
+				processContext.captureProcessScheduling(childB.pid!),
+			]);
+			expect([serialA.nice, serialB.nice]).toEqual([baseNice + 2, baseNice + 9]);
+			expect([concurrentA.nice, concurrentB.nice]).toEqual([baseNice + 2, baseNice + 9]);
+		} finally {
+			childA.kill("SIGKILL");
+			childB.kill("SIGKILL");
+		}
+
+		const kernelBatchChild = 3;
+		expect(
+			processContext.forkedProcessScheduling({
+				policy: 3 | 0x40000000,
+				priority: 0,
+				nice: 0,
+				cpus: "0",
+				memoryNodes: "0",
+			}).policy,
+		).toBe(kernelBatchChild);
+
+		const fixture = await createLinuxProcessBenchmark("pi-coalesce-events-", "in_memory", {}, os.homedir());
+		const host = systemHost(
+			fixture.workspace,
+			[fixture.tool],
+			{
+				config: {
+					processReuse: {
+						maxOutputEvents: 1,
+						replayAcceptedTaints: ["clock", "random", "pid_observation", "descriptor_observation"],
+					},
+				},
+				executionWorlds: [fixture.world],
+				resolveInvocation: (_tool, input) => fixture.invocation(input as Record<string, unknown>),
+			},
+			{ enabled: false, prepareObservedOperations: false },
+		);
+		try {
+			await fixture.prepare();
+			await host.start();
+			const cmd = `python3 -c 'import os, time; os.write(1, b"A"); time.sleep(0.02); os.write(1, b"B")'`;
+			expect(textOutput(await host.execute("bash", { command: cmd }))).toBe("AB");
+			expect(textOutput(await host.execute("bash", { command: cmd }))).toBe("AB");
+			expect(
+				fixture.backend.actorMetrics().wholeCommandPublished,
+				fixture.backend.actorMetrics().lastError,
+			).toBeGreaterThan(0);
+			expect(fixture.backend.actorMetrics().wholeCommandHits).toBeGreaterThan(0);
+		} finally {
+			await host.dispose();
+			await fixture.dispose();
 		}
 	},
 );

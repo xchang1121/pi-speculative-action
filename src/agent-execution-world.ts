@@ -35,7 +35,7 @@ import {
 	settledFilesystemStat,
 	withFilesystemReadView,
 } from "./filesystem-evidence.ts";
-import { containsFilesystemPath, relativeFilesystemPath } from "./primitives.ts";
+import { containsFilesystemPath, relativeFilesystemPath, resourceBudgetError } from "./primitives.ts";
 import {
 	captureResourceVersion,
 	collectResourceComputation,
@@ -52,6 +52,7 @@ import {
 	type ToolFilesystemOperations,
 	type ToolFilesystemStat,
 } from "./resource-version.ts";
+import { LeaseScope } from "./runtime-lifecycle.ts";
 import { cause } from "./settlement.ts";
 import { TimelineInterval } from "./task-timing.ts";
 const resourceOperationContext = new AsyncLocalStorage<
@@ -300,56 +301,65 @@ export class ResourceObjectInputs {
 	async publish() {
 		if (!this.captured.size) return 0;
 		return withFilesystemReadView(undefined, async () => {
-			const owned: ResourceVersionToken[] = [];
-			try {
-				const entries = [...this.captured];
-				const maxPartitions = 16;
-				const groups: (typeof entries)[] = [];
-				if (entries.length <= maxPartitions) {
-					for (const entry of entries) groups.push([entry]);
-				} else {
-					const chunkSize = Math.ceil(entries.length / maxPartitions);
-					for (let index = 0; index < entries.length; index += chunkSize)
-						groups.push(entries.slice(index, index + chunkSize));
-				}
-				const captureValid = async (
-					group: typeof entries,
-				): Promise<{ readonly token: ResourceVersionToken; readonly count: number }[]> => {
-					if (!group.length) return [];
-					try {
-						const token = await this.session.capture(
+			await using owned = new LeaseScope();
+			const entries = [...this.captured];
+			const maxPartitions = 16;
+			const groups: (typeof entries)[] = [];
+			const step = Math.max(1, Math.ceil(entries.length / maxPartitions));
+			for (let index = 0; index < entries.length; index += step) groups.push(entries.slice(index, index + step));
+			const captureGroup = async (
+				group: typeof entries,
+			): Promise<{ readonly token: ResourceVersionToken; readonly group: typeof entries }[]> => {
+				if (!group.length) return [];
+				try {
+					const token = owned.adopt(
+						await this.session.capture(
 							undefined,
 							this.root,
 							PI_ACTION_SEMANTICS,
 							this.session.maxBytes,
 							new Map(group),
-						);
-						owned.push(token);
-						token.view?.seal();
-						if (!(await validateResourceVersion([token], true)).expired)
-							return [{ token, count: group.length }];
-					} catch {
-						this.signal.throwIfAborted();
-					}
-					if (group.length === 1) return [];
-					const middle = Math.ceil(group.length / 2);
-					return [
-						...(await captureValid(group.slice(0, middle))),
-						...(await captureValid(group.slice(middle))),
-					];
-				};
-				const validated = (await mapFilesystem(groups, captureValid, this.signal)).flat();
-				if (!validated.length) return 0;
-				return await this.session.configuration.store.withPublication(async () => {
-					await mapFilesystem(validated, async ({ token }) => {
-						if (!await this.session.publish(token, this.signal)) throw new Error("file input publication failed");
-					}, this.signal);
+						),
+						(item) => item.release(),
+					);
+					token.view?.seal();
+					if (!(await validateResourceVersion([token], true)).expired) return [{ token, group }];
+				} catch {
 					this.signal.throwIfAborted();
-					return validated.reduce((sum, { count }) => sum + count, 0);
-				});
-			} finally {
-				await Promise.all(owned.map((token) => token.release()));
-			}
+				}
+				if (group.length === 1) return [];
+				const middle = Math.ceil(group.length / 2);
+				return [
+					...(await captureGroup(group.slice(0, middle))),
+					...(await captureGroup(group.slice(middle))),
+				];
+			};
+			const validated = (await mapFilesystem(groups, captureGroup, this.signal)).flat();
+			if (!validated.length) return 0;
+			const publishItem = async ({
+				token,
+				group,
+			}: {
+				readonly token: ResourceVersionToken;
+				readonly group: typeof entries;
+			}): Promise<number> => {
+				if (await this.session.publish(token, this.signal, [], true)) return group.length;
+				this.signal.throwIfAborted();
+				if (group.length <= 1) return 0;
+				const middle = Math.ceil(group.length / 2);
+				const split = [
+					...(await captureGroup(group.slice(0, middle))),
+					...(await captureGroup(group.slice(middle))),
+				];
+				let count = 0;
+				for (const sub of split) count += await publishItem(sub);
+				return count;
+			};
+			return await this.session.configuration.store.withPublication(async () => {
+				const counts = await mapFilesystem(validated, publishItem, this.signal);
+				this.signal.throwIfAborted();
+				return counts.reduce((sum, count) => sum + count, 0);
+			});
 		});
 	}
 	[Symbol.asyncDispose]() {
@@ -380,203 +390,223 @@ export async function evaluateResourceQuery<Output>(
 ) {
 	signal.throwIfAborted();
 	let sealed: ResourceVersionToken[] | undefined;
+	const sealedLeases = new LeaseScope();
 	const inputSource = publish && Object.freeze({});
-	const discardSealed = async () => {
-		await TimelineInterval.outside(async () => {
-			if (inputSource) resourceVersions.delete(inputSource);
-			const tokens = sealed ? [...sealed] : [];
-			sealed = undefined;
-			await Promise.allSettled(tokens.map(releaseResourceVersion));
-		});
-	};
-	const result = await withFilesystemReadView(
-		undefined,
-		async (fsView) => {
-			const borrowed: ResourceVersionToken[] = [];
-			const recover = session?.reader(root, signal, (token) => {
-				borrowed.push(token);
-			});
-			const capture = () =>
-				session
-					? session.capture(undefined, root, semantics, maxBytes)
-					: captureResourceVersion(undefined, root, semantics, maxBytes);
-			const initial = inputs ? undefined : await capture();
-			initial?.view?.seal();
-			const versions = inputs ?? [initial!];
-			const version = versions[0]!;
-			const view = version.view!;
-			const retained: ResourceVersionToken[] = [];
-			let missing: Promise<ResourceVersionToken> | undefined;
-			let captured: ResourceVersionToken | undefined;
-	// Keep the initiating view first: it owns the query's root resolution, even when another source answers first.
-	const proofs = new Map<ResourceVersionToken, Map<string, ResourceObservation>>([[version, new Map()]]);
-	const observe = (
-		token: ResourceVersionToken,
-		dependencies: ReadonlySet<string> | undefined,
-		commit = true,
-	) => {
-		// A step owns the observations of this read. The enclosing query also validates its other reads.
-		const observations = new Map<string, ResourceObservation>();
-		for (const key of dependencies ?? token.observations.keys()) {
-			const entry = token.observations.get(key);
-			if (!entry) throw new Error("resource_input_proof_missing");
-			observations.set(key, entry);
-		}
-		if (commit) {
-			const query = proofs.get(token);
-			if (query) for (const [key, entry] of observations) query.set(key, entry);
-			else proofs.set(token, new Map(observations));
-		}
-		return { ...token, observations, view: undefined };
-	};
-	const observeOwner = (
-		tokens: readonly ResourceVersionToken[],
-		dependencies: ReadonlySet<string> | undefined,
-		commit = true,
-	) =>
-		dependencies
-			? [observe(tokens[0]!, dependencies, commit)]
-			: tokens.map((token) => observe(token, undefined, commit));
+	const discardSealed = () => TimelineInterval.outside(() => sealedLeases.dispose());
 	try {
-		return await collectResourceComputation(
-			async () => {
-				if (inputSource) {
-					resourceVersions.set(inputSource, () => sealed ?? (captured ? [...versions, captured] : versions));
-					publish!(inputSource);
-				}
-				view.assertComplete(true);
-				let output: Output;
-				let completed = false;
+		const result = await withFilesystemReadView(
+			undefined,
+			async (fsView) => {
+				const queryLeases = new LeaseScope();
+				const ownedLeases = new LeaseScope();
+				const retainedSet = new Set<ResourceVersionToken>();
+				const recover = session?.reader(root, signal, (token) => {
+					queryLeases.adopt(token, releaseResourceVersion);
+				});
+				const capture = () =>
+					session
+						? session.capture(undefined, root, semantics, maxBytes)
+						: captureResourceVersion(undefined, root, semantics, maxBytes);
+				const initial = inputs ? undefined : queryLeases.adopt(await capture(), releaseResourceVersion);
+				initial?.view?.seal();
+				const versions = inputs ?? [initial!];
+				const version = versions[0]!;
+				const view = version.view!;
+				let missing: Promise<ResourceVersionToken> | undefined;
+				let captured: ResourceVersionToken | undefined;
+				// Keep the initiating view first: it owns the query's root resolution, even when another source answers first.
+				const proofs = new Map<ResourceVersionToken, Map<string, ResourceObservation>>([[version, new Map()]]);
+				const observe = (
+					token: ResourceVersionToken,
+					dependencies: ReadonlySet<string> | undefined,
+					commit = true,
+				) => {
+					// A step owns the observations of this read. The enclosing query also validates its other reads.
+					const observations = new Map<string, ResourceObservation>();
+					for (const key of dependencies ?? token.observations.keys()) {
+						const entry = token.observations.get(key);
+						if (!entry) throw new Error("resource_input_proof_missing");
+						observations.set(key, entry);
+					}
+					if (commit) {
+						const query = proofs.get(token);
+						if (query) for (const [key, entry] of observations) query.set(key, entry);
+						else proofs.set(token, new Map(observations));
+					}
+					return { ...token, observations, view: undefined };
+				};
+				const observeOwner = (
+					tokens: readonly ResourceVersionToken[],
+					dependencies: ReadonlySet<string> | undefined,
+					commit = true,
+				) =>
+					dependencies
+						? [observe(tokens[0]!, dependencies, commit)]
+						: tokens.map((token) => observe(token, undefined, commit));
 				try {
-					output = await view.evaluate(
-						execute,
-						(dependencies, commit) => observeOwner(versions, dependencies, commit),
-						root,
-						async function* (target, preparation, cold: boolean | "content" = true) {
-							const owners = [
-								versions,
-								...[...(lookup?.(target) ?? [])].map((source) => resourceVersions.get(source)?.() ?? []),
-							];
-							for (const tokens of owners)
-								for (const token of tokens)
-									if (token.view)
-										yield {
-											view: token.view.readOnly(),
-											observed: (dependencies, commit) =>
-												dependencies
-													? [observe(token, dependencies, commit)]
-													: observeOwner(tokens, undefined, commit),
-										};
-							if (!cold && !preparation) return;
-							for await (const token of recover?.(target, preparation, cold === "content") ?? [])
-								if (token.view)
-									yield {
-										view: token.view.readOnly(),
-										observed: (dependencies, commit) => [observe(token, dependencies, commit)],
-									};
-						},
+					return await collectResourceComputation(
 						async () => {
-							const token = await (missing ??= capture().then((token) => (captured = token)));
-							if (!token.view) throw new Error("resource_snapshot_budget_exceeded");
-							return {
-								view: token.view,
-								observed: (dependencies, commit) => [observe(token, dependencies, commit)],
-							};
+							if (inputSource) {
+								resourceVersions.set(
+									inputSource,
+									() => sealed ?? (captured ? [...versions, captured] : versions),
+								);
+								publish!(inputSource);
+							}
+							view.assertComplete(true);
+							let output: Output;
+							let completed = false;
+							try {
+								output = await view.evaluate(
+									execute,
+									(dependencies, commit) => observeOwner(versions, dependencies, commit),
+									root,
+									async function* (target, preparation, cold: boolean | "content" = true) {
+										const owners = [
+											versions,
+											...[...(lookup?.(target) ?? [])].map(
+												(source) => resourceVersions.get(source)?.() ?? [],
+											),
+										];
+										for (const tokens of owners)
+											for (const token of tokens)
+												if (token.view)
+													yield {
+														view: token.view.readOnly(),
+														observed: (dependencies, commit) =>
+															dependencies
+																? [observe(token, dependencies, commit)]
+																: observeOwner(tokens, undefined, commit),
+													};
+										if (!cold && !preparation) return;
+										for await (const token of recover?.(target, preparation, cold === "content") ?? [])
+											if (token.view)
+												yield {
+													view: token.view.readOnly(),
+													observed: (dependencies, commit) => [observe(token, dependencies, commit)],
+												};
+									},
+									async () => {
+										const token = await (missing ??= capture().then(
+											(item) => (captured = ownedLeases.adopt(item, releaseResourceVersion)),
+										));
+										if (!token.view) throw resourceBudgetError("resource_snapshot_budget_exceeded", true);
+										return {
+											view: token.view,
+											observed: (dependencies, commit) => [observe(token, dependencies, commit)],
+										};
+									},
+									(items) =>
+										items.map((input) => {
+											const proof = ownedLeases.adopt(
+												session ? session.retain(input) : input.manager.retain(input),
+												releaseResourceVersion,
+											);
+											retainedSet.add(proof);
+											observe(proof, undefined);
+											return proof;
+										}),
+									async (items) => {
+										if (
+											acceptObservation &&
+											items.some((proof) =>
+												[...proof.observations.values()].some(
+													(observation) => !acceptObservation(observation),
+												),
+											)
+										)
+											throw new Error("resource_input_changed_in_transaction");
+										await validateResourceInputs(items, true);
+									},
+									session?.memory,
+								);
+								completed = true;
+							} finally {
+								await TimelineInterval.outside(async () => {
+									if (!completed && !transfer) return;
+									try {
+										let bytes = captured?.view?.bytes ?? 0;
+										captured?.view?.seal();
+										const owned = captured ? [captured] : [];
+										for (const [token, observations] of proofs)
+											if (observations.size && token !== captured) {
+												const selected =
+													observations.size === token.observations.size
+														? token
+														: { ...token, observations };
+												const metadataBytes = retainMetadata
+													? Math.min(maxBytes - bytes, session?.remainingBytes ?? maxBytes)
+													: undefined;
+												const proof = retainedSet.has(selected)
+													? selected
+													: ownedLeases.adopt(
+															session
+																? session.retain(selected, metadataBytes)
+																: selected.manager.retain(selected, metadataBytes),
+															releaseResourceVersion,
+														);
+												retainedSet.add(proof);
+												owned.push(proof);
+												bytes += proof.view?.bytes ?? 0;
+											}
+										if (completed && validation === "output") await validateResourceInputs(owned, true);
+										if (!transfer) signal.throwIfAborted();
+										if (
+											(!retainMetadata || resourceProofBytes(owned) + bytes <= maxBytes) &&
+											(!session || session.bytes <= session.maxBytes)
+										) {
+											if (captured)
+												await session?.publish(
+													captured,
+													signal,
+													[...proofs].map(([token, observations]) => ({
+														...token,
+														observations,
+													})),
+												);
+											if (!completed) {
+												await fsView.verify();
+												if (transfer!(owned)) {
+													ownedLeases.move();
+													sealed = owned;
+												}
+											} else {
+												if (transfer && validation !== "prepared") signal.throwIfAborted();
+												const moved = ownedLeases.move();
+												if (inputSource) sealedLeases.defer(() => resourceVersions.delete(inputSource));
+												sealedLeases.defer(() => moved.dispose());
+												sealed = owned;
+											}
+										} else if (transfer) {
+											if (completed && validation !== "prepared") signal.throwIfAborted();
+											sealed = [];
+										}
+									} catch (error) {
+										if (completed) throw error;
+									}
+								});
+							}
+							return sealed && { output, versions: sealed, inputSource };
 						},
-						(inputs) =>
-							inputs.map((input) => {
-								const proof = session ? session.retain(input) : input.manager.retain(input);
-								retained.push(proof);
-								observe(proof, undefined);
-								return proof;
-							}),
-						async (proofs) => {
-							if (
-								acceptObservation &&
-								proofs.some((proof) =>
-									[...proof.observations.values()].some((observation) => !acceptObservation(observation)),
-								)
-							)
-								throw new Error("resource_input_changed_in_transaction");
-							await validateResourceInputs(proofs, true);
-						},
-						session?.memory,
+						(branch) => branch !== undefined,
 					);
-					completed = true;
 				} finally {
 					await TimelineInterval.outside(async () => {
-						if (!completed && !transfer) return;
-						try {
-							let bytes = captured?.view?.bytes ?? 0;
-							captured?.view?.seal();
-							const owned = captured ? [captured] : [];
-							for (const [token, observations] of proofs)
-								if (observations.size && token !== captured) {
-									const selected =
-										observations.size === token.observations.size ? token : { ...token, observations };
-									const metadataBytes = retainMetadata
-										? Math.min(maxBytes - bytes, session?.remainingBytes ?? maxBytes)
-										: undefined;
-									const proof = retained.includes(selected)
-										? selected
-										: session
-											? session.retain(selected, metadataBytes)
-											: selected.manager.retain(selected, metadataBytes);
-									if (proof !== selected) retained.push(proof);
-									owned.push(proof);
-									bytes += proof.view?.bytes ?? 0;
-								}
-							if (completed && validation === "output") await validateResourceInputs(owned, true);
-							if (!transfer) signal.throwIfAborted();
-							if (
-								(!retainMetadata || resourceProofBytes(owned) + bytes <= maxBytes) &&
-								(!session || session.bytes <= session.maxBytes)
-							) {
-								if (captured)
-									await session?.publish(
-										captured,
-										signal,
-										[...proofs].map(([token, observations]) => ({
-											...token,
-											observations,
-										})),
-									);
-								if (!completed) {
-									await fsView.verify();
-									if (transfer!(owned)) {
-										captured = undefined;
-										retained.length = 0;
-										sealed = owned;
-									}
-								} else {
-									captured = undefined;
-									retained.length = 0;
-									sealed = owned;
-								}
-							} else if (transfer) sealed = []; // Successful consumption does not require future cache retention.
-							if (completed && transfer && validation !== "prepared") signal.throwIfAborted();
-						} catch (error) {
-							if (completed) throw error;
-						} // Optional input retention preserves the original execution failure.
+						if (inputSource && !sealed) resourceVersions.delete(inputSource);
+						await ownedLeases.dispose();
+						await queryLeases.dispose();
 					});
 				}
-				return sealed && { output, versions: sealed, inputSource };
 			},
-			(branch) => branch !== undefined,
+			discardSealed,
 		);
+		if (result && (!transfer || !result.versions.length || transfer(result.versions))) {
+			sealedLeases.move();
+		}
+		return result;
 	} finally {
-		await TimelineInterval.outside(async () => {
-			if (inputSource && !sealed) resourceVersions.delete(inputSource);
-			await Promise.allSettled([...borrowed, ...retained, captured, initial].map(releaseResourceVersion));
-		});
-	}
-		},
-		discardSealed,
-	);
-	if (result?.versions.length && transfer && !transfer(result.versions)) {
 		await discardSealed();
 	}
-	return result;
 }
 /** Committed poststates enter the same read view and exact validation as captured inputs. */
 export async function createCommittedResourceInputs(

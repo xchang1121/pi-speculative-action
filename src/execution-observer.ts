@@ -3,11 +3,13 @@ import { lstat } from "node:fs/promises";
 import path from "node:path";
 import { speculativeConfig } from "./config-schema.ts";
 import {
+	composeUnixTimestampNs,
 	FILESYSTEM_OBSERVATION_FIELDS,
 	type FilesystemObservationField,
 	filesystemObservationDigest,
 } from "./filesystem-evidence.ts";
 import { type Sha256Digest, containsLogicalPath, sha256Digest, stableEqual } from "./primitives.ts";
+import { forkedProcessScheduling } from "./process-context.mjs";
 import { type DependencyRole, type ProvenanceTaint } from "./provenance-certificate.ts";
 // Linux new_utsname contains six 65-byte fields, including their padding.
 export const UTSNAME_BYTES = 6 * 65;
@@ -588,7 +590,7 @@ function nativeStatObservation(bytes: Buffer, extended: boolean): StatObservatio
 		return signed ? bytes.readBigInt64LE(offset) : bytes.readBigUInt64LE(offset);
 	};
 	const time = (offset: number) =>
-		integer(offset, 8, true) * 1000000000n + integer(offset + 8, extended ? 4 : 8);
+		composeUnixTimestampNs(integer(offset, 8, true), integer(offset + 8, extended ? 4 : 8));
 	const device = (offset: number) => linuxDevice(integer(offset, 4), integer(offset + 4, 4));
 	const values = extended
 		? {
@@ -1147,19 +1149,17 @@ export async function observeExecution(
 		if ((name === "sched_getscheduler" || name === "sched_getparam") && ok) {
 			const target = args[0] === 0n ? pid : Number(BigInt.asIntN(32, args[0]!));
 			const sched = options.scheduling;
-			const resetChild = Boolean(sched && target !== root.pid && sched.policy & 0x40000000);
-			const expectedPolicy = sched ? (resetChild ? 0 : sched.policy) : undefined;
-			const expectedPriority = sched ? (resetChild ? 0 : sched.priority) : undefined;
+			const expected = sched ? (target === root.pid ? sched : forkedProcessScheduling(sched)) : undefined;
 			const schedProven =
-				sched !== undefined &&
+				expected !== undefined &&
 				selected.has(target) &&
-				(sched.policy & ~0x40000000) !== 6 &&
-				!(sched.resetOnFork === "unprobed" && target !== root.pid);
+				(sched!.policy & ~0x40000000) !== 6 &&
+				!(sched!.resetOnFork === "unprobed" && target !== root.pid);
 			if (
 				!schedProven ||
 				(name === "sched_getscheduler"
-					? result !== expectedPolicy
-					: record.lock === undefined || record.lock < 0 || record.lock !== expectedPriority)
+					? result !== expected.policy
+					: record.lock === undefined || record.lock < 0 || record.lock !== expected.priority)
 			)
 				unsupported(name);
 		}

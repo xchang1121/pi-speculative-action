@@ -16,9 +16,12 @@ import { temporaryDirectories } from "./filesystem.ts";
 import { effectCommitFailure } from "../src/execution-world.ts";
 import {
 	ProcessHandoffOwnership,
+	ProcessHandoffRegistry,
+	ProvenanceCertificateStore,
 	sealProcessCertificate,
 	type ProcessResultRecord,
 } from "../src/process-reuse.ts";
+import { forkedProcessScheduling } from "../src/process-context.mjs";
 import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
 
 vi.mock("node:fs/promises", { spy: true });
@@ -452,20 +455,81 @@ test("a whole handoff waits for all child claims and only retries recoverable co
 	await expect(partial.commit(apply)).rejects.toThrow("partially consumed");
 });
 
-test("verifies sched_getparam and sched_getscheduler against proven scheduling context", async () => {
-	for (const [nr, targetPid, result, lock, scheduling, expected] of [
-		[143, 0, 0, 0, { policy: 0, priority: 0 }, ["clock", "random"]],
-		[145, 0, 3, -1, { policy: 3, priority: 0 }, ["clock", "random"]],
-		[145, 0, 3, -1, { policy: 0, priority: 0 }, ["clock", "random", "unsupported_syscall"]],
-		[143, 0, 0, -1, { policy: 0, priority: 0 }, ["clock", "random", "unsupported_syscall"]],
-		[145, 0, 0, -1, undefined, ["clock", "random", "unsupported_syscall"]],
-		[145, 999, -3, -1, { policy: 0, priority: 0 }, ["clock", "ipc", "pid_observation", "random"]],
+test("verifies sched_getparam, sched_getscheduler, reset-on-fork inheritance, and pins validating handoffs against eviction", async () => {
+	const base = { cpus: "0", memoryNodes: "0" };
+	expect([0x40000003, 0x40000000, 0x40000001, 0x40000002].map((policy) =>
+		forkedProcessScheduling({ ...base, policy, priority: policy & 3 ? 10 : 0, nice: -5 }),
+	)).toEqual([
+		{ ...base, policy: 3, priority: 0, nice: 0 },
+		{ ...base, policy: 0, priority: 0, nice: 0 },
+		{ ...base, policy: 0, priority: 0, nice: 0 },
+		{ ...base, policy: 0, priority: 0, nice: 0 },
+	]);
+
+	for (const [nr, targetPid, result, lock, scheduling, childPid, expected] of [
+		[143, 0, 0, 0, { policy: 0, priority: 0 }, 101, ["clock", "random"]],
+		[145, 0, 3, -1, { policy: 3, priority: 0 }, 101, ["clock", "random"]],
+		[145, 0, 3, -1, { policy: 0, priority: 0 }, 101, ["clock", "random", "unsupported_syscall"]],
+		[143, 0, 0, -1, { policy: 0, priority: 0 }, 101, ["clock", "random", "unsupported_syscall"]],
+		[145, 0, 0, -1, undefined, 101, ["clock", "random", "unsupported_syscall"]],
+		[145, 999, -3, -1, { policy: 0, priority: 0 }, 101, ["clock", "ipc", "pid_observation", "random"]],
+		[145, 0, 3, -1, { policy: 0x40000003, priority: 0 }, 102, ["clock", "random"]],
+		[145, 0, 0, -1, { policy: 0x40000003, priority: 0 }, 102, ["clock", "random", "unsupported_syscall"]],
 	] as const) {
-		const { tail, begin, finish, image, exit } = executionTrace();
-		image("/usr/bin/python3");
-		finish(begin(nr, 0, [targetPid, 0, 0, 0, 0, 0], []), result, undefined, undefined, undefined, lock);
-		exit();
+		const { frame, tail, begin, finish, image, exit } = executionTrace();
+		image("/usr/bin/python3", 101);
+		if (childPid !== 101) {
+			const forkBody = Buffer.alloc(16);
+			forkBody.writeUInt32LE(childPid, 0);
+			forkBody.writeUInt32LE(childPid, 4);
+			frame(13, 900, forkBody, 101);
+		}
+		finish(begin(nr, 0, [targetPid, 0, 0, 0, 0, 0], [], 0, childPid), result, childPid, 0, 0, lock);
+		if (childPid !== 101) exit(childPid);
+		exit(101);
 		const observed = await observeExecution(tail, "/usr/bin/python3", "/work", { scheduling });
 		expect(observed.taints).toEqual([...expected]);
 	}
+
+	const store = new ProvenanceCertificateStore(await directories.create());
+	const registry = new ProcessHandoffRegistry(store, 1024 * 1024);
+	registry.configure(1);
+	cleanup.push(() => registry.dispose(), () => store.dispose());
+	const scope = { sessionID: "s1", turnID: "t1" };
+	const keyA = sha256Digest("key-a");
+	const keyB = sha256Digest("key-b");
+	const publishOne = async (key: typeof keyA, code: number) => {
+		const work = await registry.acquire({
+			key,
+			scope,
+			producer: { executablePath: "/bin/echo", ownership: new ProcessHandoffOwnership() },
+			lookup: async () => undefined,
+		});
+		expect(work.kind).toBe("work");
+		if (work.kind === "work")
+			await registry.publish(key, work.work, {
+				...PROCESS_CERTIFICATE,
+				result: { ...PROCESS_CERTIFICATE.result, exit: { kind: "code", code } },
+			});
+	};
+	await publishOne(keyA, 0);
+	const lookupEntered = Promise.withResolvers<void>();
+	const lookupContinue = Promise.withResolvers<void>();
+	const acquiringA = registry.acquire({
+		key: keyA,
+		scope,
+		join: false,
+		lookup: async (candidates) => {
+			if (!candidates?.length) return undefined;
+			lookupEntered.resolve();
+			await lookupContinue.promise;
+			return { certificate: candidates[0]! };
+		},
+	});
+	await lookupEntered.promise;
+	await publishOne(keyB, 1);
+	lookupContinue.resolve();
+	const hitA = await acquiringA;
+	expect(hitA.kind).toBe("hit");
+	if (hitA.kind === "hit") hitA.settle?.(true);
 });

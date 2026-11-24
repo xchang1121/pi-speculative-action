@@ -56,6 +56,7 @@ import {
 import {
 	containsFilesystemPath,
 	filesystemPathKey,
+	hasErrorCode,
 	isSafeCount,
 	isSha256Digest,
 	relativeFilesystemPath,
@@ -254,7 +255,7 @@ class ResourceInputMemory {
 		return this.limit - this.retained;
 	}
 	change(bytes: number): void {
-		if (bytes > this.remainingBytes) throw resourceBudgetError("resource_snapshot_budget_exceeded");
+		if (bytes > this.remainingBytes) throw resourceBudgetError("resource_snapshot_budget_exceeded", true);
 		if (this.retained + bytes < 0) throw new Error("resource_snapshot_budget_underflow");
 		this.retained += bytes;
 	}
@@ -947,7 +948,7 @@ export class ResourceReadView {
 		}
 		if (!isSafeCount(bytes)) throw new Error("resource_snapshot_budget_invalid");
 		if (bytes > this.remainingBytes) {
-			this.failure = resourceBudgetError("resource_snapshot_budget_exceeded");
+			this.failure = resourceBudgetError("resource_snapshot_budget_exceeded", true);
 			for (const entry of this.entries.values()) this.releaseObject(entry);
 			this.entries.clear();
 			this.objectCount = 0;
@@ -2308,7 +2309,7 @@ export class ResourceVersionManager {
 				(sum, entry) => sum + observationBytes(dependencyKey(entry), entry),
 				0,
 			);
-			if (proofBytes > retainBytes) throw resourceBudgetError("resource_snapshot_budget_exceeded");
+			if (proofBytes > retainBytes) throw resourceBudgetError("resource_snapshot_budget_exceeded", true);
 			const contents = this.persistentInputs!.contents ?? new ContentChunkPool(store, limits);
 			const observations = new ResourceObservations(
 				this.persistentInputs!.memory,
@@ -3068,6 +3069,7 @@ export class ResourceInputSession {
 		token: ResourceVersionToken,
 		signal?: AbortSignal,
 		inputs: readonly ResourceVersionToken[] = [],
+		strict = false,
 	): Promise<boolean> {
 		if (
 			signal?.aborted ||
@@ -3083,7 +3085,13 @@ export class ResourceInputSession {
 			await token.manager.persist(token, inputs);
 			this.published.add(token);
 			return true;
-		} catch {
+		} catch (error) {
+			if (
+				strict &&
+				!hasErrorCode(error, "ERR_ARTIFACT_LEASE_BUDGET") &&
+				!hasErrorCode(error, "ERR_RESOURCE_BUDGET")
+			)
+				throw new Error("file input publication failed", { cause: error });
 			return false;
 		}
 	}
@@ -3594,7 +3602,7 @@ async function fingerprintDependencies(
 						: Number(info.size);
 				const retain = !view?.verifyingInputs && (view?.reserve(reserved) ?? false);
 				if (!retain && (chunked || (provided && (!hot || (view && !view.verifyingInputs)))))
-					throw resourceBudgetError("resource_snapshot_budget_exceeded");
+					throw resourceBudgetError("resource_snapshot_budget_exceeded", true);
 				const bytes = provided && (provided instanceof ChunkedContent ? provided : Buffer.from(provided));
 				// Supplied bytes own data, never a host observation window; adoption validates them exactly.
 				// A file unchanged since an earlier read of it, by the racy-git rule, needs no read unless its bytes are retained.

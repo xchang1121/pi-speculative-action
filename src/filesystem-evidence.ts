@@ -100,8 +100,10 @@ class DirectoryTypeEntry implements FilesystemTypeEvidence {
 		return this.kind === 6;
 	}
 }
-const nsToMs = (ns: bigint): bigint => (ns >= 0n ? ns / 1_000_000n : (ns - 999_999n) / 1_000_000n);
-const nsToDate = (ns: bigint): Date => new Date(Number(ns) / 1_000_000);
+export const composeUnixTimestampNs = (sec: bigint, nsec: number | bigint): bigint =>
+	sec * 1_000_000_000n + BigInt(nsec);
+const nsToMs = (ns: bigint): bigint => ns / 1_000_000n;
+const nsToDate = (ns: bigint): Date => new Date(Number(ns / 1_000_000n));
 class NativeBigIntStats implements BigIntStats {
 	readonly dev: bigint;
 	readonly ino: bigint;
@@ -117,7 +119,7 @@ class NativeBigIntStats implements BigIntStats {
 	readonly mtimeNs: bigint;
 	readonly ctimeNs: bigint;
 	readonly birthtimeNs: bigint;
-	constructor(u64: BigUint64Array, i64: BigInt64Array) {
+	constructor(u64: BigUint64Array, secI64: BigInt64Array, nsecU32: Uint32Array) {
 		this.dev = u64[0]!;
 		this.ino = u64[1]!;
 		this.mode = u64[2]!;
@@ -128,10 +130,10 @@ class NativeBigIntStats implements BigIntStats {
 		this.size = u64[7]!;
 		this.blksize = u64[8]!;
 		this.blocks = u64[9]!;
-		this.atimeNs = i64[0]!;
-		this.mtimeNs = i64[1]!;
-		this.ctimeNs = i64[2]!;
-		this.birthtimeNs = i64[3]!;
+		this.atimeNs = composeUnixTimestampNs(secI64[0]!, nsecU32[0]!);
+		this.mtimeNs = composeUnixTimestampNs(secI64[1]!, nsecU32[1]!);
+		this.ctimeNs = composeUnixTimestampNs(secI64[2]!, nsecU32[2]!);
+		this.birthtimeNs = composeUnixTimestampNs(secI64[3]!, nsecU32[3]!);
 	}
 	get atimeMs(): bigint {
 		return nsToMs(this.atimeNs);
@@ -179,10 +181,12 @@ class NativeBigIntStats implements BigIntStats {
 		return (this.mode & 0o170000n) === 0o140000n;
 	}
 }
+const NATIVE_PATH_OFFSET = 128;
 const NATIVE_IO_BYTES = 65536;
 const nativeIoBuffer = Buffer.alloc(NATIVE_IO_BYTES);
 const nativeStatU64 = new BigUint64Array(nativeIoBuffer.buffer, nativeIoBuffer.byteOffset, 10);
-const nativeStatI64 = new BigInt64Array(nativeIoBuffer.buffer, nativeIoBuffer.byteOffset + 80, 4);
+const nativeStatSecI64 = new BigInt64Array(nativeIoBuffer.buffer, nativeIoBuffer.byteOffset + 80, 4);
+const nativeStatNsecU32 = new Uint32Array(nativeIoBuffer.buffer, nativeIoBuffer.byteOffset + 112, 4);
 function compareUtf8Names(left: string, right: string): number {
 	const limit = Math.min(left.length, right.length);
 	for (let index = 0; index < limit; index++) {
@@ -417,21 +421,23 @@ export class FilesystemReadView {
 		const absolute = path.isAbsolute(target) ? target : `${process.cwd()}/${target}`;
 		if (absolute.includes("\0")) throw new Error("invalid filesystem pathname");
 		const pathBytes = Buffer.byteLength(absolute);
-		if (112 + pathBytes + 1 > NATIVE_IO_BYTES - 512) return undefined;
+		if (NATIVE_PATH_OFFSET + pathBytes + 1 > NATIVE_IO_BYTES - 512) return undefined;
 		this.observed.add(absolute);
 		const flags = 0x200000 | (follow ? 0 : constants.O_NOFOLLOW);
 		nativeIoBuffer.writeInt32LE(this.descriptor, 0);
 		nativeIoBuffer.writeUInt32LE(flags, 4);
 		nativeIoBuffer.writeUInt32LE(needStat ? 1 : 0, 8);
 		nativeIoBuffer.writeUInt32LE(pathBytes, 12);
-		nativeIoBuffer.write(absolute, 112, pathBytes, "utf8");
-		nativeIoBuffer[112 + pathBytes] = 0;
+		nativeIoBuffer.write(absolute, NATIVE_PATH_OFFSET, pathBytes, "utf8");
+		nativeIoBuffer[NATIVE_PATH_OFFSET + pathBytes] = 0;
 		const rlen = this.reader(-18, nativeIoBuffer);
 		if (!Number.isInteger(rlen)) throw new Error("native filesystem stat unavailable");
 		if (rlen < 0) throw filesystemReadError(`filesystem open failed: ${target} (flags=${flags})`, rlen);
-		const resolved = nativeIoBuffer.toString("utf8", 112, 112 + rlen);
+		const resolved = nativeIoBuffer.toString("utf8", NATIVE_PATH_OFFSET, NATIVE_PATH_OFFSET + rlen);
 		this.observed.add(resolved);
-		return needStat ? { stat: new NativeBigIntStats(nativeStatU64, nativeStatI64), resolved } : { resolved };
+		return needStat
+			? { stat: new NativeBigIntStats(nativeStatU64, nativeStatSecI64, nativeStatNsecU32), resolved }
+			: { resolved };
 	}
 	async pin(target: string, follow = false): Promise<FilesystemObjectHandle> {
 		if (this.ambient) return fs.open(target, 0x200000 | (follow ? 0 : constants.O_NOFOLLOW));
@@ -524,12 +530,12 @@ export class FilesystemReadView {
 		const absolute = path.isAbsolute(target) ? target : `${process.cwd()}/${target}`;
 		if (absolute.includes("\0")) throw new Error("invalid filesystem pathname");
 		const pathBytes = Buffer.byteLength(absolute);
-		if (112 + pathBytes + 1 <= NATIVE_IO_BYTES - 512) {
+		if (NATIVE_PATH_OFFSET + pathBytes + 1 <= NATIVE_IO_BYTES - 512) {
 			this.observed.add(absolute);
 			nativeIoBuffer.writeInt32LE(this.descriptor, 0);
 			nativeIoBuffer.writeUInt32LE(pathBytes, 4);
-			nativeIoBuffer.write(absolute, 112, pathBytes, "utf8");
-			nativeIoBuffer[112 + pathBytes] = 0;
+			nativeIoBuffer.write(absolute, NATIVE_PATH_OFFSET, pathBytes, "utf8");
+			nativeIoBuffer[NATIVE_PATH_OFFSET + pathBytes] = 0;
 			const status = this.reader(-19, nativeIoBuffer);
 			if (!Number.isInteger(status)) throw new Error("native directory scan unavailable");
 			if (status < 0)
@@ -541,7 +547,7 @@ export class FilesystemReadView {
 				const rlen = nativeIoBuffer.readUInt32LE(0);
 				const start = nativeIoBuffer.readUInt32LE(4);
 				const used = nativeIoBuffer.readUInt32LE(8);
-				this.observed.add(nativeIoBuffer.toString("utf8", 112, 112 + rlen));
+				this.observed.add(nativeIoBuffer.toString("utf8", NATIVE_PATH_OFFSET, NATIVE_PATH_OFFSET + rlen));
 				return directoryImage(nativeIoBuffer.subarray(start, start + used), undefined, false);
 			}
 		}

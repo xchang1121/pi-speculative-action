@@ -175,3 +175,46 @@ export class SharedAbortScope extends AbortController {
 		return release;
 	}
 }
+/**
+ * LIFO resource lease stack with atomic ownership transfer (`move()`).
+ * Every registered cleanup runs on `dispose()`, even if an earlier cleanup throws.
+ */
+export class LeaseScope {
+	private cleanups: (() => unknown)[] = [];
+	private moved = false;
+	private disposing?: Promise<void>;
+	defer(cleanup?: () => unknown): void {
+		if (!cleanup) return;
+		if (this.moved || this.disposing) throw new Error("lease scope is sealed");
+		this.cleanups.push(cleanup);
+	}
+	adopt<T>(value: T, cleanup: (value: T) => unknown): T {
+		this.defer(() => cleanup(value));
+		return value;
+	}
+	move(): LeaseScope {
+		if (this.moved || this.disposing) throw new Error("lease scope is sealed");
+		const next = new LeaseScope();
+		next.cleanups = this.cleanups;
+		this.cleanups = [];
+		this.moved = true;
+		return next;
+	}
+	dispose(): Promise<void> {
+		return (this.disposing ??= (async () => {
+			const pending = this.cleanups.splice(0).reverse();
+			let failure: unknown;
+			for (const cleanup of pending) {
+				try {
+					await cleanup();
+				} catch (error) {
+					failure ??= error;
+				}
+			}
+			if (failure !== undefined) throw failure;
+		})());
+	}
+	[Symbol.asyncDispose](): Promise<void> {
+		return this.dispose();
+	}
+}

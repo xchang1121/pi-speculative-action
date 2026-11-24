@@ -502,7 +502,7 @@ export class ProvenanceCertificateStore {
 	private readonly publication = new AsyncLocalStorage<{
 		database: DatabaseSync;
 		touched: Set<string>;
-		verifiedPaths: Set<string>;
+		verifiedSizes: Map<string, number>;
 		statements: Map<string, ReturnType<DatabaseSync["prepare"]>>;
 		active: boolean;
 	}>();
@@ -520,7 +520,9 @@ export class ProvenanceCertificateStore {
 		string,
 		{
 			readonly idsKey: string;
-			readonly lookup: (target: string, contentOnly?: boolean) => Set<Sha256Digest>;
+			readonly ids: readonly Sha256Digest[];
+			readonly paths: ReadonlyMap<string, readonly number[]>;
+			readonly contentPaths: ReadonlyMap<string, readonly number[]>;
 		}
 	>();
 	constructor(root: string, options: ProvenanceStoreOptions = {}) {
@@ -532,7 +534,7 @@ export class ProvenanceCertificateStore {
 			this.exclusive(
 				async () => {
 					const created = await publishImmutable(target, bytes, this.reservedRoot ? this.root : undefined);
-					this.publication.getStore()?.verifiedPaths.add(target);
+					this.publication.getStore()?.verifiedSizes.set(target, bytes.byteLength);
 					return created;
 				},
 				[this.objectKey(target)],
@@ -635,6 +637,13 @@ export class ProvenanceCertificateStore {
 		const canonical = stableStringify(body);
 		const id = sha256Digest(canonical);
 		const encoded = `${canonical.slice(0, -1)},"id":"${id}"}`;
+		if (
+			Buffer.byteLength(encoded) > speculativeConfig().storage.maxRecordBytes ||
+			artifacts.length > speculativeConfig().filesystem.maxManifestChunks
+		)
+			throw Object.assign(new Error("input version exceeds record budget"), {
+				code: "ERR_ARTIFACT_LEASE_BUDGET",
+			});
 		const record = decodeInputVersion(encoded, id);
 		if (!record) throw new Error("invalid persistent input version");
 		return this.publishRoot(`input:${id}`, record.artifacts, (database) => {
@@ -684,21 +693,13 @@ export class ProvenanceCertificateStore {
 			signal,
 		);
 	}
-	private rememberInputEntrySummary(id: Sha256Digest, payload: unknown): readonly (readonly [string, string, boolean])[] {
-		const rawEntries = (payload as { entries?: unknown } | null)?.entries;
-		const summary: (readonly [string, string, boolean])[] = [];
-		if (Array.isArray(rawEntries)) {
-			for (const item of rawEntries) {
-				if (!Array.isArray(item) || typeof item[0] !== "string") continue;
-				const meta = item[1] as { type?: unknown; content?: unknown } | null | undefined;
-				const kind = typeof meta?.type === "string" ? meta.type : "";
-				const hasContent = meta !== null && typeof meta === "object" && meta.content !== undefined && meta.content !== null;
-				summary.push([item[0], kind, hasContent]);
-			}
-		}
+	private touchInputEntrySummary(
+		id: Sha256Digest,
+		summary: readonly (readonly [string, string, boolean])[],
+	): readonly (readonly [string, string, boolean])[] {
 		this.inputEntrySummaries.delete(id);
 		this.inputEntrySummaries.set(id, summary);
-		const maxCached = this.configuration.current.filesystem.maxHistoryEntries;
+		const maxCached = Math.max(this.configuration.current.filesystem.maxHistoryEntries * 4, 64);
 		while (this.inputEntrySummaries.size > maxCached) {
 			const oldest = this.inputEntrySummaries.keys().next().value;
 			if (!oldest) break;
@@ -706,68 +707,210 @@ export class ProvenanceCertificateStore {
 		}
 		return summary;
 	}
-	/** One read snapshot supplies path hints for a whole resource query, including existing stores. */
+	private rememberInputEntrySummary(
+		id: Sha256Digest,
+		payload: unknown,
+	): readonly (readonly [string, string, boolean])[] {
+		const rawEntries = (payload as { entries?: unknown } | null)?.entries;
+		const summary: (readonly [string, string, boolean])[] = [];
+		if (Array.isArray(rawEntries)) {
+			for (const item of rawEntries) {
+				if (!Array.isArray(item) || typeof item[0] !== "string") continue;
+				const meta = item[1] as { type?: unknown; content?: unknown } | null | undefined;
+				const kind = typeof meta?.type === "string" ? meta.type : "";
+				const hasContent =
+					meta !== null && typeof meta === "object" && meta.content !== undefined && meta.content !== null;
+				summary.push([item[0], kind, hasContent]);
+			}
+		}
+		return this.touchInputEntrySummary(id, summary);
+	}
+	private async queryInputSummaries(
+		ids: readonly Sha256Digest[],
+		signal: AbortSignal,
+	): Promise<readonly (readonly [Sha256Digest, readonly (readonly [string, string, boolean])[]])[]> {
+		const buildSql = (validated: boolean) => `
+			SELECT
+				i.id AS id,
+				(
+					SELECT json_group_array(json_array(
+						e.value ->> 0,
+						e.value ->> '$[1].type',
+						IFNULL(json_type(e.value, '$[1].content'), 'null') <> 'null'
+					))
+					FROM json_each(${validated ? "CASE WHEN json_valid(i.value) THEN i.value END" : "i.value"}, '$.payload.entries') AS e
+					WHERE e.type = 'array'
+				) AS entries
+			FROM input_versions AS i
+			WHERE i.id IN (SELECT value FROM json_each(?))`;
+		const loadSingleSliced = async (
+			id: Sha256Digest,
+		): Promise<readonly [Sha256Digest, readonly (readonly [string, string, boolean])[]]> => {
+			const summary: (readonly [string, string, boolean])[] = [];
+			const step = Math.max(1, Math.floor(this.maxReadBytes / 256));
+			for (let offset = 0; ; offset += step) {
+				const slice = await this.query(
+					`SELECT
+						e.value ->> 0 AS p,
+						e.value ->> '$[1].type' AS k,
+						IFNULL(json_type(e.value, '$[1].content'), 'null') <> 'null' AS c
+					FROM input_versions AS i,
+						json_each(CASE WHEN json_valid(i.value) THEN i.value END, '$.payload.entries') AS e
+					WHERE i.id = ? AND e.type = 'array'
+					LIMIT ? OFFSET ?`,
+					[id, step, offset],
+					signal,
+				);
+				for (const item of slice) {
+					if (typeof item.p === "string")
+						summary.push([item.p, typeof item.k === "string" ? item.k : "", item.c === 1]);
+				}
+				if (slice.length < step) break;
+			}
+			return [id, this.touchInputEntrySummary(id, summary)] as const;
+		};
+		const loadChunk = async (
+			chunk: readonly Sha256Digest[],
+		): Promise<readonly (readonly [Sha256Digest, readonly (readonly [string, string, boolean])[]])[]> => {
+			if (!chunk.length) return [];
+			const param = [JSON.stringify(chunk)];
+			let rows: Record<string, SQLOutputValue>[];
+			try {
+				rows = await this.query(buildSql(false), param, signal);
+			} catch (error) {
+				if (error instanceof Error && error.message.includes("SQLite read result budget exceeded")) {
+					if (chunk.length === 1) return [await loadSingleSliced(chunk[0]!)];
+					const mid = Math.ceil(chunk.length / 2);
+					return [...(await loadChunk(chunk.slice(0, mid))), ...(await loadChunk(chunk.slice(mid)))];
+				}
+				if (!(error instanceof Error) || !/json/i.test(error.message)) throw error;
+				rows = await this.query(buildSql(true), param, signal);
+			}
+			const results: [Sha256Digest, readonly (readonly [string, string, boolean])[]][] = [];
+			for (const row of rows) {
+				const id = row.id;
+				if (!isSha256Digest(id)) continue;
+				const summary: (readonly [string, string, boolean])[] = [];
+				if (typeof row.entries === "string" && row.entries !== "[]") {
+					try {
+						const parsed = JSON.parse(row.entries) as unknown;
+						if (Array.isArray(parsed)) {
+							for (const item of parsed) {
+								if (!Array.isArray(item) || typeof item[0] !== "string") continue;
+								summary.push([item[0], typeof item[1] === "string" ? item[1] : "", item[2] === 1]);
+							}
+						}
+					} catch {
+						// Keep an empty summary for malformed entry projections.
+					}
+				}
+				results.push([id, this.touchInputEntrySummary(id, summary)]);
+			}
+			return results;
+		};
+		const batchSize = Math.max(1, Math.min(ids.length, Math.floor(this.maxReadBytes / 512)));
+		const all: (readonly [Sha256Digest, readonly (readonly [string, string, boolean])[]])[] = [];
+		for (let offset = 0; offset < ids.length; offset += batchSize) {
+			all.push(...(await loadChunk(ids.slice(offset, offset + batchSize))));
+		}
+		return all;
+	}
+	/** One read snapshot supplies path hints for a whole resource query, filtering by path before capping at limit. */
 	async inputPathIndex(root: string, limit: number, signal: AbortSignal) {
 		if (!isSafeCount(limit, 1, this.configuration.current.filesystem.maxHistoryEntries))
 			throw new Error("invalid input discovery limit");
-		const idRows = await this.query(
-			"SELECT id FROM input_versions WHERE root = ? ORDER BY rowid DESC LIMIT ?",
-			[root, limit],
-			signal,
-		);
+		const idPageSize = Math.max(1, Math.min(512, Math.floor(this.maxReadBytes / 160)));
 		const ids: Sha256Digest[] = [];
-		for (const { id } of idRows) {
-			if (isSha256Digest(id)) ids.push(id);
+		for (let cursor: number | bigint | undefined; ; ) {
+			const page = await this.query(
+				cursor === undefined
+					? "SELECT rowid AS r, id FROM input_versions WHERE root = ? ORDER BY rowid DESC LIMIT ?"
+					: "SELECT rowid AS r, id FROM input_versions WHERE root = ? AND rowid < ? ORDER BY rowid DESC LIMIT ?",
+				cursor === undefined ? [root, idPageSize] : [root, cursor, idPageSize],
+				signal,
+			);
+			for (const { id } of page) {
+				if (isSha256Digest(id)) ids.push(id);
+			}
+			if (page.length < idPageSize) break;
+			const tail = page.at(-1)?.r;
+			if (typeof tail !== "number" && typeof tail !== "bigint") break;
+			cursor = tail;
 		}
 		const idsKey = ids.join(",");
-		const cacheKey = `${root}\0${limit}`;
-		const cached = this.lastInputCatalogs.get(cacheKey);
-		if (cached && cached.idsKey === idsKey) return cached.lookup;
-		for (const id of ids) {
-			if (this.inputEntrySummaries.has(id)) continue;
-			const value = (await this.query("SELECT value FROM input_versions WHERE id = ?", [id], signal))[0]?.value;
-			if (typeof value !== "string") continue;
-			try {
-				const decoded = JSON.parse(value) as { payload?: unknown } | null;
-				this.rememberInputEntrySummary(id, decoded?.payload);
-			} catch {
-				this.inputEntrySummaries.set(id, []);
-			}
-		}
-		const paths = new Map<string, Sha256Digest[]>();
-		const contentPaths = new Map<string, Sha256Digest[]>();
-		for (const id of ids) {
-			const summary = this.inputEntrySummaries.get(id);
-			if (!summary) continue;
-			for (const [name, kind, hasContent] of summary) {
-				const key = kind === "alias" ? `tree:${name}` : name;
-				const list = paths.get(key);
-				if (list) list.push(id);
-				else paths.set(key, [id]);
-				if (kind !== "alias" && hasContent) {
-					const clist = contentPaths.get(name);
-					if (clist) clist.push(id);
-					else contentPaths.set(name, [id]);
+		let catalog = this.lastInputCatalogs.get(root);
+		if (!catalog || catalog.idsKey !== idsKey) {
+			const summaries = new Map<Sha256Digest, readonly (readonly [string, string, boolean])[]>();
+			const missingIds: Sha256Digest[] = [];
+			for (const id of ids) {
+				const cachedSummary = this.inputEntrySummaries.get(id);
+				if (cachedSummary) {
+					this.touchInputEntrySummary(id, cachedSummary);
+					summaries.set(id, cachedSummary);
+				} else {
+					missingIds.push(id);
 				}
 			}
+			if (missingIds.length) {
+				for (const [id, summary] of await this.queryInputSummaries(missingIds, signal))
+					summaries.set(id, summary);
+			}
+			const paths = new Map<string, number[]>();
+			const contentPaths = new Map<string, number[]>();
+			for (let rank = 0; rank < ids.length; rank++) {
+				const summary = summaries.get(ids[rank]!);
+				if (!summary) continue;
+				for (const [name, kind, hasContent] of summary) {
+					const key = kind === "alias" ? `tree:${name}` : name;
+					const list = paths.get(key);
+					if (list) {
+						if (list.at(-1) !== rank) list.push(rank);
+					} else paths.set(key, [rank]);
+					if (kind !== "alias" && hasContent) {
+						const clist = contentPaths.get(name);
+						if (clist) {
+							if (clist.at(-1) !== rank) clist.push(rank);
+						} else contentPaths.set(name, [rank]);
+					}
+				}
+			}
+			catalog = { idsKey, ids, paths, contentPaths };
+			this.lastInputCatalogs.delete(root);
+			this.lastInputCatalogs.set(root, catalog);
+			while (this.lastInputCatalogs.size > 32) {
+				const oldest = this.lastInputCatalogs.keys().next().value;
+				if (!oldest) break;
+				this.lastInputCatalogs.delete(oldest);
+			}
 		}
-		const lookup = (target: string, contentOnly = false) => {
-			const out = new Set((contentOnly ? contentPaths : paths).get(target));
+		const { ids: catalogIds, paths, contentPaths } = catalog;
+		return (target: string, contentOnly = false) => {
+			const lists: (readonly number[])[] = [];
+			const direct = (contentOnly ? contentPaths : paths).get(target);
+			if (direct?.length) lists.push(direct);
 			for (let current = target; ; ) {
-				for (const id of paths.get(`tree:${current}`) ?? []) out.add(id);
+				const tree = paths.get(`tree:${current}`);
+				if (tree?.length) lists.push(tree);
 				const parent = filesystemPathKey(path.dirname(current));
-				if (current === parent) return out;
+				if (current === parent) break;
 				current = parent;
 			}
+			const out = new Set<Sha256Digest>();
+			if (!lists.length) return out;
+			if (lists.length === 1) {
+				for (const rank of lists[0]!) {
+					out.add(catalogIds[rank]!);
+					if (out.size >= limit) break;
+				}
+				return out;
+			}
+			const merged = lists.flat().sort((a, b) => a - b);
+			for (const rank of merged) {
+				out.add(catalogIds[rank]!);
+				if (out.size >= limit) break;
+			}
+			return out;
 		};
-		this.lastInputCatalogs.delete(cacheKey);
-		this.lastInputCatalogs.set(cacheKey, { idsKey, lookup });
-		while (this.lastInputCatalogs.size > 32) {
-			const oldest = this.lastInputCatalogs.keys().next().value;
-			if (!oldest) break;
-			this.lastInputCatalogs.delete(oldest);
-		}
-		return lookup;
 	}
 	async findByWeakKey(
 		weakKey: Sha256Digest,
@@ -909,6 +1052,8 @@ export class ProvenanceCertificateStore {
 				database.exec(
 					"DELETE FROM certificates; DELETE FROM input_versions; DELETE FROM changes WHERE path <> ''",
 				);
+				this.inputEntrySummaries.clear();
+				this.lastInputCatalogs.clear();
 				return {
 					removedCertificates: before.roots.filter((record) => record.kind !== "input").length,
 					removedInputVersions: before.roots.filter((record) => record.kind === "input").length,
@@ -1087,9 +1232,12 @@ export class ProvenanceCertificateStore {
 				const result = await publish(database);
 				if (references.length) {
 					await this.artifacts.materialize(references);
-					const verified = this.publication.getStore()?.verifiedPaths;
+					const verified = this.publication.getStore()?.verifiedSizes;
 					const unverified = verified
-						? references.filter((reference) => !verified.has(this.artifacts.artifactPath(reference.digest)))
+						? references.filter(
+								(reference) =>
+									verified.get(this.artifacts.artifactPath(reference.digest)) !== reference.size,
+							)
 						: references;
 					if (unverified.length) {
 						const closure = await this.read((signal) =>
@@ -1101,7 +1249,7 @@ export class ProvenanceCertificateStore {
 						if (!closure) throw new Error("persistent root artifacts are unavailable");
 						await closure.dispose();
 						for (const reference of unverified)
-							verified?.add(this.artifacts.artifactPath(reference.digest));
+							verified?.set(this.artifacts.artifactPath(reference.digest), reference.size);
 					}
 				}
 				return result;
@@ -1228,7 +1376,7 @@ export class ProvenanceCertificateStore {
 			const publication = {
 				database,
 				touched: new Set(touched),
-				verifiedPaths: new Set<string>(),
+				verifiedSizes: new Map<string, number>(),
 				statements: new Map<string, ReturnType<DatabaseSync["prepare"]>>(),
 				active: true,
 			};

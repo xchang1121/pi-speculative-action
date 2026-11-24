@@ -1,6 +1,6 @@
 // @ts-check
 
-import { closeSync, openSync, readFileSync } from "node:fs";
+import fs from "node:fs";
 import { readFile, readlink, stat } from "node:fs/promises";
 import { speculativeConfig } from "./config-schema.ts";
 import { ensureNativeFilesystem, nativeFilesystem } from "./process-startup.mjs";
@@ -156,11 +156,11 @@ function parseProcessScheduling(pid, status, processStat, native) {
 	let priority = statPriority;
 	let probed = false;
 	if (native) {
-		schedProbeBuffer.writeInt32LE(pid, 0);
 		try {
-			if (native(-17, schedProbeBuffer) === 0) {
-				policy = schedProbeBuffer.readInt32LE(0);
-				priority = schedProbeBuffer.readInt32LE(4);
+			const sample = probeNativeScheduling(native, pid);
+			if (sample) {
+				policy = sample.policy;
+				priority = sample.priority;
 				probed = true;
 			}
 		} catch {
@@ -181,6 +181,22 @@ function parseProcessScheduling(pid, status, processStat, native) {
 }
 const schedProbeBuffer = Buffer.alloc(2064);
 /**
+ * Synchronously probe and copy kernel scheduling attributes before any async suspension.
+ * @param {NonNullable<typeof nativeFilesystem>} native
+ * @param {number} targetPid
+ */
+function probeNativeScheduling(native, targetPid) {
+	schedProbeBuffer.writeInt32LE(targetPid, 0);
+	if (native(-17, schedProbeBuffer) !== 0) return undefined;
+	const maskLen = schedProbeBuffer.readInt32LE(12);
+	return {
+		policy: schedProbeBuffer.readInt32LE(0),
+		priority: schedProbeBuffer.readInt32LE(4),
+		nice: schedProbeBuffer.readInt32LE(8),
+		cpus: formatCpuList(schedProbeBuffer.subarray(16, 16 + maskLen)),
+	};
+}
+/**
  * Format an active CPU affinity mask into canonical list notation matching procfs Cpus_allowed_list.
  * @param {Buffer} mask
  * @returns {string}
@@ -200,8 +216,10 @@ function formatCpuList(mask) {
 	}
 	return ranges.join(",");
 }
-/** @type {string | undefined} */
-let selfMemoryNodes;
+/** @param {string} status */
+function extractMemoryNodes(status) {
+	return /^Mems_allowed_list:\s*(.*)$/m.exec(status)?.[1]?.trim() ?? "";
+}
 /**
  * @param {number} pid
  * @returns {Promise<ProcessSchedulingContext>}
@@ -209,29 +227,19 @@ let selfMemoryNodes;
 export async function captureProcessScheduling(pid) {
 	const native = nativeFilesystem ?? (await ensureNativeFilesystem().catch(() => undefined));
 	if (native) {
-		schedProbeBuffer.writeInt32LE(pid === process.pid ? 0 : pid, 0);
 		try {
-			if (native(-17, schedProbeBuffer) === 0) {
-				const policy = schedProbeBuffer.readInt32LE(0);
-				if ((policy & ~0x40000000) === 6) {
+			const sample = probeNativeScheduling(native, pid === process.pid ? 0 : pid);
+			if (sample) {
+				if ((sample.policy & ~0x40000000) === 6) {
 					throw new Error("held process has unmodeled deadline scheduler");
 				}
-				const memoryNodes =
+				const status =
 					pid === process.pid
-						? (selfMemoryNodes ??=
-								/^Mems_allowed_list:\s*(.*)$/m
-									.exec(readFileSync("/proc/self/status", "utf8"))?.[1]
-									?.trim() ?? "")
-						: /^Mems_allowed_list:\s*(.*)$/m
-								.exec(await readFile(`/proc/${pid}/status`, "utf8"))?.[1]
-								?.trim() ?? "";
-				const maskLen = schedProbeBuffer.readInt32LE(12);
+						? fs.readFileSync("/proc/self/status", "utf8")
+						: await readFile(`/proc/${pid}/status`, "utf8");
 				return {
-					policy,
-					priority: schedProbeBuffer.readInt32LE(4),
-					nice: schedProbeBuffer.readInt32LE(8),
-					cpus: formatCpuList(schedProbeBuffer.subarray(16, 16 + maskLen)),
-					memoryNodes,
+					...sample,
+					memoryNodes: extractMemoryNodes(status),
 				};
 			}
 		} catch (error) {
@@ -246,16 +254,19 @@ export async function captureProcessScheduling(pid) {
 	return parseProcessScheduling(pid, status, processStat, native);
 }
 /**
- * @param {ProcessSchedulingContext} scheduling
- * @returns {ProcessSchedulingContext}
+ * @template {{ readonly policy: number, readonly priority: number, readonly nice?: number }} T
+ * @param {T} scheduling
+ * @returns {T}
  */
 export function forkedProcessScheduling(scheduling) {
 	if (!(scheduling.policy & 0x40000000)) return scheduling;
+	const basePolicy = scheduling.policy & ~0x40000000;
+	const resetsPolicy = basePolicy === 1 || basePolicy === 2;
 	return {
 		...scheduling,
-		policy: 0,
+		policy: resetsPolicy ? 0 : basePolicy,
 		priority: 0,
-		nice: Math.max(0, scheduling.nice),
+		...(typeof scheduling.nice === "number" ? { nice: Math.max(0, scheduling.nice) } : {}),
 	};
 }
 /** Status flags a launcher sets again on a target's routed outputs (its parent's own, like make's O_APPEND); the rest pin the stream. */
@@ -398,12 +409,12 @@ let nullOutputFlags;
 /** Status flags of a write-only /dev/null, as `2>/dev/null` and the dispatcher's discard route open it. */
 function discardFlags() {
 	if (nullOutputFlags === undefined) {
-		const fd = openSync("/dev/null", "w");
+		const fd = fs.openSync("/dev/null", "w");
 		let flags;
 		try {
-			flags = /^flags:\s*([0-7]+)/m.exec(readFileSync(`/proc/self/fdinfo/${fd}`, "utf8"))?.[1];
+			flags = /^flags:\s*([0-7]+)/m.exec(fs.readFileSync(`/proc/self/fdinfo/${fd}`, "utf8"))?.[1];
 		} finally {
-			closeSync(fd);
+			fs.closeSync(fd);
 		}
 		if (!flags) throw new Error("null device flags unavailable");
 		nullOutputFlags = Number.parseInt(flags, 8) & ~0o2000000;

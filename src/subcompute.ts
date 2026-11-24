@@ -727,24 +727,40 @@ export class SubcomputeService {
 			const data = owned.data;
 			const receipt = TimelineInterval.serialize(computation);
 			result = encode(owned.value, receipt, key, workspace, limit);
-			const metadata = { root, ...(share && { workspace }), preparations: [{ binding, key }], computation: this.configuration.current.subcomputation.persistTimelineIntervals
-				? receipt : undefined };
+			const metadata = {
+				root,
+				...(share && { workspace }),
+				preparations: [{ binding, key }],
+				computation: this.configuration.current.subcomputation.persistTimelineIntervals ? receipt : undefined,
+			};
 			const envelope = { id: key, createdAt: Date.now(), artifacts: [], payload: { ...metadata, data: "" } };
-			if (Buffer.byteLength(JSON.stringify(envelope)) + 4 * Math.ceil(data.length / 3) <= this.configuration.current.storage.maxRecordBytes)
-				await store.putInputVersion({ ...metadata, data: data.toString("base64") }, []);
-			else {
-				const bytes = data;
-				await store.withPublication(async () => store.putInputVersion(metadata, [await store.artifacts.put(bytes)]));
+			try {
+				if (
+					Buffer.byteLength(JSON.stringify(envelope)) + 4 * Math.ceil(data.length / 3) <=
+					this.configuration.current.storage.maxRecordBytes
+				)
+					await store.putInputVersion({ ...metadata, data: data.toString("base64") }, []);
+				else
+					await store.withPublication(async () =>
+						store.putInputVersion(metadata, [await store.artifacts.put(data)]),
+					);
+			} catch (error) {
+				if (hasErrorCode(error, "ERR_PROVENANCE_SCHEMA")) throw error;
+				signal.throwIfAborted();
 			}
 		}
+		const runtime = this.runtime();
+		const memoryBudget = Math.min(this.maxBytes(), runtime.resourceCacheMaxBytes ?? Infinity);
 		const prior = this.prepared.get(key);
 		if (prior) {
 			this.prepared.delete(key);
 			this.preparedBytes -= prior.bytes;
 		}
-		this.prepared.set(key, result);
-		this.preparedBytes += result.bytes;
-		this.trimPrepared();
+		if (runtime.resourceCacheMaxEntries > 0 && result.bytes <= memoryBudget) {
+			this.prepared.set(key, result);
+			this.preparedBytes += result.bytes;
+			this.trimPrepared();
+		}
 		return result;
 	}
 	private totalCachedBytes(): number {
